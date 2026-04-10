@@ -262,6 +262,8 @@ option(GGML_OPENCL_USE_ADRENO_KERNELS       "ggml: use optimized kernels for Adr
 set   (GGML_OPENCL_TARGET_VERSION "300" CACHE STRING
                                             "ggml: OpenCL API version to target")
 
+option(GGML_XDNA                            "ggml: use AMD XDNA NPU"                          OFF)
+
 option(GGML_HEXAGON                         "ggml: enable Hexagon backend"                    OFF)
 set(GGML_HEXAGON_FP32_QUANTIZE_GROUP_SIZE 128 CACHE STRING "ggml: quantize group size (32, 64, or 128)")
 
@@ -333,6 +335,7 @@ set(GGML_PUBLIC_HEADERS
     include/ggml-sycl.h
     include/ggml-vulkan.h
     include/ggml-webgpu.h
+    include/ggml-xdna.h
     include/ggml-zendnn.h
     include/ggml-openvino.h
     include/gguf.h)
