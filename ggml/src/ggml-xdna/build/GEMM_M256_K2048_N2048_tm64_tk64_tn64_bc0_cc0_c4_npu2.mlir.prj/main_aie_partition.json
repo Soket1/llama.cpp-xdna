@@ -1,0 +1,33 @@
+{
+  "aie_partition": {
+    "PDIs": [
+      {
+        "cdo_groups": [
+          {
+            "dpu_kernel_ids": [
+              "0x901"
+            ],
+            "name": "DPU",
+            "pdi_id": "0x01",
+            "pre_cdo_groups": [
+              "0xC1"
+            ],
+            "type": "PRIMARY"
+          }
+        ],
+        "file_name": "/home/alex/pruebas/npu_workspace/llama.cpp/ggml/src/ggml-xdna/build/GEMM_M256_K2048_N2048_tm64_tk64_tn64_bc0_cc0_c4_npu2.mlir.prj/main.pdi",
+        "uuid": "ef5af48f-fd75-43db-ab34-1a0cd87e3225"
+      }
+    ],
+    "inference_fingerprint": "23423",
+    "name": "QoS",
+    "operations_per_cycle": "2048",
+    "partition": {
+      "column_width": 8,
+      "start_columns": [
+        0
+      ]
+    },
+    "pre_post_fingerprint": "12345"
+  }
+}

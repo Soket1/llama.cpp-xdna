@@ -1,0 +1,103 @@
+
+MEMORY
+{
+   program (RX) : ORIGIN = 0, LENGTH = 0x0020000
+   data (!RX) : ORIGIN = 0x7E00C, LENGTH = 0x1FF4
+}
+ENTRY(__start)
+SECTIONS
+{
+  . = 0x0;
+  .text : {
+     /* the __start symbol has to come at address zero. */
+     *crt0.o(.text*)
+     _ctors_start = .;
+     _init_array_start = .;
+     KEEP(SORT(*.init_array))
+     _ctors_end = .;
+     _init_array_end = .;
+     _dtors_start = .;
+     _dtors_end = .;
+     *(.text*)
+  } > program
+  .data : {
+     *(.data*)
+     *(.rodata*)
+  } > data
+  .comment : {
+     *(.comment*)
+  }
+  .symtab : {
+     *(.symtab)
+  }
+  .shstrtab : {
+     *(.shstrtab)
+  }
+  .strtab : {
+     *(.strtab)
+  }
+  .stack_sizes : {
+     *(.stack_sizes)
+  }
+
+. = 0x70000;
+_sp_start_value_DM_stack = .;
+. += 0xD00; /* stack */
+/* No tile with memory exists to the south. */
+. = 0x40000;
+. += 0x10000;
+/* No tile with memory exists to the west. */
+. = 0x50000;
+. += 0x10000;
+. = 0x60D00;
+C_L1L2_0_1_buff_0 = .;
+. += 0x2000;
+. = 0x64000;
+C_L1L2_0_1_buff_1 = .;
+. += 0x2000;
+. = 0x68000;
+B_L2L1_0_1_cons_buff_0 = .;
+. += 0x2000;
+. = 0x6C000;
+B_L2L1_0_1_cons_buff_1 = .;
+. += 0x2000;
+. = 0x66000;
+A_L2L1_1_0_cons_buff_0 = .;
+. += 0x2000;
+. = 0x6A000;
+A_L2L1_1_0_cons_buff_1 = .;
+. += 0x2000;
+. = 0x62D00;
+rtp1_0 = .;
+. += 0x8;
+. = 0x6E000;
+_anonymous4 = .;
+. += 0xC;
+. = 0x70D00;
+C_L1L2_0_0_buff_0 = .;
+. += 0x2000;
+. = 0x74000;
+C_L1L2_0_0_buff_1 = .;
+. += 0x2000;
+. = 0x78000;
+B_L2L1_0_0_cons_buff_0 = .;
+. += 0x2000;
+. = 0x7C000;
+B_L2L1_0_0_cons_buff_1 = .;
+. += 0x2000;
+. = 0x76000;
+A_L2L1_0_0_cons_buff_0 = .;
+. += 0x2000;
+. = 0x7A000;
+A_L2L1_0_0_cons_buff_1 = .;
+. += 0x2000;
+. = 0x72D00;
+rtp0_0 = .;
+. += 0x8;
+. = 0x7E000;
+_anonymous0 = .;
+. += 0xC;
+  .bss : { *(.bss*) } > data
+}
+INPUT(GEMM_M256_K2048_N512_tm64_tk64_tn64_bc0_cc0_c4_npu2.mlir.prj/gemm_64x64x64_0_0_0_1_1.o)
+PROVIDE(main = core_0_2);
