@@ -2,52 +2,352 @@
 #include "ggml-xdna.h"
 #include "ggml-backend-impl.h"
 
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <mutex>
 #include <string>
 #include <unordered_map>
-#include <filesystem>
+#include <vector>
 
-// TODO: XRT headers (uncomment when implementing dispatch)
-// #include "xrt/xrt_device.h"
-// #include "xrt/xrt_bo.h"
-// #include "xrt/xrt_kernel.h"
-// #include "xrt/xrt_hw_context.h"
+#include "xrt/xrt_device.h"
+#include "xrt/xrt_bo.h"
+#include "xrt/xrt_kernel.h"
+#include "xrt/xrt_hw_context.h"
+
+// ============================================================================
+// Cached kernel entry — one per unique (op, shape, dtype) tuple
+// ============================================================================
+
+struct xdna_kernel_entry {
+    xrt::xclbin   xclbin;
+    xrt::hw_context hw_ctx;
+    xrt::kernel   kernel;
+    std::vector<char> insts;
+    xrt::bo       insts_bo;
+    int64_t       M, K, N;
+};
+
+// ============================================================================
+// Backend context — holds XRT device and kernel cache
+// ============================================================================
 
 struct ggml_backend_xdna_context {
-    // TODO Phase 1: XRT device handle, xclbin cache, compilation state
+    xrt::device device;
     std::string cache_dir;
+    std::string compile_script;
+    std::unordered_map<std::string, xdna_kernel_entry> kernel_cache;
+    std::mutex cache_mutex;
+    bool device_valid;
 
-    ggml_backend_xdna_context() {
+    ggml_backend_xdna_context() : device_valid(false) {
+        // Cache directory
+        const char * cache_env = getenv("GGML_XDNA_CACHE_DIR");
         const char * home = getenv("HOME");
-        if (home) {
+        if (cache_env) {
+            cache_dir = cache_env;
+        } else if (home) {
             cache_dir = std::string(home) + "/.cache/ggml-xdna/xclbin";
         } else {
             cache_dir = "/tmp/ggml-xdna/xclbin";
+        }
+
+        // Find compile.py relative to this shared library's location
+        // Fallback: look for GGML_XDNA_COMPILE_SCRIPT env var
+        const char * script_env = getenv("GGML_XDNA_COMPILE_SCRIPT");
+        if (script_env) {
+            compile_script = script_env;
+        } else {
+            compile_script = "compile.py";  // must be in PATH or CWD
+        }
+
+        // Initialize XRT device
+        try {
+            device = xrt::device(0);
+            device_valid = true;
+            GGML_LOG_INFO("ggml-xdna: XRT device initialized\n");
+        } catch (const std::exception & e) {
+            GGML_LOG_ERROR("ggml-xdna: failed to initialize XRT device: %s\n", e.what());
         }
     }
 };
 
 // ============================================================================
-// Op dispatch — Phase 1: MUL_MAT only
+// Helpers
+// ============================================================================
+
+static std::vector<char> read_binary_file(const std::string & path) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f.is_open()) {
+        GGML_LOG_ERROR("ggml-xdna: cannot open file: %s\n", path.c_str());
+        return {};
+    }
+    size_t size = f.tellg();
+    f.seekg(0);
+    std::vector<char> data(size);
+    f.read(data.data(), size);
+    return data;
+}
+
+static std::string make_cache_key(int64_t M, int64_t K, int64_t N,
+                                   const char * dtype_in, int num_cols) {
+    // Simple key: dimensions + dtype + columns
+    char buf[256];
+    snprintf(buf, sizeof(buf), "gemm_%ldx%ldx%ld_%s_%dcol",
+             (long)M, (long)K, (long)N, dtype_in, num_cols);
+    return std::string(buf);
+}
+
+// Convert f32 array to bf16 (truncate lower 16 bits of each float)
+static void f32_to_bf16(const float * src, uint16_t * dst, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        uint32_t bits;
+        memcpy(&bits, &src[i], sizeof(bits));
+        // Round to nearest even (add 0x7FFF + bit 16)
+        bits += (0x7FFF + ((bits >> 16) & 1));
+        dst[i] = (uint16_t)(bits >> 16);
+    }
+}
+
+// Convert bf16 array to f32 (pad lower 16 bits with zeros)
+static void bf16_to_f32(const uint16_t * src, float * dst, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        uint32_t bits = ((uint32_t)src[i]) << 16;
+        memcpy(&dst[i], &bits, sizeof(bits));
+    }
+}
+
+// ============================================================================
+// Compilation — call compile.py to generate xclbin + insts
+// ============================================================================
+
+static bool ensure_compiled(ggml_backend_xdna_context * ctx,
+                            const std::string & cache_key,
+                            int64_t M, int64_t K, int64_t N,
+                            const char * dtype_in, int num_cols) {
+    std::string xclbin_path = ctx->cache_dir + "/" + cache_key + ".xclbin";
+    std::string insts_path  = ctx->cache_dir + "/" + cache_key + ".insts";
+
+    // Check if already cached on disk
+    {
+        std::ifstream xf(xclbin_path);
+        std::ifstream inf(insts_path);
+        if (xf.good() && inf.good()) {
+            return true;
+        }
+    }
+
+    // Compile via Python subprocess
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd),
+             "python3 %s gemm --M %ld --K %ld --N %ld --dtype-in %s --dtype-out %s "
+             "--num-aie-columns %d --out %s 2>&1",
+             ctx->compile_script.c_str(),
+             (long)M, (long)K, (long)N,
+             dtype_in, dtype_in,
+             num_cols,
+             xclbin_path.c_str());
+
+    GGML_LOG_INFO("ggml-xdna: compiling GEMM %ldx%ldx%ld (first run, will be cached)...\n",
+                  (long)M, (long)K, (long)N);
+
+    int ret = system(cmd);
+    if (ret != 0) {
+        GGML_LOG_ERROR("ggml-xdna: compilation failed (exit code %d)\n", ret);
+        return false;
+    }
+
+    // Verify files were created
+    std::ifstream xf(xclbin_path);
+    std::ifstream inf(insts_path);
+    if (!xf.good() || !inf.good()) {
+        GGML_LOG_ERROR("ggml-xdna: compilation succeeded but output files missing\n");
+        return false;
+    }
+
+    GGML_LOG_INFO("ggml-xdna: compilation complete, cached at %s\n", xclbin_path.c_str());
+    return true;
+}
+
+// ============================================================================
+// XRT kernel loading — load xclbin + insts, create kernel handle
+// ============================================================================
+
+static xdna_kernel_entry * get_or_load_kernel(ggml_backend_xdna_context * ctx,
+                                               const std::string & cache_key,
+                                               int64_t M, int64_t K, int64_t N) {
+    std::lock_guard<std::mutex> lock(ctx->cache_mutex);
+
+    // Check in-memory cache
+    auto it = ctx->kernel_cache.find(cache_key);
+    if (it != ctx->kernel_cache.end()) {
+        return &it->second;
+    }
+
+    // Load from disk
+    std::string xclbin_path = ctx->cache_dir + "/" + cache_key + ".xclbin";
+    std::string insts_path  = ctx->cache_dir + "/" + cache_key + ".insts";
+
+    try {
+        xdna_kernel_entry entry;
+        entry.M = M;
+        entry.K = K;
+        entry.N = N;
+
+        // Load xclbin
+        entry.xclbin = xrt::xclbin(xclbin_path);
+        ctx->device.register_xclbin(entry.xclbin);
+        auto uuid = entry.xclbin.get_uuid();
+        entry.hw_ctx = xrt::hw_context(ctx->device, uuid);
+
+        // Get kernel (IRON kernels are always named "MLIR_AIE")
+        entry.kernel = xrt::kernel(entry.hw_ctx, "MLIR_AIE");
+
+        // Load instructions
+        entry.insts = read_binary_file(insts_path);
+        if (entry.insts.empty()) {
+            GGML_LOG_ERROR("ggml-xdna: failed to read insts file: %s\n", insts_path.c_str());
+            return nullptr;
+        }
+
+        // Create instruction buffer object
+        entry.insts_bo = xrt::bo(ctx->device, entry.insts.size(),
+                                  xrt::bo::flags::cacheable,
+                                  entry.kernel.group_id(1));
+        entry.insts_bo.write(entry.insts.data());
+        entry.insts_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+        auto [inserted_it, _] = ctx->kernel_cache.emplace(cache_key, std::move(entry));
+        GGML_LOG_INFO("ggml-xdna: loaded kernel for %s\n", cache_key.c_str());
+        return &inserted_it->second;
+
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("ggml-xdna: failed to load kernel %s: %s\n",
+                       cache_key.c_str(), e.what());
+        return nullptr;
+    }
+}
+
+// ============================================================================
+// Op dispatch — MUL_MAT via IRON GEMM
 // ============================================================================
 
 static void ggml_backend_xdna_mul_mat(ggml_backend_xdna_context * ctx, struct ggml_tensor * dst) {
-    const struct ggml_tensor * src0 = dst->src[0]; // weights
+    const struct ggml_tensor * src0 = dst->src[0]; // weights (K x N) or (N x K) depending on ggml layout
     const struct ggml_tensor * src1 = dst->src[1]; // input
 
-    // TODO Phase 1:
-    // 1. Compute cache key from shapes + dtypes
-    // 2. Check if xclbin exists in ctx->cache_dir
-    // 3. If miss: shell out to iron-compile to generate xclbin
-    // 4. Load xclbin via XRT
-    // 5. Create buffers, DMA input data, run kernel, DMA output
-    // 6. Write results to dst->data
+    if (!ctx->device_valid) {
+        GGML_LOG_ERROR("ggml-xdna: no valid XRT device\n");
+        return;
+    }
 
-    GGML_LOG_WARN("%s: XDNA MUL_MAT dispatch not yet implemented (src0: %ldx%ld, src1: %ldx%ld)\n",
-                  __func__, (long)src0->ne[0], (long)src0->ne[1],
-                  (long)src1->ne[0], (long)src1->ne[1]);
+    // ggml MUL_MAT: dst = src1 @ src0^T
+    // src0 shape: [ne00, ne01] = [K, N] (weights, stored row-major as N rows of K elements)
+    // src1 shape: [ne10, ne11] = [K, M] (input, stored row-major as M rows of K elements)
+    // dst  shape: [ne0,  ne1]  = [N, M]
+    // IRON GEMM: C(M,N) = A(M,K) @ B(K,N)
+    // So: A = src1 transposed view, B = src0 transposed view
+    // But since ggml stores row-major and IRON expects row-major:
+    // A = src1 data as (M, K), B = src0 data as (N, K) which needs transpose → use b_col_maj
 
-    GGML_UNUSED(ctx);
+    const int64_t K = src0->ne[0];
+    const int64_t N = src0->ne[1];
+    const int64_t M = src1->ne[1];
+
+    // For now: only handle 2D (ne2=ne3=1)
+    if (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) {
+        GGML_LOG_ERROR("ggml-xdna: batched MUL_MAT not yet supported\n");
+        return;
+    }
+
+    // Determine num_aie_columns (4 for NPU1, 8 for NPU2)
+    // TODO: detect from device
+    int num_cols = 4;
+
+    // IRON GEMM requires dimensions to be multiples of tile sizes
+    // For now, only dispatch shapes that are cleanly tileable
+    // The tile selection in compile.py handles finding valid tiles
+    std::string cache_key = make_cache_key(M, K, N, "bf16", num_cols);
+
+    // Step 1: Ensure xclbin is compiled (cache check + compile if needed)
+    if (!ensure_compiled(ctx, cache_key, M, K, N, "bf16", num_cols)) {
+        GGML_LOG_ERROR("ggml-xdna: compilation failed for GEMM %ldx%ldx%ld\n",
+                       (long)M, (long)K, (long)N);
+        return;
+    }
+
+    // Step 2: Load kernel (XRT context, from cache or disk)
+    xdna_kernel_entry * entry = get_or_load_kernel(ctx, cache_key, M, K, N);
+    if (!entry) {
+        return;
+    }
+
+    // Step 3: Convert inputs to bf16
+    size_t a_elems = M * K;
+    size_t b_elems = N * K;
+    size_t c_elems = M * N;
+    size_t a_bytes = a_elems * sizeof(uint16_t);
+    size_t b_bytes = b_elems * sizeof(uint16_t);
+    size_t c_bytes = c_elems * sizeof(uint16_t);
+
+    // Allocate XRT buffers
+    // IRON GEMM arg order: A(in), B(in), C(out)
+    // group_id mapping: 0=opcode, 1=insts, 2=insts_len, 3+=data buffers
+    xrt::bo a_bo(ctx->device, a_bytes, xrt::bo::flags::host_only, entry->kernel.group_id(3));
+    xrt::bo b_bo(ctx->device, b_bytes, xrt::bo::flags::host_only, entry->kernel.group_id(4));
+    xrt::bo c_bo(ctx->device, c_bytes, xrt::bo::flags::host_only, entry->kernel.group_id(5));
+
+    // Convert src1 (input A) to bf16 and write to buffer
+    // src1 is (M, K) in f32 — convert to bf16
+    if (src1->type == GGML_TYPE_F32) {
+        f32_to_bf16((const float *)src1->data, (uint16_t *)a_bo.map<void*>(), a_elems);
+    } else if (src1->type == GGML_TYPE_BF16) {
+        memcpy(a_bo.map<void*>(), src1->data, a_bytes);
+    }
+
+    // Convert src0 (weights B) to bf16 and write to buffer
+    // src0 is (N, K) in ggml layout — IRON expects (K, N) row-major or (N, K) col-major
+    // We compiled with b_col_maj=false, so IRON expects B as (K, N)
+    // ggml stores src0 as N rows of K elements → this IS (N, K) → we need to transpose
+    // Simplest: compile with b_col_maj=true so IRON accepts (N, K) directly
+    // TODO: for now, transpose on CPU
+    if (src0->type == GGML_TYPE_F32) {
+        // Transpose (N,K) → (K,N) while converting f32→bf16
+        const float * src0_f32 = (const float *)src0->data;
+        uint16_t * b_ptr = (uint16_t *)b_bo.map<void*>();
+        for (int64_t k = 0; k < K; k++) {
+            for (int64_t n = 0; n < N; n++) {
+                float val = src0_f32[n * K + k];
+                uint32_t bits;
+                memcpy(&bits, &val, sizeof(bits));
+                bits += (0x7FFF + ((bits >> 16) & 1));
+                b_ptr[k * N + n] = (uint16_t)(bits >> 16);
+            }
+        }
+    } else if (src0->type == GGML_TYPE_BF16) {
+        // Transpose (N,K) → (K,N) bf16
+        const uint16_t * src0_bf16 = (const uint16_t *)src0->data;
+        uint16_t * b_ptr = (uint16_t *)b_bo.map<void*>();
+        for (int64_t k = 0; k < K; k++) {
+            for (int64_t n = 0; n < N; n++) {
+                b_ptr[k * N + n] = src0_bf16[n * K + k];
+            }
+        }
+    }
+
+    // Sync inputs to device
+    a_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    b_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+    // Step 4: Execute kernel
+    // Kernel signature: (opcode=3, insts_bo, insts_len, a_bo, b_bo, c_bo)
+    auto run = entry->kernel(3, entry->insts_bo, (uint32_t)entry->insts.size(),
+                              a_bo, b_bo, c_bo);
+    run.wait();
+
+    // Step 5: Read output and convert back to f32
+    c_bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+    bf16_to_f32((const uint16_t *)c_bo.map<void*>(), (float *)dst->data, c_elems);
 }
 
 // ============================================================================
@@ -220,13 +520,14 @@ static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const s
             const struct ggml_tensor * src0 = op->src[0];
             const struct ggml_tensor * src1 = op->src[1];
 
-            // Phase 1: only claim contiguous bf16/f32 matmuls above a size threshold
-            // TODO: add quantized type support as we add IRON operators
+            // Phase 1: contiguous bf16/f32, 2D only, minimum size for NPU benefit
             const int64_t min_dim = 64;
 
             return ggml_is_contiguous(src0) &&
                    ggml_is_contiguous(src1) &&
                    src1->type == GGML_TYPE_F32 &&
+                   src0->ne[2] == 1 && src0->ne[3] == 1 &&
+                   src1->ne[2] == 1 && src1->ne[3] == 1 &&
                    (op->ne[0] >= min_dim && op->ne[1] >= min_dim) &&
                    (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_BF16);
         }
@@ -273,7 +574,6 @@ static const char * ggml_backend_xdna_reg_get_name(ggml_backend_reg_t reg) {
 }
 
 static size_t ggml_backend_xdna_reg_get_device_count(ggml_backend_reg_t reg) {
-    // TODO: detect actual XDNA device via XRT
     return 1;
 
     GGML_UNUSED(reg);

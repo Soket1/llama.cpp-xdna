@@ -88,17 +88,34 @@ class TestCacheDirectory:
         assert result is None
 
     def test_cache_hit(self):
-        """Existing xclbin file is found."""
+        """Existing xclbin + insts files are found."""
         with tempfile.TemporaryDirectory() as tmpdir:
             os.environ["GGML_XDNA_CACHE_DIR"] = tmpdir
             try:
-                # Create a fake cached xclbin
+                # Create fake cached xclbin and insts
                 key = "test_cache_key_1"
                 fake_xclbin = Path(tmpdir) / f"{key}.xclbin"
+                fake_insts = Path(tmpdir) / f"{key}.insts"
                 fake_xclbin.write_bytes(b"fake xclbin data")
+                fake_insts.write_bytes(b"fake insts data")
 
                 result = get_cached_xclbin(key)
                 assert result is not None
                 assert result == fake_xclbin
+            finally:
+                del os.environ["GGML_XDNA_CACHE_DIR"]
+
+    def test_cache_miss_without_insts(self):
+        """xclbin without matching insts file is a cache miss."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.environ["GGML_XDNA_CACHE_DIR"] = tmpdir
+            try:
+                key = "test_cache_key_2"
+                fake_xclbin = Path(tmpdir) / f"{key}.xclbin"
+                fake_xclbin.write_bytes(b"fake xclbin data")
+                # No .insts file
+
+                result = get_cached_xclbin(key)
+                assert result is None
             finally:
                 del os.environ["GGML_XDNA_CACHE_DIR"]

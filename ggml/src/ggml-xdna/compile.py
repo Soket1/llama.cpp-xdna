@@ -138,11 +138,17 @@ def compile_gemm(M: int, K: int, N: int, dtype_in: str, dtype_out: str,
     op = GEMM(**gemm_kwargs)
     op.compile()
 
-    # The compiled xclbin lives in context.build_dir with the artifact filename
+    # The compiled artifacts live in context.build_dir
     build_dir = op.context.build_dir
-    compiled_path = build_dir / op.xclbin_artifact.filename
+    compiled_xclbin = build_dir / op.xclbin_artifact.filename
+    compiled_insts = build_dir / op.insts_artifact.filename
+
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    shutil.copy2(str(compiled_path), output_path)
+    shutil.copy2(str(compiled_xclbin), output_path)
+
+    # Also copy the insts file alongside the xclbin (same name, .insts extension)
+    insts_output = output_path.replace(".xclbin", ".insts")
+    shutil.copy2(str(compiled_insts), insts_output)
 
     return output_path
 
@@ -158,10 +164,14 @@ def get_cache_dir() -> Path:
 
 
 def get_cached_xclbin(cache_key: str) -> Path | None:
-    """Check if an xclbin is cached. Returns path if found, None otherwise."""
+    """Check if an xclbin is cached. Returns path if found, None otherwise.
+
+    Both .xclbin and .insts files must exist for a cache hit.
+    """
     cache_dir = get_cache_dir()
     xclbin_path = cache_dir / f"{cache_key}.xclbin"
-    if xclbin_path.exists():
+    insts_path = cache_dir / f"{cache_key}.insts"
+    if xclbin_path.exists() and insts_path.exists():
         return xclbin_path
     return None
 
