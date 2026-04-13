@@ -58,6 +58,36 @@ class TestCacheKey:
         assert len(key) == 16
         assert all(c in "0123456789abcdef" for c in key)
 
+    def test_key_scheme_pinned(self):
+        """Pin the exact cache-key scheme (sha256 of sorted-json, 16-char prefix).
+
+        If this test fails, the Python key scheme changed. That is fine in
+        isolation (the C++ side uses its own human-readable key format like
+        gemm_MxKxN_bf16_Ncol, intentionally decoupled because C++ passes
+        --out to force the output path), but any already-cached xclbins under
+        ~/.cache/ggml-xdna will be effectively orphaned. Bump this expected
+        value deliberately when you change the scheme.
+        """
+        import hashlib, json
+        expected_payload = {
+            "op": "gemm",
+            "M": 2048,
+            "K": 2048,
+            "N": 2048,
+            "dtype_in": "bf16",
+            "dtype_out": "bf16",
+            "num_aie_columns": 4,
+            "b_col_maj": False,
+        }
+        expected = hashlib.sha256(
+            json.dumps(expected_payload, sort_keys=True).encode()
+        ).hexdigest()[:16]
+        actual = gemm_cache_key(2048, 2048, 2048, "bf16", "bf16", 4)
+        assert actual == expected, (
+            f"Cache key scheme drift: got {actual}, expected {expected}. "
+            "Update this test intentionally if the scheme was changed."
+        )
+
 
 class TestCacheDirectory:
 

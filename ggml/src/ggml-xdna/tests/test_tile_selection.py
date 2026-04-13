@@ -72,7 +72,11 @@ class TestTileSelection:
     # --- Edge cases ---
 
     def test_minimum_valid_shape(self):
-        """Smallest shape that should work: 32x8x8 with 1 column."""
+        """Smallest shape that should work: 32x8x8 with 1 column.
+
+        With bf16 min_m=8 and the M % (tile_m * 4) == 0 constraint, M=32
+        is the smallest dispatchable M (tile_m=8, 32 % 32 == 0).
+        """
         tm, tk, tn = select_gemm_tiles(32, 8, 8, 1)
         self._verify_constraints(32, 8, 8, 1, tm, tk, tn)
 
@@ -98,6 +102,42 @@ class TestTileSelection:
         with pytest.raises(ValueError, match="tile_n"):
             select_gemm_tiles(256, 64, 7, 4)
 
+    # --- bf16 minimum tile_m is 8 (IRON 4x8x8 MAC: static_assert m % (2*r) == 0, r=4) ---
+
+    def test_bf16_M32_picks_tile_m_8(self):
+        """bf16 M=32 is the smallest dispatchable: tile_m must be exactly 8.
+
+        Regression test for compile.py candidates_m = [64, 32, 16, 8]
+        (tile_m=4 was removed because IRON's aie2p/mm.cc 4x8x8 MAC requires
+        m % 8 == 0 via static_assert at line ~336).
+        """
+        tm, tk, tn = select_gemm_tiles(32, 1024, 2048, 4, "bf16")
+        assert (tm, tk, tn) == (8, 64, 64), (
+            f"Expected (8, 64, 64) for M=32 K=1024 N=2048 bf16 4col, got ({tm}, {tk}, {tn})"
+        )
+
+    def test_bf16_M16_raises(self):
+        """bf16 M=16 must raise: tile_m>=8 and M%(tm*4)==0 needs M>=32."""
+        with pytest.raises(ValueError, match="tile_m"):
+            select_gemm_tiles(16, 64, 64, 1, "bf16")
+
+    def test_bf16_M4_raises(self):
+        """bf16 M=4 must raise — the old tile_m=4 path was removed."""
+        with pytest.raises(ValueError, match="tile_m"):
+            select_gemm_tiles(4, 64, 64, 1, "bf16")
+
+    def test_bf16_M8_raises(self):
+        """bf16 M=8 must raise — smallest tile_m is 8, needs M % 32 == 0."""
+        with pytest.raises(ValueError, match="tile_m"):
+            select_gemm_tiles(8, 64, 64, 1, "bf16")
+
+    @pytest.mark.parametrize("M", [32, 64, 96, 128, 256])
+    def test_bf16_valid_small_M(self, M):
+        """Every multiple of 32 at or above 32 should be dispatchable for bf16."""
+        tm, tk, tn = select_gemm_tiles(M, 64, 64, 1, "bf16")
+        assert tm >= 8
+        assert M % (tm * 4) == 0
+
     # --- int8 constraints ---
 
     @pytest.mark.parametrize("M,K,N", [
@@ -111,3 +151,32 @@ class TestTileSelection:
         # INT8 has higher minimums
         assert tm >= 16, f"INT8 tile_m={tm} below minimum 16"
         assert tn >= 16, f"INT8 tile_n={tn} below minimum 16"
+
+    def test_int8_min_m_unchanged(self):
+        """INT8 min_m/min_k/min_n stayed 16/8/16 (no change from the bf16 tile_m rework).
+
+        Regression guard: if someone lowers int8 minima below IRON's i8 kernel
+        constraints, this catches it.
+        """
+        # M=64, tile_m must be >= 16 and 64 % (tm*4) == 0 -> tm=16
+        tm, tk, tn = select_gemm_tiles(64, 64, 64, 1, "i8")
+        assert tm >= 16
+        assert tk >= 8
+        assert tn >= 16
+
+    def test_int8_M8_raises(self):
+        """INT8 M=8 must raise — min_m=16."""
+        with pytest.raises(ValueError, match="tile_m"):
+            select_gemm_tiles(8, 64, 64, 1, "i8")
+
+
+# ---------------------------------------------------------------------------
+# C++ xdna_shape_dispatchable mirror
+# ---------------------------------------------------------------------------
+# The C++ shape filter in ggml-xdna.cpp:xdna_shape_dispatchable (~line 680)
+# mirrors the same constraints encoded in select_gemm_tiles above: M%(tm*4)==0,
+# K%tk==0, N%(tn*num_cols)==0, with bf16 min_m=8 / int8 min_m=16. It is not
+# directly exercised here because it lives in C++; its structural equivalence
+# is guarded by the Python tests above plus end-to-end runs via llama-cli.
+# If you change select_gemm_tiles thresholds, update xdna_shape_dispatchable
+# in lockstep.
