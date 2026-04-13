@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -30,6 +31,15 @@ struct xdna_kernel_entry {
     std::vector<char> insts;
     xrt::bo       insts_bo;
     int64_t       M, K, N;
+    // Persistent A (activation) and C (output) BOs. Shape is fixed by (M,K,N)
+    // for this kernel, so we allocate once and memcpy new data in per call.
+    // unique_ptr defers construction until first use (needs kernel group_id).
+    std::unique_ptr<xrt::bo> a_bo;
+    std::unique_ptr<xrt::bo> c_bo;
+    // Cache of per-weight-pointer transposed+bf16 B buffers keyed by src0->data.
+    // Weights are immutable after load, so we can transpose once and reuse.
+    std::unordered_map<const void *, xrt::bo> b_bo_cache;
+    std::unique_ptr<std::mutex> b_bo_mutex = std::make_unique<std::mutex>();
 };
 
 // ============================================================================
@@ -289,53 +299,68 @@ static void ggml_backend_xdna_mul_mat(ggml_backend_xdna_context * ctx, struct gg
         size_t b_bytes = b_elems * sizeof(uint16_t);
         size_t c_bytes = c_elems * sizeof(uint16_t);
 
-        xrt::bo a_bo(ctx->device, a_bytes, xrt::bo::flags::host_only, entry->kernel.group_id(3));
-        xrt::bo b_bo(ctx->device, b_bytes, xrt::bo::flags::host_only, entry->kernel.group_id(4));
-        xrt::bo c_bo(ctx->device, c_bytes, xrt::bo::flags::host_only, entry->kernel.group_id(5));
+        // Lazily allocate persistent A and C BOs on first dispatch for this kernel.
+        if (!entry->a_bo) {
+            entry->a_bo = std::make_unique<xrt::bo>(ctx->device, a_bytes, xrt::bo::flags::host_only, entry->kernel.group_id(3));
+        }
+        if (!entry->c_bo) {
+            entry->c_bo = std::make_unique<xrt::bo>(ctx->device, c_bytes, xrt::bo::flags::host_only, entry->kernel.group_id(5));
+        }
 
         if (src1->type == GGML_TYPE_F32) {
-            f32_to_bf16((const float *)src1->data, (uint16_t *)a_bo.map<void*>(), a_elems);
+            f32_to_bf16((const float *)src1->data, (uint16_t *)entry->a_bo->map<void*>(), a_elems);
         } else {
-            memcpy(a_bo.map<void*>(), src1->data, a_bytes);
+            memcpy(entry->a_bo->map<void*>(), src1->data, a_bytes);
         }
+        entry->a_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
-        // Transpose src0 (N,K) → (K,N) as IRON expects
-        if (src0->type == GGML_TYPE_F32) {
-            const float * src0_f32 = (const float *)src0->data;
-            uint16_t * b_ptr = (uint16_t *)b_bo.map<void*>();
-            for (int64_t k = 0; k < K; k++) {
-                for (int64_t n = 0; n < N; n++) {
-                    float val = src0_f32[n * K + k];
-                    uint32_t bits;
-                    memcpy(&bits, &val, sizeof(bits));
-                    bits += (0x7FFF + ((bits >> 16) & 1));
-                    b_ptr[k * N + n] = (uint16_t)(bits >> 16);
+        // Get or build the cached transposed B (weight). Weight data is immutable
+        // after model load, so the (transpose + bf16 convert + DMA sync) happens once
+        // per (kernel, weight_ptr) pair.
+        xrt::bo * b_bo_ptr = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(*entry->b_bo_mutex);
+            auto it = entry->b_bo_cache.find(src0->data);
+            if (it == entry->b_bo_cache.end()) {
+                xrt::bo new_b(ctx->device, b_bytes, xrt::bo::flags::host_only, entry->kernel.group_id(4));
+                if (src0->type == GGML_TYPE_F32) {
+                    const float * src0_f32 = (const float *)src0->data;
+                    uint16_t * b_ptr = (uint16_t *)new_b.map<void*>();
+                    for (int64_t k = 0; k < K; k++) {
+                        for (int64_t n = 0; n < N; n++) {
+                            float val = src0_f32[n * K + k];
+                            uint32_t bits;
+                            memcpy(&bits, &val, sizeof(bits));
+                            bits += (0x7FFF + ((bits >> 16) & 1));
+                            b_ptr[k * N + n] = (uint16_t)(bits >> 16);
+                        }
+                    }
+                } else {
+                    const uint16_t * src0_bf16 = (const uint16_t *)src0->data;
+                    uint16_t * b_ptr = (uint16_t *)new_b.map<void*>();
+                    for (int64_t k = 0; k < K; k++) {
+                        for (int64_t n = 0; n < N; n++) {
+                            b_ptr[k * N + n] = src0_bf16[n * K + k];
+                        }
+                    }
                 }
-            }
-        } else {
-            const uint16_t * src0_bf16 = (const uint16_t *)src0->data;
-            uint16_t * b_ptr = (uint16_t *)b_bo.map<void*>();
-            for (int64_t k = 0; k < K; k++) {
-                for (int64_t n = 0; n < N; n++) {
-                    b_ptr[k * N + n] = src0_bf16[n * K + k];
-                }
+                new_b.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                auto [ins, _] = entry->b_bo_cache.emplace(src0->data, std::move(new_b));
+                b_bo_ptr = &ins->second;
+                fprintf(stderr, "ggml-xdna: warm b_bo K=%ld N=%ld weight=%s (%zu cached for this kernel)\n",
+                    (long)K, (long)N, src0->name, entry->b_bo_cache.size());
+                fflush(stderr);
+            } else {
+                b_bo_ptr = &it->second;
             }
         }
-
-        a_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-        b_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
         auto run = entry->kernel(3, entry->insts_bo, (uint32_t)entry->insts.size(),
-                                  a_bo, b_bo, c_bo);
+                                  *entry->a_bo, *b_bo_ptr, *entry->c_bo);
         run.wait();
 
-        c_bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-        bf16_to_f32((const uint16_t *)c_bo.map<void*>(), (float *)dst->data, c_elems);
-        static std::atomic<int> dispatch_count{0};
-        if ((++dispatch_count) <= 5 || dispatch_count % 1000 == 0) {
-            fprintf(stderr, "ggml-xdna: NPU dispatched M=%ld K=%ld N=%ld (total=%d)\n",
-                (long)M, (long)K, (long)N, dispatch_count.load());
-        }
+        entry->c_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        bf16_to_f32((const uint16_t *)entry->c_bo->map<void*>(), (float *)dst->data, c_elems);
     } catch (const std::exception & e) {
         GGML_LOG_ERROR("ggml-xdna: XRT dispatch failed (%s)\n", e.what());
     }
@@ -383,42 +408,27 @@ static ggml_status xdna_delegate_range(ggml_backend_xdna_context * ctx,
         return GGML_STATUS_FAILED;
     }
     struct ggml_cgraph sub = ggml_graph_view(cgraph, i0, i1);
-    ggml_status s = ggml_backend_graph_compute(ctx->cpu_backend, &sub);
-    static std::atomic<int> n_deleg{0};
-    int c = ++n_deleg;
-    if (c <= 3 || c % 100 == 0) {
-        fprintf(stderr, "ggml-xdna: delegate[%d..%d) (%d nodes) status=%d call#%d\n",
-            i0, i1, i1 - i0, (int)s, c);
-        fflush(stderr);
-    }
-    return s;
+    return ggml_backend_graph_compute(ctx->cpu_backend, &sub);
 }
 
 static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     ggml_backend_xdna_context * ctx = (ggml_backend_xdna_context *)backend->context;
-
     int n = cgraph->n_nodes;
 
-    // Diagnostic: dump each MUL_MAT's shape + dispatch decision.
-    int n_mulmat = 0, n_mulmat_disp = 0;
-    for (int i = 0; i < n; i++) {
-        struct ggml_tensor * node = cgraph->nodes[i];
-        if (node->op == GGML_OP_MUL_MAT) {
-            n_mulmat++;
-            bool disp = xdna_node_npu_dispatchable(node);
-            if (disp) n_mulmat_disp++;
-            const struct ggml_tensor * s0 = node->src[0];
-            const struct ggml_tensor * s1 = node->src[1];
-            fprintf(stderr, "ggml-xdna: GC_MUL_MAT K=%lld N=%lld M=%lld  s0=[%lld,%lld,%lld,%lld] s1=[%lld,%lld,%lld,%lld]  dispatch=%d\n",
-                (long long)s0->ne[0], (long long)s0->ne[1], (long long)s1->ne[1],
-                (long long)s0->ne[0], (long long)s0->ne[1], (long long)s0->ne[2], (long long)s0->ne[3],
-                (long long)s1->ne[0], (long long)s1->ne[1], (long long)s1->ne[2], (long long)s1->ne[3],
-                disp ? 1 : 0);
+    static const bool debug = getenv("XDNA_DEBUG") != NULL;
+    if (debug) {
+        int n_mulmat = 0, n_mulmat_disp = 0;
+        for (int i = 0; i < n; i++) {
+            struct ggml_tensor * node = cgraph->nodes[i];
+            if (node->op == GGML_OP_MUL_MAT) {
+                n_mulmat++;
+                if (xdna_node_npu_dispatchable(node)) n_mulmat_disp++;
+            }
         }
+        fprintf(stderr, "ggml-xdna: graph_compute n_nodes=%d mul_mat=%d npu_dispatchable=%d\n",
+                n, n_mulmat, n_mulmat_disp);
+        fflush(stderr);
     }
-    fprintf(stderr, "ggml-xdna: graph_compute CALLED n_nodes=%d mul_mat=%d npu_dispatchable=%d\n",
-            n, n_mulmat, n_mulmat_disp);
-    fflush(stderr);
 
     // Sweep the graph. Walk nodes in order: collect runs of consecutive
     // CPU-bound nodes and delegate them as one cgraph view; break out to
@@ -573,17 +583,9 @@ static void * ggml_backend_xdna_buffer_get_base(ggml_backend_buffer_t buffer) {
 }
 
 static void ggml_backend_xdna_buffer_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
-    static std::atomic<size_t> total_set_bytes{0};
-    static std::atomic<int>    n_set_calls{0};
     memcpy((char *)tensor->data + offset, data, size);
-    size_t t = (total_set_bytes += size);
-    int    c = ++n_set_calls;
-    if (c % 50 == 1 || c <= 3) {
-        fprintf(stderr, "ggml-xdna: set_tensor call#%d name=%s size=%zu total=%.1f MiB\n",
-            c, tensor->name, size, t / 1048576.0);
-        fflush(stderr);
-    }
     GGML_UNUSED(buffer);
+    GGML_UNUSED(tensor);
 }
 
 static void ggml_backend_xdna_buffer_get_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -630,8 +632,11 @@ static ggml_backend_buffer_t ggml_backend_xdna_buffer_type_alloc_buffer(ggml_bac
         GGML_LOG_ERROR("ggml-xdna: failed to allocate %zu bytes\n", size);
         return NULL;
     }
-    fprintf(stderr, "ggml-xdna: ALLOC_BUFFER size=%zu (%.1f MiB)\n", size, size / (1024.0 * 1024.0));
-    fflush(stderr);
+    static const bool debug = getenv("XDNA_DEBUG") != NULL;
+    if (debug) {
+        fprintf(stderr, "ggml-xdna: alloc_buffer size=%zu (%.1f MiB)\n", size, size / 1048576.0);
+        fflush(stderr);
+    }
     return ggml_backend_buffer_init(buft, ggml_backend_xdna_buffer_i, data, size);
 }
 
