@@ -2,6 +2,7 @@
 #include "ggml-xdna.h"
 #include "ggml-backend-impl.h"
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -231,127 +232,140 @@ static xdna_kernel_entry * get_or_load_kernel(ggml_backend_xdna_context * ctx,
 }
 
 // ============================================================================
-// Op dispatch — MUL_MAT via IRON GEMM
+// Op dispatch — MUL_MAT via IRON GEMM (with CPU fallback)
 // ============================================================================
 
-static void ggml_backend_xdna_mul_mat(ggml_backend_xdna_context * ctx, struct ggml_tensor * dst) {
-    const struct ggml_tensor * src0 = dst->src[0]; // weights (K x N) or (N x K) depending on ggml layout
-    const struct ggml_tensor * src1 = dst->src[1]; // input
+static bool xdna_shape_dispatchable(int64_t M, int64_t K, int64_t N);
 
-    if (!ctx->device_valid) {
-        GGML_LOG_ERROR("ggml-xdna: no valid XRT device\n");
-        return;
+// Naive CPU MUL_MAT for shapes NPU can't tile.
+// ggml MUL_MAT: dst[m,n] = sum_k src1[m,k] * src0[n,k]
+// src0 is row-major [K,N] stored as N rows × K cols (weight B^T).
+// src1 is row-major [K,M] stored as M rows × K cols.
+// dst  is row-major [N,M] stored as M rows × N cols.
+static void xdna_mul_mat_cpu_fallback(struct ggml_tensor * dst) {
+    const struct ggml_tensor * s0 = dst->src[0];
+    const struct ggml_tensor * s1 = dst->src[1];
+    const int64_t K = s0->ne[0];
+    const int64_t N = s0->ne[1];
+    const int64_t M = s1->ne[1];
+
+    const float * a = (const float *) s1->data;
+    float       * c = (float *)       dst->data;
+
+    if (s0->type == GGML_TYPE_F32) {
+        const float * b = (const float *) s0->data;
+        for (int64_t m = 0; m < M; ++m) {
+            for (int64_t n = 0; n < N; ++n) {
+                float acc = 0.f;
+                for (int64_t k = 0; k < K; ++k) acc += a[m*K + k] * b[n*K + k];
+                c[m*N + n] = acc;
+            }
+        }
+    } else { // BF16
+        const uint16_t * b = (const uint16_t *) s0->data;
+        for (int64_t m = 0; m < M; ++m) {
+            for (int64_t n = 0; n < N; ++n) {
+                float acc = 0.f;
+                for (int64_t k = 0; k < K; ++k) {
+                    uint32_t bits = ((uint32_t) b[n*K + k]) << 16;
+                    float bf;
+                    memcpy(&bf, &bits, 4);
+                    acc += a[m*K + k] * bf;
+                }
+                c[m*N + n] = acc;
+            }
+        }
     }
+}
 
-    // ggml MUL_MAT: dst = src1 @ src0^T
-    // src0 shape: [ne00, ne01] = [K, N] (weights, stored row-major as N rows of K elements)
-    // src1 shape: [ne10, ne11] = [K, M] (input, stored row-major as M rows of K elements)
-    // dst  shape: [ne0,  ne1]  = [N, M]
-    // IRON GEMM: C(M,N) = A(M,K) @ B(K,N)
-    // So: A = src1 transposed view, B = src0 transposed view
-    // But since ggml stores row-major and IRON expects row-major:
-    // A = src1 data as (M, K), B = src0 data as (N, K) which needs transpose → use b_col_maj
+static void ggml_backend_xdna_mul_mat(ggml_backend_xdna_context * ctx, struct ggml_tensor * dst) {
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
 
     const int64_t K = src0->ne[0];
     const int64_t N = src0->ne[1];
     const int64_t M = src1->ne[1];
 
-    GGML_LOG_INFO("ggml-xdna: MUL_MAT dispatch M=%ld K=%ld N=%ld\n", (long)src1->ne[1], (long)src0->ne[0], (long)src0->ne[1]);
-
-    // For now: only handle 2D (ne2=ne3=1)
-    if (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) {
-        GGML_LOG_ERROR("ggml-xdna: batched MUL_MAT not yet supported\n");
+    if (!xdna_shape_dispatchable(M, K, N) || !ctx->device_valid) {
+        xdna_mul_mat_cpu_fallback(dst);
         return;
     }
 
-    // Determine num_aie_columns (4 for NPU1, 8 for NPU2)
-    // TODO: detect from device
     int num_cols = 4;
-
-    // IRON GEMM requires dimensions to be multiples of tile sizes
-    // For now, only dispatch shapes that are cleanly tileable
-    // The tile selection in compile.py handles finding valid tiles
     std::string cache_key = make_cache_key(M, K, N, "bf16", num_cols);
 
-    // Step 1: Ensure xclbin is compiled (cache check + compile if needed)
     if (!ensure_compiled(ctx, cache_key, M, K, N, "bf16", num_cols)) {
-        GGML_LOG_ERROR("ggml-xdna: compilation failed for GEMM %ldx%ldx%ld\n",
+        GGML_LOG_ERROR("ggml-xdna: compile failed for %ldx%ldx%ld, falling back to CPU\n",
                        (long)M, (long)K, (long)N);
+        xdna_mul_mat_cpu_fallback(dst);
         return;
     }
 
-    // Step 2: Load kernel (XRT context, from cache or disk)
     xdna_kernel_entry * entry = get_or_load_kernel(ctx, cache_key, M, K, N);
     if (!entry) {
+        xdna_mul_mat_cpu_fallback(dst);
         return;
     }
 
-    // Step 3: Convert inputs to bf16
-    size_t a_elems = M * K;
-    size_t b_elems = N * K;
-    size_t c_elems = M * N;
-    size_t a_bytes = a_elems * sizeof(uint16_t);
-    size_t b_bytes = b_elems * sizeof(uint16_t);
-    size_t c_bytes = c_elems * sizeof(uint16_t);
+    try {
+        size_t a_elems = M * K;
+        size_t b_elems = N * K;
+        size_t c_elems = M * N;
+        size_t a_bytes = a_elems * sizeof(uint16_t);
+        size_t b_bytes = b_elems * sizeof(uint16_t);
+        size_t c_bytes = c_elems * sizeof(uint16_t);
 
-    // Allocate XRT buffers
-    // IRON GEMM arg order: A(in), B(in), C(out)
-    // group_id mapping: 0=opcode, 1=insts, 2=insts_len, 3+=data buffers
-    xrt::bo a_bo(ctx->device, a_bytes, xrt::bo::flags::host_only, entry->kernel.group_id(3));
-    xrt::bo b_bo(ctx->device, b_bytes, xrt::bo::flags::host_only, entry->kernel.group_id(4));
-    xrt::bo c_bo(ctx->device, c_bytes, xrt::bo::flags::host_only, entry->kernel.group_id(5));
+        xrt::bo a_bo(ctx->device, a_bytes, xrt::bo::flags::host_only, entry->kernel.group_id(3));
+        xrt::bo b_bo(ctx->device, b_bytes, xrt::bo::flags::host_only, entry->kernel.group_id(4));
+        xrt::bo c_bo(ctx->device, c_bytes, xrt::bo::flags::host_only, entry->kernel.group_id(5));
 
-    // Convert src1 (input A) to bf16 and write to buffer
-    // src1 is (M, K) in f32 — convert to bf16
-    if (src1->type == GGML_TYPE_F32) {
-        f32_to_bf16((const float *)src1->data, (uint16_t *)a_bo.map<void*>(), a_elems);
-    } else if (src1->type == GGML_TYPE_BF16) {
-        memcpy(a_bo.map<void*>(), src1->data, a_bytes);
-    }
+        if (src1->type == GGML_TYPE_F32) {
+            f32_to_bf16((const float *)src1->data, (uint16_t *)a_bo.map<void*>(), a_elems);
+        } else {
+            memcpy(a_bo.map<void*>(), src1->data, a_bytes);
+        }
 
-    // Convert src0 (weights B) to bf16 and write to buffer
-    // src0 is (N, K) in ggml layout — IRON expects (K, N) row-major or (N, K) col-major
-    // We compiled with b_col_maj=false, so IRON expects B as (K, N)
-    // ggml stores src0 as N rows of K elements → this IS (N, K) → we need to transpose
-    // Simplest: compile with b_col_maj=true so IRON accepts (N, K) directly
-    // TODO: for now, transpose on CPU
-    if (src0->type == GGML_TYPE_F32) {
-        // Transpose (N,K) → (K,N) while converting f32→bf16
-        const float * src0_f32 = (const float *)src0->data;
-        uint16_t * b_ptr = (uint16_t *)b_bo.map<void*>();
-        for (int64_t k = 0; k < K; k++) {
-            for (int64_t n = 0; n < N; n++) {
-                float val = src0_f32[n * K + k];
-                uint32_t bits;
-                memcpy(&bits, &val, sizeof(bits));
-                bits += (0x7FFF + ((bits >> 16) & 1));
-                b_ptr[k * N + n] = (uint16_t)(bits >> 16);
+        // Transpose src0 (N,K) → (K,N) as IRON expects
+        if (src0->type == GGML_TYPE_F32) {
+            const float * src0_f32 = (const float *)src0->data;
+            uint16_t * b_ptr = (uint16_t *)b_bo.map<void*>();
+            for (int64_t k = 0; k < K; k++) {
+                for (int64_t n = 0; n < N; n++) {
+                    float val = src0_f32[n * K + k];
+                    uint32_t bits;
+                    memcpy(&bits, &val, sizeof(bits));
+                    bits += (0x7FFF + ((bits >> 16) & 1));
+                    b_ptr[k * N + n] = (uint16_t)(bits >> 16);
+                }
+            }
+        } else {
+            const uint16_t * src0_bf16 = (const uint16_t *)src0->data;
+            uint16_t * b_ptr = (uint16_t *)b_bo.map<void*>();
+            for (int64_t k = 0; k < K; k++) {
+                for (int64_t n = 0; n < N; n++) {
+                    b_ptr[k * N + n] = src0_bf16[n * K + k];
+                }
             }
         }
-    } else if (src0->type == GGML_TYPE_BF16) {
-        // Transpose (N,K) → (K,N) bf16
-        const uint16_t * src0_bf16 = (const uint16_t *)src0->data;
-        uint16_t * b_ptr = (uint16_t *)b_bo.map<void*>();
-        for (int64_t k = 0; k < K; k++) {
-            for (int64_t n = 0; n < N; n++) {
-                b_ptr[k * N + n] = src0_bf16[n * K + k];
-            }
+
+        a_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        b_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+        auto run = entry->kernel(3, entry->insts_bo, (uint32_t)entry->insts.size(),
+                                  a_bo, b_bo, c_bo);
+        run.wait();
+
+        c_bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        bf16_to_f32((const uint16_t *)c_bo.map<void*>(), (float *)dst->data, c_elems);
+        static std::atomic<int> dispatch_count{0};
+        if ((++dispatch_count) <= 5 || dispatch_count % 1000 == 0) {
+            fprintf(stderr, "ggml-xdna: NPU dispatched M=%ld K=%ld N=%ld (total=%d)\n",
+                (long)M, (long)K, (long)N, dispatch_count.load());
         }
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("ggml-xdna: XRT dispatch failed (%s), falling back to CPU\n", e.what());
+        xdna_mul_mat_cpu_fallback(dst);
     }
-
-    // Sync inputs to device
-    a_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-    b_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-
-    // Step 4: Execute kernel
-    // Kernel signature: (opcode=3, insts_bo, insts_len, a_bo, b_bo, c_bo)
-    auto run = entry->kernel(3, entry->insts_bo, (uint32_t)entry->insts.size(),
-                              a_bo, b_bo, c_bo);
-    run.wait();
-
-    // Step 5: Read output and convert back to f32
-    c_bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-    bf16_to_f32((const uint16_t *)c_bo.map<void*>(), (float *)dst->data, c_elems);
 }
 
 // ============================================================================
@@ -373,22 +387,11 @@ static void ggml_backend_xdna_free(ggml_backend_t backend) {
 static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     ggml_backend_xdna_context * ctx = (ggml_backend_xdna_context *)backend->context;
 
-    static int gc_call = 0;
-    int mul_mat_seen = 0, mul_mat_dispatched = 0, skipped_flag = 0;
-
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor * node = cgraph->nodes[i];
 
-        if (node->op == GGML_OP_MUL_MAT) mul_mat_seen++;
-
-        if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
-            if (node->op == GGML_OP_MUL_MAT) skipped_flag++;
-            continue;
-        }
-
         switch (node->op) {
             case GGML_OP_MUL_MAT:
-                mul_mat_dispatched++;
                 ggml_backend_xdna_mul_mat(ctx, node);
                 break;
 
@@ -403,10 +406,6 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                 GGML_ABORT("%s: unsupported op %s\n", __func__, ggml_op_desc(node));
         }
     }
-
-    fprintf(stderr, "ggml-xdna: GRAPH_COMPUTE call=%d n_nodes=%d mul_mat_seen=%d skipped_by_flag=%d dispatched=%d\n",
-        gc_call, cgraph->n_nodes, mul_mat_seen, skipped_flag, mul_mat_dispatched);
-    gc_call++;
 
     return GGML_STATUS_SUCCESS;
 
@@ -505,10 +504,10 @@ static void ggml_backend_xdna_device_get_props(ggml_backend_dev_t dev, struct gg
 }
 
 static ggml_backend_t ggml_backend_xdna_device_init_backend(ggml_backend_dev_t dev, const char * params) {
-    fprintf(stderr, "ggml-xdna: INIT_BACKEND called params=%s\n", params ? params : "(null)");
     return ggml_backend_xdna_init();
 
     GGML_UNUSED(dev);
+    GGML_UNUSED(params);
 }
 
 // ============================================================================
@@ -571,11 +570,10 @@ static const ggml_backend_buffer_i ggml_backend_xdna_buffer_i = {
 };
 
 static ggml_backend_buffer_t ggml_backend_xdna_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
-    fprintf(stderr, "ggml-xdna: ALLOC_BUFFER size=%zu\n", size);
     size_t aligned_size = (size + 63) & ~size_t(63);
     void * data = aligned_alloc(64, aligned_size);
     if (!data) {
-        fprintf(stderr, "ggml-xdna: failed to allocate %zu bytes\n", size);
+        GGML_LOG_ERROR("ggml-xdna: failed to allocate %zu bytes\n", size);
         return NULL;
     }
     return ggml_backend_buffer_init(buft, ggml_backend_xdna_buffer_i, data, size);
@@ -611,7 +609,6 @@ ggml_backend_buffer_type_t ggml_backend_xdna_buffer_type(void) {
 }
 
 static ggml_backend_buffer_type_t ggml_backend_xdna_device_get_buffer_type(ggml_backend_dev_t dev) {
-    fprintf(stderr, "ggml-xdna: GET_BUFFER_TYPE called\n");
     return ggml_backend_xdna_buffer_type();
 
     GGML_UNUSED(dev);
@@ -624,6 +621,19 @@ static ggml_backend_buffer_t ggml_backend_xdna_device_buffer_from_host_ptr(ggml_
     GGML_UNUSED(max_tensor_size);
 }
 
+// NPU dispatchability: returns true only if the shape tiles cleanly on the NPU.
+// When this returns false, graph_compute must fall back to CPU.
+static bool xdna_shape_dispatchable(int64_t M, int64_t K, int64_t N) {
+    if (M < 32 || K < 32 || N < 32) return false;
+    const int num_cols = 4;
+    const int64_t tiles[] = {64, 32, 16, 8};
+    bool m_ok = false, k_ok = false, n_ok = false;
+    for (int i = 0; i < 4 && !m_ok; i++) if (M % (tiles[i] * 4)        == 0) m_ok = true;
+    for (int i = 0; i < 4 && !k_ok; i++) if (K %  tiles[i]             == 0) k_ok = true;
+    for (int i = 0; i < 4 && !n_ok; i++) if (N % (tiles[i] * num_cols) == 0) n_ok = true;
+    return m_ok && k_ok && n_ok;
+}
+
 static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     switch (op->op) {
         case GGML_OP_NONE:
@@ -633,53 +643,17 @@ static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const s
         case GGML_OP_TRANSPOSE:
             return true;
 
-        case GGML_OP_MUL_MAT:
-        {
+        case GGML_OP_MUL_MAT: {
             const struct ggml_tensor * src0 = op->src[0];
             const struct ggml_tensor * src1 = op->src[1];
-
-            const char * fail = nullptr;
-            bool result = false;
-
-            if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1)) { fail = "not_contig"; goto done; }
-            if (src0->ne[2] != 1 || src0->ne[3] != 1) { fail = "src0_3d"; goto done; }
-            if (src1->ne[2] != 1 || src1->ne[3] != 1) { fail = "src1_3d"; goto done; }
-            if (src1->type != GGML_TYPE_F32) { fail = "src1_not_f32"; goto done; }
-            if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_BF16) { fail = "src0_bad_type"; goto done; }
-
-            {
-                const int64_t K = src0->ne[0];
-                const int64_t N = src0->ne[1];
-                const int64_t M = src1->ne[1];
-
-                if (M < 32 || K < 32 || N < 32) { fail = "min_dim"; goto done; }
-
-                const int num_cols = 4;
-                const int64_t tile_candidates[] = {64, 32, 16, 8};
-                const int n_cands = 4;
-
-                bool m_ok = false, k_ok = false, n_ok = false;
-                for (int i = 0; i < n_cands && !m_ok; i++) if (M % (tile_candidates[i] * 4) == 0) m_ok = true;
-                for (int i = 0; i < n_cands && !k_ok; i++) if (K % tile_candidates[i] == 0) k_ok = true;
-                for (int i = 0; i < n_cands && !n_ok; i++) if (N % (tile_candidates[i] * num_cols) == 0) n_ok = true;
-
-                if (!m_ok) fail = "m_no_tile";
-                else if (!k_ok) fail = "k_no_tile";
-                else if (!n_ok) fail = "n_no_tile";
-                else result = true;
-            }
-        done:
-            {
-                static int sop_count = 0;
-                if (sop_count < 20) {
-                    fprintf(stderr, "ggml-xdna: SUPPORTS_OP MUL_MAT src0=[%ld,%ld] t=%d src1=[%ld,%ld] t=%d -> %s (%s)\n",
-                        (long)src0->ne[0], (long)src0->ne[1], src0->type,
-                        (long)src1->ne[0], (long)src1->ne[1], src1->type,
-                        result ? "TRUE" : "FALSE", fail ? fail : "ok");
-                    sop_count++;
-                }
-            }
-            return result;
+            if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1)) return false;
+            if (src0->ne[2] != 1 || src0->ne[3] != 1) return false;
+            if (src1->ne[2] != 1 || src1->ne[3] != 1) return false;
+            if (src1->type != GGML_TYPE_F32) return false;
+            if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_BF16) return false;
+            // Only claim shapes NPU can actually dispatch — others flow to CPU backend
+            // which reads our host buffers directly (is_host=true).
+            return xdna_shape_dispatchable(src1->ne[1], src0->ne[0], src0->ne[1]);
         }
 
         default:
@@ -697,11 +671,13 @@ static bool ggml_backend_xdna_device_supports_buft(ggml_backend_dev_t dev, ggml_
     GGML_UNUSED(dev);
 }
 
-// Actively claim ops from CPU buffer ownership.
+// Scheduler hint: deprioritize us for shapes that NPU can't dispatch.
+// Ops still come to us (we own weight buffers), but this tells the scheduler
+// that for shapes where we'd just fall back to CPU, there's no speed win.
 static bool ggml_backend_xdna_device_offload_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
-    bool ok = ggml_backend_xdna_device_supports_op(dev, op);
-    fprintf(stderr, "ggml-xdna: OFFLOAD_OP op=%s -> %s\n", ggml_op_desc(op), ok ? "true" : "false");
-    return ok;
+    if (op->op != GGML_OP_MUL_MAT) return false;
+    return xdna_shape_dispatchable(op->src[1]->ne[1], op->src[0]->ne[0], op->src[0]->ne[1]);
+    GGML_UNUSED(dev);
 }
 
 static const struct ggml_backend_device_i ggml_backend_xdna_device_i = {
