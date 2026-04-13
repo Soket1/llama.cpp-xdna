@@ -2,6 +2,7 @@
 #include "ggml-xdna.h"
 #include "ggml-backend-impl.h"
 
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -9,6 +10,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <unistd.h>
 
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_bo.h"
@@ -65,9 +67,9 @@ struct ggml_backend_xdna_context {
         try {
             device = xrt::device(0);
             device_valid = true;
-            GGML_LOG_INFO("ggml-xdna: XRT device initialized\n");
+            fprintf(stderr, "ggml-xdna: XRT device initialized\n");
         } catch (const std::exception & e) {
-            GGML_LOG_ERROR("ggml-xdna: failed to initialize XRT device: %s\n", e.what());
+            fprintf(stderr, "ggml-xdna: failed to initialize XRT device: %s\n", e.what());
         }
     }
 };
@@ -254,6 +256,8 @@ static void ggml_backend_xdna_mul_mat(ggml_backend_xdna_context * ctx, struct gg
     const int64_t N = src0->ne[1];
     const int64_t M = src1->ne[1];
 
+    GGML_LOG_INFO("ggml-xdna: MUL_MAT dispatch M=%ld K=%ld N=%ld\n", (long)src1->ne[1], (long)src0->ne[0], (long)src0->ne[1]);
+
     // For now: only handle 2D (ne2=ne3=1)
     if (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) {
         GGML_LOG_ERROR("ggml-xdna: batched MUL_MAT not yet supported\n");
@@ -369,15 +373,22 @@ static void ggml_backend_xdna_free(ggml_backend_t backend) {
 static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     ggml_backend_xdna_context * ctx = (ggml_backend_xdna_context *)backend->context;
 
+    static int gc_call = 0;
+    int mul_mat_seen = 0, mul_mat_dispatched = 0, skipped_flag = 0;
+
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor * node = cgraph->nodes[i];
 
+        if (node->op == GGML_OP_MUL_MAT) mul_mat_seen++;
+
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            if (node->op == GGML_OP_MUL_MAT) skipped_flag++;
             continue;
         }
 
         switch (node->op) {
             case GGML_OP_MUL_MAT:
+                mul_mat_dispatched++;
                 ggml_backend_xdna_mul_mat(ctx, node);
                 break;
 
@@ -392,6 +403,10 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                 GGML_ABORT("%s: unsupported op %s\n", __func__, ggml_op_desc(node));
         }
     }
+
+    fprintf(stderr, "ggml-xdna: GRAPH_COMPUTE call=%d n_nodes=%d mul_mat_seen=%d skipped_by_flag=%d dispatched=%d\n",
+        gc_call, cgraph->n_nodes, mul_mat_seen, skipped_flag, mul_mat_dispatched);
+    gc_call++;
 
     return GGML_STATUS_SUCCESS;
 
@@ -461,14 +476,17 @@ static const char * ggml_backend_xdna_device_get_description(ggml_backend_dev_t 
 }
 
 static void ggml_backend_xdna_device_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) {
-    *free  = 0;
-    *total = 0;
+    long pages     = sysconf(_SC_PHYS_PAGES);
+    long page_size = sysconf(_SC_PAGE_SIZE);
+    size_t ram = (pages > 0 && page_size > 0) ? (size_t)pages * (size_t)page_size : (8ULL << 30);
+    *total = ram / 2;
+    *free  = *total;
 
     GGML_UNUSED(dev);
 }
 
 static enum ggml_backend_dev_type ggml_backend_xdna_device_get_type(ggml_backend_dev_t dev) {
-    return GGML_BACKEND_DEVICE_TYPE_ACCEL;
+    return GGML_BACKEND_DEVICE_TYPE_GPU;
 
     GGML_UNUSED(dev);
 }
@@ -487,14 +505,114 @@ static void ggml_backend_xdna_device_get_props(ggml_backend_dev_t dev, struct gg
 }
 
 static ggml_backend_t ggml_backend_xdna_device_init_backend(ggml_backend_dev_t dev, const char * params) {
+    fprintf(stderr, "ggml-xdna: INIT_BACKEND called params=%s\n", params ? params : "(null)");
     return ggml_backend_xdna_init();
 
     GGML_UNUSED(dev);
-    GGML_UNUSED(params);
+}
+
+// ============================================================================
+// Buffer type — owns weight allocations so scheduler routes ops to us
+// ============================================================================
+
+static const char * ggml_backend_xdna_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
+    return "XDNA";
+    GGML_UNUSED(buft);
+}
+
+static void ggml_backend_xdna_buffer_free(ggml_backend_buffer_t buffer) {
+    free(buffer->context);
+}
+
+static void * ggml_backend_xdna_buffer_get_base(ggml_backend_buffer_t buffer) {
+    return buffer->context;
+}
+
+static void ggml_backend_xdna_buffer_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    memcpy((char *)tensor->data + offset, data, size);
+    GGML_UNUSED(buffer);
+}
+
+static void ggml_backend_xdna_buffer_get_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    memcpy(data, (const char *)tensor->data + offset, size);
+    GGML_UNUSED(buffer);
+}
+
+static void ggml_backend_xdna_buffer_memset_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
+    memset((char *)tensor->data + offset, value, size);
+    GGML_UNUSED(buffer);
+}
+
+static bool ggml_backend_xdna_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * src, struct ggml_tensor * dst) {
+    if (ggml_backend_buffer_is_host(src->buffer)) {
+        memcpy(dst->data, src->data, ggml_nbytes(src));
+        return true;
+    }
+    return false;
+    GGML_UNUSED(buffer);
+}
+
+static void ggml_backend_xdna_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+    memset(buffer->context, value, buffer->size);
+}
+
+static const ggml_backend_buffer_i ggml_backend_xdna_buffer_i = {
+    /* .free_buffer     = */ ggml_backend_xdna_buffer_free,
+    /* .get_base        = */ ggml_backend_xdna_buffer_get_base,
+    /* .init_tensor     = */ NULL,
+    /* .memset_tensor   = */ ggml_backend_xdna_buffer_memset_tensor,
+    /* .set_tensor      = */ ggml_backend_xdna_buffer_set_tensor,
+    /* .get_tensor      = */ ggml_backend_xdna_buffer_get_tensor,
+    /* .set_tensor_2d   = */ NULL,
+    /* .get_tensor_2d   = */ NULL,
+    /* .cpy_tensor      = */ ggml_backend_xdna_buffer_cpy_tensor,
+    /* .clear           = */ ggml_backend_xdna_buffer_clear,
+    /* .reset           = */ NULL,
+};
+
+static ggml_backend_buffer_t ggml_backend_xdna_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    fprintf(stderr, "ggml-xdna: ALLOC_BUFFER size=%zu\n", size);
+    size_t aligned_size = (size + 63) & ~size_t(63);
+    void * data = aligned_alloc(64, aligned_size);
+    if (!data) {
+        fprintf(stderr, "ggml-xdna: failed to allocate %zu bytes\n", size);
+        return NULL;
+    }
+    return ggml_backend_buffer_init(buft, ggml_backend_xdna_buffer_i, data, size);
+}
+
+static size_t ggml_backend_xdna_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
+    return 64;
+    GGML_UNUSED(buft);
+}
+
+static bool ggml_backend_xdna_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
+    return true;
+    GGML_UNUSED(buft);
+}
+
+ggml_backend_buffer_type_t ggml_backend_xdna_buffer_type(void) {
+    static struct ggml_backend_buffer_type buft = {
+        /* .iface = */ {
+            /* .get_name      = */ ggml_backend_xdna_buffer_type_get_name,
+            /* .alloc_buffer  = */ ggml_backend_xdna_buffer_type_alloc_buffer,
+            /* .get_alignment = */ ggml_backend_xdna_buffer_type_get_alignment,
+            /* .get_max_size  = */ NULL,
+            /* .get_alloc_size= */ NULL,
+            /* .is_host       = */ ggml_backend_xdna_buffer_type_is_host,
+        },
+        /* .device  = */ NULL,
+        /* .context = */ NULL,
+    };
+    if (buft.device == NULL) {
+        buft.device = ggml_backend_reg_dev_get(ggml_backend_xdna_reg(), 0);
+    }
+    return &buft;
 }
 
 static ggml_backend_buffer_type_t ggml_backend_xdna_device_get_buffer_type(ggml_backend_dev_t dev) {
-    return ggml_backend_cpu_buffer_type();
+    fprintf(stderr, "ggml-xdna: GET_BUFFER_TYPE called\n");
+    return ggml_backend_xdna_buffer_type();
 
     GGML_UNUSED(dev);
 }
@@ -520,16 +638,48 @@ static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const s
             const struct ggml_tensor * src0 = op->src[0];
             const struct ggml_tensor * src1 = op->src[1];
 
-            // Phase 1: contiguous bf16/f32, 2D only, minimum size for NPU benefit
-            const int64_t min_dim = 64;
+            const char * fail = nullptr;
+            bool result = false;
 
-            return ggml_is_contiguous(src0) &&
-                   ggml_is_contiguous(src1) &&
-                   src1->type == GGML_TYPE_F32 &&
-                   src0->ne[2] == 1 && src0->ne[3] == 1 &&
-                   src1->ne[2] == 1 && src1->ne[3] == 1 &&
-                   (op->ne[0] >= min_dim && op->ne[1] >= min_dim) &&
-                   (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_BF16);
+            if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1)) { fail = "not_contig"; goto done; }
+            if (src0->ne[2] != 1 || src0->ne[3] != 1) { fail = "src0_3d"; goto done; }
+            if (src1->ne[2] != 1 || src1->ne[3] != 1) { fail = "src1_3d"; goto done; }
+            if (src1->type != GGML_TYPE_F32) { fail = "src1_not_f32"; goto done; }
+            if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_BF16) { fail = "src0_bad_type"; goto done; }
+
+            {
+                const int64_t K = src0->ne[0];
+                const int64_t N = src0->ne[1];
+                const int64_t M = src1->ne[1];
+
+                if (M < 32 || K < 32 || N < 32) { fail = "min_dim"; goto done; }
+
+                const int num_cols = 4;
+                const int64_t tile_candidates[] = {64, 32, 16, 8};
+                const int n_cands = 4;
+
+                bool m_ok = false, k_ok = false, n_ok = false;
+                for (int i = 0; i < n_cands && !m_ok; i++) if (M % (tile_candidates[i] * 4) == 0) m_ok = true;
+                for (int i = 0; i < n_cands && !k_ok; i++) if (K % tile_candidates[i] == 0) k_ok = true;
+                for (int i = 0; i < n_cands && !n_ok; i++) if (N % (tile_candidates[i] * num_cols) == 0) n_ok = true;
+
+                if (!m_ok) fail = "m_no_tile";
+                else if (!k_ok) fail = "k_no_tile";
+                else if (!n_ok) fail = "n_no_tile";
+                else result = true;
+            }
+        done:
+            {
+                static int sop_count = 0;
+                if (sop_count < 20) {
+                    fprintf(stderr, "ggml-xdna: SUPPORTS_OP MUL_MAT src0=[%ld,%ld] t=%d src1=[%ld,%ld] t=%d -> %s (%s)\n",
+                        (long)src0->ne[0], (long)src0->ne[1], src0->type,
+                        (long)src1->ne[0], (long)src1->ne[1], src1->type,
+                        result ? "TRUE" : "FALSE", fail ? fail : "ok");
+                    sop_count++;
+                }
+            }
+            return result;
         }
 
         default:
@@ -540,9 +690,18 @@ static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const s
 }
 
 static bool ggml_backend_xdna_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
-    return ggml_backend_buft_is_host(buft);
+    // Our own buffer type → we own these (weights routed to us)
+    // CPU host buffer → readable by us (activations from CPU side)
+    return buft == ggml_backend_xdna_buffer_type() || ggml_backend_buft_is_host(buft);
 
     GGML_UNUSED(dev);
+}
+
+// Actively claim ops from CPU buffer ownership.
+static bool ggml_backend_xdna_device_offload_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
+    bool ok = ggml_backend_xdna_device_supports_op(dev, op);
+    fprintf(stderr, "ggml-xdna: OFFLOAD_OP op=%s -> %s\n", ggml_op_desc(op), ok ? "true" : "false");
+    return ok;
 }
 
 static const struct ggml_backend_device_i ggml_backend_xdna_device_i = {
@@ -557,7 +716,7 @@ static const struct ggml_backend_device_i ggml_backend_xdna_device_i = {
     /* .buffer_from_host_ptr = */ ggml_backend_xdna_device_buffer_from_host_ptr,
     /* .supports_op          = */ ggml_backend_xdna_device_supports_op,
     /* .supports_buft        = */ ggml_backend_xdna_device_supports_buft,
-    /* .offload_op           = */ NULL,
+    /* .offload_op           = */ ggml_backend_xdna_device_offload_op,
     /* .event_new            = */ NULL,
     /* .event_free           = */ NULL,
     /* .event_synchronize    = */ NULL,

@@ -86,6 +86,10 @@
 #include "ggml-openvino.h"
 #endif
 
+#ifdef GGML_USE_XDNA
+#include "ggml-xdna.h"
+#endif
+
 namespace fs = std::filesystem;
 
 static std::string path_str(const fs::path & path) {
@@ -151,6 +155,9 @@ struct ggml_backend_registry {
 #endif
 #ifdef GGML_USE_CANN
         register_backend(ggml_backend_cann_reg());
+#endif
+#ifdef GGML_USE_XDNA
+        register_backend(ggml_backend_xdna_reg());
 #endif
 #ifdef GGML_USE_BLAS
         register_backend(ggml_backend_blas_reg());
