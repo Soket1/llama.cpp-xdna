@@ -1,6 +1,7 @@
 #include "ggml-impl.h"
 #include "ggml-xdna.h"
 #include "ggml-backend-impl.h"
+#include "ggml-cpu.h"
 
 #include <atomic>
 #include <cstdio>
@@ -42,8 +43,11 @@ struct ggml_backend_xdna_context {
     std::unordered_map<std::string, xdna_kernel_entry> kernel_cache;
     std::mutex cache_mutex;
     bool device_valid;
+    // CPU backend for delegating ops we don't run on NPU.
+    // Our buffers are plain host RAM so CPU can compute on them directly.
+    ggml_backend_t cpu_backend;
 
-    ggml_backend_xdna_context() : device_valid(false) {
+    ggml_backend_xdna_context() : device_valid(false), cpu_backend(nullptr) {
         // Cache directory
         const char * cache_env = getenv("GGML_XDNA_CACHE_DIR");
         const char * home = getenv("HOME");
@@ -71,6 +75,16 @@ struct ggml_backend_xdna_context {
             fprintf(stderr, "ggml-xdna: XRT device initialized\n");
         } catch (const std::exception & e) {
             fprintf(stderr, "ggml-xdna: failed to initialize XRT device: %s\n", e.what());
+        }
+
+        // CPU backend for fallback. Our buffers are plain host RAM so CPU
+        // can operate on them directly — no copies needed.
+        cpu_backend = ggml_backend_cpu_init();
+    }
+
+    ~ggml_backend_xdna_context() {
+        if (cpu_backend) {
+            ggml_backend_free(cpu_backend);
         }
     }
 };
@@ -232,52 +246,15 @@ static xdna_kernel_entry * get_or_load_kernel(ggml_backend_xdna_context * ctx,
 }
 
 // ============================================================================
-// Op dispatch — MUL_MAT via IRON GEMM (with CPU fallback)
+// Op dispatch — MUL_MAT via IRON GEMM
 // ============================================================================
 
 static bool xdna_shape_dispatchable(int64_t M, int64_t K, int64_t N);
 
-// Naive CPU MUL_MAT for shapes NPU can't tile.
-// ggml MUL_MAT: dst[m,n] = sum_k src1[m,k] * src0[n,k]
-// src0 is row-major [K,N] stored as N rows × K cols (weight B^T).
-// src1 is row-major [K,M] stored as M rows × K cols.
-// dst  is row-major [N,M] stored as M rows × N cols.
-static void xdna_mul_mat_cpu_fallback(struct ggml_tensor * dst) {
-    const struct ggml_tensor * s0 = dst->src[0];
-    const struct ggml_tensor * s1 = dst->src[1];
-    const int64_t K = s0->ne[0];
-    const int64_t N = s0->ne[1];
-    const int64_t M = s1->ne[1];
-
-    const float * a = (const float *) s1->data;
-    float       * c = (float *)       dst->data;
-
-    if (s0->type == GGML_TYPE_F32) {
-        const float * b = (const float *) s0->data;
-        for (int64_t m = 0; m < M; ++m) {
-            for (int64_t n = 0; n < N; ++n) {
-                float acc = 0.f;
-                for (int64_t k = 0; k < K; ++k) acc += a[m*K + k] * b[n*K + k];
-                c[m*N + n] = acc;
-            }
-        }
-    } else { // BF16
-        const uint16_t * b = (const uint16_t *) s0->data;
-        for (int64_t m = 0; m < M; ++m) {
-            for (int64_t n = 0; n < N; ++n) {
-                float acc = 0.f;
-                for (int64_t k = 0; k < K; ++k) {
-                    uint32_t bits = ((uint32_t) b[n*K + k]) << 16;
-                    float bf;
-                    memcpy(&bf, &bits, 4);
-                    acc += a[m*K + k] * bf;
-                }
-                c[m*N + n] = acc;
-            }
-        }
-    }
-}
-
+// NPU-only MUL_MAT. Caller (graph_compute) must have already verified
+// xdna_shape_dispatchable() before invoking this — no CPU fallback here.
+// On unexpected XRT failure we log and return without writing dst; the
+// resulting garbage is a correctness bug caller-side, not silent degradation.
 static void ggml_backend_xdna_mul_mat(ggml_backend_xdna_context * ctx, struct ggml_tensor * dst) {
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
@@ -286,8 +263,8 @@ static void ggml_backend_xdna_mul_mat(ggml_backend_xdna_context * ctx, struct gg
     const int64_t N = src0->ne[1];
     const int64_t M = src1->ne[1];
 
-    if (!xdna_shape_dispatchable(M, K, N) || !ctx->device_valid) {
-        xdna_mul_mat_cpu_fallback(dst);
+    if (!ctx->device_valid) {
+        GGML_LOG_ERROR("ggml-xdna: mul_mat called but XRT device invalid\n");
         return;
     }
 
@@ -295,15 +272,12 @@ static void ggml_backend_xdna_mul_mat(ggml_backend_xdna_context * ctx, struct gg
     std::string cache_key = make_cache_key(M, K, N, "bf16", num_cols);
 
     if (!ensure_compiled(ctx, cache_key, M, K, N, "bf16", num_cols)) {
-        GGML_LOG_ERROR("ggml-xdna: compile failed for %ldx%ldx%ld, falling back to CPU\n",
-                       (long)M, (long)K, (long)N);
-        xdna_mul_mat_cpu_fallback(dst);
+        GGML_LOG_ERROR("ggml-xdna: compile failed for %ldx%ldx%ld\n", (long)M, (long)K, (long)N);
         return;
     }
 
     xdna_kernel_entry * entry = get_or_load_kernel(ctx, cache_key, M, K, N);
     if (!entry) {
-        xdna_mul_mat_cpu_fallback(dst);
         return;
     }
 
@@ -363,8 +337,7 @@ static void ggml_backend_xdna_mul_mat(ggml_backend_xdna_context * ctx, struct gg
                 (long)M, (long)K, (long)N, dispatch_count.load());
         }
     } catch (const std::exception & e) {
-        GGML_LOG_ERROR("ggml-xdna: XRT dispatch failed (%s), falling back to CPU\n", e.what());
-        xdna_mul_mat_cpu_fallback(dst);
+        GGML_LOG_ERROR("ggml-xdna: XRT dispatch failed (%s)\n", e.what());
     }
 }
 
@@ -384,34 +357,99 @@ static void ggml_backend_xdna_free(ggml_backend_t backend) {
     delete backend;
 }
 
+// Can we run this node on the NPU right now? (MUL_MAT + tileable shape.)
+static bool xdna_node_npu_dispatchable(const struct ggml_tensor * node) {
+    // TEMP DEBUG: force CPU fallback for all MUL_MAT to isolate NPU bug from scheduler/buffer bugs.
+    static const bool force_cpu = getenv("XDNA_FORCE_CPU") != NULL;
+    if (force_cpu) return false;
+    if (node->op != GGML_OP_MUL_MAT) return false;
+    const struct ggml_tensor * s0 = node->src[0];
+    const struct ggml_tensor * s1 = node->src[1];
+    const int64_t K = s0->ne[0];
+    const int64_t N = s0->ne[1];
+    const int64_t M = s1->ne[1];
+    return xdna_shape_dispatchable(M, K, N);
+}
+
+// Delegate a contiguous run of nodes [i0, i1) to the CPU backend as a single
+// batched call — cheaper than per-node calls and lets the CPU backend keep
+// its own state (threads, arenas) across related nodes.
+static ggml_status xdna_delegate_range(ggml_backend_xdna_context * ctx,
+                                       struct ggml_cgraph * cgraph,
+                                       int i0, int i1) {
+    if (i1 <= i0) return GGML_STATUS_SUCCESS;
+    if (!ctx->cpu_backend) {
+        GGML_LOG_ERROR("ggml-xdna: CPU backend not initialized, cannot delegate\n");
+        return GGML_STATUS_FAILED;
+    }
+    struct ggml_cgraph sub = ggml_graph_view(cgraph, i0, i1);
+    ggml_status s = ggml_backend_graph_compute(ctx->cpu_backend, &sub);
+    static std::atomic<int> n_deleg{0};
+    int c = ++n_deleg;
+    if (c <= 3 || c % 100 == 0) {
+        fprintf(stderr, "ggml-xdna: delegate[%d..%d) (%d nodes) status=%d call#%d\n",
+            i0, i1, i1 - i0, (int)s, c);
+        fflush(stderr);
+    }
+    return s;
+}
+
 static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     ggml_backend_xdna_context * ctx = (ggml_backend_xdna_context *)backend->context;
 
-    int mm_count = 0;
-    for (int i = 0; i < cgraph->n_nodes; i++) {
-        if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT) mm_count++;
-    }
-    static std::atomic<int> gc{0};
-    fprintf(stderr, "ggml-xdna: GC call=%d n_nodes=%d mul_mats=%d\n", gc++, cgraph->n_nodes, mm_count);
+    int n = cgraph->n_nodes;
 
-    for (int i = 0; i < cgraph->n_nodes; i++) {
+    // Diagnostic: dump each MUL_MAT's shape + dispatch decision.
+    int n_mulmat = 0, n_mulmat_disp = 0;
+    for (int i = 0; i < n; i++) {
+        struct ggml_tensor * node = cgraph->nodes[i];
+        if (node->op == GGML_OP_MUL_MAT) {
+            n_mulmat++;
+            bool disp = xdna_node_npu_dispatchable(node);
+            if (disp) n_mulmat_disp++;
+            const struct ggml_tensor * s0 = node->src[0];
+            const struct ggml_tensor * s1 = node->src[1];
+            fprintf(stderr, "ggml-xdna: GC_MUL_MAT K=%lld N=%lld M=%lld  s0=[%lld,%lld,%lld,%lld] s1=[%lld,%lld,%lld,%lld]  dispatch=%d\n",
+                (long long)s0->ne[0], (long long)s0->ne[1], (long long)s1->ne[1],
+                (long long)s0->ne[0], (long long)s0->ne[1], (long long)s0->ne[2], (long long)s0->ne[3],
+                (long long)s1->ne[0], (long long)s1->ne[1], (long long)s1->ne[2], (long long)s1->ne[3],
+                disp ? 1 : 0);
+        }
+    }
+    fprintf(stderr, "ggml-xdna: graph_compute CALLED n_nodes=%d mul_mat=%d npu_dispatchable=%d\n",
+            n, n_mulmat, n_mulmat_disp);
+    fflush(stderr);
+
+    // Sweep the graph. Walk nodes in order: collect runs of consecutive
+    // CPU-bound nodes and delegate them as one cgraph view; break out to
+    // dispatch each NPU-capable MUL_MAT individually. View ops are skipped
+    // (included in the CPU run — CPU handles them as no-ops but keeping them
+    // in-range preserves sched invariants).
+    int cpu_run_start = -1;
+    for (int i = 0; i < n; i++) {
         struct ggml_tensor * node = cgraph->nodes[i];
 
-        switch (node->op) {
-            case GGML_OP_MUL_MAT:
-                ggml_backend_xdna_mul_mat(ctx, node);
-                break;
-
-            case GGML_OP_NONE:
-            case GGML_OP_RESHAPE:
-            case GGML_OP_VIEW:
-            case GGML_OP_PERMUTE:
-            case GGML_OP_TRANSPOSE:
-                break;
-
-            default:
-                GGML_ABORT("%s: unsupported op %s\n", __func__, ggml_op_desc(node));
+        if (xdna_node_npu_dispatchable(node)) {
+            // Flush any pending CPU run up to this point.
+            if (cpu_run_start >= 0) {
+                ggml_status s = xdna_delegate_range(ctx, cgraph, cpu_run_start, i);
+                if (s != GGML_STATUS_SUCCESS) return s;
+                cpu_run_start = -1;
+            }
+            // Dispatch to NPU.
+            ggml_backend_xdna_mul_mat(ctx, node);
+            continue;
         }
+
+        // View-only nodes are pure metadata — they still need to be in the
+        // CPU run (CPU treats them as no-ops), so we just extend the range.
+        if (cpu_run_start < 0) cpu_run_start = i;
+    }
+
+    // Flush trailing CPU run.
+    if (cpu_run_start >= 0) {
+        ggml_status s = xdna_delegate_range(ctx, cgraph, cpu_run_start, n);
+        if (s != GGML_STATUS_SUCCESS) return s;
     }
 
     return GGML_STATUS_SUCCESS;
@@ -505,7 +543,7 @@ static void ggml_backend_xdna_device_get_props(ggml_backend_dev_t dev, struct gg
     props->caps = {
         /* .async                 = */ false,
         /* .host_buffer           = */ false,
-        /* .buffer_from_host_ptr  = */ true,
+        /* .buffer_from_host_ptr  = */ false,
         /* .events                = */ false,
     };
 }
@@ -535,7 +573,16 @@ static void * ggml_backend_xdna_buffer_get_base(ggml_backend_buffer_t buffer) {
 }
 
 static void ggml_backend_xdna_buffer_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    static std::atomic<size_t> total_set_bytes{0};
+    static std::atomic<int>    n_set_calls{0};
     memcpy((char *)tensor->data + offset, data, size);
+    size_t t = (total_set_bytes += size);
+    int    c = ++n_set_calls;
+    if (c % 50 == 1 || c <= 3) {
+        fprintf(stderr, "ggml-xdna: set_tensor call#%d name=%s size=%zu total=%.1f MiB\n",
+            c, tensor->name, size, t / 1048576.0);
+        fflush(stderr);
+    }
     GGML_UNUSED(buffer);
 }
 
@@ -583,6 +630,8 @@ static ggml_backend_buffer_t ggml_backend_xdna_buffer_type_alloc_buffer(ggml_bac
         GGML_LOG_ERROR("ggml-xdna: failed to allocate %zu bytes\n", size);
         return NULL;
     }
+    fprintf(stderr, "ggml-xdna: ALLOC_BUFFER size=%zu (%.1f MiB)\n", size, size / (1024.0 * 1024.0));
+    fflush(stderr);
     return ggml_backend_buffer_init(buft, ggml_backend_xdna_buffer_i, data, size);
 }
 
@@ -592,7 +641,10 @@ static size_t ggml_backend_xdna_buffer_type_get_alignment(ggml_backend_buffer_ty
 }
 
 static bool ggml_backend_xdna_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
-    return true;
+    // NPU shares host RAM with CPU — our buffers ARE plain host memory.
+    // But we advertise as a device (not host) so the scheduler routes compute
+    // work to us instead of treating us like CPU-owned storage.
+    return false;
     GGML_UNUSED(buft);
 }
 
@@ -629,23 +681,29 @@ static ggml_backend_buffer_t ggml_backend_xdna_device_buffer_from_host_ptr(ggml_
 }
 
 // NPU dispatchability: returns true only if the shape tiles cleanly on the NPU.
-// tile_m=4 is XDNA2-specific (4x8x8 MAC) and needs emulate_bf16_mmul_with_bfp16=False.
-// Minimum M=16 (smallest tile_m=4 * 4 cores). K, N >= 32.
+// Kernel invariant (aie_kernels/aie2p/mm.cc): 4x8x8 bf16_f32 MAC has r=4, so
+// tile_m % (2*r) == 0 → tile_m >= 8 and divisible by 8. Minimum M = tile_m * 4 = 32.
+// Cap N at 32768 to skip vocab projection (248320) for now — compile is huge.
 static bool xdna_shape_dispatchable(int64_t M, int64_t K, int64_t N) {
-    if (M < 16 || K < 32 || N < 32) return false;
+    if (M < 32 || K < 32 || N < 32 || N > 32768) return false;
     const int num_cols = 4;
-    const int64_t tiles_m[] = {64, 32, 16, 8, 4};
+    const int64_t tiles_m[] = {64, 32, 16, 8};
     const int64_t tiles_k[] = {64, 32, 16, 8};
     const int64_t tiles_n[] = {64, 32, 16, 8};
     bool m_ok = false, k_ok = false, n_ok = false;
-    for (int i = 0; i < 5 && !m_ok; i++) if (M % (tiles_m[i] * 4)        == 0) m_ok = true;
+    for (int i = 0; i < 4 && !m_ok; i++) if (M % (tiles_m[i] * 4)        == 0) m_ok = true;
     for (int i = 0; i < 4 && !k_ok; i++) if (K %  tiles_k[i]             == 0) k_ok = true;
     for (int i = 0; i < 4 && !n_ok; i++) if (N % (tiles_n[i] * num_cols) == 0) n_ok = true;
     return m_ok && k_ok && n_ok;
 }
 
 static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
+    // Liberal claim list (OpenVINO-style): the scheduler aborts if no backend
+    // claims an op. We claim everything we can plausibly run, then decide
+    // NPU-vs-CPU inside graph_compute. Unclaimable ops (e.g. training-only)
+    // fall through to `default: false`.
     switch (op->op) {
+        // Metadata / no-op — always claim.
         case GGML_OP_NONE:
         case GGML_OP_RESHAPE:
         case GGML_OP_VIEW:
@@ -653,27 +711,58 @@ static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const s
         case GGML_OP_TRANSPOSE:
             return true;
 
+        // MUL_MAT: keep type/contig gates (these fail the whole graph if we lie);
+        // dispatchability is decided per-node in graph_compute.
         case GGML_OP_MUL_MAT: {
             const struct ggml_tensor * src0 = op->src[0];
             const struct ggml_tensor * src1 = op->src[1];
-            if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1)) return false;
+            if (!ggml_is_contiguous(src0)) return false;
+            if (!ggml_is_contiguous(src1)) return false;
             if (src0->ne[2] != 1 || src0->ne[3] != 1) return false;
             if (src1->ne[2] != 1 || src1->ne[3] != 1) return false;
             if (src1->type != GGML_TYPE_F32) return false;
             if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_BF16) return false;
-            int64_t M = src1->ne[1], K = src0->ne[0], N = src0->ne[1];
-            bool ok = xdna_shape_dispatchable(M, K, N);
-            // Dedupe: log each unique shape once
-            static std::mutex log_mu;
-            static std::unordered_map<uint64_t, int> seen;
-            uint64_t key = ((uint64_t)M << 40) | ((uint64_t)K << 20) | (uint64_t)N;
-            std::lock_guard<std::mutex> lk(log_mu);
-            if (seen[key]++ == 0) {
-                fprintf(stderr, "ggml-xdna: QUERY M=%ld K=%ld N=%ld -> %s\n",
-                    (long)M, (long)K, (long)N, ok ? "DISPATCH" : "cpu");
-            }
-            return ok;
+            return true;
         }
+
+        // Elementwise arithmetic.
+        case GGML_OP_ADD:
+        case GGML_OP_MUL:
+        case GGML_OP_SUB:
+        case GGML_OP_DIV:
+            return true;
+
+        // Normalization.
+        case GGML_OP_RMS_NORM:
+        case GGML_OP_NORM:
+        case GGML_OP_GROUP_NORM:
+            return true;
+
+        // Scaling.
+        case GGML_OP_SCALE:
+            return true;
+
+        // Copy / contiguity fixes.
+        case GGML_OP_CPY:
+        case GGML_OP_CONT:
+        case GGML_OP_DUP:
+            return true;
+
+        // Indexing (embeddings, KV cache writes).
+        case GGML_OP_GET_ROWS:
+        case GGML_OP_SET_ROWS:
+            return true;
+
+        // Attention-adjacent.
+        case GGML_OP_ROPE:
+        case GGML_OP_SOFT_MAX:
+        case GGML_OP_FLASH_ATTN_EXT:
+            return true;
+
+        // Activations — umbrella ops covering SILU/GELU/RELU/... and SWIGLU/GEGLU/...
+        case GGML_OP_UNARY:
+        case GGML_OP_GLU:
+            return true;
 
         default:
             return false;
@@ -683,9 +772,10 @@ static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const s
 }
 
 static bool ggml_backend_xdna_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
-    // Our own buffer type → we own these (weights routed to us)
-    // CPU host buffer → readable by us (activations from CPU side)
-    return buft == ggml_backend_xdna_buffer_type() || ggml_backend_buft_is_host(buft);
+    // Strict: only claim our own buffer type. The scheduler uses this to decide
+    // where tensors live; claiming host buffers too would make us indistinguishable
+    // from CPU and break routing.
+    return buft == ggml_backend_xdna_buffer_type();
 
     GGML_UNUSED(dev);
 }

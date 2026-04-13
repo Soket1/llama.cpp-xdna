@@ -58,15 +58,16 @@ def select_gemm_tiles(M: int, K: int, N: int, num_aie_columns: int,
         (tile_m, tile_k, tile_n)
     """
     # Default tile sizes that work well for most shapes
-    candidates_m = [64, 32, 16, 8, 4]
+    candidates_m = [64, 32, 16, 8]
     candidates_k = [64, 32, 16, 8]
     candidates_n = [64, 32, 16, 8]
 
     if dtype_in == "i8":
         min_m, min_k, min_n = 16, 8, 16
     else:
-        # bf16 with emulate_bf16_mmul_with_bfp16=False allows tile_m=4 on XDNA2
-        min_m, min_k, min_n = 4, 8, 8
+        # bf16 4x8x8 MAC in IRON's aie2p mm.cc requires tile_m % (2*r) == 0 with r=4,
+        # so minimum tile_m is 8 (not 4). Attempting 4 triggers a static_assert.
+        min_m, min_k, min_n = 8, 8, 8
 
     tile_m = None
     for tm in candidates_m:
