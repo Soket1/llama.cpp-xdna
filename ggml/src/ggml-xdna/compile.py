@@ -58,14 +58,15 @@ def select_gemm_tiles(M: int, K: int, N: int, num_aie_columns: int,
         (tile_m, tile_k, tile_n)
     """
     # Default tile sizes that work well for most shapes
-    candidates_m = [64, 32, 16, 8]
+    candidates_m = [64, 32, 16, 8, 4]
     candidates_k = [64, 32, 16, 8]
     candidates_n = [64, 32, 16, 8]
 
     if dtype_in == "i8":
         min_m, min_k, min_n = 16, 8, 16
     else:
-        min_m, min_k, min_n = 8, 8, 8
+        # bf16 with emulate_bf16_mmul_with_bfp16=False allows tile_m=4 on XDNA2
+        min_m, min_k, min_n = 4, 8, 8
 
     tile_m = None
     for tm in candidates_m:
@@ -133,7 +134,9 @@ def compile_gemm(M: int, K: int, N: int, dtype_in: str, dtype_out: str,
 
     # Don't set bf16-specific flags for int8
     if dtype_in != "i8":
-        gemm_kwargs["emulate_bf16_mmul_with_bfp16"] = True
+        # False enables tile_m=4 (4x8x8 MAC) on XDNA2 for more shape coverage
+        gemm_kwargs["emulate_bf16_mmul_with_bfp16"] = False
+        gemm_kwargs["prio_accuracy"] = True
 
     op = GEMM(**gemm_kwargs)
     op.compile()

@@ -387,6 +387,13 @@ static void ggml_backend_xdna_free(ggml_backend_t backend) {
 static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     ggml_backend_xdna_context * ctx = (ggml_backend_xdna_context *)backend->context;
 
+    int mm_count = 0;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT) mm_count++;
+    }
+    static std::atomic<int> gc{0};
+    fprintf(stderr, "ggml-xdna: GC call=%d n_nodes=%d mul_mats=%d\n", gc++, cgraph->n_nodes, mm_count);
+
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor * node = cgraph->nodes[i];
 
@@ -622,15 +629,18 @@ static ggml_backend_buffer_t ggml_backend_xdna_device_buffer_from_host_ptr(ggml_
 }
 
 // NPU dispatchability: returns true only if the shape tiles cleanly on the NPU.
-// When this returns false, graph_compute must fall back to CPU.
+// tile_m=4 is XDNA2-specific (4x8x8 MAC) and needs emulate_bf16_mmul_with_bfp16=False.
+// Minimum M=16 (smallest tile_m=4 * 4 cores). K, N >= 32.
 static bool xdna_shape_dispatchable(int64_t M, int64_t K, int64_t N) {
-    if (M < 32 || K < 32 || N < 32) return false;
+    if (M < 16 || K < 32 || N < 32) return false;
     const int num_cols = 4;
-    const int64_t tiles[] = {64, 32, 16, 8};
+    const int64_t tiles_m[] = {64, 32, 16, 8, 4};
+    const int64_t tiles_k[] = {64, 32, 16, 8};
+    const int64_t tiles_n[] = {64, 32, 16, 8};
     bool m_ok = false, k_ok = false, n_ok = false;
-    for (int i = 0; i < 4 && !m_ok; i++) if (M % (tiles[i] * 4)        == 0) m_ok = true;
-    for (int i = 0; i < 4 && !k_ok; i++) if (K %  tiles[i]             == 0) k_ok = true;
-    for (int i = 0; i < 4 && !n_ok; i++) if (N % (tiles[i] * num_cols) == 0) n_ok = true;
+    for (int i = 0; i < 5 && !m_ok; i++) if (M % (tiles_m[i] * 4)        == 0) m_ok = true;
+    for (int i = 0; i < 4 && !k_ok; i++) if (K %  tiles_k[i]             == 0) k_ok = true;
+    for (int i = 0; i < 4 && !n_ok; i++) if (N % (tiles_n[i] * num_cols) == 0) n_ok = true;
     return m_ok && k_ok && n_ok;
 }
 
@@ -651,9 +661,18 @@ static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const s
             if (src1->ne[2] != 1 || src1->ne[3] != 1) return false;
             if (src1->type != GGML_TYPE_F32) return false;
             if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_BF16) return false;
-            // Only claim shapes NPU can actually dispatch — others flow to CPU backend
-            // which reads our host buffers directly (is_host=true).
-            return xdna_shape_dispatchable(src1->ne[1], src0->ne[0], src0->ne[1]);
+            int64_t M = src1->ne[1], K = src0->ne[0], N = src0->ne[1];
+            bool ok = xdna_shape_dispatchable(M, K, N);
+            // Dedupe: log each unique shape once
+            static std::mutex log_mu;
+            static std::unordered_map<uint64_t, int> seen;
+            uint64_t key = ((uint64_t)M << 40) | ((uint64_t)K << 20) | (uint64_t)N;
+            std::lock_guard<std::mutex> lk(log_mu);
+            if (seen[key]++ == 0) {
+                fprintf(stderr, "ggml-xdna: QUERY M=%ld K=%ld N=%ld -> %s\n",
+                    (long)M, (long)K, (long)N, ok ? "DISPATCH" : "cpu");
+            }
+            return ok;
         }
 
         default:
