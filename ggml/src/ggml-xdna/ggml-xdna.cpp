@@ -30,6 +30,7 @@ static std::atomic<size_t> g_cpy_tensor_calls{0};
 #include "xrt/xrt_bo.h"
 #include "xrt/xrt_kernel.h"
 #include "xrt/xrt_hw_context.h"
+#include "xrt/experimental/xrt_kernel.h"  // xrt::runlist (production-linked in libxrt_coreutil)
 
 // ============================================================================
 // Cached kernel entry — one per unique (op, shape, dtype) tuple
@@ -953,37 +954,6 @@ static xrt::bo * swiglu_warm_weight(ggml_backend_xdna_context * ctx,
     }
 }
 
-// Helpers to emit a matmul invocation with the right arg order per op kind.
-static xrt::run swiglu_invoke_matmul_1(xdna_swiglu_kernel_entry * entry,
-                                       xrt::bo & weight_bo,
-                                       xrt::bo & input_bo,
-                                       xrt::bo & output_bo) {
-    xrt::kernel & k = entry->kernels[XDNA_SWIGLU_MATMUL_1];
-    xrt::bo    & ib = entry->insts_bo[XDNA_SWIGLU_MATMUL_1];
-    const uint32_t isize = (uint32_t)entry->insts_data[XDNA_SWIGLU_MATMUL_1].size();
-    if (entry->op_kind == XDNA_OP_SWIGLU_PREFILL) {
-        // GEMM arg order: (input, weight, output)
-        return k(3, ib, isize, input_bo, weight_bo, output_bo);
-    } else {
-        // GEMV arg order: (matrix, vector, output)
-        return k(3, ib, isize, weight_bo, input_bo, output_bo);
-    }
-}
-
-static xrt::run swiglu_invoke_matmul_2(xdna_swiglu_kernel_entry * entry,
-                                       xrt::bo & weight_bo,
-                                       xrt::bo & input_bo,
-                                       xrt::bo & output_bo) {
-    xrt::kernel & k = entry->kernels[XDNA_SWIGLU_MATMUL_2];
-    xrt::bo    & ib = entry->insts_bo[XDNA_SWIGLU_MATMUL_2];
-    const uint32_t isize = (uint32_t)entry->insts_data[XDNA_SWIGLU_MATMUL_2].size();
-    if (entry->op_kind == XDNA_OP_SWIGLU_PREFILL) {
-        return k(3, ib, isize, input_bo, weight_bo, output_bo);
-    } else {
-        return k(3, ib, isize, weight_bo, input_bo, output_bo);
-    }
-}
-
 // Forward decls for shape-dispatchability checks.
 static bool xdna_shape_dispatchable_swiglu_decode(int64_t K_emb, int64_t N_hid, int num_cols);
 static bool xdna_shape_dispatchable_swiglu_prefill(int64_t M_seq, int64_t K_emb, int64_t N_hid, int num_cols);
@@ -1126,50 +1096,99 @@ static void ggml_backend_xdna_mul_mat_swiglu(ggml_backend_xdna_context * ctx,
         entry->input_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
         auto t_in_e  = clk::now();
 
-        // 5-invocation SwiGLU sequence (mirrors swiglu_base.py _SwiGLUCallable.__call__).
+        // 5-kernel SwiGLU sequence batched as one xrt::runlist. Runs execute
+        // atomically in add() order on-device, so data deps (r1->r3, r2->r4,
+        // r3->r4, r4->r5) are preserved. The whole chain goes to firmware in
+        // one mailbox command (ERT_CMD_CHAIN) and returns one completion —
+        // replacing 5 ioctl/wait round-trips with 1.
         //   1. matmul_1(w_gate, input) -> left
         //   2. matmul_1(w_up,   input) -> right
         //   3. SiLU(left) -> left_swished
         //   4. EltwiseMul(left_swished, right) -> intermediate
         //   5. matmul_2(w_down, intermediate) -> output
-        // Each run.wait() is a host-device round-trip; matches Python semantics.
-        // Chaining without intermediate waits is a future optimization.
-        auto t_r1_s  = clk::now();
-        auto r1      = swiglu_invoke_matmul_1(entry, *w1_bo_ptr, *entry->input_bo, *entry->left_bo);
-        auto t_r1_sm = clk::now();
-        r1.wait();
-        auto t_r1_e  = clk::now();
+        const uint32_t mm1_isize  = (uint32_t)entry->insts_data[XDNA_SWIGLU_MATMUL_1].size();
+        const uint32_t mm2_isize  = (uint32_t)entry->insts_data[XDNA_SWIGLU_MATMUL_2].size();
+        const uint32_t silu_isize = (uint32_t)entry->insts_data[XDNA_SWIGLU_SILU].size();
+        const uint32_t eltw_isize = (uint32_t)entry->insts_data[XDNA_SWIGLU_ELTWISE].size();
 
-        auto t_r2_s  = clk::now();
-        auto r2      = swiglu_invoke_matmul_1(entry, *w2_bo_ptr, *entry->input_bo, *entry->right_bo);
-        auto t_r2_sm = clk::now();
-        r2.wait();
-        auto t_r2_e  = clk::now();
+        auto t_build_s = clk::now();
+        xrt::runlist rl(entry->hw_ctx);
 
-        auto t_r3_s  = clk::now();
-        auto r3      = entry->kernels[XDNA_SWIGLU_SILU](
-            3, entry->insts_bo[XDNA_SWIGLU_SILU],
-            (uint32_t)entry->insts_data[XDNA_SWIGLU_SILU].size(),
-            *entry->left_bo, *entry->left_swished_bo);
-        auto t_r3_sm = clk::now();
-        r3.wait();
-        auto t_r3_e  = clk::now();
+        // NOTE: must build runs via explicit ctor + set_arg + rl.add. The
+        // kernel functor `k(args...)` implicitly calls run.start(), which is
+        // UB on a run that is subsequently added to a runlist.
 
-        auto t_r4_s  = clk::now();
-        auto r4      = entry->kernels[XDNA_SWIGLU_ELTWISE](
-            3, entry->insts_bo[XDNA_SWIGLU_ELTWISE],
-            (uint32_t)entry->insts_data[XDNA_SWIGLU_ELTWISE].size(),
-            *entry->left_swished_bo, *entry->right_bo, *entry->intermediate_bo);
-        auto t_r4_sm = clk::now();
-        r4.wait();
-        auto t_r4_e  = clk::now();
+        // matmul_1 (gate)
+        {
+            xrt::run r(entry->kernels[XDNA_SWIGLU_MATMUL_1]);
+            r.set_arg(0, 3u);
+            r.set_arg(1, entry->insts_bo[XDNA_SWIGLU_MATMUL_1]);
+            r.set_arg(2, mm1_isize);
+            if (op_kind == XDNA_OP_SWIGLU_PREFILL) {
+                r.set_arg(3, *entry->input_bo); r.set_arg(4, *w1_bo_ptr);       r.set_arg(5, *entry->left_bo);
+            } else {
+                r.set_arg(3, *w1_bo_ptr);       r.set_arg(4, *entry->input_bo); r.set_arg(5, *entry->left_bo);
+            }
+            rl.add(std::move(r));
+        }
 
-        auto t_r5_s  = clk::now();
-        auto r5      = swiglu_invoke_matmul_2(entry, *w3_bo_ptr,
-                                              *entry->intermediate_bo, *entry->output_bo);
-        auto t_r5_sm = clk::now();
-        r5.wait();
-        auto t_r5_e  = clk::now();
+        // matmul_1 (up)
+        {
+            xrt::run r(entry->kernels[XDNA_SWIGLU_MATMUL_1]);
+            r.set_arg(0, 3u);
+            r.set_arg(1, entry->insts_bo[XDNA_SWIGLU_MATMUL_1]);
+            r.set_arg(2, mm1_isize);
+            if (op_kind == XDNA_OP_SWIGLU_PREFILL) {
+                r.set_arg(3, *entry->input_bo); r.set_arg(4, *w2_bo_ptr);       r.set_arg(5, *entry->right_bo);
+            } else {
+                r.set_arg(3, *w2_bo_ptr);       r.set_arg(4, *entry->input_bo); r.set_arg(5, *entry->right_bo);
+            }
+            rl.add(std::move(r));
+        }
+
+        // silu(left) -> left_swished
+        {
+            xrt::run r(entry->kernels[XDNA_SWIGLU_SILU]);
+            r.set_arg(0, 3u);
+            r.set_arg(1, entry->insts_bo[XDNA_SWIGLU_SILU]);
+            r.set_arg(2, silu_isize);
+            r.set_arg(3, *entry->left_bo);
+            r.set_arg(4, *entry->left_swished_bo);
+            rl.add(std::move(r));
+        }
+
+        // eltwise_mul(left_swished, right) -> intermediate
+        {
+            xrt::run r(entry->kernels[XDNA_SWIGLU_ELTWISE]);
+            r.set_arg(0, 3u);
+            r.set_arg(1, entry->insts_bo[XDNA_SWIGLU_ELTWISE]);
+            r.set_arg(2, eltw_isize);
+            r.set_arg(3, *entry->left_swished_bo);
+            r.set_arg(4, *entry->right_bo);
+            r.set_arg(5, *entry->intermediate_bo);
+            rl.add(std::move(r));
+        }
+
+        // matmul_2 (down)
+        {
+            xrt::run r(entry->kernels[XDNA_SWIGLU_MATMUL_2]);
+            r.set_arg(0, 3u);
+            r.set_arg(1, entry->insts_bo[XDNA_SWIGLU_MATMUL_2]);
+            r.set_arg(2, mm2_isize);
+            if (op_kind == XDNA_OP_SWIGLU_PREFILL) {
+                r.set_arg(3, *entry->intermediate_bo); r.set_arg(4, *w3_bo_ptr);              r.set_arg(5, *entry->output_bo);
+            } else {
+                r.set_arg(3, *w3_bo_ptr);              r.set_arg(4, *entry->intermediate_bo); r.set_arg(5, *entry->output_bo);
+            }
+            rl.add(std::move(r));
+        }
+        auto t_build_e = clk::now();
+
+        rl.execute();
+        auto t_exec_e = clk::now();
+
+        rl.wait();
+        auto t_wait_e = clk::now();
 
         // Pull the final output back to host (the only result downstream actually needs).
         auto t_out_s = clk::now();
@@ -1203,25 +1222,25 @@ static void ggml_backend_xdna_mul_mat_swiglu(ggml_backend_xdna_context * ctx,
             auto us = [](clk::time_point a, clk::time_point b) {
                 return (long)std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
             };
-            // Per-subkernel: submit | wait (submit = xrt::kernel::operator() return; wait = run.wait()).
+            // rl_build = construct 5 xrt::run objects + rl.add().
+            // rl_exec  = rl.execute() — non-blocking submit of the chain.
+            // rl_wait  = rl.wait()    — blocks until all 5 complete on-device.
             // Write-backs: sync(BO_FROM_DEVICE) + bf16_to_f32 combined.
             GGML_LOG_INFO(
                 "ggml-xdna: swiglu_prof %s M=%ld K=%ld N=%ld in=%ld "
-                "mm1=%ld|%ld mm1b=%ld|%ld silu=%ld|%ld eltw=%ld|%ld mm2=%ld|%ld "
+                "rl_build=%ld rl_exec=%ld rl_wait=%ld "
                 "out=%ld wb_l=%ld wb_r=%ld wb_i=%ld total=%ld us\n",
                 op_kind == XDNA_OP_SWIGLU_PREFILL ? "prefill" : "decode",
                 (long)M, (long)embedding_dim, (long)hidden_dim,
-                us(t_in_s,  t_in_e),
-                us(t_r1_s,  t_r1_sm), us(t_r1_sm, t_r1_e),
-                us(t_r2_s,  t_r2_sm), us(t_r2_sm, t_r2_e),
-                us(t_r3_s,  t_r3_sm), us(t_r3_sm, t_r3_e),
-                us(t_r4_s,  t_r4_sm), us(t_r4_sm, t_r4_e),
-                us(t_r5_s,  t_r5_sm), us(t_r5_sm, t_r5_e),
-                us(t_out_s, t_out_e),
-                us(t_wbl_s, t_wbl_e),
-                us(t_wbr_s, t_wbr_e),
-                us(t_wbi_s, t_wbi_e),
-                us(t_in_s,  t_wbi_e));
+                us(t_in_s,    t_in_e),
+                us(t_build_s, t_build_e),
+                us(t_build_e, t_exec_e),
+                us(t_exec_e,  t_wait_e),
+                us(t_out_s,   t_out_e),
+                us(t_wbl_s,   t_wbl_e),
+                us(t_wbr_s,   t_wbr_e),
+                us(t_wbi_s,   t_wbi_e),
+                us(t_in_s,    t_wbi_e));
         }
 
     } catch (const std::exception & e) {
