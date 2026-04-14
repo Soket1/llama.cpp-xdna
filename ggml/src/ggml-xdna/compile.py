@@ -60,6 +60,46 @@ def gemv_cache_key(N: int, K: int, dtype_in: str, dtype_out: str,
     return hashlib.sha256(key_json.encode()).hexdigest()[:16]
 
 
+def swiglu_decode_cache_key(embedding_dim: int, hidden_dim: int,
+                            dtype: str, num_aie_columns: int) -> str:
+    """Cache key for a SwiGLU decode (M=1) configuration.
+
+    Tile sizes for the inner GEMV/SiLU/EltwiseMul ops are derived from
+    (embedding_dim, hidden_dim, num_aie_columns) so they aren't part of the key.
+    """
+    key_data = {
+        "op": "swiglu_decode",
+        "embedding_dim": embedding_dim,
+        "hidden_dim": hidden_dim,
+        "dtype": dtype,
+        "num_aie_columns": num_aie_columns,
+    }
+    key_json = json.dumps(key_data, sort_keys=True)
+    return hashlib.sha256(key_json.encode()).hexdigest()[:16]
+
+
+def swiglu_prefill_cache_key(seq_len: int, embedding_dim: int, hidden_dim: int,
+                             dtype: str, num_aie_columns: int) -> str:
+    """Cache key for a SwiGLU prefill (M>=32) configuration."""
+    key_data = {
+        "op": "swiglu_prefill",
+        "seq_len": seq_len,
+        "embedding_dim": embedding_dim,
+        "hidden_dim": hidden_dim,
+        "dtype": dtype,
+        "num_aie_columns": num_aie_columns,
+    }
+    key_json = json.dumps(key_data, sort_keys=True)
+    return hashlib.sha256(key_json.encode()).hexdigest()[:16]
+
+
+# Sub-kernel attribute prefixes inside the chained SwiGLU xclbin. These must
+# match the names passed to chain_swiglu_artifacts in iron/operators/swiglu_*/op.py.
+# The C++ backend looks up insts files by these names.
+SWIGLU_DECODE_KERNELS = ("gemv_1", "silu", "eltwise_mul", "gemv_2")
+SWIGLU_PREFILL_KERNELS = ("gemm_1", "silu", "eltwise_mul", "gemm_2")
+
+
 # ---------------------------------------------------------------------------
 # Tile size selection
 # ---------------------------------------------------------------------------
@@ -165,6 +205,56 @@ def select_gemv_tiles(N: int, K: int, num_aie_columns: int,
     return tile_in, tile_out
 
 
+def validate_swiglu_decode_shapes(embedding_dim: int, hidden_dim: int,
+                                  num_aie_columns: int) -> None:
+    """Verify a (embedding_dim, hidden_dim, cols) tuple is dispatchable to SwiGLUDecode.
+
+    Mirrors the divisibility constraints encoded in iron/operators/swiglu_decode/op.py
+    (silu/eltwise_mul tile_size = hidden_dim // (n_cols * 2) and hidden_dim // n_cols).
+    Raises ValueError on any violation so the C++ backend can fall back cleanly.
+    """
+    if num_aie_columns not in (4, 8):
+        raise ValueError(
+            f"num_aie_columns must be 4 (NPU1) or 8 (NPU2), got {num_aie_columns}"
+        )
+    if hidden_dim % (num_aie_columns * 2) != 0:
+        raise ValueError(
+            f"hidden_dim={hidden_dim} must be divisible by 2*num_aie_columns="
+            f"{num_aie_columns * 2} (SiLU per-column tile)"
+        )
+    if embedding_dim % num_aie_columns != 0:
+        raise ValueError(
+            f"embedding_dim={embedding_dim} must be divisible by "
+            f"num_aie_columns={num_aie_columns}"
+        )
+    # The two GEMV stages must themselves be dispatchable. Reuse the GEMV tile
+    # selector — it raises ValueError on K%64 / per-col / L1 budget violations.
+    select_gemv_tiles(N=hidden_dim, K=embedding_dim, num_aie_columns=num_aie_columns)
+    select_gemv_tiles(N=embedding_dim, K=hidden_dim, num_aie_columns=num_aie_columns)
+
+
+def validate_swiglu_prefill_shapes(seq_len: int, embedding_dim: int, hidden_dim: int,
+                                   num_aie_columns: int) -> None:
+    """Verify a SwiGLU prefill shape is dispatchable.
+
+    The two GEMM stages have IRON's standard (M%(tile_m*4), K%tile_k,
+    N%(tile_n*cols)) constraints — we delegate to select_gemm_tiles for both.
+    """
+    if num_aie_columns not in (4, 8):
+        raise ValueError(
+            f"num_aie_columns must be 4 (NPU1) or 8 (NPU2), got {num_aie_columns}"
+        )
+    if hidden_dim % (num_aie_columns * 2) != 0:
+        raise ValueError(
+            f"hidden_dim={hidden_dim} must be divisible by 2*num_aie_columns="
+            f"{num_aie_columns * 2} (SiLU per-column tile)"
+        )
+    select_gemm_tiles(M=seq_len, K=embedding_dim, N=hidden_dim,
+                      num_aie_columns=num_aie_columns, dtype_in="bf16")
+    select_gemm_tiles(M=seq_len, K=hidden_dim, N=embedding_dim,
+                      num_aie_columns=num_aie_columns, dtype_in="bf16")
+
+
 # ---------------------------------------------------------------------------
 # Compilation
 # ---------------------------------------------------------------------------
@@ -266,6 +356,88 @@ def compile_gemv(N: int, K: int, dtype_in: str, dtype_out: str,
     return output_path
 
 
+def compile_swiglu_decode(embedding_dim: int, hidden_dim: int, dtype: str,
+                          num_aie_columns: int, output_dir: str) -> str:
+    """Compile an IRON SwiGLU decode operator and stage its artifacts into output_dir.
+
+    SwiGLU is a chained xclbin: one combined xclbin with 4 kernels
+    (gemv_1, silu, eltwise_mul, gemv_2), plus 4 separate insts files. We stage
+    everything under a single directory so the C++ side has a deterministic
+    layout to consume.
+
+    Output layout:
+        <output_dir>/combined.xclbin
+        <output_dir>/swiglu_gemv_1.insts
+        <output_dir>/swiglu_silu.insts
+        <output_dir>/swiglu_eltwise_mul.insts
+        <output_dir>/swiglu_gemv_2.insts
+    """
+    if dtype != "bf16":
+        raise ValueError(f"SwiGLU currently supports only bf16, got {dtype}")
+    validate_swiglu_decode_shapes(embedding_dim, hidden_dim, num_aie_columns)
+
+    # SwiGLUDecode reads num_aie_columns from the live device. The C++ caller
+    # always passes the device's actual cols, so we cross-check here to fail
+    # loudly if a stale cache key is requested against a different device.
+    actual_cols = aie_utils.get_current_device().cols
+    if actual_cols != num_aie_columns:
+        raise ValueError(
+            f"Device column mismatch: requested {num_aie_columns}, current "
+            f"device reports {actual_cols}. Compile on the target device."
+        )
+
+    from iron.operators.swiglu_decode.op import SwiGLUDecode
+
+    op = SwiGLUDecode(embedding_dim=embedding_dim, hidden_dim=hidden_dim)
+    op.compile()
+
+    _stage_swiglu_artifacts(op, SWIGLU_DECODE_KERNELS, output_dir)
+    return output_dir
+
+
+def compile_swiglu_prefill(seq_len: int, embedding_dim: int, hidden_dim: int,
+                           dtype: str, num_aie_columns: int, output_dir: str) -> str:
+    """Compile an IRON SwiGLU prefill operator and stage its artifacts.
+
+    Output layout mirrors compile_swiglu_decode but with gemm_1/gemm_2 kernel names.
+    """
+    if dtype != "bf16":
+        raise ValueError(f"SwiGLU currently supports only bf16, got {dtype}")
+    validate_swiglu_prefill_shapes(seq_len, embedding_dim, hidden_dim, num_aie_columns)
+
+    actual_cols = aie_utils.get_current_device().cols
+    if actual_cols != num_aie_columns:
+        raise ValueError(
+            f"Device column mismatch: requested {num_aie_columns}, current "
+            f"device reports {actual_cols}. Compile on the target device."
+        )
+
+    from iron.operators.swiglu_prefill.op import SwiGLUPrefill
+
+    op = SwiGLUPrefill(
+        seq_len=seq_len, embedding_dim=embedding_dim, hidden_dim=hidden_dim
+    )
+    op.compile()
+
+    _stage_swiglu_artifacts(op, SWIGLU_PREFILL_KERNELS, output_dir)
+    return output_dir
+
+
+def _stage_swiglu_artifacts(op, kernel_names: tuple[str, ...], output_dir: str) -> None:
+    """Copy a compiled SwiGLU op's combined xclbin + per-kernel insts to output_dir."""
+    os.makedirs(output_dir, exist_ok=True)
+    build_dir = op.context.build_dir
+
+    combined_src = build_dir / op.combined_xclbin.filename
+    shutil.copy2(str(combined_src), os.path.join(output_dir, "combined.xclbin"))
+
+    for name in kernel_names:
+        insts_artifact = getattr(op, f"{name}_insts")
+        src = build_dir / insts_artifact.filename
+        dst = os.path.join(output_dir, f"swiglu_{name}.insts")
+        shutil.copy2(str(src), dst)
+
+
 # ---------------------------------------------------------------------------
 # Cache management
 # ---------------------------------------------------------------------------
@@ -326,6 +498,60 @@ def compile_gemv_cached(N: int, K: int, dtype_in: str = "bf16",
     return Path(output_path)
 
 
+def get_cached_swiglu_dir(cache_key: str, kernel_names: tuple[str, ...]) -> Path | None:
+    """Check if a SwiGLU bundle is cached. Returns the directory if found, else None.
+
+    The combined.xclbin and *all* expected per-kernel insts files must exist.
+    """
+    cache_dir = get_cache_dir() / cache_key
+    if not (cache_dir / "combined.xclbin").exists():
+        return None
+    for name in kernel_names:
+        if not (cache_dir / f"swiglu_{name}.insts").exists():
+            return None
+    return cache_dir
+
+
+def compile_swiglu_decode_cached(embedding_dim: int, hidden_dim: int,
+                                 dtype: str = "bf16",
+                                 num_aie_columns: int = 4) -> Path:
+    """Compile a SwiGLU decode operator with caching.
+
+    Returns path to the cache directory containing combined.xclbin + 4 insts files.
+    """
+    key = swiglu_decode_cache_key(embedding_dim, hidden_dim, dtype, num_aie_columns)
+
+    cached = get_cached_swiglu_dir(key, SWIGLU_DECODE_KERNELS)
+    if cached is not None:
+        return cached
+
+    output_dir = str(get_cache_dir() / key)
+    compile_swiglu_decode(embedding_dim, hidden_dim, dtype, num_aie_columns, output_dir)
+    return Path(output_dir)
+
+
+def compile_swiglu_prefill_cached(seq_len: int, embedding_dim: int, hidden_dim: int,
+                                  dtype: str = "bf16",
+                                  num_aie_columns: int = 4) -> Path:
+    """Compile a SwiGLU prefill operator with caching.
+
+    Returns path to the cache directory containing combined.xclbin + 4 insts files.
+    """
+    key = swiglu_prefill_cache_key(
+        seq_len, embedding_dim, hidden_dim, dtype, num_aie_columns
+    )
+
+    cached = get_cached_swiglu_dir(key, SWIGLU_PREFILL_KERNELS)
+    if cached is not None:
+        return cached
+
+    output_dir = str(get_cache_dir() / key)
+    compile_swiglu_prefill(
+        seq_len, embedding_dim, hidden_dim, dtype, num_aie_columns, output_dir
+    )
+    return Path(output_dir)
+
+
 # ---------------------------------------------------------------------------
 # CLI entry point (called by C++ backend)
 # ---------------------------------------------------------------------------
@@ -353,6 +579,29 @@ def main():
     gemv_parser.add_argument("--dtype-out", default="bf16", choices=["bf16"])
     gemv_parser.add_argument("--num-aie-columns", type=int, default=4)
     gemv_parser.add_argument("--out", type=str, help="Output xclbin path (default: cache)")
+
+    # SwiGLU decode subcommand
+    swd_parser = subparsers.add_parser(
+        "swiglu-decode", help="Compile fused SwiGLU FFN (M=1 decode path)"
+    )
+    swd_parser.add_argument("--embedding-dim", type=int, required=True)
+    swd_parser.add_argument("--hidden-dim", type=int, required=True)
+    swd_parser.add_argument("--dtype", default="bf16", choices=["bf16"])
+    swd_parser.add_argument("--num-aie-columns", type=int, default=4)
+    swd_parser.add_argument("--out", type=str,
+                            help="Output directory (default: cache)")
+
+    # SwiGLU prefill subcommand
+    swp_parser = subparsers.add_parser(
+        "swiglu-prefill", help="Compile fused SwiGLU FFN (M>=32 prefill path)"
+    )
+    swp_parser.add_argument("--seq-len", type=int, required=True)
+    swp_parser.add_argument("--embedding-dim", type=int, required=True)
+    swp_parser.add_argument("--hidden-dim", type=int, required=True)
+    swp_parser.add_argument("--dtype", default="bf16", choices=["bf16"])
+    swp_parser.add_argument("--num-aie-columns", type=int, default=4)
+    swp_parser.add_argument("--out", type=str,
+                            help="Output directory (default: cache)")
 
     args = parser.parse_args()
 
@@ -384,6 +633,30 @@ def main():
                 args.N, args.K,
                 args.dtype_in, args.dtype_out,
                 args.num_aie_columns,
+            )
+        print(path)
+    elif args.op == "swiglu-decode":
+        if args.out:
+            path = compile_swiglu_decode(
+                args.embedding_dim, args.hidden_dim,
+                args.dtype, args.num_aie_columns, args.out,
+            )
+        else:
+            path = compile_swiglu_decode_cached(
+                args.embedding_dim, args.hidden_dim,
+                args.dtype, args.num_aie_columns,
+            )
+        print(path)
+    elif args.op == "swiglu-prefill":
+        if args.out:
+            path = compile_swiglu_prefill(
+                args.seq_len, args.embedding_dim, args.hidden_dim,
+                args.dtype, args.num_aie_columns, args.out,
+            )
+        else:
+            path = compile_swiglu_prefill_cached(
+                args.seq_len, args.embedding_dim, args.hidden_dim,
+                args.dtype, args.num_aie_columns,
             )
         print(path)
 
