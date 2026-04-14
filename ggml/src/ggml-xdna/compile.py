@@ -100,6 +100,27 @@ def swiglu_prefill_cache_key(seq_len: int, embedding_dim: int, hidden_dim: int,
     return hashlib.sha256(key_json.encode()).hexdigest()[:16]
 
 
+def swiglu_decode_int8_cache_key(embedding_dim: int, hidden_dim: int,
+                                 num_aie_columns: int,
+                                 group_size: int = 32) -> str:
+    """Cache key for a W8A16 INT8 SwiGLU decode (M=1) configuration.
+
+    Disjoint from bf16 swiglu / gemm / gemv keys by virtue of the "op" field.
+    group_size participates because it is baked into the inner gemv_int8
+    kernel at compile time via -DGROUP_SIZE. dtype is implied (int8 weights +
+    bf16 activations) and thus omitted.
+    """
+    key_data = {
+        "op": "swiglu_decode_int8",
+        "embedding_dim": embedding_dim,
+        "hidden_dim": hidden_dim,
+        "num_aie_columns": num_aie_columns,
+        "group_size": group_size,
+    }
+    key_json = json.dumps(key_data, sort_keys=True)
+    return hashlib.sha256(key_json.encode()).hexdigest()[:16]
+
+
 def select_swiglu_prefill_tile_m(seq_len: int) -> int:
     """Pick the largest valid tile_m for a given prefill seq_len.
 
@@ -117,6 +138,12 @@ def select_swiglu_prefill_tile_m(seq_len: int) -> int:
 # The C++ backend looks up insts files by these names.
 SWIGLU_DECODE_KERNELS = ("gemv_1", "silu", "eltwise_mul", "gemv_2")
 SWIGLU_PREFILL_KERNELS = ("gemm_1", "silu", "eltwise_mul", "gemm_2")
+# W8A16 (INT8 weights + bf16 activations) SwiGLU decode. Sub-op prefixes come
+# from iron/operators/swiglu_decode_int8/op.py chain_swiglu_artifacts() call.
+# SiLU / eltwise_mul share the same compiled binaries as the bf16 chain
+# (they operate on bf16 intermediates), but are keyed under their int8-namespace
+# insts files inside this bundle — the C++ backend loads them via distinct tags.
+SWIGLU_DECODE_INT8_KERNELS = ("gemv_int8_1", "silu", "eltwise_mul", "gemv_int8_2")
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +275,51 @@ def validate_swiglu_decode_shapes(embedding_dim: int, hidden_dim: int,
         )
     # The two GEMV stages must themselves be dispatchable. Reuse the GEMV tile
     # selector — it raises ValueError on K%64 / per-col / L1 budget violations.
+    select_gemv_tiles(N=hidden_dim, K=embedding_dim, num_aie_columns=num_aie_columns)
+    select_gemv_tiles(N=embedding_dim, K=hidden_dim, num_aie_columns=num_aie_columns)
+
+
+def validate_swiglu_decode_int8_shapes(embedding_dim: int, hidden_dim: int,
+                                       num_aie_columns: int,
+                                       group_size: int = 32) -> None:
+    """Verify an (embedding_dim, hidden_dim, cols, group_size) tuple dispatches
+    to SwiGLUDecodeInt8.
+
+    Adds the INT8-specific group_size divisibility constraints on top of the
+    bf16 SwiGLUDecode checks. The two inner gemv_int8 stages must also satisfy
+    the standard bf16 GEMV L1-budget + per-col tiling constraints (K is the
+    dim reduced in each stage; activations are still bf16).
+    """
+    if num_aie_columns not in (4, 8):
+        raise ValueError(
+            f"num_aie_columns must be 4 (NPU1) or 8 (NPU2), got {num_aie_columns}"
+        )
+    if group_size % 32 != 0:
+        raise ValueError(
+            f"group_size={group_size} must be a multiple of 32 (Q8_0 block size)"
+        )
+    if embedding_dim % group_size != 0:
+        raise ValueError(
+            f"embedding_dim={embedding_dim} must be a multiple of "
+            f"group_size={group_size} (gemv_int8_1 K constraint)"
+        )
+    if hidden_dim % group_size != 0:
+        raise ValueError(
+            f"hidden_dim={hidden_dim} must be a multiple of "
+            f"group_size={group_size} (gemv_int8_2 K constraint)"
+        )
+    if hidden_dim % (num_aie_columns * 2) != 0:
+        raise ValueError(
+            f"hidden_dim={hidden_dim} must be divisible by 2*num_aie_columns="
+            f"{num_aie_columns * 2} (SiLU per-column tile)"
+        )
+    if embedding_dim % num_aie_columns != 0:
+        raise ValueError(
+            f"embedding_dim={embedding_dim} must be divisible by "
+            f"num_aie_columns={num_aie_columns}"
+        )
+    # Reuse the bf16 GEMV tile selector for the K%64 + per-col checks (the
+    # gemv_int8 kernel uses the same kernel_vector_size=64 under the hood).
     select_gemv_tiles(N=hidden_dim, K=embedding_dim, num_aie_columns=num_aie_columns)
     select_gemv_tiles(N=embedding_dim, K=hidden_dim, num_aie_columns=num_aie_columns)
 
@@ -436,6 +508,40 @@ def compile_swiglu_decode(embedding_dim: int, hidden_dim: int, dtype: str,
     return output_dir
 
 
+def compile_swiglu_decode_int8(embedding_dim: int, hidden_dim: int,
+                               num_aie_columns: int, output_dir: str,
+                               group_size: int = 32) -> str:
+    """Compile an IRON SwiGLUDecodeInt8 operator and stage its artifacts.
+
+    Mirrors compile_swiglu_decode layout: one combined xclbin with 4 sub-ops
+    (gemv_int8_1, silu, eltwise_mul, gemv_int8_2) plus 4 insts files, staged
+    under ``output_dir``. No weights are packed here — weights are runtime data
+    that the C++ backend loads from the GGUF and repacks per-tile at dispatch.
+    """
+    validate_swiglu_decode_int8_shapes(embedding_dim, hidden_dim,
+                                       num_aie_columns, group_size=group_size)
+
+    # SwiGLUDecodeInt8 reads num_aie_columns from the live device (mirrors bf16).
+    actual_cols = aie_utils.get_current_device().cols
+    if actual_cols != num_aie_columns:
+        raise ValueError(
+            f"Device column mismatch: requested {num_aie_columns}, current "
+            f"device reports {actual_cols}. Compile on the target device."
+        )
+
+    from iron.operators.swiglu_decode_int8.op import SwiGLUDecodeInt8
+
+    op = SwiGLUDecodeInt8(
+        embedding_dim=embedding_dim,
+        hidden_dim=hidden_dim,
+        group_size=group_size,
+    )
+    op.compile()
+
+    _stage_swiglu_artifacts(op, SWIGLU_DECODE_INT8_KERNELS, output_dir)
+    return output_dir
+
+
 def compile_swiglu_prefill(seq_len: int, embedding_dim: int, hidden_dim: int,
                            dtype: str, num_aie_columns: int, output_dir: str,
                            tile_m: int | None = None) -> str:
@@ -580,6 +686,30 @@ def compile_swiglu_decode_cached(embedding_dim: int, hidden_dim: int,
     return Path(output_dir)
 
 
+def compile_swiglu_decode_int8_cached(embedding_dim: int, hidden_dim: int,
+                                      num_aie_columns: int = 4,
+                                      group_size: int = 32) -> Path:
+    """Compile a SwiGLUDecodeInt8 operator with caching.
+
+    Returns path to the cache directory containing combined.xclbin + 4 insts
+    files (SWIGLU_DECODE_INT8_KERNELS).
+    """
+    key = swiglu_decode_int8_cache_key(
+        embedding_dim, hidden_dim, num_aie_columns, group_size=group_size
+    )
+
+    cached = get_cached_swiglu_dir(key, SWIGLU_DECODE_INT8_KERNELS)
+    if cached is not None:
+        return cached
+
+    output_dir = str(get_cache_dir() / key)
+    compile_swiglu_decode_int8(
+        embedding_dim, hidden_dim, num_aie_columns, output_dir,
+        group_size=group_size,
+    )
+    return Path(output_dir)
+
+
 def compile_swiglu_prefill_cached(seq_len: int, embedding_dim: int, hidden_dim: int,
                                   dtype: str = "bf16",
                                   num_aie_columns: int = 4,
@@ -643,6 +773,21 @@ def main():
     swd_parser.add_argument("--out", type=str,
                             help="Output directory (default: cache)")
 
+    # SwiGLU decode INT8 subcommand (W8A16)
+    swdi_parser = subparsers.add_parser(
+        "swiglu-decode-int8",
+        help="Compile fused W8A16 SwiGLU FFN (INT8 weights + bf16 activations, "
+             "M=1 decode path)",
+    )
+    swdi_parser.add_argument("--embedding-dim", type=int, required=True)
+    swdi_parser.add_argument("--hidden-dim", type=int, required=True)
+    swdi_parser.add_argument("--num-aie-columns", type=int, default=4)
+    swdi_parser.add_argument("--group-size", type=int, default=32,
+                             help="Quantization group size (must match Q8_0=32 "
+                                  "for ggml Q8_0 weights)")
+    swdi_parser.add_argument("--out", type=str,
+                             help="Output directory (default: cache)")
+
     # SwiGLU prefill subcommand
     swp_parser = subparsers.add_parser(
         "swiglu-prefill", help="Compile fused SwiGLU FFN (M>=32 prefill path)"
@@ -700,6 +845,20 @@ def main():
             path = compile_swiglu_decode_cached(
                 args.embedding_dim, args.hidden_dim,
                 args.dtype, args.num_aie_columns,
+            )
+        print(path)
+    elif args.op == "swiglu-decode-int8":
+        if args.out:
+            path = compile_swiglu_decode_int8(
+                args.embedding_dim, args.hidden_dim,
+                args.num_aie_columns, args.out,
+                group_size=args.group_size,
+            )
+        else:
+            path = compile_swiglu_decode_int8_cached(
+                args.embedding_dim, args.hidden_dim,
+                args.num_aie_columns,
+                group_size=args.group_size,
             )
         print(path)
     elif args.op == "swiglu-prefill":
