@@ -1745,10 +1745,13 @@ static size_t ggml_backend_xdna_buffer_type_get_alignment(ggml_backend_buffer_ty
 }
 
 static bool ggml_backend_xdna_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
-    // NPU shares host RAM with CPU — our buffers ARE plain host memory.
-    // But we advertise as a device (not host) so the scheduler routes compute
-    // work to us instead of treating us like CPU-owned storage.
-    return false;
+    // NPU memory IS host RAM (shared via DMA). is_host signals tensor-
+    // placement compatibility, not who runs the op — supports_op still gates
+    // execution separately. Advertising true lets CPU operate on our
+    // tensors without a scheduler split at every CPU↔XDNA boundary
+    // (graph INPUTs like inp_pos / inp_out_ids / kq_mask would otherwise
+    // fragment the decoder graph into per-layer sub-graphs).
+    return true;
     GGML_UNUSED(buft);
 }
 
