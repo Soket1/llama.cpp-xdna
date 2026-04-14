@@ -15,6 +15,16 @@
 #include <vector>
 #include <unistd.h>
 
+// Session-wide buffer-traffic counters (behind XDNA_DEBUG). These measure
+// how much data the scheduler moves through our buffer interface — a proxy
+// for inter-backend copy overhead. Logged on backend_free.
+static std::atomic<size_t> g_set_tensor_bytes{0};
+static std::atomic<size_t> g_set_tensor_calls{0};
+static std::atomic<size_t> g_get_tensor_bytes{0};
+static std::atomic<size_t> g_get_tensor_calls{0};
+static std::atomic<size_t> g_cpy_tensor_bytes{0};
+static std::atomic<size_t> g_cpy_tensor_calls{0};
+
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_bo.h"
 #include "xrt/xrt_kernel.h"
@@ -511,6 +521,18 @@ static const char * ggml_backend_xdna_get_name(ggml_backend_t backend) {
 
 static void ggml_backend_xdna_free(ggml_backend_t backend) {
     ggml_backend_xdna_context * ctx = (ggml_backend_xdna_context *)backend->context;
+    static const bool debug = getenv("XDNA_DEBUG") != NULL;
+    if (debug) {
+        auto mib = [](size_t b) { return (double)b / (1024.0 * 1024.0); };
+        fprintf(stderr,
+                "ggml-xdna: buffer traffic summary — "
+                "set_tensor: %zu calls / %.1f MiB, "
+                "get_tensor: %zu calls / %.1f MiB, "
+                "cpy_tensor: %zu calls / %.1f MiB\n",
+                g_set_tensor_calls.load(), mib(g_set_tensor_bytes.load()),
+                g_get_tensor_calls.load(), mib(g_get_tensor_bytes.load()),
+                g_cpy_tensor_calls.load(), mib(g_cpy_tensor_bytes.load()));
+    }
     delete ctx;
     delete backend;
 }
@@ -718,12 +740,16 @@ static void * ggml_backend_xdna_buffer_get_base(ggml_backend_buffer_t buffer) {
 
 static void ggml_backend_xdna_buffer_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     memcpy((char *)tensor->data + offset, data, size);
+    g_set_tensor_bytes.fetch_add(size, std::memory_order_relaxed);
+    g_set_tensor_calls.fetch_add(1, std::memory_order_relaxed);
     GGML_UNUSED(buffer);
     GGML_UNUSED(tensor);
 }
 
 static void ggml_backend_xdna_buffer_get_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     memcpy(data, (const char *)tensor->data + offset, size);
+    g_get_tensor_bytes.fetch_add(size, std::memory_order_relaxed);
+    g_get_tensor_calls.fetch_add(1, std::memory_order_relaxed);
     GGML_UNUSED(buffer);
 }
 
@@ -734,7 +760,10 @@ static void ggml_backend_xdna_buffer_memset_tensor(ggml_backend_buffer_t buffer,
 
 static bool ggml_backend_xdna_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * src, struct ggml_tensor * dst) {
     if (ggml_backend_buffer_is_host(src->buffer)) {
-        memcpy(dst->data, src->data, ggml_nbytes(src));
+        size_t nbytes = ggml_nbytes(src);
+        memcpy(dst->data, src->data, nbytes);
+        g_cpy_tensor_bytes.fetch_add(nbytes, std::memory_order_relaxed);
+        g_cpy_tensor_calls.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
     return false;
