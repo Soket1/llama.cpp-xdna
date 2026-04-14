@@ -4,6 +4,7 @@
 #include "ggml-cpu.h"
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -683,6 +684,133 @@ static bool ensure_swiglu_compiled(ggml_backend_xdna_context * ctx,
     return true;
 }
 
+// Prime the hw_context by firing one dummy submit of each sub-kernel right
+// after the xclbin is loaded. Agent investigation traced the ~1800 µs first-
+// submit cold-start to the XDNA driver's ctx-connect slow path (DRM scheduler
+// init + aie2_config_cu mailbox + HMM range walk of BOs). Paying that here
+// once per kernel-entry lets real dispatches return in ~20 µs.
+//
+// Uses scratch BOs sized like the real dispatch for each slot so every BO
+// goes through its actual group_id binding. BOs fall out of scope at return
+// and are freed — we only need to exercise the first-submit paths.
+static void swiglu_warmup_entry(ggml_backend_xdna_context * ctx,
+                                xdna_swiglu_kernel_entry * entry) {
+    using clk = std::chrono::steady_clock;
+    static const bool dbg = getenv("XDNA_DEBUG") != NULL;
+    const auto t_start = clk::now();
+
+    const int64_t embedding_dim = entry->embedding_dim;
+    const int64_t hidden_dim    = entry->hidden_dim;
+    const int64_t M             = entry->seq_len;  // 1 for decode, seq_len for prefill
+    const bool prefill          = (entry->op_kind == XDNA_OP_SWIGLU_PREFILL);
+
+    const size_t input_bytes  = (size_t)embedding_dim * (size_t)M * sizeof(uint16_t);
+    const size_t hidden_bytes = (size_t)hidden_dim    * (size_t)M * sizeof(uint16_t);
+    const size_t weight_bytes = (size_t)embedding_dim * (size_t)hidden_dim * sizeof(uint16_t);
+
+    // Group IDs match the real dispatcher's persistent-BO allocation pattern.
+    const int mm1_in_grp = prefill ? 3 : 4;  // GEMM A vs GEMV vector
+    const int mm1_w_grp  = prefill ? 4 : 3;  // GEMM B vs GEMV matrix
+    const int mm2_w_grp  = prefill ? 4 : 3;
+
+    try {
+        xrt::bo sc_input(ctx->device, input_bytes,  xrt::bo::flags::host_only,
+                         entry->kernels[XDNA_SWIGLU_MATMUL_1].group_id(mm1_in_grp));
+        xrt::bo sc_output(ctx->device, input_bytes, xrt::bo::flags::host_only,
+                          entry->kernels[XDNA_SWIGLU_MATMUL_2].group_id(5));
+        xrt::bo sc_left(ctx->device, hidden_bytes, xrt::bo::flags::host_only,
+                        entry->kernels[XDNA_SWIGLU_MATMUL_1].group_id(5));
+        xrt::bo sc_right(ctx->device, hidden_bytes, xrt::bo::flags::host_only,
+                         entry->kernels[XDNA_SWIGLU_MATMUL_1].group_id(5));
+        xrt::bo sc_left_swished(ctx->device, hidden_bytes, xrt::bo::flags::host_only,
+                                entry->kernels[XDNA_SWIGLU_SILU].group_id(4));
+        xrt::bo sc_intermediate(ctx->device, hidden_bytes, xrt::bo::flags::host_only,
+                                entry->kernels[XDNA_SWIGLU_ELTWISE].group_id(5));
+        xrt::bo sc_w1(ctx->device, weight_bytes, xrt::bo::flags::host_only,
+                      entry->kernels[XDNA_SWIGLU_MATMUL_1].group_id(mm1_w_grp));
+        xrt::bo sc_w2(ctx->device, weight_bytes, xrt::bo::flags::host_only,
+                      entry->kernels[XDNA_SWIGLU_MATMUL_1].group_id(mm1_w_grp));
+        xrt::bo sc_w3(ctx->device, weight_bytes, xrt::bo::flags::host_only,
+                      entry->kernels[XDNA_SWIGLU_MATMUL_2].group_id(mm2_w_grp));
+
+        memset(sc_input.map<void*>(),         0, input_bytes);
+        memset(sc_output.map<void*>(),        0, input_bytes);
+        memset(sc_left.map<void*>(),          0, hidden_bytes);
+        memset(sc_right.map<void*>(),         0, hidden_bytes);
+        memset(sc_left_swished.map<void*>(),  0, hidden_bytes);
+        memset(sc_intermediate.map<void*>(),  0, hidden_bytes);
+        memset(sc_w1.map<void*>(),            0, weight_bytes);
+        memset(sc_w2.map<void*>(),            0, weight_bytes);
+        memset(sc_w3.map<void*>(),            0, weight_bytes);
+        sc_input.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        sc_w1.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        sc_w2.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        sc_w3.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+        // Mirror the real 5-invoke SwiGLU sequence. Both mm1 weights get
+        // exercised so w_gate and w_up BO-slot paths are both primed.
+        const uint32_t mm1_isize = (uint32_t)entry->insts_data[XDNA_SWIGLU_MATMUL_1].size();
+        const uint32_t mm2_isize = (uint32_t)entry->insts_data[XDNA_SWIGLU_MATMUL_2].size();
+        xrt::run r;
+
+        if (prefill) {
+            r = entry->kernels[XDNA_SWIGLU_MATMUL_1](
+                3, entry->insts_bo[XDNA_SWIGLU_MATMUL_1], mm1_isize,
+                sc_input, sc_w1, sc_left);
+        } else {
+            r = entry->kernels[XDNA_SWIGLU_MATMUL_1](
+                3, entry->insts_bo[XDNA_SWIGLU_MATMUL_1], mm1_isize,
+                sc_w1, sc_input, sc_left);
+        }
+        r.wait();
+
+        if (prefill) {
+            r = entry->kernels[XDNA_SWIGLU_MATMUL_1](
+                3, entry->insts_bo[XDNA_SWIGLU_MATMUL_1], mm1_isize,
+                sc_input, sc_w2, sc_right);
+        } else {
+            r = entry->kernels[XDNA_SWIGLU_MATMUL_1](
+                3, entry->insts_bo[XDNA_SWIGLU_MATMUL_1], mm1_isize,
+                sc_w2, sc_input, sc_right);
+        }
+        r.wait();
+
+        r = entry->kernels[XDNA_SWIGLU_SILU](
+            3, entry->insts_bo[XDNA_SWIGLU_SILU],
+            (uint32_t)entry->insts_data[XDNA_SWIGLU_SILU].size(),
+            sc_left, sc_left_swished);
+        r.wait();
+
+        r = entry->kernels[XDNA_SWIGLU_ELTWISE](
+            3, entry->insts_bo[XDNA_SWIGLU_ELTWISE],
+            (uint32_t)entry->insts_data[XDNA_SWIGLU_ELTWISE].size(),
+            sc_left_swished, sc_right, sc_intermediate);
+        r.wait();
+
+        if (prefill) {
+            r = entry->kernels[XDNA_SWIGLU_MATMUL_2](
+                3, entry->insts_bo[XDNA_SWIGLU_MATMUL_2], mm2_isize,
+                sc_intermediate, sc_w3, sc_output);
+        } else {
+            r = entry->kernels[XDNA_SWIGLU_MATMUL_2](
+                3, entry->insts_bo[XDNA_SWIGLU_MATMUL_2], mm2_isize,
+                sc_w3, sc_intermediate, sc_output);
+        }
+        r.wait();
+
+        if (dbg) {
+            auto t_end = clk::now();
+            auto us = std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_start).count();
+            GGML_LOG_INFO("ggml-xdna: swiglu warmup %s M=%ld emb=%ld hid=%ld took %ld us\n",
+                          prefill ? "prefill" : "decode",
+                          (long)M, (long)embedding_dim, (long)hidden_dim, (long)us);
+        }
+    } catch (const std::exception & e) {
+        GGML_LOG_INFO("ggml-xdna: warning: SwiGLU warmup failed (%s) — first dispatch will pay the cost\n",
+                      e.what());
+    }
+}
+
 static xdna_swiglu_kernel_entry * get_or_load_swiglu_kernel(
         ggml_backend_xdna_context * ctx,
         const std::string & cache_key,
@@ -735,8 +863,14 @@ static xdna_swiglu_kernel_entry * get_or_load_swiglu_kernel(
         }
 
         auto [inserted_it, _] = ctx->swiglu_cache.emplace(cache_key, std::move(entry));
+        xdna_swiglu_kernel_entry * entry_ptr = &inserted_it->second;
         GGML_LOG_INFO("ggml-xdna: loaded SwiGLU kernel bundle for %s\n", cache_key.c_str());
-        return &inserted_it->second;
+
+        // Pay the first-submit slow-path cost (ctx-connect + HMM pin) once
+        // here instead of on the first real FFN dispatch. Non-fatal on failure.
+        swiglu_warmup_entry(ctx, entry_ptr);
+
+        return entry_ptr;
 
     } catch (const std::exception & e) {
         GGML_LOG_ERROR("ggml-xdna: failed to load SwiGLU kernel %s: %s\n",
@@ -973,6 +1107,15 @@ static void ggml_backend_xdna_mul_mat_swiglu(ggml_backend_xdna_context * ctx,
             if (!w1_bo_ptr || !w2_bo_ptr || !w3_bo_ptr) return;
         }
 
+        // Profiling: split each phase into submit (xrt::kernel::operator())
+        // vs wait (run.wait()) so we can tell whether per-call overhead is
+        // host-submit cost or on-device execution + host stall. Also times
+        // the 4 host<->device DMA/convert phases. Prints one compact line
+        // per dispatch under XDNA_DEBUG.
+        using clk = std::chrono::steady_clock;
+        static const bool prof = getenv("XDNA_DEBUG") != NULL;
+        auto t_in_s  = clk::now();
+
         // Load input activation (freshly computed per token/step).
         if (src1_input->type == GGML_TYPE_F32) {
             f32_to_bf16((const float *)src1_input->data,
@@ -981,6 +1124,7 @@ static void ggml_backend_xdna_mul_mat_swiglu(ggml_backend_xdna_context * ctx,
             memcpy(entry->input_bo->map<void*>(), src1_input->data, input_bytes);
         }
         entry->input_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        auto t_in_e  = clk::now();
 
         // 5-invocation SwiGLU sequence (mirrors swiglu_base.py _SwiGLUCallable.__call__).
         //   1. matmul_1(w_gate, input) -> left
@@ -990,47 +1134,95 @@ static void ggml_backend_xdna_mul_mat_swiglu(ggml_backend_xdna_context * ctx,
         //   5. matmul_2(w_down, intermediate) -> output
         // Each run.wait() is a host-device round-trip; matches Python semantics.
         // Chaining without intermediate waits is a future optimization.
-        auto r1 = swiglu_invoke_matmul_1(entry, *w1_bo_ptr, *entry->input_bo, *entry->left_bo);
+        auto t_r1_s  = clk::now();
+        auto r1      = swiglu_invoke_matmul_1(entry, *w1_bo_ptr, *entry->input_bo, *entry->left_bo);
+        auto t_r1_sm = clk::now();
         r1.wait();
+        auto t_r1_e  = clk::now();
 
-        auto r2 = swiglu_invoke_matmul_1(entry, *w2_bo_ptr, *entry->input_bo, *entry->right_bo);
+        auto t_r2_s  = clk::now();
+        auto r2      = swiglu_invoke_matmul_1(entry, *w2_bo_ptr, *entry->input_bo, *entry->right_bo);
+        auto t_r2_sm = clk::now();
         r2.wait();
+        auto t_r2_e  = clk::now();
 
-        auto r3 = entry->kernels[XDNA_SWIGLU_SILU](
+        auto t_r3_s  = clk::now();
+        auto r3      = entry->kernels[XDNA_SWIGLU_SILU](
             3, entry->insts_bo[XDNA_SWIGLU_SILU],
             (uint32_t)entry->insts_data[XDNA_SWIGLU_SILU].size(),
             *entry->left_bo, *entry->left_swished_bo);
+        auto t_r3_sm = clk::now();
         r3.wait();
+        auto t_r3_e  = clk::now();
 
-        auto r4 = entry->kernels[XDNA_SWIGLU_ELTWISE](
+        auto t_r4_s  = clk::now();
+        auto r4      = entry->kernels[XDNA_SWIGLU_ELTWISE](
             3, entry->insts_bo[XDNA_SWIGLU_ELTWISE],
             (uint32_t)entry->insts_data[XDNA_SWIGLU_ELTWISE].size(),
             *entry->left_swished_bo, *entry->right_bo, *entry->intermediate_bo);
+        auto t_r4_sm = clk::now();
         r4.wait();
+        auto t_r4_e  = clk::now();
 
-        auto r5 = swiglu_invoke_matmul_2(entry, *w3_bo_ptr,
-                                         *entry->intermediate_bo, *entry->output_bo);
+        auto t_r5_s  = clk::now();
+        auto r5      = swiglu_invoke_matmul_2(entry, *w3_bo_ptr,
+                                              *entry->intermediate_bo, *entry->output_bo);
+        auto t_r5_sm = clk::now();
         r5.wait();
+        auto t_r5_e  = clk::now();
 
         // Pull the final output back to host (the only result downstream actually needs).
+        auto t_out_s = clk::now();
         entry->output_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
         bf16_to_f32((const uint16_t *)entry->output_bo->map<void*>(),
                     (float *)dst_final->data, output_elems);
+        auto t_out_e = clk::now();
 
         // Copy intermediates back so any downstream consumer that looked past
         // the fused pattern still sees correct tensor->data contents. These are
         // O(M*hidden_dim) each — small compared to the compute we just did.
+        auto t_wbl_s = clk::now();
         entry->left_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
         bf16_to_f32((const uint16_t *)entry->left_bo->map<void*>(),
                     (float *)gate_dst->data, hidden_elems);
+        auto t_wbl_e = clk::now();
 
+        auto t_wbr_s = clk::now();
         entry->right_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
         bf16_to_f32((const uint16_t *)entry->right_bo->map<void*>(),
                     (float *)up_dst->data, hidden_elems);
+        auto t_wbr_e = clk::now();
 
+        auto t_wbi_s = clk::now();
         entry->intermediate_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
         bf16_to_f32((const uint16_t *)entry->intermediate_bo->map<void*>(),
                     (float *)glu_dst->data, hidden_elems);
+        auto t_wbi_e = clk::now();
+
+        if (prof) {
+            auto us = [](clk::time_point a, clk::time_point b) {
+                return (long)std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
+            };
+            // Per-subkernel: submit | wait (submit = xrt::kernel::operator() return; wait = run.wait()).
+            // Write-backs: sync(BO_FROM_DEVICE) + bf16_to_f32 combined.
+            GGML_LOG_INFO(
+                "ggml-xdna: swiglu_prof %s M=%ld K=%ld N=%ld in=%ld "
+                "mm1=%ld|%ld mm1b=%ld|%ld silu=%ld|%ld eltw=%ld|%ld mm2=%ld|%ld "
+                "out=%ld wb_l=%ld wb_r=%ld wb_i=%ld total=%ld us\n",
+                op_kind == XDNA_OP_SWIGLU_PREFILL ? "prefill" : "decode",
+                (long)M, (long)embedding_dim, (long)hidden_dim,
+                us(t_in_s,  t_in_e),
+                us(t_r1_s,  t_r1_sm), us(t_r1_sm, t_r1_e),
+                us(t_r2_s,  t_r2_sm), us(t_r2_sm, t_r2_e),
+                us(t_r3_s,  t_r3_sm), us(t_r3_sm, t_r3_e),
+                us(t_r4_s,  t_r4_sm), us(t_r4_sm, t_r4_e),
+                us(t_r5_s,  t_r5_sm), us(t_r5_sm, t_r5_e),
+                us(t_out_s, t_out_e),
+                us(t_wbl_s, t_wbl_e),
+                us(t_wbr_s, t_wbr_e),
+                us(t_wbi_s, t_wbi_e),
+                us(t_in_s,  t_wbi_e));
+        }
 
     } catch (const std::exception & e) {
         GGML_LOG_ERROR("ggml-xdna: SwiGLU XRT dispatch failed (%s)\n", e.what());
