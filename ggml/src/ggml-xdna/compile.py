@@ -237,8 +237,13 @@ def validate_swiglu_prefill_shapes(seq_len: int, embedding_dim: int, hidden_dim:
                                    num_aie_columns: int) -> None:
     """Verify a SwiGLU prefill shape is dispatchable.
 
-    The two GEMM stages have IRON's standard (M%(tile_m*4), K%tile_k,
-    N%(tile_n*cols)) constraints — we delegate to select_gemm_tiles for both.
+    IRON's SwiGLUPrefill constructs GEMMs with the dataclass defaults
+    (tile_m=tile_k=tile_n=64), so the constraints are fixed:
+        seq_len     % (64 * 4)            == 0  (min_M = tile_m * num_aie_rows=4 = 256)
+        embedding   % 64                  == 0
+        hidden      % 64                  == 0
+        hidden      % (64 * num_aie_cols) == 0  (N of gemm_1)
+        embedding   % (64 * num_aie_cols) == 0  (N of gemm_2)
     """
     if num_aie_columns not in (4, 8):
         raise ValueError(
@@ -249,10 +254,25 @@ def validate_swiglu_prefill_shapes(seq_len: int, embedding_dim: int, hidden_dim:
             f"hidden_dim={hidden_dim} must be divisible by 2*num_aie_columns="
             f"{num_aie_columns * 2} (SiLU per-column tile)"
         )
-    select_gemm_tiles(M=seq_len, K=embedding_dim, N=hidden_dim,
-                      num_aie_columns=num_aie_columns, dtype_in="bf16")
-    select_gemm_tiles(M=seq_len, K=hidden_dim, N=embedding_dim,
-                      num_aie_columns=num_aie_columns, dtype_in="bf16")
+    if seq_len % 256 != 0:
+        raise ValueError(
+            f"seq_len={seq_len} must be a multiple of 256 "
+            f"(IRON SwiGLUPrefill uses default tile_m=64 → min_M=256)"
+        )
+    if embedding_dim % 64 != 0:
+        raise ValueError(f"embedding_dim={embedding_dim} must be a multiple of 64")
+    if hidden_dim % 64 != 0:
+        raise ValueError(f"hidden_dim={hidden_dim} must be a multiple of 64")
+    if hidden_dim % (64 * num_aie_columns) != 0:
+        raise ValueError(
+            f"hidden_dim={hidden_dim} must be a multiple of 64*num_aie_columns="
+            f"{64 * num_aie_columns} (gemm_1 tile_n*cols)"
+        )
+    if embedding_dim % (64 * num_aie_columns) != 0:
+        raise ValueError(
+            f"embedding_dim={embedding_dim} must be a multiple of 64*num_aie_columns="
+            f"{64 * num_aie_columns} (gemm_2 tile_n*cols)"
+        )
 
 
 # ---------------------------------------------------------------------------
