@@ -1064,8 +1064,11 @@ struct xdna_swiglu_match {
 // llama.cpp emits via ggml_swiglu_split in llama-graph.cpp:1141.
 static bool xdna_try_match_swiglu(const struct ggml_cgraph * cgraph, int i,
                                   xdna_swiglu_match * out) {
+    // Under XDNA_DEBUG, log why early match attempts fail — capped so a long
+    // session doesn't drown the log. Useful when llama.cpp cgraph emission
+    // changes and the matcher suddenly misses.
     static const bool dbg = getenv("XDNA_DEBUG") != NULL;
-    static std::atomic<int> dbg_remaining{dbg ? 200 : 0};
+    static std::atomic<int> dbg_remaining{dbg ? 16 : 0};
     auto dbg_ok = [&]() { return dbg && dbg_remaining.fetch_sub(1) > 0; };
     #define SWIGLU_REJECT(reason) do { \
         if (dbg_ok()) fprintf(stderr, "ggml-xdna: swiglu reject @%d: %s\n", i, reason); \
@@ -1158,19 +1161,6 @@ static bool xdna_try_match_swiglu(const struct ggml_cgraph * cgraph, int i,
 
     const int64_t M = input->ne[1];
     const int num_cols = 8;
-
-    // One-shot shape dump — logs the first ~8 match attempts then stops spamming.
-    if (dbg_ok()) {
-        fprintf(stderr,
-                "ggml-xdna: swiglu window @%d input=[%ld,%ld,%ld,%ld] "
-                "gate_w=[%ld,%ld,%ld,%ld] up_w=[%ld,%ld,%ld,%ld] down_w=[%ld,%ld,%ld,%ld] M=%ld\n",
-                i,
-                (long)input->ne[0], (long)input->ne[1], (long)input->ne[2], (long)input->ne[3],
-                (long)gate_w->ne[0], (long)gate_w->ne[1], (long)gate_w->ne[2], (long)gate_w->ne[3],
-                (long)up_w->ne[0], (long)up_w->ne[1], (long)up_w->ne[2], (long)up_w->ne[3],
-                (long)down_w->ne[0], (long)down_w->ne[1], (long)down_w->ne[2], (long)down_w->ne[3],
-                (long)M);
-    }
 
     if (M == 1) {
         if (!xdna_shape_dispatchable_swiglu_decode(embedding_dim, hidden_dim, num_cols))
