@@ -41,6 +41,25 @@ def gemm_cache_key(M: int, K: int, N: int, dtype_in: str, dtype_out: str,
     return hashlib.sha256(key_json.encode()).hexdigest()[:16]
 
 
+def gemv_cache_key(N: int, K: int, dtype_in: str, dtype_out: str,
+                   num_aie_columns: int) -> str:
+    """Generate a deterministic cache key for a GEMV configuration.
+
+    N is the matrix-row dimension (== IRON GEMV's M); K is the reduction dim.
+    Tile sizes are derived from (N, K, cols) so they're not part of the key.
+    """
+    key_data = {
+        "op": "gemv",
+        "N": N,
+        "K": K,
+        "dtype_in": dtype_in,
+        "dtype_out": dtype_out,
+        "num_aie_columns": num_aie_columns,
+    }
+    key_json = json.dumps(key_data, sort_keys=True)
+    return hashlib.sha256(key_json.encode()).hexdigest()[:16]
+
+
 # ---------------------------------------------------------------------------
 # Tile size selection
 # ---------------------------------------------------------------------------
@@ -94,6 +113,56 @@ def select_gemm_tiles(M: int, K: int, N: int, num_aie_columns: int,
         raise ValueError(f"Cannot find valid tile_n for N={N}, num_aie_columns={num_aie_columns}")
 
     return tile_m, tile_k, tile_n
+
+
+def select_gemv_tiles(N: int, K: int, num_aie_columns: int,
+                      kernel_vector_size: int = 64) -> tuple[int, int]:
+    """Select (tile_size_input, tile_size_output) for IRON GEMV.
+
+    IRON GEMV constraints (iron/operators/gemv/design.py):
+        N % cols == 0
+        tile_out % tile_in == 0, tile_out >= tile_in
+        tile_out <= N//cols
+        (N//cols) % tile_out == 0
+        (N//cols) % tile_in == 0
+        K % kernel_vector_size == 0
+
+    Note: IRON calls the matrix-row dim "M" — here we use N (matches ggml/GEMM usage).
+    """
+    if K % kernel_vector_size != 0:
+        raise ValueError(f"K={K} must be a multiple of kernel_vector_size={kernel_vector_size}")
+    if N % num_aie_columns != 0:
+        raise ValueError(f"N={N} must be divisible by num_aie_columns={num_aie_columns}")
+
+    per_col = N // num_aie_columns
+
+    # tile_out: largest divisor of per_col up to a reasonable cap (matches test configs)
+    tso_candidates = [2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1]
+    tile_out = None
+    for tso in tso_candidates:
+        if tso <= per_col and per_col % tso == 0:
+            tile_out = tso
+            break
+    if tile_out is None:
+        raise ValueError(f"Cannot find tile_size_output for N={N}, cols={num_aie_columns}")
+
+    # tile_in: L1 double-buffered matrix tile is 2 * tile_in * K * sizeof(bf16) bytes.
+    # AIE2p core-tile usable budget is ~32KB — cap tile_in accordingly so we
+    # don't blow past L1. Prefer larger tile_in for throughput when it fits.
+    l1_budget_bytes = 32 * 1024
+    bf16 = 2
+    max_tsi_by_l1 = max(1, l1_budget_bytes // (2 * K * bf16))  # 2 = double-buffer
+    tsi_candidates = [8, 4, 2, 1]
+    tile_in = None
+    for tsi in tsi_candidates:
+        if (tsi <= tile_out and tsi <= max_tsi_by_l1
+                and tile_out % tsi == 0 and per_col % tsi == 0):
+            tile_in = tsi
+            break
+    if tile_in is None:
+        raise ValueError(f"Cannot find tile_size_input for N={N}, K={K}, cols={num_aie_columns}")
+
+    return tile_in, tile_out
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +226,46 @@ def compile_gemm(M: int, K: int, N: int, dtype_in: str, dtype_out: str,
     return output_path
 
 
+def compile_gemv(N: int, K: int, dtype_in: str, dtype_out: str,
+                 num_aie_columns: int, output_path: str) -> str:
+    """Compile an IRON GEMV operator and save the xclbin.
+
+    Args:
+        N: Matrix-row dimension (output length). Maps to IRON GEMV's M.
+        K: Reduction dimension (vector length).
+        dtype_in: Input dtype (currently only "bf16" supported by iron GEMV op).
+        dtype_out: Output dtype (currently only "bf16").
+        num_aie_columns: Number of AIE columns to use.
+        output_path: Where to write the xclbin.
+    """
+    from iron.operators.gemv.op import GEMV
+
+    if dtype_in != "bf16" or dtype_out != "bf16":
+        raise ValueError(f"GEMV currently supports only bf16 in/out, got {dtype_in}/{dtype_out}")
+
+    tile_in, tile_out = select_gemv_tiles(N, K, num_aie_columns)
+
+    op = GEMV(
+        M=N,                        # IRON calls it M; it's the matrix-row dim
+        K=K,
+        num_aie_columns=num_aie_columns,
+        tile_size_input=tile_in,
+        tile_size_output=tile_out,
+    )
+    op.compile()
+
+    build_dir = op.context.build_dir
+    compiled_xclbin = build_dir / op.xclbin_artifact.filename
+    compiled_insts = build_dir / op.insts_artifact.filename
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    shutil.copy2(str(compiled_xclbin), output_path)
+    insts_output = output_path.replace(".xclbin", ".insts")
+    shutil.copy2(str(compiled_insts), insts_output)
+
+    return output_path
+
+
 # ---------------------------------------------------------------------------
 # Cache management
 # ---------------------------------------------------------------------------
@@ -199,6 +308,24 @@ def compile_gemm_cached(M: int, K: int, N: int, dtype_in: str = "bf16",
     return Path(output_path)
 
 
+def compile_gemv_cached(N: int, K: int, dtype_in: str = "bf16",
+                        dtype_out: str = "bf16", num_aie_columns: int = 4) -> Path:
+    """Compile a GEMV operator with caching.
+
+    Returns path to the xclbin (cached or newly compiled).
+    """
+    cache_key = gemv_cache_key(N, K, dtype_in, dtype_out, num_aie_columns)
+
+    cached = get_cached_xclbin(cache_key)
+    if cached is not None:
+        return cached
+
+    cache_dir = get_cache_dir()
+    output_path = str(cache_dir / f"{cache_key}.xclbin")
+    compile_gemv(N, K, dtype_in, dtype_out, num_aie_columns, output_path)
+    return Path(output_path)
+
+
 # ---------------------------------------------------------------------------
 # CLI entry point (called by C++ backend)
 # ---------------------------------------------------------------------------
@@ -218,6 +345,15 @@ def main():
     gemm_parser.add_argument("--b-col-maj", action="store_true")
     gemm_parser.add_argument("--out", type=str, help="Output xclbin path (default: cache)")
 
+    # GEMV subcommand
+    gemv_parser = subparsers.add_parser("gemv", help="Compile GEMV operator (M=1 decode)")
+    gemv_parser.add_argument("--N", type=int, required=True, help="Matrix-row dim (output length)")
+    gemv_parser.add_argument("--K", type=int, required=True, help="Reduction dim (vector length)")
+    gemv_parser.add_argument("--dtype-in", default="bf16", choices=["bf16"])
+    gemv_parser.add_argument("--dtype-out", default="bf16", choices=["bf16"])
+    gemv_parser.add_argument("--num-aie-columns", type=int, default=4)
+    gemv_parser.add_argument("--out", type=str, help="Output xclbin path (default: cache)")
+
     args = parser.parse_args()
 
     if args.op == "gemm":
@@ -234,6 +370,20 @@ def main():
                 args.dtype_in, args.dtype_out,
                 args.num_aie_columns,
                 args.b_col_maj,
+            )
+        print(path)
+    elif args.op == "gemv":
+        if args.out:
+            path = compile_gemv(
+                args.N, args.K,
+                args.dtype_in, args.dtype_out,
+                args.num_aie_columns, args.out,
+            )
+        else:
+            path = compile_gemv_cached(
+                args.N, args.K,
+                args.dtype_in, args.dtype_out,
+                args.num_aie_columns,
             )
         print(path)
 

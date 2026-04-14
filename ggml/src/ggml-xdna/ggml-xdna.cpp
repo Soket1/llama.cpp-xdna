@@ -24,20 +24,29 @@
 // Cached kernel entry — one per unique (op, shape, dtype) tuple
 // ============================================================================
 
+enum xdna_op_kind : int {
+    XDNA_OP_GEMM = 0,  // M>=32 prefill MUL_MAT via IRON GEMM
+    XDNA_OP_GEMV = 1,  // M==1  decode  MUL_MAT via IRON GEMV
+};
+
 struct xdna_kernel_entry {
+    xdna_op_kind  op_kind;
     xrt::xclbin   xclbin;
     xrt::hw_context hw_ctx;
     xrt::kernel   kernel;
     std::vector<char> insts;
     xrt::bo       insts_bo;
     int64_t       M, K, N;
-    // Persistent A (activation) and C (output) BOs. Shape is fixed by (M,K,N)
-    // for this kernel, so we allocate once and memcpy new data in per call.
+    // Persistent per-call BOs. Shape is fixed by (M,K,N) for this kernel,
+    // so we allocate once and memcpy new data in per call.
     // unique_ptr defers construction until first use (needs kernel group_id).
+    // GEMM: a_bo = activation (M*K bf16), c_bo = output (M*N bf16)
+    // GEMV: a_bo = vector activation (K bf16), c_bo = output (N bf16)
     std::unique_ptr<xrt::bo> a_bo;
     std::unique_ptr<xrt::bo> c_bo;
-    // Cache of per-weight-pointer transposed+bf16 B buffers keyed by src0->data.
-    // Weights are immutable after load, so we can transpose once and reuse.
+    // Cache of per-weight-pointer bf16 weight buffers keyed by src0->data.
+    // Weights are immutable after load, so we convert+DMA once and reuse.
+    // GEMM: transposed to [K,N] row-major. GEMV: native [N,K] row-major.
     std::unordered_map<const void *, xrt::bo> b_bo_cache;
     std::unique_ptr<std::mutex> b_bo_mutex = std::make_unique<std::mutex>();
 };
@@ -116,12 +125,18 @@ static std::vector<char> read_binary_file(const std::string & path) {
     return data;
 }
 
-static std::string make_cache_key(int64_t M, int64_t K, int64_t N,
+static std::string make_cache_key(xdna_op_kind op_kind,
+                                   int64_t M, int64_t K, int64_t N,
                                    const char * dtype_in, int num_cols) {
-    // Simple key: dimensions + dtype + columns
     char buf[256];
-    snprintf(buf, sizeof(buf), "gemm_%ldx%ldx%ld_%s_%dcol",
-             (long)M, (long)K, (long)N, dtype_in, num_cols);
+    if (op_kind == XDNA_OP_GEMV) {
+        // GEMV: M is implicitly 1, key omits it.
+        snprintf(buf, sizeof(buf), "gemv_K%ld_N%ld_%s_%dcol",
+                 (long)K, (long)N, dtype_in, num_cols);
+    } else {
+        snprintf(buf, sizeof(buf), "gemm_%ldx%ldx%ld_%s_%dcol",
+                 (long)M, (long)K, (long)N, dtype_in, num_cols);
+    }
     return std::string(buf);
 }
 
@@ -150,6 +165,7 @@ static void bf16_to_f32(const uint16_t * src, float * dst, size_t n) {
 
 static bool ensure_compiled(ggml_backend_xdna_context * ctx,
                             const std::string & cache_key,
+                            xdna_op_kind op_kind,
                             int64_t M, int64_t K, int64_t N,
                             const char * dtype_in, int num_cols) {
     std::string xclbin_path = ctx->cache_dir + "/" + cache_key + ".xclbin";
@@ -166,17 +182,29 @@ static bool ensure_compiled(ggml_backend_xdna_context * ctx,
 
     // Compile via Python subprocess
     char cmd[1024];
-    snprintf(cmd, sizeof(cmd),
-             "python3 %s gemm --M %ld --K %ld --N %ld --dtype-in %s --dtype-out %s "
-             "--num-aie-columns %d --out %s 2>&1",
-             ctx->compile_script.c_str(),
-             (long)M, (long)K, (long)N,
-             dtype_in, dtype_in,
-             num_cols,
-             xclbin_path.c_str());
-
-    GGML_LOG_INFO("ggml-xdna: compiling GEMM %ldx%ldx%ld (first run, will be cached)...\n",
-                  (long)M, (long)K, (long)N);
+    if (op_kind == XDNA_OP_GEMV) {
+        snprintf(cmd, sizeof(cmd),
+                 "python3 %s gemv --N %ld --K %ld --dtype-in %s --dtype-out %s "
+                 "--num-aie-columns %d --out %s 2>&1",
+                 ctx->compile_script.c_str(),
+                 (long)N, (long)K,
+                 dtype_in, dtype_in,
+                 num_cols,
+                 xclbin_path.c_str());
+        GGML_LOG_INFO("ggml-xdna: compiling GEMV K=%ld N=%ld (first run, will be cached)...\n",
+                      (long)K, (long)N);
+    } else {
+        snprintf(cmd, sizeof(cmd),
+                 "python3 %s gemm --M %ld --K %ld --N %ld --dtype-in %s --dtype-out %s "
+                 "--num-aie-columns %d --out %s 2>&1",
+                 ctx->compile_script.c_str(),
+                 (long)M, (long)K, (long)N,
+                 dtype_in, dtype_in,
+                 num_cols,
+                 xclbin_path.c_str());
+        GGML_LOG_INFO("ggml-xdna: compiling GEMM %ldx%ldx%ld (first run, will be cached)...\n",
+                      (long)M, (long)K, (long)N);
+    }
 
     int ret = system(cmd);
     if (ret != 0) {
@@ -202,6 +230,7 @@ static bool ensure_compiled(ggml_backend_xdna_context * ctx,
 
 static xdna_kernel_entry * get_or_load_kernel(ggml_backend_xdna_context * ctx,
                                                const std::string & cache_key,
+                                               xdna_op_kind op_kind,
                                                int64_t M, int64_t K, int64_t N) {
     std::lock_guard<std::mutex> lock(ctx->cache_mutex);
 
@@ -217,6 +246,7 @@ static xdna_kernel_entry * get_or_load_kernel(ggml_backend_xdna_context * ctx,
 
     try {
         xdna_kernel_entry entry;
+        entry.op_kind = op_kind;
         entry.M = M;
         entry.K = K;
         entry.N = N;
@@ -260,12 +290,13 @@ static xdna_kernel_entry * get_or_load_kernel(ggml_backend_xdna_context * ctx,
 // ============================================================================
 
 static bool xdna_shape_dispatchable(int64_t M, int64_t K, int64_t N);
+static bool xdna_shape_dispatchable_gemv(int64_t K, int64_t N);
 
-// NPU-only MUL_MAT. Caller (graph_compute) must have already verified
+// GEMM (prefill, M>=32). Caller (graph_compute) must have already verified
 // xdna_shape_dispatchable() before invoking this — no CPU fallback here.
 // On unexpected XRT failure we log and return without writing dst; the
 // resulting garbage is a correctness bug caller-side, not silent degradation.
-static void ggml_backend_xdna_mul_mat(ggml_backend_xdna_context * ctx, struct ggml_tensor * dst) {
+static void ggml_backend_xdna_mul_mat_gemm(ggml_backend_xdna_context * ctx, struct ggml_tensor * dst) {
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
 
@@ -279,14 +310,14 @@ static void ggml_backend_xdna_mul_mat(ggml_backend_xdna_context * ctx, struct gg
     }
 
     int num_cols = 4;
-    std::string cache_key = make_cache_key(M, K, N, "bf16", num_cols);
+    std::string cache_key = make_cache_key(XDNA_OP_GEMM, M, K, N, "bf16", num_cols);
 
-    if (!ensure_compiled(ctx, cache_key, M, K, N, "bf16", num_cols)) {
+    if (!ensure_compiled(ctx, cache_key, XDNA_OP_GEMM, M, K, N, "bf16", num_cols)) {
         GGML_LOG_ERROR("ggml-xdna: compile failed for %ldx%ldx%ld\n", (long)M, (long)K, (long)N);
         return;
     }
 
-    xdna_kernel_entry * entry = get_or_load_kernel(ctx, cache_key, M, K, N);
+    xdna_kernel_entry * entry = get_or_load_kernel(ctx, cache_key, XDNA_OP_GEMM, M, K, N);
     if (!entry) {
         return;
     }
@@ -366,6 +397,108 @@ static void ggml_backend_xdna_mul_mat(ggml_backend_xdna_context * ctx, struct gg
     }
 }
 
+// GEMV (decode, M==1). Caller must have verified xdna_shape_dispatchable_gemv().
+// IRON GEMV arg order is (matrix, vector, output) — different from GEMM's
+// (A_activation, B_weight, C_output). Kernel group_ids: matrix=3, vector=4, output=5.
+// Matrix layout matches ggml src0 natively ([N,K] row-major), so no transpose.
+static void ggml_backend_xdna_mul_mat_gemv(ggml_backend_xdna_context * ctx, struct ggml_tensor * dst) {
+    const struct ggml_tensor * src0 = dst->src[0];  // weight (matrix), [N,K]
+    const struct ggml_tensor * src1 = dst->src[1];  // activation (vector), [K]
+
+    const int64_t K = src0->ne[0];
+    const int64_t N = src0->ne[1];
+
+    if (!ctx->device_valid) {
+        GGML_LOG_ERROR("ggml-xdna: gemv called but XRT device invalid\n");
+        return;
+    }
+
+    int num_cols = 4;
+    std::string cache_key = make_cache_key(XDNA_OP_GEMV, 1, K, N, "bf16", num_cols);
+
+    if (!ensure_compiled(ctx, cache_key, XDNA_OP_GEMV, 1, K, N, "bf16", num_cols)) {
+        GGML_LOG_ERROR("ggml-xdna: GEMV compile failed for K=%ld N=%ld\n", (long)K, (long)N);
+        return;
+    }
+
+    xdna_kernel_entry * entry = get_or_load_kernel(ctx, cache_key, XDNA_OP_GEMV, 1, K, N);
+    if (!entry) return;
+
+    try {
+        size_t vec_elems = K;
+        size_t mat_elems = N * K;
+        size_t out_elems = N;
+        size_t vec_bytes = vec_elems * sizeof(uint16_t);
+        size_t mat_bytes = mat_elems * sizeof(uint16_t);
+        size_t out_bytes = out_elems * sizeof(uint16_t);
+
+        // Lazily allocate persistent vector and output BOs.
+        // group_ids: matrix=3, vector=4, output=5 (per IRON arg_spec).
+        if (!entry->a_bo) {
+            entry->a_bo = std::make_unique<xrt::bo>(
+                ctx->device, vec_bytes, xrt::bo::flags::host_only, entry->kernel.group_id(4));
+        }
+        if (!entry->c_bo) {
+            entry->c_bo = std::make_unique<xrt::bo>(
+                ctx->device, out_bytes, xrt::bo::flags::host_only, entry->kernel.group_id(5));
+        }
+
+        // Load vector activation fresh each call (changes per token).
+        if (src1->type == GGML_TYPE_F32) {
+            f32_to_bf16((const float *)src1->data, (uint16_t *)entry->a_bo->map<void*>(), vec_elems);
+        } else {
+            memcpy(entry->a_bo->map<void*>(), src1->data, vec_bytes);
+        }
+        entry->a_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+        // Cached bf16 weight matrix keyed by src0->data. No transpose —
+        // IRON GEMV expects [N,K] row-major, which is ggml src0's native layout.
+        xrt::bo * mat_bo_ptr = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(*entry->b_bo_mutex);
+            auto it = entry->b_bo_cache.find(src0->data);
+            if (it == entry->b_bo_cache.end()) {
+                xrt::bo new_mat(ctx->device, mat_bytes, xrt::bo::flags::host_only,
+                                entry->kernel.group_id(3));
+                if (src0->type == GGML_TYPE_F32) {
+                    f32_to_bf16((const float *)src0->data,
+                                (uint16_t *)new_mat.map<void*>(), mat_elems);
+                } else {
+                    memcpy(new_mat.map<void*>(), src0->data, mat_bytes);
+                }
+                new_mat.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                auto [ins, _] = entry->b_bo_cache.emplace(src0->data, std::move(new_mat));
+                mat_bo_ptr = &ins->second;
+                fprintf(stderr, "ggml-xdna: warm gemv matrix K=%ld N=%ld weight=%s (%zu cached)\n",
+                        (long)K, (long)N, src0->name, entry->b_bo_cache.size());
+                fflush(stderr);
+            } else {
+                mat_bo_ptr = &it->second;
+            }
+        }
+
+        // Arg order: (opcode, insts, insts_size, matrix, vector, output)
+        auto run = entry->kernel(3, entry->insts_bo, (uint32_t)entry->insts.size(),
+                                  *mat_bo_ptr, *entry->a_bo, *entry->c_bo);
+        run.wait();
+
+        entry->c_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        bf16_to_f32((const uint16_t *)entry->c_bo->map<void*>(), (float *)dst->data, out_elems);
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("ggml-xdna: GEMV XRT dispatch failed (%s)\n", e.what());
+    }
+}
+
+// Dispatch MUL_MAT to GEMM (M>=32 prefill) or GEMV (M==1 decode) kernel.
+static void ggml_backend_xdna_mul_mat(ggml_backend_xdna_context * ctx, struct ggml_tensor * dst) {
+    const int64_t M = dst->src[1]->ne[1];
+    if (M == 1) {
+        ggml_backend_xdna_mul_mat_gemv(ctx, dst);
+    } else {
+        ggml_backend_xdna_mul_mat_gemm(ctx, dst);
+    }
+}
+
 // ============================================================================
 // Backend interface
 // ============================================================================
@@ -393,6 +526,7 @@ static bool xdna_node_npu_dispatchable(const struct ggml_tensor * node) {
     const int64_t K = s0->ne[0];
     const int64_t N = s0->ne[1];
     const int64_t M = s1->ne[1];
+    if (M == 1) return xdna_shape_dispatchable_gemv(K, N);
     return xdna_shape_dispatchable(M, K, N);
 }
 
@@ -688,7 +822,9 @@ static ggml_backend_buffer_t ggml_backend_xdna_device_buffer_from_host_ptr(ggml_
 // NPU dispatchability: returns true only if the shape tiles cleanly on the NPU.
 // Kernel invariant (aie_kernels/aie2p/mm.cc): 4x8x8 bf16_f32 MAC has r=4, so
 // tile_m % (2*r) == 0 → tile_m >= 8 and divisible by 8. Minimum M = tile_m * 4 = 32.
-// Cap N at 32768 to skip vocab projection (248320) for now — compile is huge.
+// Cap N at 32768 to skip vocab projection (248320) — aiecc BD overflow at
+// N-tiles per shim >~485 (248320 = 2^9*5*97, can't tile friendlier without
+// N-chunking in the backend).
 static bool xdna_shape_dispatchable(int64_t M, int64_t K, int64_t N) {
     if (M < 32 || K < 32 || N < 32 || N > 32768) return false;
     const int num_cols = 4;
@@ -700,6 +836,28 @@ static bool xdna_shape_dispatchable(int64_t M, int64_t K, int64_t N) {
     for (int i = 0; i < 4 && !k_ok; i++) if (K %  tiles_k[i]             == 0) k_ok = true;
     for (int i = 0; i < 4 && !n_ok; i++) if (N % (tiles_n[i] * num_cols) == 0) n_ok = true;
     return m_ok && k_ok && n_ok;
+}
+
+// GEMV (M=1 decode) dispatchability. IRON GEMV constraints:
+//   K % kernel_vector_size == 0  (default 64)
+//   N % num_cols == 0, per_col = N/num_cols >= 8, (per_col % tile_out) == 0 for
+//   some tile_out <= per_col. With the candidate set in compile.py
+//   select_gemv_tiles, any per_col >= 8 with per_col a power-of-two multiple works.
+// Same vocab-proj N cap applies (BD-overflow territory).
+static bool xdna_shape_dispatchable_gemv(int64_t K, int64_t N) {
+    // GEMV is correct but currently slower than CPU for M=1 decode because
+    // per-call XRT submit/wait overhead dominates the tiny GEMV compute
+    // (2.7x regression on Qwen3.5-0.8B). Off by default; opt in via
+    // XDNA_ENABLE_GEMV=1 once fused multi-op dispatch lands.
+    static const bool gemv_enabled = getenv("XDNA_ENABLE_GEMV") != NULL;
+    if (!gemv_enabled) return false;
+    const int num_cols = 4;
+    if (K < 64 || K % 64 != 0) return false;
+    if (N < num_cols || N % num_cols != 0) return false;
+    const int64_t per_col = N / num_cols;
+    if (per_col < 8) return false;
+    if (N > 32768) return false;  // BD-overflow cap (same as GEMM)
+    return true;
 }
 
 static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
@@ -790,7 +948,11 @@ static bool ggml_backend_xdna_device_supports_buft(ggml_backend_dev_t dev, ggml_
 // that for shapes where we'd just fall back to CPU, there's no speed win.
 static bool ggml_backend_xdna_device_offload_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     if (op->op != GGML_OP_MUL_MAT) return false;
-    return xdna_shape_dispatchable(op->src[1]->ne[1], op->src[0]->ne[0], op->src[0]->ne[1]);
+    const int64_t K = op->src[0]->ne[0];
+    const int64_t N = op->src[0]->ne[1];
+    const int64_t M = op->src[1]->ne[1];
+    if (M == 1) return xdna_shape_dispatchable_gemv(K, N);
+    return xdna_shape_dispatchable(M, K, N);
     GGML_UNUSED(dev);
 }
 
