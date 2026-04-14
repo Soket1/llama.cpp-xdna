@@ -591,16 +591,30 @@ static void ggml_backend_xdna_mul_mat(ggml_backend_xdna_context * ctx, struct gg
 // Fused SwiGLU FFN — chained xclbin with 4 sub-kernels
 // ============================================================================
 
+// Pick the largest tile_m such that IRON GEMM's M % (tile_m * 4) == 0 holds.
+// Returns 0 if seq_len < 32 or has no valid tile in {64, 32, 16, 8}.
+static int xdna_pick_swiglu_prefill_tile_m(int64_t seq_len) {
+    static const int tms[] = {64, 32, 16, 8};
+    for (int i = 0; i < 4; i++) {
+        if (seq_len % ((int64_t)tms[i] * 4) == 0) return tms[i];
+    }
+    return 0;
+}
+
 static std::string make_swiglu_cache_key(xdna_op_kind op_kind,
                                          int64_t embedding_dim, int64_t hidden_dim,
-                                         int64_t seq_len, int num_cols) {
+                                         int64_t seq_len, int num_cols,
+                                         int tile_m) {
     char buf[256];
     if (op_kind == XDNA_OP_SWIGLU_DECODE) {
         snprintf(buf, sizeof(buf), "swiglu_decode_K%ld_N%ld_bf16_%dcol",
                  (long)embedding_dim, (long)hidden_dim, num_cols);
     } else {
-        snprintf(buf, sizeof(buf), "swiglu_prefill_M%ld_K%ld_N%ld_bf16_%dcol",
-                 (long)seq_len, (long)embedding_dim, (long)hidden_dim, num_cols);
+        // Include tile_m in the key so different prefill M values with different
+        // picked tile_m values get distinct xclbins.
+        snprintf(buf, sizeof(buf), "swiglu_prefill_M%ld_K%ld_N%ld_tm%d_bf16_%dcol",
+                 (long)seq_len, (long)embedding_dim, (long)hidden_dim,
+                 tile_m, num_cols);
     }
     return std::string(buf);
 }
@@ -621,7 +635,8 @@ static bool ensure_swiglu_compiled(ggml_backend_xdna_context * ctx,
                                    const std::string & cache_key,
                                    xdna_op_kind op_kind,
                                    int64_t embedding_dim, int64_t hidden_dim,
-                                   int64_t seq_len, int num_cols) {
+                                   int64_t seq_len, int num_cols,
+                                   int tile_m) {
     const std::string bundle_dir = ctx->cache_dir + "/" + cache_key;
     const char * const * insts_tags = (op_kind == XDNA_OP_SWIGLU_DECODE)
         ? XDNA_SWIGLU_DECODE_INSTS_TAGS
@@ -644,12 +659,12 @@ static bool ensure_swiglu_compiled(ggml_backend_xdna_context * ctx,
     } else {
         snprintf(cmd, sizeof(cmd),
                  "python3 %s swiglu-prefill --seq-len %ld --embedding-dim %ld --hidden-dim %ld "
-                 "--num-aie-columns %d --out %s 2>&1",
+                 "--num-aie-columns %d --tile-m %d --out %s 2>&1",
                  ctx->compile_script.c_str(),
                  (long)seq_len, (long)embedding_dim, (long)hidden_dim,
-                 num_cols, bundle_dir.c_str());
-        GGML_LOG_INFO("ggml-xdna: compiling SwiGLU prefill M=%ld K=%ld N=%ld (first run, will be cached)...\n",
-                      (long)seq_len, (long)embedding_dim, (long)hidden_dim);
+                 num_cols, tile_m, bundle_dir.c_str());
+        GGML_LOG_INFO("ggml-xdna: compiling SwiGLU prefill M=%ld K=%ld N=%ld tile_m=%d (first run, will be cached)...\n",
+                      (long)seq_len, (long)embedding_dim, (long)hidden_dim, tile_m);
     }
 
     int ret = system(cmd);
@@ -870,11 +885,16 @@ static void ggml_backend_xdna_mul_mat_swiglu(ggml_backend_xdna_context * ctx,
     const xdna_op_kind op_kind = (M == 1) ? XDNA_OP_SWIGLU_DECODE : XDNA_OP_SWIGLU_PREFILL;
     const int64_t seq_len      = (op_kind == XDNA_OP_SWIGLU_DECODE) ? 1 : M;
 
+    // tile_m only applies to the prefill inner GEMMs; decode (GEMV-based) ignores it.
+    // The pattern matcher rejected M if no tile_m exists, so a 0 here would be a bug.
+    const int tile_m = (op_kind == XDNA_OP_SWIGLU_PREFILL)
+        ? xdna_pick_swiglu_prefill_tile_m(seq_len) : 0;
+
     std::string cache_key = make_swiglu_cache_key(op_kind, embedding_dim, hidden_dim,
-                                                  seq_len, num_cols);
+                                                  seq_len, num_cols, tile_m);
 
     if (!ensure_swiglu_compiled(ctx, cache_key, op_kind,
-                                embedding_dim, hidden_dim, seq_len, num_cols)) {
+                                embedding_dim, hidden_dim, seq_len, num_cols, tile_m)) {
         GGML_LOG_ERROR("ggml-xdna: SwiGLU compile failed for %s\n", cache_key.c_str());
         return;
     }
@@ -1033,17 +1053,20 @@ static bool xdna_shape_dispatchable_swiglu_decode(int64_t K_emb, int64_t N_hid, 
     return true;
 }
 
-// Shape-dispatchability for fused SwiGLU prefill. IRON's SwiGLUPrefill hardcodes
-// GEMM's default tile_m=64, so min_M = tile_m * 4 = 256. Until we PR a
-// tile-override knob upstream, require M % 256 == 0 and M >= 256.
+// Shape-dispatchability for fused SwiGLU prefill. With tile_m-override support
+// now wired through the bridge (IRON PR: SwiGLUPrefill tile_m/k/n), we accept
+// any M for which xdna_pick_swiglu_prefill_tile_m returns a valid tile.
+// tile_k and tile_n still use IRON's default of 64.
 static bool xdna_shape_dispatchable_swiglu_prefill(int64_t M_seq, int64_t K_emb,
                                                    int64_t N_hid, int num_cols) {
     if (num_cols != 4 && num_cols != 8) return false;
-    if (M_seq < 256 || M_seq % 256 != 0) return false;
+    if (xdna_pick_swiglu_prefill_tile_m(M_seq) == 0) return false;
     if (K_emb < 64  || K_emb % 64  != 0) return false;   // default tile_k=64
     if (N_hid < (int64_t)num_cols * 64 || N_hid % ((int64_t)num_cols * 64) != 0) return false;  // default tile_n=64
     if (N_hid > 32768 || K_emb > 32768) return false;
     if (N_hid % (num_cols * 2) != 0) return false;       // SiLU per-column tile
+    // gemm_2 swaps K and N: must ALSO satisfy embedding_dim divisibility for tile_n.
+    if (K_emb % ((int64_t)num_cols * 64) != 0) return false;
     return true;
 }
 
@@ -1166,6 +1189,12 @@ static bool xdna_try_match_swiglu(const struct ggml_cgraph * cgraph, int i,
         if (!xdna_shape_dispatchable_swiglu_decode(embedding_dim, hidden_dim, num_cols))
             SWIGLU_REJECT("decode shape not dispatchable");
     } else if (M >= 32) {
+        // Prefill is opt-in *in addition* to the master XDNA_ENABLE_SWIGLU gate:
+        // it's correct but currently 3x slower than CPU at Qwen's FFN shape
+        // (M=64, K=1024, N=3584). Kept gated off until chained on-device submit
+        // or INT8 weights bring arithmetic intensity up.
+        static const bool prefill_enabled = getenv("XDNA_ENABLE_SWIGLU_PREFILL") != NULL;
+        if (!prefill_enabled) SWIGLU_REJECT("prefill disabled (set XDNA_ENABLE_SWIGLU_PREFILL=1 to opt in)");
         if (!xdna_shape_dispatchable_swiglu_prefill(M, embedding_dim, hidden_dim, num_cols))
             SWIGLU_REJECT("prefill shape not dispatchable");
     } else {

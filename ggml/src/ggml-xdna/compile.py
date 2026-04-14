@@ -79,8 +79,14 @@ def swiglu_decode_cache_key(embedding_dim: int, hidden_dim: int,
 
 
 def swiglu_prefill_cache_key(seq_len: int, embedding_dim: int, hidden_dim: int,
-                             dtype: str, num_aie_columns: int) -> str:
-    """Cache key for a SwiGLU prefill (M>=32) configuration."""
+                             dtype: str, num_aie_columns: int,
+                             tile_m: int | None = None) -> str:
+    """Cache key for a SwiGLU prefill configuration.
+
+    tile_m is a distinguishing input because it changes the compiled xclbin
+    (different MAC tiling). tile_k/tile_n are left at IRON's defaults and
+    omitted from the key — revisit if we ever vary them too.
+    """
     key_data = {
         "op": "swiglu_prefill",
         "seq_len": seq_len,
@@ -88,9 +94,22 @@ def swiglu_prefill_cache_key(seq_len: int, embedding_dim: int, hidden_dim: int,
         "hidden_dim": hidden_dim,
         "dtype": dtype,
         "num_aie_columns": num_aie_columns,
+        "tile_m": tile_m,
     }
     key_json = json.dumps(key_data, sort_keys=True)
     return hashlib.sha256(key_json.encode()).hexdigest()[:16]
+
+
+def select_swiglu_prefill_tile_m(seq_len: int) -> int:
+    """Pick the largest valid tile_m for a given prefill seq_len.
+
+    IRON GEMM requires seq_len % (tile_m * 4) == 0 with tile_m in {64,32,16,8}.
+    Returns 0 if no candidate works (caller should fall back / reject).
+    """
+    for tm in (64, 32, 16, 8):
+        if seq_len % (tm * 4) == 0:
+            return tm
+    return 0
 
 
 # Sub-kernel attribute prefixes inside the chained SwiGLU xclbin. These must
@@ -234,16 +253,13 @@ def validate_swiglu_decode_shapes(embedding_dim: int, hidden_dim: int,
 
 
 def validate_swiglu_prefill_shapes(seq_len: int, embedding_dim: int, hidden_dim: int,
-                                   num_aie_columns: int) -> None:
+                                   num_aie_columns: int,
+                                   tile_m: int | None = None) -> None:
     """Verify a SwiGLU prefill shape is dispatchable.
 
-    IRON's SwiGLUPrefill constructs GEMMs with the dataclass defaults
-    (tile_m=tile_k=tile_n=64), so the constraints are fixed:
-        seq_len     % (64 * 4)            == 0  (min_M = tile_m * num_aie_rows=4 = 256)
-        embedding   % 64                  == 0
-        hidden      % 64                  == 0
-        hidden      % (64 * num_aie_cols) == 0  (N of gemm_1)
-        embedding   % (64 * num_aie_cols) == 0  (N of gemm_2)
+    If tile_m is None, IRON defaults to 64 → min_M = 256. If overridden, the
+    constraint loosens to seq_len % (tile_m * 4) == 0. tile_k/tile_n remain
+    at IRON's default of 64.
     """
     if num_aie_columns not in (4, 8):
         raise ValueError(
@@ -254,10 +270,15 @@ def validate_swiglu_prefill_shapes(seq_len: int, embedding_dim: int, hidden_dim:
             f"hidden_dim={hidden_dim} must be divisible by 2*num_aie_columns="
             f"{num_aie_columns * 2} (SiLU per-column tile)"
         )
-    if seq_len % 256 != 0:
+    effective_tile_m = tile_m if tile_m is not None else 64
+    if effective_tile_m not in (64, 32, 16, 8):
         raise ValueError(
-            f"seq_len={seq_len} must be a multiple of 256 "
-            f"(IRON SwiGLUPrefill uses default tile_m=64 → min_M=256)"
+            f"tile_m={effective_tile_m} must be one of 64, 32, 16, 8"
+        )
+    min_M = effective_tile_m * 4
+    if seq_len % min_M != 0:
+        raise ValueError(
+            f"seq_len={seq_len} must be a multiple of {min_M} (tile_m={effective_tile_m})"
         )
     if embedding_dim % 64 != 0:
         raise ValueError(f"embedding_dim={embedding_dim} must be a multiple of 64")
@@ -416,14 +437,19 @@ def compile_swiglu_decode(embedding_dim: int, hidden_dim: int, dtype: str,
 
 
 def compile_swiglu_prefill(seq_len: int, embedding_dim: int, hidden_dim: int,
-                           dtype: str, num_aie_columns: int, output_dir: str) -> str:
+                           dtype: str, num_aie_columns: int, output_dir: str,
+                           tile_m: int | None = None) -> str:
     """Compile an IRON SwiGLU prefill operator and stage its artifacts.
 
     Output layout mirrors compile_swiglu_decode but with gemm_1/gemm_2 kernel names.
+    When tile_m is provided it is forwarded to SwiGLUPrefill, overriding the
+    default (64) in both inner GEMMs. Requires the IRON PR adding tile
+    overrides on SwiGLUPrefill to be merged locally.
     """
     if dtype != "bf16":
         raise ValueError(f"SwiGLU currently supports only bf16, got {dtype}")
-    validate_swiglu_prefill_shapes(seq_len, embedding_dim, hidden_dim, num_aie_columns)
+    validate_swiglu_prefill_shapes(seq_len, embedding_dim, hidden_dim,
+                                   num_aie_columns, tile_m=tile_m)
 
     actual_cols = aie_utils.get_current_device().cols
     if actual_cols != num_aie_columns:
@@ -434,9 +460,13 @@ def compile_swiglu_prefill(seq_len: int, embedding_dim: int, hidden_dim: int,
 
     from iron.operators.swiglu_prefill.op import SwiGLUPrefill
 
-    op = SwiGLUPrefill(
+    kwargs = dict(
         seq_len=seq_len, embedding_dim=embedding_dim, hidden_dim=hidden_dim
     )
+    if tile_m is not None:
+        kwargs["tile_m"] = tile_m
+
+    op = SwiGLUPrefill(**kwargs)
     op.compile()
 
     _stage_swiglu_artifacts(op, SWIGLU_PREFILL_KERNELS, output_dir)
@@ -552,13 +582,14 @@ def compile_swiglu_decode_cached(embedding_dim: int, hidden_dim: int,
 
 def compile_swiglu_prefill_cached(seq_len: int, embedding_dim: int, hidden_dim: int,
                                   dtype: str = "bf16",
-                                  num_aie_columns: int = 4) -> Path:
+                                  num_aie_columns: int = 4,
+                                  tile_m: int | None = None) -> Path:
     """Compile a SwiGLU prefill operator with caching.
 
     Returns path to the cache directory containing combined.xclbin + 4 insts files.
     """
     key = swiglu_prefill_cache_key(
-        seq_len, embedding_dim, hidden_dim, dtype, num_aie_columns
+        seq_len, embedding_dim, hidden_dim, dtype, num_aie_columns, tile_m=tile_m
     )
 
     cached = get_cached_swiglu_dir(key, SWIGLU_PREFILL_KERNELS)
@@ -567,7 +598,8 @@ def compile_swiglu_prefill_cached(seq_len: int, embedding_dim: int, hidden_dim: 
 
     output_dir = str(get_cache_dir() / key)
     compile_swiglu_prefill(
-        seq_len, embedding_dim, hidden_dim, dtype, num_aie_columns, output_dir
+        seq_len, embedding_dim, hidden_dim, dtype, num_aie_columns, output_dir,
+        tile_m=tile_m,
     )
     return Path(output_dir)
 
@@ -620,6 +652,9 @@ def main():
     swp_parser.add_argument("--hidden-dim", type=int, required=True)
     swp_parser.add_argument("--dtype", default="bf16", choices=["bf16"])
     swp_parser.add_argument("--num-aie-columns", type=int, default=4)
+    swp_parser.add_argument("--tile-m", type=int, default=None,
+                            help="Override tile_m for both inner GEMMs "
+                                 "(default: IRON SwiGLUPrefill default of 64)")
     swp_parser.add_argument("--out", type=str,
                             help="Output directory (default: cache)")
 
@@ -672,11 +707,13 @@ def main():
             path = compile_swiglu_prefill(
                 args.seq_len, args.embedding_dim, args.hidden_dim,
                 args.dtype, args.num_aie_columns, args.out,
+                tile_m=args.tile_m,
             )
         else:
             path = compile_swiglu_prefill_cached(
                 args.seq_len, args.embedding_dim, args.hidden_dim,
                 args.dtype, args.num_aie_columns,
+                tile_m=args.tile_m,
             )
         print(path)
 

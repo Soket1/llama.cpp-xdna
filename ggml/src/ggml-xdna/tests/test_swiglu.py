@@ -103,6 +103,9 @@ class TestSwigluPrefillCacheKey:
         assert k4 != k8
 
     def test_key_scheme_pinned(self):
+        """Prefill cache key now includes tile_m so different tile choices
+        don't clobber each other. Update the expected value intentionally
+        when the scheme changes."""
         expected_payload = {
             "op": "swiglu_prefill",
             "seq_len": 256,
@@ -110,12 +113,22 @@ class TestSwigluPrefillCacheKey:
             "hidden_dim": 3584,
             "dtype": "bf16",
             "num_aie_columns": 4,
+            "tile_m": None,
         }
         expected = hashlib.sha256(
             json.dumps(expected_payload, sort_keys=True).encode()
         ).hexdigest()[:16]
         actual = swiglu_prefill_cache_key(256, 1024, 3584, "bf16", 4)
         assert actual == expected
+
+    def test_tile_m_changes_key(self):
+        """Different tile_m values must produce different cache keys."""
+        k_default = swiglu_prefill_cache_key(256, 1024, 3584, "bf16", 4)
+        k_tm16 = swiglu_prefill_cache_key(256, 1024, 3584, "bf16", 4, tile_m=16)
+        k_tm64 = swiglu_prefill_cache_key(256, 1024, 3584, "bf16", 4, tile_m=64)
+        assert k_default != k_tm16
+        assert k_default != k_tm64
+        assert k_tm16 != k_tm64
 
 
 # ---------------------------------------------------------------------------
