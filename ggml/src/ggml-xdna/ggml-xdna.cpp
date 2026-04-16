@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -43,6 +44,7 @@ enum xdna_op_kind : int {
     XDNA_OP_SWIGLU_PREFILL     = 3,  // M>=32 fused SwiGLU FFN (gate/up/down + SiLU + mul)
     XDNA_OP_SWIGLU_DECODE_INT8 = 4,  // M==1  W8A16 fused SwiGLU FFN (int8 weights, bf16 acts)
     XDNA_OP_SWIGLU_FUSED_INT8  = 5,  // M==1  fused gate+up+silu+mul INT8 + standalone down GEMV
+    XDNA_OP_SWIGLU_PREFILL_INT8 = 6,  // M>=32 W8A8 INT8 SwiGLU FFN (both weights and activations int8)
 };
 
 struct xdna_kernel_entry {
@@ -117,6 +119,17 @@ static constexpr const char * XDNA_SWIGLU_DECODE_INT8_KERNEL_NAMES[XDNA_SWIGLU_N
 };
 static constexpr const char * XDNA_SWIGLU_DECODE_INT8_INSTS_TAGS[XDNA_SWIGLU_NUM_SLOTS] = {
     "gemv_int8_1", "silu", "eltwise_mul", "gemv_int8_2",
+};
+// INT8 prefill uses the same GEMM-based kernel names as bf16 prefill
+// (the difference is dtype_in=i8, dtype_out=bf16s in the compiled xclbin).
+static constexpr const char * XDNA_SWIGLU_PREFILL_INT8_KERNEL_NAMES[XDNA_SWIGLU_NUM_SLOTS] = {
+    "swiglu_gemm_1",
+    "swiglu_silu",
+    "swiglu_eltwise_mul",
+    "swiglu_gemm_2",
+};
+static constexpr const char * XDNA_SWIGLU_PREFILL_INT8_INSTS_TAGS[XDNA_SWIGLU_NUM_SLOTS] = {
+    "gemm_1", "silu", "eltwise_mul", "gemm_2",
 };
 
 struct xdna_swiglu_kernel_entry {
@@ -474,6 +487,113 @@ static void xdna_repack_q8_0_to_gemv_int8(
             }
         }
     }
+}
+
+// Repack Q8_0 weights to per-tensor int8 in (K, N) row-major layout for GEMM.
+// Returns the per-tensor scale factor.
+// Q8_0: each block = [fp16 scale][32 int8 values]. Per-block dequant: x_f = qs * d.
+// We compute a global scale = max(|qs[i] * d_block|) / 127 across ALL blocks,
+// then re-quantize: out[i] = round(qs[i] * d_block / global_scale).
+// Result is (K, N) row-major int8 — transposed from ggml's (N, K) native layout.
+static float xdna_repack_q8_0_to_gemm_int8(
+        const uint8_t * q8_0,
+        int64_t N, int64_t K,  // N=rows in ggml layout, K=cols
+        int8_t * out_int8) {    // (K, N) transposed output
+    const int group_size = 32;
+    const size_t Q8_0_BLOCK_BYTES = 2 + group_size;
+    const int64_t groups_per_row = K / group_size;
+    const size_t row_stride = (size_t)groups_per_row * Q8_0_BLOCK_BYTES;
+
+    // Pass 1: find global max |value| across all dequantized elements
+    float global_max = 0.0f;
+    for (int64_t n = 0; n < N; n++) {
+        const uint8_t * row = q8_0 + (size_t)n * row_stride;
+        for (int64_t g = 0; g < groups_per_row; g++) {
+            const uint8_t * blk = row + (size_t)g * Q8_0_BLOCK_BYTES;
+            float d = ggml_fp16_to_fp32(*(const ggml_fp16_t *)blk);
+            float abs_d = fabsf(d);
+            for (int j = 0; j < group_size; j++) {
+                float val = abs_d * fabsf((float)(int8_t)blk[2 + j]);
+                if (val > global_max) global_max = val;
+            }
+        }
+    }
+
+    float per_tensor_scale = (global_max > 1e-10f) ? (global_max / 127.0f) : 1e-10f;
+
+    // Pass 2: re-quantize and transpose (N, K) → (K, N)
+    for (int64_t n = 0; n < N; n++) {
+        const uint8_t * row = q8_0 + (size_t)n * row_stride;
+        for (int64_t g = 0; g < groups_per_row; g++) {
+            const uint8_t * blk = row + (size_t)g * Q8_0_BLOCK_BYTES;
+            float d = ggml_fp16_to_fp32(*(const ggml_fp16_t *)blk);
+            for (int j = 0; j < group_size; j++) {
+                int64_t k = g * group_size + j;
+                float val = (float)(int8_t)blk[2 + j] * d;
+                int32_t q = (int32_t)roundf(val / per_tensor_scale);
+                if (q > 127) q = 127;
+                if (q < -128) q = -128;
+                out_int8[k * N + n] = (int8_t)q;  // transposed: (K, N) layout
+            }
+        }
+    }
+
+    return per_tensor_scale;
+}
+
+// Magic sentinel that GEMM bf16s design.py embeds at RTP write locations.
+static constexpr uint32_t XDNA_BF16S_SCALE_MAGIC = 0x34123412;
+
+// Find magic sentinel offsets in insts data (called once at load time).
+static std::vector<size_t> xdna_find_bf16s_scale_offsets(const std::vector<char> & insts_data) {
+    std::vector<size_t> offsets;
+    const size_t n_words = insts_data.size() / sizeof(uint32_t);
+    const uint32_t * words = (const uint32_t *)insts_data.data();
+    for (size_t i = 0; i < n_words; i++) {
+        if (words[i] == XDNA_BF16S_SCALE_MAGIC) {
+            offsets.push_back(i);
+        }
+    }
+    return offsets;
+}
+
+// Patch bf16s scale at pre-computed offsets.
+static void xdna_patch_bf16s_scale(std::vector<char> & insts_data,
+                                    const std::vector<size_t> & offsets,
+                                    float scale) {
+    uint32_t scale_bits;
+    memcpy(&scale_bits, &scale, sizeof(scale_bits));
+    uint32_t * words = (uint32_t *)insts_data.data();
+    for (size_t off : offsets) {
+        words[off] = scale_bits;
+    }
+}
+
+// Per-tensor symmetric quantization: bf16 → int8 + float scale.
+static float xdna_quantize_bf16_to_int8(const uint16_t * bf16_data, int8_t * out_int8, size_t n_elems) {
+    // Find max abs value
+    float max_abs = 0.0f;
+    for (size_t i = 0; i < n_elems; i++) {
+        // Convert bf16 to f32: shift left by 16 bits
+        uint32_t bits = (uint32_t)bf16_data[i] << 16;
+        float val;
+        memcpy(&val, &bits, sizeof(val));
+        float abs_val = fabsf(val);
+        if (abs_val > max_abs) max_abs = abs_val;
+    }
+    float scale = (max_abs > 1e-10f) ? (max_abs / 127.0f) : 1e-10f;
+    float inv_scale = 1.0f / scale;
+
+    for (size_t i = 0; i < n_elems; i++) {
+        uint32_t bits = (uint32_t)bf16_data[i] << 16;
+        float val;
+        memcpy(&val, &bits, sizeof(val));
+        int32_t q = (int32_t)roundf(val * inv_scale);
+        if (q > 127) q = 127;
+        if (q < -128) q = -128;
+        out_int8[i] = (int8_t)q;
+    }
+    return scale;
 }
 
 // ============================================================================
@@ -845,6 +965,10 @@ static std::string make_swiglu_cache_key(xdna_op_kind op_kind,
         snprintf(buf, sizeof(buf),
                  "swiglu_decode_int8_K%ld_N%ld_%dcol_g%d",
                  (long)embedding_dim, (long)hidden_dim, num_cols, group_size);
+    } else if (op_kind == XDNA_OP_SWIGLU_PREFILL_INT8) {
+        snprintf(buf, sizeof(buf), "swiglu_prefill_int8_M%ld_K%ld_N%ld_tm%d_%dcol",
+                 (long)seq_len, (long)embedding_dim, (long)hidden_dim,
+                 tile_m, num_cols);
     } else {
         // Include tile_m in the key so different prefill M values with different
         // picked tile_m values get distinct xclbins.
@@ -880,6 +1004,8 @@ static bool ensure_swiglu_compiled(ggml_backend_xdna_context * ctx,
             insts_tags = XDNA_SWIGLU_DECODE_INSTS_TAGS; break;
         case XDNA_OP_SWIGLU_DECODE_INT8:
             insts_tags = XDNA_SWIGLU_DECODE_INT8_INSTS_TAGS; break;
+        case XDNA_OP_SWIGLU_PREFILL_INT8:
+            insts_tags = XDNA_SWIGLU_PREFILL_INT8_INSTS_TAGS; break;
         default:
             insts_tags = XDNA_SWIGLU_PREFILL_INSTS_TAGS; break;
     }
@@ -907,6 +1033,15 @@ static bool ensure_swiglu_compiled(ggml_backend_xdna_context * ctx,
                  num_cols, group_size, bundle_dir.c_str());
         GGML_LOG_INFO("ggml-xdna: compiling SwiGLU decode INT8 K=%ld N=%ld g=%d (first run, will be cached)...\n",
                       (long)embedding_dim, (long)hidden_dim, group_size);
+    } else if (op_kind == XDNA_OP_SWIGLU_PREFILL_INT8) {
+        snprintf(cmd, sizeof(cmd),
+                 "python3 %s swiglu-prefill-int8 --seq-len %ld --embedding-dim %ld --hidden-dim %ld "
+                 "--num-aie-columns %d --tile-m %d --out %s 2>&1",
+                 ctx->compile_script.c_str(),
+                 (long)seq_len, (long)embedding_dim, (long)hidden_dim,
+                 num_cols, tile_m, bundle_dir.c_str());
+        GGML_LOG_INFO("ggml-xdna: compiling SwiGLU prefill INT8 M=%ld K=%ld N=%ld tile_m=%d...\n",
+                      (long)seq_len, (long)embedding_dim, (long)hidden_dim, tile_m);
     } else {
         snprintf(cmd, sizeof(cmd),
                  "python3 %s swiglu-prefill --seq-len %ld --embedding-dim %ld --hidden-dim %ld "
@@ -1088,6 +1223,10 @@ static xdna_swiglu_kernel_entry * get_or_load_swiglu_kernel(
             kernel_names = XDNA_SWIGLU_DECODE_INT8_KERNEL_NAMES;
             insts_tags   = XDNA_SWIGLU_DECODE_INT8_INSTS_TAGS;
             break;
+        case XDNA_OP_SWIGLU_PREFILL_INT8:
+            kernel_names = XDNA_SWIGLU_PREFILL_INT8_KERNEL_NAMES;
+            insts_tags   = XDNA_SWIGLU_PREFILL_INT8_INSTS_TAGS;
+            break;
         default:
             kernel_names = XDNA_SWIGLU_PREFILL_KERNEL_NAMES;
             insts_tags   = XDNA_SWIGLU_PREFILL_INSTS_TAGS;
@@ -1138,7 +1277,7 @@ static xdna_swiglu_kernel_entry * get_or_load_swiglu_kernel(
         // different tile size, different arg-group mapping). The first real
         // INT8 dispatch will pay the one-shot ctx-connect cost instead — small
         // relative to the per-layer repack it has to do anyway.
-        if (op_kind != XDNA_OP_SWIGLU_DECODE_INT8) {
+        if (op_kind != XDNA_OP_SWIGLU_DECODE_INT8 && op_kind != XDNA_OP_SWIGLU_PREFILL_INT8) {
             swiglu_warmup_entry(ctx, entry_ptr);
         }
 
@@ -1846,6 +1985,265 @@ static void ggml_backend_xdna_mul_mat_swiglu_int8(
 }
 
 // ============================================================================
+// W8A8 INT8 SwiGLU prefill — per-tensor quantized activations + weights
+// ============================================================================
+
+// Dispatch a W8A8 fused SwiGLU FFN for prefill (M>=32): Q8_0 weights re-quantized
+// to per-tensor int8, bf16 activations quantized to per-tensor int8, GEMM output
+// is bf16 (via bf16s scaled accumulation). Inter-stage bf16 intermediates are
+// re-quantized to int8 before the down projection GEMM.
+static void ggml_backend_xdna_mul_mat_swiglu_prefill_int8(
+        ggml_backend_xdna_context * ctx,
+        struct ggml_tensor * gate_dst,
+        struct ggml_tensor * up_dst,
+        struct ggml_tensor * glu_dst,
+        struct ggml_tensor * dst_final,
+        const struct ggml_tensor * src0_gate_w,
+        const struct ggml_tensor * src0_up_w,
+        const struct ggml_tensor * src0_down_w,
+        const struct ggml_tensor * src1_input) {
+    if (!ctx->device_valid) {
+        GGML_LOG_ERROR("ggml-xdna: SwiGLU prefill INT8 called but XRT device invalid\n");
+        return;
+    }
+
+    const int64_t M = src1_input->ne[1];
+    const int64_t embedding_dim = src1_input->ne[0];
+    const int64_t hidden_dim = src0_gate_w->ne[1];
+    const int num_cols = 8;
+    const xdna_op_kind op_kind = XDNA_OP_SWIGLU_PREFILL_INT8;
+    const int tile_m = xdna_pick_swiglu_prefill_tile_m(M);
+
+    std::string cache_key = make_swiglu_cache_key(op_kind, embedding_dim, hidden_dim, M, num_cols, tile_m);
+    if (!ensure_swiglu_compiled(ctx, cache_key, op_kind, embedding_dim, hidden_dim, M, num_cols, tile_m))
+        return;
+    auto * entry = get_or_load_swiglu_kernel(ctx, cache_key, op_kind, embedding_dim, hidden_dim, M, num_cols);
+    if (!entry) return;
+
+    try {
+        const size_t input_i8_bytes = (size_t)M * embedding_dim;       // int8: 1 byte per element
+        const size_t hidden_bf16_bytes = (size_t)M * hidden_dim * 2;   // bf16: 2 bytes per element
+        const size_t hidden_i8_bytes = (size_t)M * hidden_dim;         // int8
+        const size_t output_bf16_bytes = (size_t)M * embedding_dim * 2; // bf16
+
+        // Lazily allocate BOs.
+        // GEMM i8→bf16s: arg3=A(int8 M*K), arg4=B(int8 K*N), arg5=C(bf16 M*N)
+        if (!entry->input_bo) {
+            entry->input_bo = std::make_unique<xrt::bo>(
+                ctx->device, input_i8_bytes, xrt::bo::flags::host_only,
+                entry->kernels[XDNA_SWIGLU_MATMUL_1].group_id(3));
+        }
+        if (!entry->output_bo) {
+            entry->output_bo = std::make_unique<xrt::bo>(
+                ctx->device, output_bf16_bytes, xrt::bo::flags::host_only,
+                entry->kernels[XDNA_SWIGLU_MATMUL_2].group_id(5));
+        }
+        if (!entry->left_bo) {
+            entry->left_bo = std::make_unique<xrt::bo>(
+                ctx->device, hidden_bf16_bytes, xrt::bo::flags::host_only,
+                entry->kernels[XDNA_SWIGLU_MATMUL_1].group_id(5));
+        }
+        if (!entry->right_bo) {
+            entry->right_bo = std::make_unique<xrt::bo>(
+                ctx->device, hidden_bf16_bytes, xrt::bo::flags::host_only,
+                entry->kernels[XDNA_SWIGLU_MATMUL_1].group_id(5));
+        }
+        if (!entry->left_swished_bo) {
+            entry->left_swished_bo = std::make_unique<xrt::bo>(
+                ctx->device, hidden_bf16_bytes, xrt::bo::flags::host_only,
+                entry->kernels[XDNA_SWIGLU_SILU].group_id(4));
+        }
+        if (!entry->intermediate_bo) {
+            entry->intermediate_bo = std::make_unique<xrt::bo>(
+                ctx->device, hidden_bf16_bytes, xrt::bo::flags::host_only,
+                entry->kernels[XDNA_SWIGLU_ELTWISE].group_id(5));
+        }
+
+        // Temporary BO for int8 intermediate (GEMM2 A-input after re-quantization).
+        xrt::bo intermediate_i8_bo(
+            ctx->device, hidden_i8_bytes, xrt::bo::flags::host_only,
+            entry->kernels[XDNA_SWIGLU_MATMUL_2].group_id(3));
+
+        // Warm INT8 weights (Q8_0 → per-tensor int8 + scale). Use a local static
+        // map for (bo, scale) pairs keyed by weight->data pointer.
+        struct int8_weight_info {
+            xrt::bo bo;
+            float scale;
+        };
+        static std::unordered_map<const void *, int8_weight_info> s_int8_wt_cache;
+        static std::mutex s_int8_wt_mutex;
+
+        float wt_gate_scale, wt_up_scale, wt_down_scale;
+        xrt::bo * w1_bo_ptr, * w2_bo_ptr, * w3_bo_ptr;
+
+        {
+            std::lock_guard<std::mutex> lock(s_int8_wt_mutex);
+
+            auto warm_int8_weight = [&](const ggml_tensor * wt, int kernel_slot,
+                                        const char * name) -> std::pair<xrt::bo *, float> {
+                auto it = s_int8_wt_cache.find(wt->data);
+                if (it != s_int8_wt_cache.end()) {
+                    return {&it->second.bo, it->second.scale};
+                }
+
+                const int64_t wK = wt->ne[0];
+                const int64_t wN = wt->ne[1];
+                const size_t wt_bytes = (size_t)wK * wN;  // int8: 1 byte per element
+
+                xrt::bo new_bo(ctx->device, wt_bytes, xrt::bo::flags::host_only,
+                               entry->kernels[kernel_slot].group_id(4));  // B @ group 4
+
+                float scale = xdna_repack_q8_0_to_gemm_int8(
+                    (const uint8_t *)wt->data, wN, wK,
+                    (int8_t *)new_bo.map<void*>());
+                new_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+                fprintf(stderr, "ggml-xdna: warm INT8 prefill %s K=%ld N=%ld scale=%.6f\n",
+                        name, (long)wK, (long)wN, scale);
+
+                auto [ins, _] = s_int8_wt_cache.emplace(
+                    wt->data, int8_weight_info{std::move(new_bo), scale});
+                return {&ins->second.bo, ins->second.scale};
+            };
+
+            auto [w1, s1] = warm_int8_weight(src0_gate_w, XDNA_SWIGLU_MATMUL_1, "w_gate");
+            auto [w2, s2] = warm_int8_weight(src0_up_w, XDNA_SWIGLU_MATMUL_1, "w_up");
+            auto [w3, s3] = warm_int8_weight(src0_down_w, XDNA_SWIGLU_MATMUL_2, "w_down");
+            w1_bo_ptr = w1; wt_gate_scale = s1;
+            w2_bo_ptr = w2; wt_up_scale = s2;
+            w3_bo_ptr = w3; wt_down_scale = s3;
+        }
+
+        using clk = std::chrono::steady_clock;
+        static const bool prof = getenv("XDNA_DEBUG") != NULL;
+        auto t_total_s = clk::now();
+
+        // --- Stage 0: Quantize bf16 activation → int8 ---
+        std::vector<uint16_t> input_bf16(M * embedding_dim);
+        if (src1_input->type == GGML_TYPE_F32) {
+            f32_to_bf16((const float *)src1_input->data, input_bf16.data(), M * embedding_dim);
+        } else {
+            memcpy(input_bf16.data(), src1_input->data, M * embedding_dim * 2);
+        }
+
+        float act_scale = xdna_quantize_bf16_to_int8(
+            input_bf16.data(),
+            (int8_t *)entry->input_bo->map<void*>(),
+            (size_t)M * embedding_dim);
+        entry->input_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+        // Find bf16s scale patch offsets in GEMM insts (first time only per entry).
+        // These are stored on the entry via a static map keyed by cache_key since
+        // xdna_swiglu_kernel_entry doesn't have dedicated fields for them.
+        struct patch_offsets_t {
+            std::vector<size_t> gemm1;
+            std::vector<size_t> gemm2;
+        };
+        static std::unordered_map<std::string, patch_offsets_t> s_patch_offsets;
+        static std::mutex s_patch_offsets_mutex;
+        {
+            std::lock_guard<std::mutex> lock(s_patch_offsets_mutex);
+            if (s_patch_offsets.find(cache_key) == s_patch_offsets.end()) {
+                patch_offsets_t po;
+                po.gemm1 = xdna_find_bf16s_scale_offsets(entry->insts_data[XDNA_SWIGLU_MATMUL_1]);
+                po.gemm2 = xdna_find_bf16s_scale_offsets(entry->insts_data[XDNA_SWIGLU_MATMUL_2]);
+                s_patch_offsets[cache_key] = std::move(po);
+            }
+        }
+        const auto & po = s_patch_offsets[cache_key];
+
+        // Helper: patch scale into a copy of GEMM insts, create temp insts BO, run kernel.
+        auto run_gemm_with_scale = [&](xrt::kernel & kernel,
+                                        const std::vector<char> & orig_insts,
+                                        const std::vector<size_t> & offsets,
+                                        float scale,
+                                        xrt::bo & a_bo, xrt::bo & b_bo, xrt::bo & c_bo) {
+            auto insts = orig_insts;  // mutable copy
+            xdna_patch_bf16s_scale(insts, offsets, scale);
+            uint32_t isize = (uint32_t)insts.size();
+            xrt::bo temp_insts_bo(ctx->device, insts.data(), insts.size(),
+                                  xrt::bo::flags::cacheable,
+                                  kernel.group_id(1));
+            temp_insts_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            auto run = kernel(3u, temp_insts_bo, isize, a_bo, b_bo, c_bo);
+            run.wait();
+        };
+
+        // --- Stage 1: GEMM gate (i8 × i8 → bf16) ---
+        run_gemm_with_scale(entry->kernels[XDNA_SWIGLU_MATMUL_1],
+                           entry->insts_data[XDNA_SWIGLU_MATMUL_1], po.gemm1,
+                           act_scale * wt_gate_scale,
+                           *entry->input_bo, *w1_bo_ptr, *entry->left_bo);
+
+        // --- Stage 1b: GEMM up (i8 × i8 → bf16) ---
+        run_gemm_with_scale(entry->kernels[XDNA_SWIGLU_MATMUL_1],
+                           entry->insts_data[XDNA_SWIGLU_MATMUL_1], po.gemm1,
+                           act_scale * wt_up_scale,
+                           *entry->input_bo, *w2_bo_ptr, *entry->right_bo);
+
+        // --- Stage 2: SiLU + MUL (bf16, same as bf16 prefill) ---
+        {
+            auto r = entry->kernels[XDNA_SWIGLU_SILU](
+                3u, entry->insts_bo[XDNA_SWIGLU_SILU],
+                (uint32_t)entry->insts_data[XDNA_SWIGLU_SILU].size(),
+                *entry->left_bo, *entry->left_swished_bo);
+            r.wait();
+        }
+        {
+            auto r = entry->kernels[XDNA_SWIGLU_ELTWISE](
+                3u, entry->insts_bo[XDNA_SWIGLU_ELTWISE],
+                (uint32_t)entry->insts_data[XDNA_SWIGLU_ELTWISE].size(),
+                *entry->left_swished_bo, *entry->right_bo, *entry->intermediate_bo);
+            r.wait();
+        }
+
+        // --- Stage 3: Read back intermediate bf16, quantize → int8, upload ---
+        entry->intermediate_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        float im_scale = xdna_quantize_bf16_to_int8(
+            (const uint16_t *)entry->intermediate_bo->map<void*>(),
+            (int8_t *)intermediate_i8_bo.map<void*>(),
+            (size_t)M * hidden_dim);
+        intermediate_i8_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+        // --- Stage 4: GEMM down (i8 × i8 → bf16) ---
+        run_gemm_with_scale(entry->kernels[XDNA_SWIGLU_MATMUL_2],
+                           entry->insts_data[XDNA_SWIGLU_MATMUL_2], po.gemm2,
+                           im_scale * wt_down_scale,
+                           intermediate_i8_bo, *w3_bo_ptr, *entry->output_bo);
+
+        // --- Read back output ---
+        entry->output_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        bf16_to_f32((const uint16_t *)entry->output_bo->map<void*>(),
+                    (float *)dst_final->data, (size_t)M * embedding_dim);
+
+        // Write back intermediates for downstream consumers.
+        entry->left_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        bf16_to_f32((const uint16_t *)entry->left_bo->map<void*>(),
+                    (float *)gate_dst->data, (size_t)M * hidden_dim);
+        entry->right_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        bf16_to_f32((const uint16_t *)entry->right_bo->map<void*>(),
+                    (float *)up_dst->data, (size_t)M * hidden_dim);
+        entry->intermediate_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        bf16_to_f32((const uint16_t *)entry->intermediate_bo->map<void*>(),
+                    (float *)glu_dst->data, (size_t)M * hidden_dim);
+
+        if (prof) {
+            auto t_total_e = clk::now();
+            auto us = [](clk::time_point a, clk::time_point b) {
+                return (long)std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
+            };
+            GGML_LOG_INFO(
+                "ggml-xdna: swiglu_prof prefill_int8 M=%ld K=%ld N=%ld total=%ld us\n",
+                (long)M, (long)embedding_dim, (long)hidden_dim,
+                us(t_total_s, t_total_e));
+        }
+
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("ggml-xdna: SwiGLU prefill INT8 XRT dispatch failed (%s)\n", e.what());
+    }
+}
+
+// ============================================================================
 // Fused INT8 SwiGLU — 2-dispatch path (fused gate+up+silu+mul + down GEMV)
 // ============================================================================
 
@@ -2418,13 +2816,18 @@ static bool xdna_try_match_swiglu(const struct ggml_cgraph * cgraph, int i,
         static const bool prefill_enabled = getenv("XDNA_ENABLE_SWIGLU_PREFILL") != NULL;
         if (!prefill_enabled) SWIGLU_REJECT("prefill disabled (set XDNA_ENABLE_SWIGLU_PREFILL=1 to opt in)");
         if (allow_int8) {
-            // INT8 prefill is out of scope for this integration — only the
-            // IRON SwiGLUDecodeInt8 operator exists (M=1). Fall back to bf16
-            // prefill only if weights are bf16; otherwise reject.
-            SWIGLU_REJECT("prefill-int8 not yet supported");
+            // W8A8 INT8 prefill. Gated behind XDNA_ENABLE_SWIGLU_PREFILL_INT8.
+            static const bool prefill_int8_ok = getenv("XDNA_ENABLE_SWIGLU_PREFILL_INT8") != NULL;
+            if (!prefill_int8_ok)
+                SWIGLU_REJECT("prefill-int8 disabled (set XDNA_ENABLE_SWIGLU_PREFILL_INT8=1)");
+            int tm = xdna_pick_swiglu_prefill_tile_m(M);
+            if (tm < 16) SWIGLU_REJECT("prefill-int8 tile_m < 16");
+            if (!xdna_shape_dispatchable_swiglu_prefill(M, embedding_dim, hidden_dim, num_cols))
+                SWIGLU_REJECT("prefill-int8 shape not dispatchable");
+        } else {
+            if (!xdna_shape_dispatchable_swiglu_prefill(M, embedding_dim, hidden_dim, num_cols))
+                SWIGLU_REJECT("prefill shape not dispatchable");
         }
-        if (!xdna_shape_dispatchable_swiglu_prefill(M, embedding_dim, hidden_dim, num_cols))
-            SWIGLU_REJECT("prefill shape not dispatchable");
     } else {
         if (dbg) fprintf(stderr, "ggml-xdna: swiglu reject @%d: M=%ld in (1, 32)\n",
                          i, (long)M);
@@ -2562,17 +2965,27 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                     cpu_run_start = -1;
                 }
                 if (m.is_int8) {
-                    static const bool fused_int8_ok = getenv("XDNA_ENABLE_SWIGLU_FUSED") != NULL;
-                    if (fused_int8_ok) {
-                        ggml_backend_xdna_mul_mat_swiglu_fused_int8(
+                    const int64_t M_match = m.input->ne[1];
+                    if (M_match >= 32) {
+                        // W8A8 INT8 prefill path
+                        ggml_backend_xdna_mul_mat_swiglu_prefill_int8(
                             ctx,
                             m.gate_mm, m.up_mm, m.glu, m.down_mm,
                             m.gate_w, m.up_w, m.down_w, m.input);
                     } else {
-                        ggml_backend_xdna_mul_mat_swiglu_int8(
-                            ctx,
-                            m.gate_mm, m.up_mm, m.glu, m.down_mm,
-                            m.gate_w, m.up_w, m.down_w, m.input);
+                        // INT8 decode paths (M==1)
+                        static const bool fused_int8_ok = getenv("XDNA_ENABLE_SWIGLU_FUSED") != NULL;
+                        if (fused_int8_ok) {
+                            ggml_backend_xdna_mul_mat_swiglu_fused_int8(
+                                ctx,
+                                m.gate_mm, m.up_mm, m.glu, m.down_mm,
+                                m.gate_w, m.up_w, m.down_w, m.input);
+                        } else {
+                            ggml_backend_xdna_mul_mat_swiglu_int8(
+                                ctx,
+                                m.gate_mm, m.up_mm, m.glu, m.down_mm,
+                                m.gate_w, m.up_w, m.down_w, m.input);
+                        }
                     }
                 } else {
                     ggml_backend_xdna_mul_mat_swiglu(
