@@ -42,6 +42,7 @@ enum xdna_op_kind : int {
     XDNA_OP_SWIGLU_DECODE      = 2,  // M==1  fused SwiGLU FFN (gate/up/down + SiLU + mul)
     XDNA_OP_SWIGLU_PREFILL     = 3,  // M>=32 fused SwiGLU FFN (gate/up/down + SiLU + mul)
     XDNA_OP_SWIGLU_DECODE_INT8 = 4,  // M==1  W8A16 fused SwiGLU FFN (int8 weights, bf16 acts)
+    XDNA_OP_SWIGLU_FUSED_INT8  = 5,  // M==1  fused gate+up+silu+mul INT8 + standalone down GEMV
 };
 
 struct xdna_kernel_entry {
@@ -163,6 +164,46 @@ struct xdna_swiglu_kernel_entry {
 };
 
 // ============================================================================
+// Fused INT8 SwiGLU entry — 2 separate xclbins (fused gate+up+silu+mul + down GEMV)
+// ============================================================================
+
+struct xdna_swiglu_fused_entry {
+    xdna_op_kind  op_kind;  // always XDNA_OP_SWIGLU_FUSED_INT8
+
+    // Two independent xclbins, hw_contexts, and kernels.
+    xrt::xclbin     fused_xclbin;
+    xrt::hw_context fused_hw_ctx;
+    xrt::kernel     fused_kernel;
+    std::vector<char> fused_insts_data;
+    xrt::bo         fused_insts_bo;
+
+    xrt::xclbin     down_xclbin;
+    xrt::hw_context down_hw_ctx;
+    xrt::kernel     down_kernel;
+    std::vector<char> down_insts_data;
+    xrt::bo         down_insts_bo;
+
+    int64_t embedding_dim;
+    int64_t hidden_dim;
+    int     num_cols;
+    int     group_size;
+    int     fused_m_input;  // clamped tile_size_input for gate/up (fused kernel)
+    int     down_m_input;   // clamped tile_size_input for down GEMV
+
+    // I/O BOs (lazy — allocated on first dispatch).
+    std::unique_ptr<xrt::bo> input_bo;         // embedding_dim bf16
+    std::unique_ptr<xrt::bo> intermediate_bo;  // hidden_dim bf16
+    std::unique_ptr<xrt::bo> output_bo;        // embedding_dim bf16
+
+    // Weight BO caches — one map per slot, keyed by ggml weight tensor data ptr.
+    std::unordered_map<const void *, xrt::bo> w_gate_bo_cache;
+    std::unordered_map<const void *, xrt::bo> w_up_bo_cache;
+    std::unordered_map<const void *, xrt::bo> w_down_bo_cache;
+
+    std::unique_ptr<std::mutex> weights_mutex = std::make_unique<std::mutex>();
+};
+
+// ============================================================================
 // Backend context — holds XRT device and kernel cache
 // ============================================================================
 
@@ -172,6 +213,7 @@ struct ggml_backend_xdna_context {
     std::string compile_script;
     std::unordered_map<std::string, xdna_kernel_entry> kernel_cache;
     std::unordered_map<std::string, xdna_swiglu_kernel_entry> swiglu_cache;
+    std::unordered_map<std::string, xdna_swiglu_fused_entry> swiglu_fused_cache;
     std::mutex cache_mutex;
     bool device_valid;
     // CPU backend for delegating ops we don't run on NPU.
@@ -1782,6 +1824,383 @@ static void ggml_backend_xdna_mul_mat_swiglu_int8(
     }
 }
 
+// ============================================================================
+// Fused INT8 SwiGLU — 2-dispatch path (fused gate+up+silu+mul + down GEMV)
+// ============================================================================
+
+static std::string make_swiglu_fused_cache_key(int64_t embedding_dim, int64_t hidden_dim,
+                                                int num_cols, int group_size) {
+    char buf[256];
+    snprintf(buf, sizeof(buf), "swiglu_fused_int8_K%ld_N%ld_%dcol_g%d",
+             (long)embedding_dim, (long)hidden_dim, num_cols, group_size);
+    return std::string(buf);
+}
+
+static bool swiglu_fused_bundle_present(const std::string & bundle_dir) {
+    std::ifstream f1(bundle_dir + "/fused.xclbin");
+    if (!f1.good()) return false;
+    std::ifstream f2(bundle_dir + "/fused.insts");
+    if (!f2.good()) return false;
+    std::ifstream f3(bundle_dir + "/down_gemv.xclbin");
+    if (!f3.good()) return false;
+    std::ifstream f4(bundle_dir + "/down_gemv.insts");
+    if (!f4.good()) return false;
+    return true;
+}
+
+static bool ensure_swiglu_fused_compiled(ggml_backend_xdna_context * ctx,
+                                         const std::string & cache_key,
+                                         int64_t embedding_dim, int64_t hidden_dim,
+                                         int num_cols, int group_size) {
+    const std::string bundle_dir = ctx->cache_dir + "/" + cache_key;
+    if (swiglu_fused_bundle_present(bundle_dir)) {
+        return true;
+    }
+
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd),
+             "python3 %s swiglu-fused-int8 --embedding-dim %ld --hidden-dim %ld "
+             "--num-aie-columns %d --group-size %d --out %s 2>&1",
+             ctx->compile_script.c_str(),
+             (long)embedding_dim, (long)hidden_dim,
+             num_cols, group_size, bundle_dir.c_str());
+    GGML_LOG_INFO("ggml-xdna: compiling SwiGLU fused INT8 K=%ld N=%ld g=%d (first run, will be cached)...\n",
+                  (long)embedding_dim, (long)hidden_dim, group_size);
+
+    int ret = system(cmd);
+    if (ret != 0) {
+        GGML_LOG_ERROR("ggml-xdna: SwiGLU fused INT8 compilation failed (exit code %d)\n", ret);
+        return false;
+    }
+
+    if (!swiglu_fused_bundle_present(bundle_dir)) {
+        GGML_LOG_ERROR("ggml-xdna: SwiGLU fused INT8 compilation succeeded but bundle files missing in %s\n",
+                       bundle_dir.c_str());
+        return false;
+    }
+
+    GGML_LOG_INFO("ggml-xdna: SwiGLU fused INT8 compilation complete, cached at %s\n", bundle_dir.c_str());
+    return true;
+}
+
+static xdna_swiglu_fused_entry * get_or_load_swiglu_fused_kernel(
+        ggml_backend_xdna_context * ctx,
+        const std::string & cache_key,
+        int64_t embedding_dim, int64_t hidden_dim,
+        int num_cols, int group_size,
+        int fused_m_input, int down_m_input) {
+    std::lock_guard<std::mutex> lock(ctx->cache_mutex);
+
+    auto it = ctx->swiglu_fused_cache.find(cache_key);
+    if (it != ctx->swiglu_fused_cache.end()) {
+        return &it->second;
+    }
+
+    const std::string bundle_dir = ctx->cache_dir + "/" + cache_key;
+
+    try {
+        xdna_swiglu_fused_entry entry;
+        entry.op_kind       = XDNA_OP_SWIGLU_FUSED_INT8;
+        entry.embedding_dim = embedding_dim;
+        entry.hidden_dim    = hidden_dim;
+        entry.num_cols      = num_cols;
+        entry.group_size    = group_size;
+        entry.fused_m_input = fused_m_input;
+        entry.down_m_input  = down_m_input;
+
+        // Load fused xclbin (gate+up+silu+mul)
+        entry.fused_xclbin = xrt::xclbin(bundle_dir + "/fused.xclbin");
+        ctx->device.register_xclbin(entry.fused_xclbin);
+        auto fused_uuid = entry.fused_xclbin.get_uuid();
+        entry.fused_hw_ctx = xrt::hw_context(ctx->device, fused_uuid);
+        entry.fused_kernel = xrt::kernel(entry.fused_hw_ctx, "MLIR_AIE");
+
+        entry.fused_insts_data = read_binary_file(bundle_dir + "/fused.insts");
+        if (entry.fused_insts_data.empty()) {
+            GGML_LOG_ERROR("ggml-xdna: failed to read fused insts file\n");
+            return nullptr;
+        }
+        entry.fused_insts_bo = xrt::bo(ctx->device, entry.fused_insts_data.size(),
+                                        xrt::bo::flags::cacheable,
+                                        entry.fused_kernel.group_id(1));
+        entry.fused_insts_bo.write(entry.fused_insts_data.data());
+        entry.fused_insts_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+        // Load down GEMV xclbin
+        entry.down_xclbin = xrt::xclbin(bundle_dir + "/down_gemv.xclbin");
+        ctx->device.register_xclbin(entry.down_xclbin);
+        auto down_uuid = entry.down_xclbin.get_uuid();
+        entry.down_hw_ctx = xrt::hw_context(ctx->device, down_uuid);
+        entry.down_kernel = xrt::kernel(entry.down_hw_ctx, "MLIR_AIE");
+
+        entry.down_insts_data = read_binary_file(bundle_dir + "/down_gemv.insts");
+        if (entry.down_insts_data.empty()) {
+            GGML_LOG_ERROR("ggml-xdna: failed to read down_gemv insts file\n");
+            return nullptr;
+        }
+        entry.down_insts_bo = xrt::bo(ctx->device, entry.down_insts_data.size(),
+                                       xrt::bo::flags::cacheable,
+                                       entry.down_kernel.group_id(1));
+        entry.down_insts_bo.write(entry.down_insts_data.data());
+        entry.down_insts_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+        auto [inserted_it, _] = ctx->swiglu_fused_cache.emplace(cache_key, std::move(entry));
+        GGML_LOG_INFO("ggml-xdna: loaded SwiGLU fused INT8 kernel bundle for %s\n", cache_key.c_str());
+        return &inserted_it->second;
+
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("ggml-xdna: failed to load SwiGLU fused INT8 kernel %s: %s\n",
+                       cache_key.c_str(), e.what());
+        return nullptr;
+    }
+}
+
+// Warm (or look up) an INT8 weight BO for the fused SwiGLU path. Identical to
+// swiglu_warm_weight_int8 but takes an xrt::kernel directly instead of
+// entry+slot, since the fused entry has two separate kernels (not an array).
+static xrt::bo * swiglu_fused_warm_weight_int8(ggml_backend_xdna_context * ctx,
+                                                xdna_swiglu_fused_entry * entry,
+                                                std::unordered_map<const void *, xrt::bo> & cache,
+                                                const struct ggml_tensor * weight,
+                                                xrt::kernel & kernel,
+                                                int arg_group_id,
+                                                int m_input,
+                                                int num_cols,
+                                                int group_size,
+                                                const char * slot_name) {
+    auto it = cache.find(weight->data);
+    if (it != cache.end()) {
+        return &it->second;
+    }
+
+    const int64_t K = weight->ne[0];
+    const int64_t N = weight->ne[1];
+
+    const int64_t num_groups_per_row = K / group_size;
+    const size_t packed_bytes_per_tile =
+        (size_t)m_input * (size_t)K + (size_t)m_input * (size_t)num_groups_per_row * 2;
+    const int64_t rows_per_col = N / num_cols;
+    const int64_t tiles_per_col = rows_per_col / m_input;
+    const size_t n_bytes = (size_t)num_cols * (size_t)tiles_per_col * packed_bytes_per_tile;
+
+    try {
+        xrt::bo new_bo(ctx->device, n_bytes, xrt::bo::flags::host_only,
+                       kernel.group_id(arg_group_id));
+
+        uint8_t * dst = (uint8_t *)new_bo.map<void*>();
+        const uint8_t * src_q8_0 = (const uint8_t *)weight->data;
+
+        xdna_repack_q8_0_to_gemv_int8(src_q8_0, /*M=*/N, K, m_input, num_cols,
+                                      group_size, dst);
+
+        new_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        auto [ins, _] = cache.emplace(weight->data, std::move(new_bo));
+
+        fprintf(stderr,
+                "ggml-xdna: warm SwiGLU-fused-int8 %s K=%ld N=%ld g=%d m_in=%d weight=%s (%zu cached)\n",
+                slot_name, (long)K, (long)N, group_size, m_input,
+                weight->name, cache.size());
+        fflush(stderr);
+        return &ins->second;
+
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("ggml-xdna: failed to warm SwiGLU-fused-int8 %s weight: %s\n",
+                       slot_name, e.what());
+        return nullptr;
+    }
+}
+
+// Dispatch a fused INT8 SwiGLU FFN via 2-dispatch path:
+//   Run 1: fused kernel (gate_gemv + up_gemv + silu + eltwise_mul) → intermediate
+//   Run 2: down GEMV kernel (intermediate → output)
+// Each kernel lives in its own xclbin/hw_context. Intermediate data passes
+// through host DDR with explicit syncs between the two runs.
+static void ggml_backend_xdna_mul_mat_swiglu_fused_int8(
+        ggml_backend_xdna_context * ctx,
+        struct ggml_tensor * gate_dst,
+        struct ggml_tensor * up_dst,
+        struct ggml_tensor * glu_dst,
+        struct ggml_tensor * dst_final,
+        const struct ggml_tensor * src0_gate_w,
+        const struct ggml_tensor * src0_up_w,
+        const struct ggml_tensor * src0_down_w,
+        const struct ggml_tensor * src1_input) {
+    if (!ctx->device_valid) {
+        GGML_LOG_ERROR("ggml-xdna: SwiGLU-fused-int8 called but XRT device invalid\n");
+        return;
+    }
+
+    const int64_t embedding_dim = src1_input->ne[0];
+    const int64_t hidden_dim    = src0_gate_w->ne[1];
+
+    const int num_cols   = 8;
+    const int group_size = 32;
+
+    // Compute clamped tile_size_input for fused (gate/up) and down stages.
+    //   fused: M=hidden_dim, K=embedding_dim, tso=hidden_dim/cols
+    //   down:  M=embedding_dim, K=hidden_dim, tso=embedding_dim/cols
+    const int fused_tso = (int)(hidden_dim / num_cols);
+    const int down_tso  = (int)(embedding_dim / num_cols);
+    const int fused_m_input = xdna_clamp_gemv_int8_tile_in(
+        /*requested_tsi=*/1, fused_tso, embedding_dim, group_size);
+    const int down_m_input = xdna_clamp_gemv_int8_tile_in(
+        /*requested_tsi=*/1, down_tso, hidden_dim, group_size);
+
+    std::string cache_key = make_swiglu_fused_cache_key(
+        embedding_dim, hidden_dim, num_cols, group_size);
+
+    if (!ensure_swiglu_fused_compiled(ctx, cache_key,
+                                      embedding_dim, hidden_dim, num_cols, group_size)) {
+        GGML_LOG_ERROR("ggml-xdna: SwiGLU-fused-int8 compile failed for %s\n", cache_key.c_str());
+        return;
+    }
+
+    xdna_swiglu_fused_entry * entry = get_or_load_swiglu_fused_kernel(
+        ctx, cache_key, embedding_dim, hidden_dim, num_cols, group_size,
+        fused_m_input, down_m_input);
+    if (!entry) return;
+
+    try {
+        const size_t input_elems  = (size_t)embedding_dim;
+        const size_t output_elems = (size_t)embedding_dim;
+        const size_t hidden_elems = (size_t)hidden_dim;
+        const size_t input_bytes  = input_elems  * sizeof(uint16_t);
+        const size_t output_bytes = output_elems * sizeof(uint16_t);
+        const size_t hidden_bytes = hidden_elems * sizeof(uint16_t);
+
+        // Lazily allocate persistent BOs.
+        // Fused kernel args: (opcode, insts, isize, w_gate, w_up, input, intermediate)
+        //   w_gate @ group_id(3), w_up @ group_id(4), input @ group_id(5), output @ group_id(6)
+        // Down kernel args: (opcode, insts, isize, w_down, intermediate, output)
+        //   w_down @ group_id(3), intermediate @ group_id(4), output @ group_id(5)
+        if (!entry->input_bo) {
+            entry->input_bo = std::make_unique<xrt::bo>(
+                ctx->device, input_bytes, xrt::bo::flags::host_only,
+                entry->fused_kernel.group_id(5));
+        }
+        if (!entry->intermediate_bo) {
+            entry->intermediate_bo = std::make_unique<xrt::bo>(
+                ctx->device, hidden_bytes, xrt::bo::flags::host_only,
+                entry->fused_kernel.group_id(6));
+        }
+        if (!entry->output_bo) {
+            entry->output_bo = std::make_unique<xrt::bo>(
+                ctx->device, output_bytes, xrt::bo::flags::host_only,
+                entry->down_kernel.group_id(5));
+        }
+
+        // Warm (or look up) per-layer packed INT8 weight BOs.
+        xrt::bo * w_gate_bo = nullptr;
+        xrt::bo * w_up_bo   = nullptr;
+        xrt::bo * w_down_bo = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(*entry->weights_mutex);
+            w_gate_bo = swiglu_fused_warm_weight_int8(
+                ctx, entry, entry->w_gate_bo_cache, src0_gate_w,
+                entry->fused_kernel, 3, fused_m_input, num_cols, group_size, "w_gate");
+            w_up_bo = swiglu_fused_warm_weight_int8(
+                ctx, entry, entry->w_up_bo_cache, src0_up_w,
+                entry->fused_kernel, 4, fused_m_input, num_cols, group_size, "w_up");
+            w_down_bo = swiglu_fused_warm_weight_int8(
+                ctx, entry, entry->w_down_bo_cache, src0_down_w,
+                entry->down_kernel, 3, down_m_input, num_cols, group_size, "w_down");
+            if (!w_gate_bo || !w_up_bo || !w_down_bo) return;
+        }
+
+        using clk = std::chrono::steady_clock;
+        static const bool prof = getenv("XDNA_DEBUG") != NULL;
+        auto t_in_s = clk::now();
+
+        // Load fresh input activation (bf16-from-f32 convert).
+        if (src1_input->type == GGML_TYPE_F32) {
+            f32_to_bf16((const float *)src1_input->data,
+                        (uint16_t *)entry->input_bo->map<void*>(), input_elems);
+        } else {
+            memcpy(entry->input_bo->map<void*>(), src1_input->data, input_bytes);
+        }
+        entry->input_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        auto t_in_e = clk::now();
+
+        // Run 1: fused kernel (gate + up + silu + eltwise_mul)
+        // Args: (opcode=3, insts_bo, insts_size, w_gate, w_up, input, intermediate)
+        auto t_fused_s = clk::now();
+        {
+            xrt::run r(entry->fused_kernel);
+            r.set_arg(0, 3u);
+            r.set_arg(1, entry->fused_insts_bo);
+            r.set_arg(2, (uint32_t)entry->fused_insts_data.size());
+            r.set_arg(3, *w_gate_bo);
+            r.set_arg(4, *w_up_bo);
+            r.set_arg(5, *entry->input_bo);
+            r.set_arg(6, *entry->intermediate_bo);
+            r.start();
+            r.wait();
+        }
+        auto t_fused_e = clk::now();
+
+        // Sync intermediate between the two hw_contexts. The fused kernel wrote
+        // to intermediate_bo via DMA; we need to pull it back to host, then push
+        // it so the down kernel's DMA can read it.
+        entry->intermediate_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        entry->intermediate_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        auto t_sync_e = clk::now();
+
+        // Run 2: down GEMV kernel
+        // Args: (opcode=3, insts_bo, insts_size, w_down, intermediate, output)
+        auto t_down_s = clk::now();
+        {
+            xrt::run r(entry->down_kernel);
+            r.set_arg(0, 3u);
+            r.set_arg(1, entry->down_insts_bo);
+            r.set_arg(2, (uint32_t)entry->down_insts_data.size());
+            r.set_arg(3, *w_down_bo);
+            r.set_arg(4, *entry->intermediate_bo);
+            r.set_arg(5, *entry->output_bo);
+            r.start();
+            r.wait();
+        }
+        auto t_down_e = clk::now();
+
+        // Sync output back and convert bf16 → f32.
+        auto t_out_s = clk::now();
+        entry->output_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        bf16_to_f32((const uint16_t *)entry->output_bo->map<void*>(),
+                    (float *)dst_final->data, output_elems);
+        auto t_out_e = clk::now();
+
+        // Write back intermediate to glu_dst for downstream inspection tools.
+        // The fused kernel doesn't produce separate gate/up outputs — those
+        // intermediate tensors are never read by the graph (i += 3 skips them).
+        // Zero them as a safety measure.
+        auto t_wb_s = clk::now();
+        bf16_to_f32((const uint16_t *)entry->intermediate_bo->map<void*>(),
+                    (float *)glu_dst->data, hidden_elems);
+        memset(gate_dst->data, 0, (size_t)hidden_dim * sizeof(float));
+        memset(up_dst->data,   0, (size_t)hidden_dim * sizeof(float));
+        auto t_wb_e = clk::now();
+
+        if (prof) {
+            auto us = [](clk::time_point a, clk::time_point b) {
+                return (long)std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
+            };
+            GGML_LOG_INFO(
+                "ggml-xdna: swiglu_prof fused_int8 K=%ld N=%ld in=%ld "
+                "fused=%ld sync=%ld down=%ld out=%ld wb=%ld total=%ld us\n",
+                (long)embedding_dim, (long)hidden_dim,
+                us(t_in_s,    t_in_e),
+                us(t_fused_s, t_fused_e),
+                us(t_fused_e, t_sync_e),
+                us(t_down_s,  t_down_e),
+                us(t_out_s,   t_out_e),
+                us(t_wb_s,    t_wb_e),
+                us(t_in_s,    t_wb_e));
+        }
+
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("ggml-xdna: SwiGLU-fused-int8 XRT dispatch failed (%s)\n", e.what());
+    }
+}
+
 // Shape-dispatchability for fused SwiGLU decode. Must be a superset of
 // validate_swiglu_decode_shapes in compile.py.
 static bool xdna_shape_dispatchable_swiglu_decode(int64_t K_emb, int64_t N_hid, int num_cols) {
@@ -2126,10 +2545,18 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                     cpu_run_start = -1;
                 }
                 if (m.is_int8) {
-                    ggml_backend_xdna_mul_mat_swiglu_int8(
-                        ctx,
-                        m.gate_mm, m.up_mm, m.glu, m.down_mm,
-                        m.gate_w, m.up_w, m.down_w, m.input);
+                    static const bool fused_int8_ok = getenv("XDNA_ENABLE_SWIGLU_FUSED") != NULL;
+                    if (fused_int8_ok) {
+                        ggml_backend_xdna_mul_mat_swiglu_fused_int8(
+                            ctx,
+                            m.gate_mm, m.up_mm, m.glu, m.down_mm,
+                            m.gate_w, m.up_w, m.down_w, m.input);
+                    } else {
+                        ggml_backend_xdna_mul_mat_swiglu_int8(
+                            ctx,
+                            m.gate_mm, m.up_mm, m.glu, m.down_mm,
+                            m.gate_w, m.up_w, m.down_w, m.input);
+                    }
                 } else {
                     ggml_backend_xdna_mul_mat_swiglu(
                         ctx,
