@@ -2021,13 +2021,15 @@ static void ggml_backend_xdna_mul_mat_swiglu_prefill_int8(
     if (!entry) return;
 
     try {
-        const size_t input_i8_bytes = (size_t)M * embedding_dim;       // int8: 1 byte per element
-        const size_t hidden_bf16_bytes = (size_t)M * hidden_dim * 2;   // bf16: 2 bytes per element
-        const size_t hidden_i8_bytes = (size_t)M * hidden_dim;         // int8
-        const size_t output_bf16_bytes = (size_t)M * embedding_dim * 2; // bf16
+        const size_t input_i8_bytes    = (size_t)M * embedding_dim;      // int8
+        const size_t hidden_bf16_bytes = (size_t)M * hidden_dim * 2;     // bf16
+        const size_t output_bf16_bytes = (size_t)M * embedding_dim * 2;  // bf16
+        const size_t input_elems       = (size_t)M * embedding_dim;
+        const size_t hidden_elems      = (size_t)M * hidden_dim;
 
-        // Lazily allocate BOs.
-        // GEMM i8→bf16s: arg3=A(int8 M*K), arg4=B(int8 K*N), arg5=C(bf16 M*N)
+        // Lazily allocate persistent BOs.
+        // GEMM1 (i8→bf16s): arg3=A(int8), arg4=B(int8), arg5=C(bf16)
+        // GEMM2 (bf16):     arg3=A(bf16), arg4=B(bf16), arg5=C(bf16)
         if (!entry->input_bo) {
             entry->input_bo = std::make_unique<xrt::bo>(
                 ctx->device, input_i8_bytes, xrt::bo::flags::host_only,
@@ -2059,13 +2061,7 @@ static void ggml_backend_xdna_mul_mat_swiglu_prefill_int8(
                 entry->kernels[XDNA_SWIGLU_ELTWISE].group_id(5));
         }
 
-        // Temporary BO for int8 intermediate (GEMM2 A-input after re-quantization).
-        xrt::bo intermediate_i8_bo(
-            ctx->device, hidden_i8_bytes, xrt::bo::flags::host_only,
-            entry->kernels[XDNA_SWIGLU_MATMUL_2].group_id(3));
-
-        // Warm INT8 weights (Q8_0 → per-tensor int8 + scale). Use a local static
-        // map for (bo, scale) pairs keyed by weight->data pointer.
+        // Warm INT8 gate/up weights (Q8_0 → per-tensor int8 + scale).
         struct int8_weight_info {
             xrt::bo bo;
             float scale;
@@ -2073,8 +2069,8 @@ static void ggml_backend_xdna_mul_mat_swiglu_prefill_int8(
         static std::unordered_map<const void *, int8_weight_info> s_int8_wt_cache;
         static std::mutex s_int8_wt_mutex;
 
-        float wt_gate_scale, wt_up_scale, wt_down_scale;
-        xrt::bo * w1_bo_ptr, * w2_bo_ptr, * w3_bo_ptr;
+        float wt_gate_scale, wt_up_scale;
+        xrt::bo * w1_bo_ptr, * w2_bo_ptr;
 
         {
             std::lock_guard<std::mutex> lock(s_int8_wt_mutex);
@@ -2085,22 +2081,16 @@ static void ggml_backend_xdna_mul_mat_swiglu_prefill_int8(
                 if (it != s_int8_wt_cache.end()) {
                     return {&it->second.bo, it->second.scale};
                 }
-
                 const int64_t wK = wt->ne[0];
                 const int64_t wN = wt->ne[1];
-                const size_t wt_bytes = (size_t)wK * wN;  // int8: 1 byte per element
-
-                xrt::bo new_bo(ctx->device, wt_bytes, xrt::bo::flags::host_only,
-                               entry->kernels[kernel_slot].group_id(4));  // B @ group 4
-
+                xrt::bo new_bo(ctx->device, (size_t)wK * wN, xrt::bo::flags::host_only,
+                               entry->kernels[kernel_slot].group_id(4));
                 float scale = xdna_repack_q8_0_to_gemm_int8(
                     (const uint8_t *)wt->data, wN, wK,
                     (int8_t *)new_bo.map<void*>());
                 new_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-
                 fprintf(stderr, "ggml-xdna: warm INT8 prefill %s K=%ld N=%ld scale=%.6f\n",
                         name, (long)wK, (long)wN, scale);
-
                 auto [ins, _] = s_int8_wt_cache.emplace(
                     wt->data, int8_weight_info{std::move(new_bo), scale});
                 return {&ins->second.bo, ins->second.scale};
@@ -2108,134 +2098,192 @@ static void ggml_backend_xdna_mul_mat_swiglu_prefill_int8(
 
             auto [w1, s1] = warm_int8_weight(src0_gate_w, XDNA_SWIGLU_MATMUL_1, "w_gate");
             auto [w2, s2] = warm_int8_weight(src0_up_w, XDNA_SWIGLU_MATMUL_1, "w_up");
-            auto [w3, s3] = warm_int8_weight(src0_down_w, XDNA_SWIGLU_MATMUL_2, "w_down");
             w1_bo_ptr = w1; wt_gate_scale = s1;
             w2_bo_ptr = w2; wt_up_scale = s2;
-            w3_bo_ptr = w3; wt_down_scale = s3;
+        }
+
+        // Warm bf16 down weight (Q8_0 → dequant → bf16 transposed).
+        // Reuse the existing bf16 weight warmup from the bf16 prefill path.
+        xrt::bo * w3_bo_ptr = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(*entry->weights_mutex);
+            w3_bo_ptr = swiglu_warm_weight(ctx, entry, entry->w3_bo_cache,
+                                           src0_down_w, XDNA_SWIGLU_MATMUL_2,
+                                           4, "w_down");
+            if (!w3_bo_ptr) return;
         }
 
         using clk = std::chrono::steady_clock;
         static const bool prof = getenv("XDNA_DEBUG") != NULL;
-        auto t_total_s = clk::now();
+        auto t_in_s = clk::now();
 
         // --- Stage 0: Quantize bf16 activation → int8 ---
-        std::vector<uint16_t> input_bf16(M * embedding_dim);
+        std::vector<uint16_t> input_bf16(input_elems);
         if (src1_input->type == GGML_TYPE_F32) {
-            f32_to_bf16((const float *)src1_input->data, input_bf16.data(), M * embedding_dim);
+            f32_to_bf16((const float *)src1_input->data, input_bf16.data(), input_elems);
         } else {
-            memcpy(input_bf16.data(), src1_input->data, M * embedding_dim * 2);
+            memcpy(input_bf16.data(), src1_input->data, input_elems * 2);
         }
-
         float act_scale = xdna_quantize_bf16_to_int8(
             input_bf16.data(),
             (int8_t *)entry->input_bo->map<void*>(),
-            (size_t)M * embedding_dim);
+            input_elems);
         entry->input_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        auto t_in_e = clk::now();
 
-        // Find bf16s scale patch offsets in GEMM insts (first time only per entry).
-        // These are stored on the entry via a static map keyed by cache_key since
-        // xdna_swiglu_kernel_entry doesn't have dedicated fields for them.
-        struct patch_offsets_t {
-            std::vector<size_t> gemm1;
-            std::vector<size_t> gemm2;
+        // Pre-allocated insts BOs for gate and up (different bf16s scales).
+        // Allocated once per entry, patched in-place each call to avoid
+        // per-invocation xrt::bo allocation overhead.
+        struct prefill_int8_insts_cache {
+            std::vector<size_t> gemm1_offsets;
+            xrt::bo gate_insts_bo;
+            xrt::bo up_insts_bo;
+            std::vector<char> gate_insts_data;
+            std::vector<char> up_insts_data;
+            bool initialized = false;
         };
-        static std::unordered_map<std::string, patch_offsets_t> s_patch_offsets;
-        static std::mutex s_patch_offsets_mutex;
+        static std::unordered_map<std::string, prefill_int8_insts_cache> s_insts_cache;
+        static std::mutex s_insts_mutex;
         {
-            std::lock_guard<std::mutex> lock(s_patch_offsets_mutex);
-            if (s_patch_offsets.find(cache_key) == s_patch_offsets.end()) {
-                patch_offsets_t po;
-                po.gemm1 = xdna_find_bf16s_scale_offsets(entry->insts_data[XDNA_SWIGLU_MATMUL_1]);
-                po.gemm2 = xdna_find_bf16s_scale_offsets(entry->insts_data[XDNA_SWIGLU_MATMUL_2]);
-                s_patch_offsets[cache_key] = std::move(po);
+            std::lock_guard<std::mutex> lock(s_insts_mutex);
+            if (s_insts_cache.find(cache_key) == s_insts_cache.end()) {
+                prefill_int8_insts_cache ic;
+                ic.gemm1_offsets = xdna_find_bf16s_scale_offsets(
+                    entry->insts_data[XDNA_SWIGLU_MATMUL_1]);
+                ic.gate_insts_data = entry->insts_data[XDNA_SWIGLU_MATMUL_1];
+                ic.up_insts_data   = entry->insts_data[XDNA_SWIGLU_MATMUL_1];
+                auto & k = entry->kernels[XDNA_SWIGLU_MATMUL_1];
+                size_t sz = ic.gate_insts_data.size();
+                ic.gate_insts_bo = xrt::bo(ctx->device, sz,
+                    xrt::bo::flags::cacheable, k.group_id(1));
+                ic.up_insts_bo = xrt::bo(ctx->device, sz,
+                    xrt::bo::flags::cacheable, k.group_id(1));
+                ic.initialized = true;
+                s_insts_cache[cache_key] = std::move(ic);
             }
         }
-        const auto & po = s_patch_offsets[cache_key];
+        auto & ic = s_insts_cache[cache_key];
 
-        // Helper: patch scale into a copy of GEMM insts, create temp insts BO, run kernel.
-        auto run_gemm_with_scale = [&](xrt::kernel & kernel,
-                                        const std::vector<char> & orig_insts,
-                                        const std::vector<size_t> & offsets,
-                                        float scale,
-                                        xrt::bo & a_bo, xrt::bo & b_bo, xrt::bo & c_bo) {
-            auto insts = orig_insts;  // mutable copy
-            xdna_patch_bf16s_scale(insts, offsets, scale);
-            uint32_t isize = (uint32_t)insts.size();
-            xrt::bo temp_insts_bo(ctx->device, insts.data(), insts.size(),
-                                  xrt::bo::flags::cacheable,
-                                  kernel.group_id(1));
-            temp_insts_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-            auto run = kernel(3u, temp_insts_bo, isize, a_bo, b_bo, c_bo);
-            run.wait();
-        };
+        // Patch scales in-place and sync (no BO allocation).
+        xdna_patch_bf16s_scale(ic.gate_insts_data, ic.gemm1_offsets, act_scale * wt_gate_scale);
+        memcpy(ic.gate_insts_bo.map<void*>(), ic.gate_insts_data.data(), ic.gate_insts_data.size());
+        ic.gate_insts_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
-        // --- Stage 1: GEMM gate (i8 × i8 → bf16) ---
-        run_gemm_with_scale(entry->kernels[XDNA_SWIGLU_MATMUL_1],
-                           entry->insts_data[XDNA_SWIGLU_MATMUL_1], po.gemm1,
-                           act_scale * wt_gate_scale,
-                           *entry->input_bo, *w1_bo_ptr, *entry->left_bo);
+        xdna_patch_bf16s_scale(ic.up_insts_data, ic.gemm1_offsets, act_scale * wt_up_scale);
+        memcpy(ic.up_insts_bo.map<void*>(), ic.up_insts_data.data(), ic.up_insts_data.size());
+        ic.up_insts_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
-        // --- Stage 1b: GEMM up (i8 × i8 → bf16) ---
-        run_gemm_with_scale(entry->kernels[XDNA_SWIGLU_MATMUL_1],
-                           entry->insts_data[XDNA_SWIGLU_MATMUL_1], po.gemm1,
-                           act_scale * wt_up_scale,
-                           *entry->input_bo, *w2_bo_ptr, *entry->right_bo);
+        const uint32_t mm1_isize  = (uint32_t)entry->insts_data[XDNA_SWIGLU_MATMUL_1].size();
+        const uint32_t mm2_isize  = (uint32_t)entry->insts_data[XDNA_SWIGLU_MATMUL_2].size();
+        const uint32_t silu_isize = (uint32_t)entry->insts_data[XDNA_SWIGLU_SILU].size();
+        const uint32_t eltw_isize = (uint32_t)entry->insts_data[XDNA_SWIGLU_ELTWISE].size();
 
-        // --- Stage 2: SiLU + MUL (bf16, same as bf16 prefill) ---
+        // Build single runlist: gate(i8) + up(i8) + silu + mul + down(bf16).
+        // Each xrt::run gets its own insts_bo, so gate and up can have different
+        // bf16s scales despite sharing the same kernel.
+        auto t_build_s = clk::now();
+        xrt::runlist rl(entry->hw_ctx);
+
+        // GEMM1 gate (i8 × i8 → bf16s)
         {
-            auto r = entry->kernels[XDNA_SWIGLU_SILU](
-                3u, entry->insts_bo[XDNA_SWIGLU_SILU],
-                (uint32_t)entry->insts_data[XDNA_SWIGLU_SILU].size(),
-                *entry->left_bo, *entry->left_swished_bo);
-            r.wait();
-        }
-        {
-            auto r = entry->kernels[XDNA_SWIGLU_ELTWISE](
-                3u, entry->insts_bo[XDNA_SWIGLU_ELTWISE],
-                (uint32_t)entry->insts_data[XDNA_SWIGLU_ELTWISE].size(),
-                *entry->left_swished_bo, *entry->right_bo, *entry->intermediate_bo);
-            r.wait();
+            xrt::run r(entry->kernels[XDNA_SWIGLU_MATMUL_1]);
+            r.set_arg(0, 3u);
+            r.set_arg(1, ic.gate_insts_bo);
+            r.set_arg(2, mm1_isize);
+            r.set_arg(3, *entry->input_bo);
+            r.set_arg(4, *w1_bo_ptr);
+            r.set_arg(5, *entry->left_bo);
+            rl.add(std::move(r));
         }
 
-        // --- Stage 3: Read back intermediate bf16, quantize → int8, upload ---
-        entry->intermediate_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-        float im_scale = xdna_quantize_bf16_to_int8(
-            (const uint16_t *)entry->intermediate_bo->map<void*>(),
-            (int8_t *)intermediate_i8_bo.map<void*>(),
-            (size_t)M * hidden_dim);
-        intermediate_i8_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        // GEMM1 up (i8 × i8 → bf16s, different scale)
+        {
+            xrt::run r(entry->kernels[XDNA_SWIGLU_MATMUL_1]);
+            r.set_arg(0, 3u);
+            r.set_arg(1, ic.up_insts_bo);
+            r.set_arg(2, mm1_isize);
+            r.set_arg(3, *entry->input_bo);
+            r.set_arg(4, *w2_bo_ptr);
+            r.set_arg(5, *entry->right_bo);
+            rl.add(std::move(r));
+        }
 
-        // --- Stage 4: GEMM down (i8 × i8 → bf16) ---
-        run_gemm_with_scale(entry->kernels[XDNA_SWIGLU_MATMUL_2],
-                           entry->insts_data[XDNA_SWIGLU_MATMUL_2], po.gemm2,
-                           im_scale * wt_down_scale,
-                           intermediate_i8_bo, *w3_bo_ptr, *entry->output_bo);
+        // SiLU(left) → left_swished
+        {
+            xrt::run r(entry->kernels[XDNA_SWIGLU_SILU]);
+            r.set_arg(0, 3u);
+            r.set_arg(1, entry->insts_bo[XDNA_SWIGLU_SILU]);
+            r.set_arg(2, silu_isize);
+            r.set_arg(3, *entry->left_bo);
+            r.set_arg(4, *entry->left_swished_bo);
+            rl.add(std::move(r));
+        }
+
+        // MUL(left_swished, right) → intermediate
+        {
+            xrt::run r(entry->kernels[XDNA_SWIGLU_ELTWISE]);
+            r.set_arg(0, 3u);
+            r.set_arg(1, entry->insts_bo[XDNA_SWIGLU_ELTWISE]);
+            r.set_arg(2, eltw_isize);
+            r.set_arg(3, *entry->left_swished_bo);
+            r.set_arg(4, *entry->right_bo);
+            r.set_arg(5, *entry->intermediate_bo);
+            rl.add(std::move(r));
+        }
+
+        // GEMM2 down (bf16 × bf16 → bf16, no scale patching)
+        {
+            xrt::run r(entry->kernels[XDNA_SWIGLU_MATMUL_2]);
+            r.set_arg(0, 3u);
+            r.set_arg(1, entry->insts_bo[XDNA_SWIGLU_MATMUL_2]);
+            r.set_arg(2, mm2_isize);
+            r.set_arg(3, *entry->intermediate_bo);
+            r.set_arg(4, *w3_bo_ptr);
+            r.set_arg(5, *entry->output_bo);
+            rl.add(std::move(r));
+        }
+        auto t_build_e = clk::now();
+
+        rl.execute();
+        auto t_exec_e = clk::now();
+
+        rl.wait();
+        auto t_wait_e = clk::now();
 
         // --- Read back output ---
+        auto t_out_s = clk::now();
         entry->output_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
         bf16_to_f32((const uint16_t *)entry->output_bo->map<void*>(),
-                    (float *)dst_final->data, (size_t)M * embedding_dim);
+                    (float *)dst_final->data, input_elems);
+        auto t_out_e = clk::now();
 
         // Write back intermediates for downstream consumers.
         entry->left_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
         bf16_to_f32((const uint16_t *)entry->left_bo->map<void*>(),
-                    (float *)gate_dst->data, (size_t)M * hidden_dim);
+                    (float *)gate_dst->data, hidden_elems);
         entry->right_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
         bf16_to_f32((const uint16_t *)entry->right_bo->map<void*>(),
-                    (float *)up_dst->data, (size_t)M * hidden_dim);
+                    (float *)up_dst->data, hidden_elems);
         entry->intermediate_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
         bf16_to_f32((const uint16_t *)entry->intermediate_bo->map<void*>(),
-                    (float *)glu_dst->data, (size_t)M * hidden_dim);
+                    (float *)glu_dst->data, hidden_elems);
+        auto t_wb_e = clk::now();
 
         if (prof) {
-            auto t_total_e = clk::now();
             auto us = [](clk::time_point a, clk::time_point b) {
                 return (long)std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
             };
             GGML_LOG_INFO(
-                "ggml-xdna: swiglu_prof prefill_int8 M=%ld K=%ld N=%ld total=%ld us\n",
+                "ggml-xdna: swiglu_prof prefill_int8 M=%ld K=%ld N=%ld "
+                "in=%ld rl_build=%ld rl_exec=%ld rl_wait=%ld out=%ld wb=%ld total=%ld us\n",
                 (long)M, (long)embedding_dim, (long)hidden_dim,
-                us(t_total_s, t_total_e));
+                us(t_in_s,     t_in_e),
+                us(t_build_s,  t_build_e),
+                us(t_build_e,  t_exec_e),
+                us(t_exec_e,   t_wait_e),
+                us(t_out_s,    t_out_e),
+                us(t_out_e,    t_wb_e),
+                us(t_in_s,     t_wb_e));
         }
 
     } catch (const std::exception & e) {
