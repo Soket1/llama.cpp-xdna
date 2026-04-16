@@ -164,22 +164,22 @@ struct xdna_swiglu_kernel_entry {
 };
 
 // ============================================================================
-// Fused INT8 SwiGLU entry — 2 separate xclbins (fused gate+up+silu+mul + down GEMV)
+// Fused INT8 SwiGLU entry — single combined xclbin with 2 kernel entries
+// (fused gate+up+silu+mul + down GEMV), dispatched via xrt::runlist.
 // ============================================================================
 
 struct xdna_swiglu_fused_entry {
     xdna_op_kind  op_kind;  // always XDNA_OP_SWIGLU_FUSED_INT8
 
-    // Two independent xclbins, hw_contexts, and kernels.
-    xrt::xclbin     fused_xclbin;
-    xrt::hw_context fused_hw_ctx;
-    xrt::kernel     fused_kernel;
+    // Single combined xclbin with 2 kernel entries.
+    xrt::xclbin     xclbin;
+    xrt::hw_context hw_ctx;
+    xrt::kernel     fused_kernel;   // gate+up+silu+mul
+    xrt::kernel     down_kernel;    // standalone down GEMV
+
+    // Per-kernel insts data + BOs.
     std::vector<char> fused_insts_data;
     xrt::bo         fused_insts_bo;
-
-    xrt::xclbin     down_xclbin;
-    xrt::hw_context down_hw_ctx;
-    xrt::kernel     down_kernel;
     std::vector<char> down_insts_data;
     xrt::bo         down_insts_bo;
 
@@ -359,6 +359,27 @@ static inline uint16_t fp16_to_bf16(uint16_t h) {
 //   C (output) buffer, double-buffered: 2 * tso * 2 bytes
 //   A (packed weights+scales) buffer, per-tile, double-buffered.
 // Returns the clamped tile_size_input (>= 1).
+// Auto-select the largest tile_size_input that fits in L1 and divides tso.
+// Fewer, larger tiles means fewer DMA transactions — per-tile DMA overhead
+// (BD setup + sync) dominates GEMV wall time at M=1.
+static int xdna_best_gemv_int8_tile_in(int tso, int64_t K, int group_size) {
+    const int L1_TOTAL = 64 * 1024;
+    const int STACK_AND_SCRATCH = 2 * 1024;
+    const int B_bytes = (int)(K * 2);
+    const int C_bytes_x2 = 2 * tso * 2;
+    const int A_budget = (L1_TOTAL - STACK_AND_SCRATCH - B_bytes - C_bytes_x2) / 2;
+    const int num_groups_per_row = (int)(K / group_size);
+
+    static const int candidates[] = {64, 32, 16, 8, 4, 2, 1};
+    for (int tsi : candidates) {
+        if (tso % tsi != 0) continue;
+        int tile_bytes = tsi * (int)K + tsi * num_groups_per_row * 2;
+        if (tile_bytes <= A_budget) return tsi;
+    }
+    return 1;
+}
+
+// Legacy clamp-down function (kept for callers that pass a specific requested_tsi).
 static int xdna_clamp_gemv_int8_tile_in(int requested_tsi, int tso,
                                         int64_t K, int group_size) {
     const int L1_TOTAL = 64 * 1024;
@@ -1837,14 +1858,12 @@ static std::string make_swiglu_fused_cache_key(int64_t embedding_dim, int64_t hi
 }
 
 static bool swiglu_fused_bundle_present(const std::string & bundle_dir) {
-    std::ifstream f1(bundle_dir + "/fused.xclbin");
+    std::ifstream f1(bundle_dir + "/combined.xclbin");
     if (!f1.good()) return false;
-    std::ifstream f2(bundle_dir + "/fused.insts");
+    std::ifstream f2(bundle_dir + "/swiglu_fused.insts");
     if (!f2.good()) return false;
-    std::ifstream f3(bundle_dir + "/down_gemv.xclbin");
+    std::ifstream f3(bundle_dir + "/swiglu_down_gemv_int8.insts");
     if (!f3.good()) return false;
-    std::ifstream f4(bundle_dir + "/down_gemv.insts");
-    if (!f4.good()) return false;
     return true;
 }
 
@@ -1908,16 +1927,18 @@ static xdna_swiglu_fused_entry * get_or_load_swiglu_fused_kernel(
         entry.fused_m_input = fused_m_input;
         entry.down_m_input  = down_m_input;
 
-        // Load fused xclbin (gate+up+silu+mul)
-        entry.fused_xclbin = xrt::xclbin(bundle_dir + "/fused.xclbin");
-        ctx->device.register_xclbin(entry.fused_xclbin);
-        auto fused_uuid = entry.fused_xclbin.get_uuid();
-        entry.fused_hw_ctx = xrt::hw_context(ctx->device, fused_uuid);
-        entry.fused_kernel = xrt::kernel(entry.fused_hw_ctx, "MLIR_AIE");
+        // Load combined xclbin (fused gate+up+silu+mul + down GEMV)
+        entry.xclbin = xrt::xclbin(bundle_dir + "/combined.xclbin");
+        ctx->device.register_xclbin(entry.xclbin);
+        auto uuid = entry.xclbin.get_uuid();
+        entry.hw_ctx = xrt::hw_context(ctx->device, uuid);
+        entry.fused_kernel = xrt::kernel(entry.hw_ctx, "swiglu_fused");
+        entry.down_kernel  = xrt::kernel(entry.hw_ctx, "swiglu_down_gemv_int8");
 
-        entry.fused_insts_data = read_binary_file(bundle_dir + "/fused.insts");
+        // Load fused kernel insts
+        entry.fused_insts_data = read_binary_file(bundle_dir + "/swiglu_fused.insts");
         if (entry.fused_insts_data.empty()) {
-            GGML_LOG_ERROR("ggml-xdna: failed to read fused insts file\n");
+            GGML_LOG_ERROR("ggml-xdna: failed to read swiglu_fused insts file\n");
             return nullptr;
         }
         entry.fused_insts_bo = xrt::bo(ctx->device, entry.fused_insts_data.size(),
@@ -1926,16 +1947,10 @@ static xdna_swiglu_fused_entry * get_or_load_swiglu_fused_kernel(
         entry.fused_insts_bo.write(entry.fused_insts_data.data());
         entry.fused_insts_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
-        // Load down GEMV xclbin
-        entry.down_xclbin = xrt::xclbin(bundle_dir + "/down_gemv.xclbin");
-        ctx->device.register_xclbin(entry.down_xclbin);
-        auto down_uuid = entry.down_xclbin.get_uuid();
-        entry.down_hw_ctx = xrt::hw_context(ctx->device, down_uuid);
-        entry.down_kernel = xrt::kernel(entry.down_hw_ctx, "MLIR_AIE");
-
-        entry.down_insts_data = read_binary_file(bundle_dir + "/down_gemv.insts");
+        // Load down GEMV kernel insts
+        entry.down_insts_data = read_binary_file(bundle_dir + "/swiglu_down_gemv_int8.insts");
         if (entry.down_insts_data.empty()) {
-            GGML_LOG_ERROR("ggml-xdna: failed to read down_gemv insts file\n");
+            GGML_LOG_ERROR("ggml-xdna: failed to read swiglu_down_gemv_int8 insts file\n");
             return nullptr;
         }
         entry.down_insts_bo = xrt::bo(ctx->device, entry.down_insts_data.size(),
@@ -1957,7 +1972,7 @@ static xdna_swiglu_fused_entry * get_or_load_swiglu_fused_kernel(
 
 // Warm (or look up) an INT8 weight BO for the fused SwiGLU path. Identical to
 // swiglu_warm_weight_int8 but takes an xrt::kernel directly instead of
-// entry+slot, since the fused entry has two separate kernels (not an array).
+// entry+slot, since the fused entry has two named kernels (not an array).
 static xrt::bo * swiglu_fused_warm_weight_int8(ggml_backend_xdna_context * ctx,
                                                 xdna_swiglu_fused_entry * entry,
                                                 std::unordered_map<const void *, xrt::bo> & cache,
@@ -2010,11 +2025,11 @@ static xrt::bo * swiglu_fused_warm_weight_int8(ggml_backend_xdna_context * ctx,
     }
 }
 
-// Dispatch a fused INT8 SwiGLU FFN via 2-dispatch path:
+// Dispatch a fused INT8 SwiGLU FFN via runlist (single combined xclbin):
 //   Run 1: fused kernel (gate_gemv + up_gemv + silu + eltwise_mul) → intermediate
 //   Run 2: down GEMV kernel (intermediate → output)
-// Each kernel lives in its own xclbin/hw_context. Intermediate data passes
-// through host DDR with explicit syncs between the two runs.
+// Both kernels share a single hw_context from the combined xclbin. The runlist
+// executes both runs atomically in add() order — no intermediate host sync needed.
 static void ggml_backend_xdna_mul_mat_swiglu_fused_int8(
         ggml_backend_xdna_context * ctx,
         struct ggml_tensor * gate_dst,
@@ -2041,10 +2056,10 @@ static void ggml_backend_xdna_mul_mat_swiglu_fused_int8(
     //   down:  M=embedding_dim, K=hidden_dim, tso=embedding_dim/cols
     const int fused_tso = (int)(hidden_dim / num_cols);
     const int down_tso  = (int)(embedding_dim / num_cols);
-    const int fused_m_input = xdna_clamp_gemv_int8_tile_in(
-        /*requested_tsi=*/1, fused_tso, embedding_dim, group_size);
-    const int down_m_input = xdna_clamp_gemv_int8_tile_in(
-        /*requested_tsi=*/1, down_tso, hidden_dim, group_size);
+    const int fused_m_input = xdna_best_gemv_int8_tile_in(
+        fused_tso, embedding_dim, group_size);
+    const int down_m_input = xdna_best_gemv_int8_tile_in(
+        down_tso, hidden_dim, group_size);
 
     std::string cache_key = make_swiglu_fused_cache_key(
         embedding_dim, hidden_dim, num_cols, group_size);
@@ -2121,9 +2136,14 @@ static void ggml_backend_xdna_mul_mat_swiglu_fused_int8(
         entry->input_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
         auto t_in_e = clk::now();
 
+        // Build runlist: fused kernel + down GEMV, dispatched atomically.
+        // No intermediate host sync needed — both runs share one hw_context
+        // and the runlist executes them in add() order on-device.
+        auto t_rl_build_s = clk::now();
+        xrt::runlist rl(entry->hw_ctx);
+
         // Run 1: fused kernel (gate + up + silu + eltwise_mul)
         // Args: (opcode=3, insts_bo, insts_size, w_gate, w_up, input, intermediate)
-        auto t_fused_s = clk::now();
         {
             xrt::run r(entry->fused_kernel);
             r.set_arg(0, 3u);
@@ -2133,21 +2153,11 @@ static void ggml_backend_xdna_mul_mat_swiglu_fused_int8(
             r.set_arg(4, *w_up_bo);
             r.set_arg(5, *entry->input_bo);
             r.set_arg(6, *entry->intermediate_bo);
-            r.start();
-            r.wait();
+            rl.add(std::move(r));
         }
-        auto t_fused_e = clk::now();
-
-        // Sync intermediate between the two hw_contexts. The fused kernel wrote
-        // to intermediate_bo via DMA; we need to pull it back to host, then push
-        // it so the down kernel's DMA can read it.
-        entry->intermediate_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-        entry->intermediate_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
-        auto t_sync_e = clk::now();
 
         // Run 2: down GEMV kernel
         // Args: (opcode=3, insts_bo, insts_size, w_down, intermediate, output)
-        auto t_down_s = clk::now();
         {
             xrt::run r(entry->down_kernel);
             r.set_arg(0, 3u);
@@ -2156,10 +2166,17 @@ static void ggml_backend_xdna_mul_mat_swiglu_fused_int8(
             r.set_arg(3, *w_down_bo);
             r.set_arg(4, *entry->intermediate_bo);
             r.set_arg(5, *entry->output_bo);
-            r.start();
-            r.wait();
+            rl.add(std::move(r));
         }
-        auto t_down_e = clk::now();
+        auto t_rl_build_e = clk::now();
+
+        auto t_rl_exec_s = clk::now();
+        rl.execute();
+        auto t_rl_exec_e = clk::now();
+
+        auto t_rl_wait_s = clk::now();
+        rl.wait();
+        auto t_rl_wait_e = clk::now();
 
         // Sync output back and convert bf16 → f32.
         auto t_out_s = clk::now();
@@ -2185,15 +2202,15 @@ static void ggml_backend_xdna_mul_mat_swiglu_fused_int8(
             };
             GGML_LOG_INFO(
                 "ggml-xdna: swiglu_prof fused_int8 K=%ld N=%ld in=%ld "
-                "fused=%ld sync=%ld down=%ld out=%ld wb=%ld total=%ld us\n",
+                "rl_build=%ld rl_exec=%ld rl_wait=%ld out=%ld wb=%ld total=%ld us\n",
                 (long)embedding_dim, (long)hidden_dim,
-                us(t_in_s,    t_in_e),
-                us(t_fused_s, t_fused_e),
-                us(t_fused_e, t_sync_e),
-                us(t_down_s,  t_down_e),
-                us(t_out_s,   t_out_e),
-                us(t_wb_s,    t_wb_e),
-                us(t_in_s,    t_wb_e));
+                us(t_in_s,       t_in_e),
+                us(t_rl_build_s, t_rl_build_e),
+                us(t_rl_exec_s,  t_rl_exec_e),
+                us(t_rl_wait_s,  t_rl_wait_e),
+                us(t_out_s,      t_out_e),
+                us(t_wb_s,       t_wb_e),
+                us(t_in_s,       t_wb_e));
         }
 
     } catch (const std::exception & e) {

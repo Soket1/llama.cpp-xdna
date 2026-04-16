@@ -162,6 +162,9 @@ SWIGLU_PREFILL_KERNELS = ("gemm_1", "silu", "eltwise_mul", "gemm_2")
 # (they operate on bf16 intermediates), but are keyed under their int8-namespace
 # insts files inside this bundle — the C++ backend loads them via distinct tags.
 SWIGLU_DECODE_INT8_KERNELS = ("gemv_int8_1", "silu", "eltwise_mul", "gemv_int8_2")
+# Fused gate+up+silu+mul + standalone down GEMV, chained into one xclbin.
+# Names must match chain_swiglu_artifacts() call in chained.py.
+SWIGLU_FUSED_CHAINED_KERNELS = ("fused", "down_gemv_int8")
 
 
 # ---------------------------------------------------------------------------
@@ -563,13 +566,16 @@ def compile_swiglu_decode_int8(embedding_dim: int, hidden_dim: int,
 def compile_swiglu_fused_int8(embedding_dim: int, hidden_dim: int,
                               num_aie_columns: int, output_dir: str,
                               group_size: int = 32) -> str:
-    """Compile the fused gate+up+silu+mul INT8 operator + standalone down GEMV.
+    """Compile the chained fused+down INT8 SwiGLU composite.
 
-    Produces two xclbin/insts pairs in output_dir:
-        fused.xclbin / fused.insts    — gate+up+silu+mul (single AIE design)
-        down_gemv.xclbin / down_gemv.insts — standalone gemv_int8 for down proj
+    Produces one combined xclbin with 2 kernel entries (fused gate+up+silu+mul
+    + standalone down GEMV) plus 2 insts files, staged under output_dir.
+    Both kernels share one hw_context and can be batched via xrt::runlist.
 
-    The C++ backend dispatches these as 2 invocations instead of 5 (chained).
+    Output layout:
+        <output_dir>/combined.xclbin
+        <output_dir>/swiglu_fused.insts
+        <output_dir>/swiglu_down_gemv_int8.insts
     """
     validate_swiglu_decode_int8_shapes(embedding_dim, hidden_dim,
                                        num_aie_columns, group_size=group_size)
@@ -581,42 +587,18 @@ def compile_swiglu_fused_int8(embedding_dim: int, hidden_dim: int,
             f"device reports {actual_cols}. Compile on the target device."
         )
 
-    os.makedirs(output_dir, exist_ok=True)
+    from iron.operators.swiglu_decode_int8_fused.chained import (
+        SwiGLUDecodeInt8FusedChained,
+    )
 
-    # 1. Compile the fused gate+up+silu+mul operator (single xclbin).
-    from iron.operators.swiglu_decode_int8_fused.op import SwiGLUDecodeInt8Fused
-
-    fused_op = SwiGLUDecodeInt8Fused(
+    op = SwiGLUDecodeInt8FusedChained(
         embedding_dim=embedding_dim,
         hidden_dim=hidden_dim,
-        num_aie_columns=num_aie_columns,
         group_size=group_size,
     )
-    fused_op.compile()
+    op.compile()
 
-    fused_build = fused_op.context.build_dir
-    shutil.copy2(str(fused_build / fused_op.xclbin_artifact.filename),
-                 os.path.join(output_dir, "fused.xclbin"))
-    shutil.copy2(str(fused_build / fused_op.insts_artifact.filename),
-                 os.path.join(output_dir, "fused.insts"))
-
-    # 2. Compile the standalone gemv_int8 for the down projection.
-    from iron.operators.gemv_int8.op import GEMVInt8
-
-    down_op = GEMVInt8(
-        M=embedding_dim,       # output rows
-        K=hidden_dim,          # reduction dim
-        num_aie_columns=num_aie_columns,
-        group_size=group_size,
-    )
-    down_op.compile()
-
-    down_build = down_op.context.build_dir
-    shutil.copy2(str(down_build / down_op.xclbin_artifact.filename),
-                 os.path.join(output_dir, "down_gemv.xclbin"))
-    shutil.copy2(str(down_build / down_op.insts_artifact.filename),
-                 os.path.join(output_dir, "down_gemv.insts"))
-
+    _stage_swiglu_artifacts(op, SWIGLU_FUSED_CHAINED_KERNELS, output_dir)
     return output_dir
 
 
@@ -788,30 +770,18 @@ def compile_swiglu_decode_int8_cached(embedding_dim: int, hidden_dim: int,
     return Path(output_dir)
 
 
-def get_cached_swiglu_fused_int8_dir(cache_key: str) -> Path | None:
-    """Check if a fused SwiGLU INT8 bundle is cached.
-
-    Requires fused.xclbin, fused.insts, down_gemv.xclbin, down_gemv.insts.
-    """
-    cache_dir = get_cache_dir() / cache_key
-    for f in ("fused.xclbin", "fused.insts", "down_gemv.xclbin", "down_gemv.insts"):
-        if not (cache_dir / f).exists():
-            return None
-    return cache_dir
-
-
 def compile_swiglu_fused_int8_cached(embedding_dim: int, hidden_dim: int,
                                       num_aie_columns: int = 4,
                                       group_size: int = 32) -> Path:
-    """Compile the fused gate+up+silu+mul INT8 + down GEMV with caching.
+    """Compile the chained fused+down INT8 SwiGLU with caching.
 
-    Returns path to the cache directory containing fused.xclbin/insts + down_gemv.xclbin/insts.
+    Returns path to the cache directory containing combined.xclbin + 2 insts.
     """
     key = swiglu_fused_int8_cache_key(
         embedding_dim, hidden_dim, num_aie_columns, group_size=group_size
     )
 
-    cached = get_cached_swiglu_fused_int8_dir(key)
+    cached = get_cached_swiglu_dir(key, SWIGLU_FUSED_CHAINED_KERNELS)
     if cached is not None:
         return cached
 

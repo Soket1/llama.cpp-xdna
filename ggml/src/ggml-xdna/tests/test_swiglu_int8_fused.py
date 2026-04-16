@@ -17,7 +17,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from compile import (
     swiglu_fused_int8_cache_key,
     validate_swiglu_decode_int8_shapes,
-    get_cached_swiglu_fused_int8_dir,
+    get_cached_swiglu_dir,
+    SWIGLU_FUSED_CHAINED_KERNELS,
 )
 
 
@@ -128,42 +129,46 @@ class TestSwigluFusedInt8ShapeValidation:
 
 
 class TestSwigluFusedInt8CacheLayout:
-    """The C++ backend reads fused.xclbin/insts + down_gemv.xclbin/insts."""
+    """The C++ backend reads combined.xclbin + 2 swiglu_*.insts files."""
+
+    def test_kernel_name_constants_pinned(self):
+        assert SWIGLU_FUSED_CHAINED_KERNELS == ("fused", "down_gemv_int8")
 
     def test_cache_miss_when_dir_absent(self, tmp_path, monkeypatch):
         monkeypatch.setenv("GGML_XDNA_CACHE_DIR", str(tmp_path))
-        assert get_cached_swiglu_fused_int8_dir("nonexistent_key") is None
+        assert get_cached_swiglu_dir(
+            "nonexistent_key", SWIGLU_FUSED_CHAINED_KERNELS
+        ) is None
 
-    def test_cache_miss_when_fused_xclbin_missing(self, tmp_path, monkeypatch):
+    def test_cache_miss_when_xclbin_missing(self, tmp_path, monkeypatch):
         monkeypatch.setenv("GGML_XDNA_CACHE_DIR", str(tmp_path))
         key = "abc123"
         d = tmp_path / key
         d.mkdir()
-        (d / "fused.insts").write_bytes(b"x")
-        (d / "down_gemv.xclbin").write_bytes(b"x")
-        (d / "down_gemv.insts").write_bytes(b"x")
-        assert get_cached_swiglu_fused_int8_dir(key) is None
+        for name in SWIGLU_FUSED_CHAINED_KERNELS:
+            (d / f"swiglu_{name}.insts").write_bytes(b"x")
+        # combined.xclbin missing
+        assert get_cached_swiglu_dir(key, SWIGLU_FUSED_CHAINED_KERNELS) is None
 
-    def test_cache_miss_when_down_gemv_missing(self, tmp_path, monkeypatch):
+    def test_cache_miss_when_insts_missing(self, tmp_path, monkeypatch):
         monkeypatch.setenv("GGML_XDNA_CACHE_DIR", str(tmp_path))
         key = "abc123"
         d = tmp_path / key
         d.mkdir()
-        (d / "fused.xclbin").write_bytes(b"x")
-        (d / "fused.insts").write_bytes(b"x")
-        (d / "down_gemv.insts").write_bytes(b"x")
-        # down_gemv.xclbin missing
-        assert get_cached_swiglu_fused_int8_dir(key) is None
+        (d / "combined.xclbin").write_bytes(b"x")
+        # Only first insts present
+        (d / f"swiglu_{SWIGLU_FUSED_CHAINED_KERNELS[0]}.insts").write_bytes(b"x")
+        assert get_cached_swiglu_dir(key, SWIGLU_FUSED_CHAINED_KERNELS) is None
 
     def test_cache_hit_when_complete(self, tmp_path, monkeypatch):
         monkeypatch.setenv("GGML_XDNA_CACHE_DIR", str(tmp_path))
         key = "abc123"
         d = tmp_path / key
         d.mkdir()
-        for f in ("fused.xclbin", "fused.insts",
-                  "down_gemv.xclbin", "down_gemv.insts"):
-            (d / f).write_bytes(b"x")
-        result = get_cached_swiglu_fused_int8_dir(key)
+        (d / "combined.xclbin").write_bytes(b"x")
+        for name in SWIGLU_FUSED_CHAINED_KERNELS:
+            (d / f"swiglu_{name}.insts").write_bytes(b"x")
+        result = get_cached_swiglu_dir(key, SWIGLU_FUSED_CHAINED_KERNELS)
         assert result == d
 
 
