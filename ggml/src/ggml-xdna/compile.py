@@ -121,6 +121,24 @@ def swiglu_decode_int8_cache_key(embedding_dim: int, hidden_dim: int,
     return hashlib.sha256(key_json.encode()).hexdigest()[:16]
 
 
+def swiglu_fused_int8_cache_key(embedding_dim: int, hidden_dim: int,
+                                num_aie_columns: int,
+                                group_size: int = 32) -> str:
+    """Cache key for the fused gate+up+silu+mul INT8 operator + standalone down GEMV.
+
+    Distinct from swiglu_decode_int8 (chained) by the "op" field.
+    """
+    key_data = {
+        "op": "swiglu_fused_int8",
+        "embedding_dim": embedding_dim,
+        "hidden_dim": hidden_dim,
+        "num_aie_columns": num_aie_columns,
+        "group_size": group_size,
+    }
+    key_json = json.dumps(key_data, sort_keys=True)
+    return hashlib.sha256(key_json.encode()).hexdigest()[:16]
+
+
 def select_swiglu_prefill_tile_m(seq_len: int) -> int:
     """Pick the largest valid tile_m for a given prefill seq_len.
 
@@ -542,6 +560,66 @@ def compile_swiglu_decode_int8(embedding_dim: int, hidden_dim: int,
     return output_dir
 
 
+def compile_swiglu_fused_int8(embedding_dim: int, hidden_dim: int,
+                              num_aie_columns: int, output_dir: str,
+                              group_size: int = 32) -> str:
+    """Compile the fused gate+up+silu+mul INT8 operator + standalone down GEMV.
+
+    Produces two xclbin/insts pairs in output_dir:
+        fused.xclbin / fused.insts    — gate+up+silu+mul (single AIE design)
+        down_gemv.xclbin / down_gemv.insts — standalone gemv_int8 for down proj
+
+    The C++ backend dispatches these as 2 invocations instead of 5 (chained).
+    """
+    validate_swiglu_decode_int8_shapes(embedding_dim, hidden_dim,
+                                       num_aie_columns, group_size=group_size)
+
+    actual_cols = aie_utils.get_current_device().cols
+    if actual_cols != num_aie_columns:
+        raise ValueError(
+            f"Device column mismatch: requested {num_aie_columns}, current "
+            f"device reports {actual_cols}. Compile on the target device."
+        )
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # 1. Compile the fused gate+up+silu+mul operator (single xclbin).
+    from iron.operators.swiglu_decode_int8_fused.op import SwiGLUDecodeInt8Fused
+
+    fused_op = SwiGLUDecodeInt8Fused(
+        embedding_dim=embedding_dim,
+        hidden_dim=hidden_dim,
+        num_aie_columns=num_aie_columns,
+        group_size=group_size,
+    )
+    fused_op.compile()
+
+    fused_build = fused_op.context.build_dir
+    shutil.copy2(str(fused_build / fused_op.xclbin_artifact.filename),
+                 os.path.join(output_dir, "fused.xclbin"))
+    shutil.copy2(str(fused_build / fused_op.insts_artifact.filename),
+                 os.path.join(output_dir, "fused.insts"))
+
+    # 2. Compile the standalone gemv_int8 for the down projection.
+    from iron.operators.gemv_int8.op import GEMVInt8
+
+    down_op = GEMVInt8(
+        M=embedding_dim,       # output rows
+        K=hidden_dim,          # reduction dim
+        num_aie_columns=num_aie_columns,
+        group_size=group_size,
+    )
+    down_op.compile()
+
+    down_build = down_op.context.build_dir
+    shutil.copy2(str(down_build / down_op.xclbin_artifact.filename),
+                 os.path.join(output_dir, "down_gemv.xclbin"))
+    shutil.copy2(str(down_build / down_op.insts_artifact.filename),
+                 os.path.join(output_dir, "down_gemv.insts"))
+
+    return output_dir
+
+
 def compile_swiglu_prefill(seq_len: int, embedding_dim: int, hidden_dim: int,
                            dtype: str, num_aie_columns: int, output_dir: str,
                            tile_m: int | None = None) -> str:
@@ -710,6 +788,41 @@ def compile_swiglu_decode_int8_cached(embedding_dim: int, hidden_dim: int,
     return Path(output_dir)
 
 
+def get_cached_swiglu_fused_int8_dir(cache_key: str) -> Path | None:
+    """Check if a fused SwiGLU INT8 bundle is cached.
+
+    Requires fused.xclbin, fused.insts, down_gemv.xclbin, down_gemv.insts.
+    """
+    cache_dir = get_cache_dir() / cache_key
+    for f in ("fused.xclbin", "fused.insts", "down_gemv.xclbin", "down_gemv.insts"):
+        if not (cache_dir / f).exists():
+            return None
+    return cache_dir
+
+
+def compile_swiglu_fused_int8_cached(embedding_dim: int, hidden_dim: int,
+                                      num_aie_columns: int = 4,
+                                      group_size: int = 32) -> Path:
+    """Compile the fused gate+up+silu+mul INT8 + down GEMV with caching.
+
+    Returns path to the cache directory containing fused.xclbin/insts + down_gemv.xclbin/insts.
+    """
+    key = swiglu_fused_int8_cache_key(
+        embedding_dim, hidden_dim, num_aie_columns, group_size=group_size
+    )
+
+    cached = get_cached_swiglu_fused_int8_dir(key)
+    if cached is not None:
+        return cached
+
+    output_dir = str(get_cache_dir() / key)
+    compile_swiglu_fused_int8(
+        embedding_dim, hidden_dim, num_aie_columns, output_dir,
+        group_size=group_size,
+    )
+    return Path(output_dir)
+
+
 def compile_swiglu_prefill_cached(seq_len: int, embedding_dim: int, hidden_dim: int,
                                   dtype: str = "bf16",
                                   num_aie_columns: int = 4,
@@ -788,6 +901,20 @@ def main():
     swdi_parser.add_argument("--out", type=str,
                              help="Output directory (default: cache)")
 
+    # SwiGLU fused INT8 subcommand (gate+up+silu+mul fused + standalone down GEMV)
+    swfi_parser = subparsers.add_parser(
+        "swiglu-fused-int8",
+        help="Compile fused gate+up+silu+mul INT8 + standalone down GEMV "
+             "(2-dispatch path, W8A16)",
+    )
+    swfi_parser.add_argument("--embedding-dim", type=int, required=True)
+    swfi_parser.add_argument("--hidden-dim", type=int, required=True)
+    swfi_parser.add_argument("--num-aie-columns", type=int, default=4)
+    swfi_parser.add_argument("--group-size", type=int, default=32,
+                             help="Quantization group size (must match Q8_0=32)")
+    swfi_parser.add_argument("--out", type=str,
+                             help="Output directory (default: cache)")
+
     # SwiGLU prefill subcommand
     swp_parser = subparsers.add_parser(
         "swiglu-prefill", help="Compile fused SwiGLU FFN (M>=32 prefill path)"
@@ -856,6 +983,20 @@ def main():
             )
         else:
             path = compile_swiglu_decode_int8_cached(
+                args.embedding_dim, args.hidden_dim,
+                args.num_aie_columns,
+                group_size=args.group_size,
+            )
+        print(path)
+    elif args.op == "swiglu-fused-int8":
+        if args.out:
+            path = compile_swiglu_fused_int8(
+                args.embedding_dim, args.hidden_dim,
+                args.num_aie_columns, args.out,
+                group_size=args.group_size,
+            )
+        else:
+            path = compile_swiglu_fused_int8_cached(
                 args.embedding_dim, args.hidden_dim,
                 args.num_aie_columns,
                 group_size=args.group_size,
