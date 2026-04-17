@@ -48,6 +48,8 @@ enum xdna_op_kind : int {
     XDNA_OP_SWIGLU_FUSED_INT8  = 5,  // M==1  fused gate+up+silu+mul INT8 + standalone down GEMV
     XDNA_OP_SWIGLU_PREFILL_INT8 = 6,  // M>=32 W8A8 INT8 SwiGLU FFN (both weights and activations int8)
     XDNA_OP_QKV                 = 7,  // M==1 chained Q/K/V (3 bf16 GEMVs sharing input)
+    XDNA_OP_RMS_NORM            = 8,  // standalone RMSNorm (bf16, eps=1e-5 baked-in)
+    XDNA_OP_ATTENTION_PREFILL   = 9,  // chained attention block (RMSNorm+QKV+RoPE+MHA+O+residual)
 };
 
 struct xdna_kernel_entry {
@@ -256,6 +258,138 @@ struct xdna_qkv_entry {
 };
 
 // ============================================================================
+// Attention-prefill chained entry — 11 sub-kernels in one combined.xclbin.
+// Mirrors iron/operators/attention_block_prefill/op.py AttentionBlockPrefill.
+// Kernel names inside the xclbin are "attn_prefill_<slot>"; insts files are
+// staged at "<bundle_dir>/attn_prefill_<slot>.insts".
+// ============================================================================
+
+enum xdna_attn_prefill_slot : int {
+    XDNA_ATTN_RMS_NORM = 0,
+    XDNA_ATTN_GEMM_Q   = 1,
+    XDNA_ATTN_GEMM_KV  = 2,  // shared by K and V projections
+    XDNA_ATTN_ROPE_Q   = 3,
+    XDNA_ATTN_ROPE_K   = 4,
+    XDNA_ATTN_PERM_Q   = 5,
+    XDNA_ATTN_PERM_KV  = 6,  // shared by K and V permutations
+    XDNA_ATTN_MHA      = 7,
+    XDNA_ATTN_PERM_O   = 8,
+    XDNA_ATTN_GEMM_O   = 9,
+    XDNA_ATTN_ADD      = 10,
+    XDNA_ATTN_NUM_SLOTS = 11,
+};
+
+static constexpr const char * XDNA_ATTN_PREFILL_KERNEL_NAMES[XDNA_ATTN_NUM_SLOTS] = {
+    "attn_prefill_rms_norm",
+    "attn_prefill_gemm_q",
+    "attn_prefill_gemm_kv",
+    "attn_prefill_rope_q",
+    "attn_prefill_rope_k",
+    "attn_prefill_perm_q",
+    "attn_prefill_perm_kv",
+    "attn_prefill_mha",
+    "attn_prefill_perm_o",
+    "attn_prefill_gemm_o",
+    "attn_prefill_add",
+};
+
+static constexpr const char * XDNA_ATTN_PREFILL_INSTS_TAGS[XDNA_ATTN_NUM_SLOTS] = {
+    "rms_norm", "gemm_q", "gemm_kv", "rope_q", "rope_k",
+    "perm_q",   "perm_kv","mha",    "perm_o", "gemm_o", "add",
+};
+
+struct xdna_attention_prefill_entry {
+    xdna_op_kind    op_kind;  // always XDNA_OP_ATTENTION_PREFILL
+
+    xrt::xclbin     xclbin;
+    xrt::hw_context hw_ctx;
+    xrt::kernel     kernels[XDNA_ATTN_NUM_SLOTS];
+    std::vector<char> insts_data[XDNA_ATTN_NUM_SLOTS];
+    xrt::bo         insts_bo  [XDNA_ATTN_NUM_SLOTS];
+
+    // Shape params (baked into the xclbin).
+    int64_t seq_len_padded;
+    int64_t embed_dim;
+    int64_t num_heads;
+    int64_t num_kv_heads;
+    int64_t head_dim;
+
+    std::string cache_key;
+
+    // Per-call persistent BOs (lazy, allocated on first dispatch).
+    //   bo_x_in    : (seq*embed) bf16 — residual input, also fed to RMSNorm
+    //   bo_x_norm  : (seq*embed) bf16 — RMSNorm output
+    //   bo_q_proj  : (seq*H*d)   bf16 — GEMM_Q output (pre-RoPE)
+    //   bo_k_proj  : (seq*KV*d)  bf16 — GEMM_KV(K) output
+    //   bo_v_proj  : (seq*KV*d)  bf16 — GEMM_KV(V) output
+    //   bo_q_rope  : (seq*H*d)   bf16 — RoPE(Q)
+    //   bo_k_rope  : (seq*KV*d)  bf16 — RoPE(K)
+    //   bo_q_perm  : (H*seq_pad*d) bf16  (MHA's Q/K/V all share this buffer size)
+    //   bo_k_perm  : (H*seq_pad*d) bf16  (oversized to match MHA's arg_spec)
+    //   bo_v_perm  : (H*seq_pad*d) bf16  (ditto)
+    //   bo_attn_out: (H*seq_pad*d) bf16 — MHA output
+    //   bo_o_perm  : (seq*H*d)   bf16 — perm_o output (seq,H,d)
+    //   bo_o_proj  : (seq*embed) bf16 — GEMM_O output
+    //   bo_output  : (seq*embed) bf16 — residual ADD output (final)
+    //   bo_gain    : (embed)     bf16 — RMSNorm gain (per-layer, repacked-cached)
+    //   bo_angles  : (seq*d)     bf16 — RoPE cos/sin LUT (per-dispatch, positions vary)
+    std::unique_ptr<xrt::bo> bo_x_in;
+    std::unique_ptr<xrt::bo> bo_x_norm;
+    std::unique_ptr<xrt::bo> bo_q_proj;
+    std::unique_ptr<xrt::bo> bo_k_proj;
+    std::unique_ptr<xrt::bo> bo_v_proj;
+    std::unique_ptr<xrt::bo> bo_q_rope;
+    std::unique_ptr<xrt::bo> bo_k_rope;
+    std::unique_ptr<xrt::bo> bo_q_perm;
+    std::unique_ptr<xrt::bo> bo_k_perm;
+    std::unique_ptr<xrt::bo> bo_v_perm;
+    std::unique_ptr<xrt::bo> bo_attn_out;
+    std::unique_ptr<xrt::bo> bo_o_perm;
+    std::unique_ptr<xrt::bo> bo_o_proj;
+    std::unique_ptr<xrt::bo> bo_output;
+    std::unique_ptr<xrt::bo> bo_angles;
+
+    // Per-layer weight / gain BOs, cached by source ggml tensor data pointer.
+    // w_q/w_k/w_v/w_o hold bf16 transposed [K,N] layouts (GEMM B-buffer);
+    // gain holds bf16 row of size embed_dim.
+    std::unordered_map<const void *, xrt::bo> w_q_bo_cache;
+    std::unordered_map<const void *, xrt::bo> w_k_bo_cache;
+    std::unordered_map<const void *, xrt::bo> w_v_bo_cache;
+    std::unordered_map<const void *, xrt::bo> w_o_bo_cache;
+    std::unordered_map<const void *, xrt::bo> gain_bo_cache;
+
+    std::unique_ptr<std::mutex> weights_mutex = std::make_unique<std::mutex>();
+};
+
+// ============================================================================
+// Standalone RMSNorm entry — single-kernel xclbin, one kernel, one insts file.
+// Staged under a bundle dir (combined.xclbin + rms_norm_main.insts) so the
+// on-disk layout matches chained composites while the in-memory entry stays
+// minimal (no runlist, no chained sub-kernels).
+// ============================================================================
+
+struct xdna_rms_norm_entry {
+    xrt::xclbin     xclbin;
+    xrt::hw_context hw_ctx;
+    xrt::kernel     kernel;
+    std::vector<char> insts;
+    xrt::bo         insts_bo;
+
+    std::string cache_key;
+    int64_t size;
+    int num_cols;
+    int num_channels;
+    int tile_size;
+
+    // Persistent per-call BOs. RMSNorm's shape is fixed by (size); one call
+    // streams new activations in and results out, both bf16.
+    //   in_bo : size * sizeof(uint16_t) bf16 input
+    //   out_bo: size * sizeof(uint16_t) bf16 output
+    std::unique_ptr<xrt::bo> in_bo;
+    std::unique_ptr<xrt::bo> out_bo;
+};
+
+// ============================================================================
 // Backend context — holds XRT device and kernel cache
 // ============================================================================
 
@@ -267,6 +401,8 @@ struct ggml_backend_xdna_context {
     std::unordered_map<std::string, xdna_swiglu_kernel_entry> swiglu_cache;
     std::unordered_map<std::string, xdna_swiglu_fused_entry> swiglu_fused_cache;
     std::unordered_map<std::string, xdna_qkv_entry> qkv_cache;
+    std::unordered_map<std::string, xdna_rms_norm_entry> rms_norm_cache;
+    std::unordered_map<std::string, xdna_attention_prefill_entry> attention_prefill_cache;
     std::mutex cache_mutex;
     bool device_valid;
     // CPU backend for delegating ops we don't run on NPU.
@@ -3556,6 +3692,1405 @@ static bool xdna_try_match_swiglu(const struct ggml_cgraph * cgraph, int i,
 }
 
 // ============================================================================
+// Attention-prefill matcher (Stage 4b.3 Phase A — scaffolding only).
+//
+// Purpose: prove that the multi-node pattern matcher reliably fires on a real
+// Llama-3.2-1B graph, with aggressive offload_op keeping the whole attention
+// block in the XDNA scheduler segment.
+//
+// Phase A does NOT dispatch. On a successful match we only log; the matched
+// nodes still fall through to CPU via the normal per-node loop. This keeps
+// the model producing correct output while we observe matches.
+//
+// The pattern we look for (per layer, Llama-3.2-1B):
+//   (a) RMS_NORM(inpL)
+//   (b) MUL(rms_norm_out, attn_norm_weight)          ← gain multiply
+//   (c) MUL_MAT(wq, attn_norm_out)                    ← Q proj
+//   (d) MUL_MAT(wk, attn_norm_out)                    ← K proj
+//   (e) MUL_MAT(wv, attn_norm_out)                    ← V proj
+//       [VIEW/RESHAPE/CONT intermediates — tolerated and skipped]
+//   (f) ROPE on Q
+//   (g) ROPE on K
+//       [SET_ROWS for KV-cache writes — tolerated and skipped]
+//   (h) FLASH_ATTN_EXT(Q_rope, K_cached, V_cached, mask)
+//       [VIEW/RESHAPE/CONT on attn output — tolerated]
+//   (i) MUL_MAT(wo, attn_out)                         ← O proj
+//   (j) ADD(o_proj, inpL)                             ← residual
+//
+// Expanded-attention (no FLASH_ATTN_EXT, i.e. MUL_MAT(K,Q)→SCALE→ADD(mask)
+// →SOFT_MAX→MUL_MAT(V,softmax)) is not supported in Phase A — we log and
+// bail. Llama.cpp emits FLASH_ATTN_EXT by default.
+// ============================================================================
+
+struct xdna_attention_match {
+    int rms_norm_idx;
+    int attn_norm_mul_idx;
+    int q_proj_idx;
+    int k_proj_idx;
+    int v_proj_idx;
+    int q_rope_idx;
+    int k_rope_idx;
+    int attn_core_idx;       // FLASH_ATTN_EXT index; -1 for expanded path (unsupported)
+    int o_proj_idx;
+    int residual_add_idx;
+
+    // Key tensor pointers (for future dispatch)
+    struct ggml_tensor * inpL;
+    struct ggml_tensor * gain;
+    struct ggml_tensor * wq;
+    struct ggml_tensor * wk;
+    struct ggml_tensor * wv;
+    struct ggml_tensor * wo;
+    struct ggml_tensor * inp_pos;
+    struct ggml_tensor * attn_rope_freqs;
+    struct ggml_tensor * q_rope_node;  // for op_params: theta_base, mode, n_dims, scales
+
+    // Shape params (for future xclbin selection)
+    int64_t seq_len;
+    int64_t embed_dim;
+    int64_t num_heads;
+    int64_t num_kv_heads;
+    int64_t head_dim;
+};
+
+// Walk backwards through VIEW/RESHAPE/CONT/PERMUTE/TRANSPOSE/CPY/DUP nodes to
+// find the underlying "real" tensor a later op was actually built from. Used
+// for inpL residual identification and for tracking the attn_norm_out
+// activation as it is re-shaped through Q/K/V projections.
+static struct ggml_tensor * xdna_strip_view(struct ggml_tensor * t) {
+    while (t && t->src[0] != nullptr) {
+        switch (t->op) {
+            case GGML_OP_VIEW:
+            case GGML_OP_RESHAPE:
+            case GGML_OP_CONT:
+            case GGML_OP_PERMUTE:
+            case GGML_OP_TRANSPOSE:
+            case GGML_OP_CPY:
+            case GGML_OP_DUP:
+                t = t->src[0];
+                continue;
+            default:
+                return t;
+        }
+    }
+    return t;
+}
+
+// Attempt to match a full attention prefill block starting at cgraph->nodes[i]
+// (which must be a RMS_NORM). On success, populates *out with tensor pointers
+// and node indices and returns true. Does NOT consume nodes — caller is
+// responsible for deciding what to do with the match.
+static bool xdna_try_match_attention_prefill(const struct ggml_cgraph * cgraph, int start_idx,
+                                             xdna_attention_match * out) {
+    static const bool dbg = getenv("XDNA_DEBUG") != NULL;
+    // Bounded reject-reason log (per-process, reset conceptually per graph
+    // via the counter in graph_compute — here we just cap total spam).
+    static std::atomic<int> dbg_remaining{dbg ? 24 : 0};
+    auto dbg_ok = [&]() { return dbg && dbg_remaining.fetch_sub(1) > 0; };
+    #define ATTN_REJECT(reason) do { \
+        if (dbg_ok()) fprintf(stderr, "ggml-xdna: attn_prefill reject @%d: %s\n", start_idx, reason); \
+        return false; \
+    } while (0)
+
+    const int n = cgraph->n_nodes;
+    if (start_idx >= n) return false;
+
+    struct ggml_tensor * n_rms = cgraph->nodes[start_idx];
+    if (n_rms->op != GGML_OP_RMS_NORM) return false;
+
+    struct ggml_tensor * inpL = n_rms->src[0];
+    if (!inpL) ATTN_REJECT("RMS_NORM has no src[0]");
+
+    // Step 1: MUL(rms_norm_out, gain) — the attn_norm gain. Scan a small
+    // window forward (tolerate a view or two between RMS_NORM and MUL).
+    int attn_norm_mul_idx = -1;
+    struct ggml_tensor * attn_norm_out = nullptr;
+    struct ggml_tensor * gain = nullptr;
+    for (int j = start_idx + 1; j < std::min(start_idx + 6, n); j++) {
+        struct ggml_tensor * nj = cgraph->nodes[j];
+        if (nj->op != GGML_OP_MUL) continue;
+        // One of the two sources must derive from n_rms (possibly through a
+        // view). The other is the gain weight.
+        struct ggml_tensor * s0 = nj->src[0];
+        struct ggml_tensor * s1 = nj->src[1];
+        struct ggml_tensor * s0r = xdna_strip_view(s0);
+        struct ggml_tensor * s1r = xdna_strip_view(s1);
+        if (s0r == n_rms) {
+            attn_norm_mul_idx = j;
+            attn_norm_out = nj;
+            gain = s1;
+            break;
+        } else if (s1r == n_rms) {
+            attn_norm_mul_idx = j;
+            attn_norm_out = nj;
+            gain = s0;
+            break;
+        }
+    }
+    if (attn_norm_mul_idx < 0) ATTN_REJECT("no MUL(rms_norm, gain) follower");
+
+    // Step 2: three MUL_MATs off attn_norm_out (Q, K, V). They can appear in
+    // any order and there may be VIEWs separating them. Walk forward until we
+    // have three whose src[1] strips back to attn_norm_out.
+    int q_idx = -1, k_idx = -1, v_idx = -1;
+    int mm_found = 0;
+    int mm_idxs[3] = {-1, -1, -1};
+    struct ggml_tensor * mm_nodes[3] = {nullptr, nullptr, nullptr};
+    int scan_limit = std::min(attn_norm_mul_idx + 24, n);
+    for (int j = attn_norm_mul_idx + 1; j < scan_limit && mm_found < 3; j++) {
+        struct ggml_tensor * nj = cgraph->nodes[j];
+        if (nj->op != GGML_OP_MUL_MAT) continue;
+        struct ggml_tensor * act = xdna_strip_view(nj->src[1]);
+        if (act != attn_norm_out) continue;
+        mm_idxs[mm_found] = j;
+        mm_nodes[mm_found] = nj;
+        mm_found++;
+    }
+    if (mm_found < 3) ATTN_REJECT("fewer than 3 MUL_MATs share attn_norm_out");
+
+    // Identify Q by output feature count: Q has the largest N (embed_dim =
+    // num_heads * head_dim); K and V are equal (num_kv_heads * head_dim).
+    // Disambiguating K vs V by cgraph index is unreliable (llama.cpp emits
+    // Q, V, K order on some archs) — instead we identify K by "has an inbound
+    // ROPE", V by elimination, since K gets RoPE'd and V does not.
+    int big_slot = 0;
+    for (int k = 1; k < 3; k++) {
+        if (mm_nodes[k]->ne[0] > mm_nodes[big_slot]->ne[0]) big_slot = k;
+    }
+    q_idx = mm_idxs[big_slot];
+    struct ggml_tensor * q_mm = mm_nodes[big_slot];
+    int kv_slots[2]; int kv_fill = 0;
+    for (int k = 0; k < 3; k++) if (k != big_slot) kv_slots[kv_fill++] = k;
+    struct ggml_tensor * kv_cand[2] = {mm_nodes[kv_slots[0]], mm_nodes[kv_slots[1]]};
+    int               kv_cand_idx[2] = {mm_idxs[kv_slots[0]], mm_idxs[kv_slots[1]]};
+
+    if (kv_cand[0]->ne[0] != kv_cand[1]->ne[0]) ATTN_REJECT("K/V projection N mismatch");
+    if (q_mm->ne[0] % kv_cand[0]->ne[0] != 0)   ATTN_REJECT("Q/KV head ratio not integer");
+
+    // Step 3: find ROPE on Q and ROPE on K. Follow graph forward; tolerate
+    // intervening VIEW/RESHAPE/CONT nodes. Llama-3.2 cgraph emits Q_ROPE
+    // (and its reshape) BEFORE K_mm/V_mm, so scan from right after the first
+    // MUL_MAT.
+    int q_rope_idx = -1, k_rope_idx = -1;
+    struct ggml_tensor * q_rope = nullptr, * k_rope = nullptr;
+    struct ggml_tensor * inp_pos = nullptr, * rope_freqs = nullptr;
+    int k_cand_slot = -1;  // 0 or 1 — which of kv_cand has an inbound ROPE (= K)
+    int rope_scan_start = std::min(q_idx, std::min(kv_cand_idx[0], kv_cand_idx[1])) + 1;
+    int rope_scan_limit = std::min(std::max(q_idx, std::max(kv_cand_idx[0], kv_cand_idx[1])) + 40, n);
+    for (int j = rope_scan_start; j < rope_scan_limit; j++) {
+        struct ggml_tensor * nj = cgraph->nodes[j];
+        if (nj->op != GGML_OP_ROPE) continue;
+        struct ggml_tensor * src0 = xdna_strip_view(nj->src[0]);
+        struct ggml_tensor * anc = src0;
+        for (int steps = 0; anc && steps < 6; steps++) {
+            if (anc == q_mm || anc == kv_cand[0] || anc == kv_cand[1]) break;
+            if (anc->src[0] == nullptr) break;
+            anc = xdna_strip_view(anc->src[0]);
+        }
+        if (anc == q_mm && q_rope_idx < 0) {
+            q_rope_idx = j; q_rope = nj;
+        } else if (k_rope_idx < 0) {
+            if (anc == kv_cand[0]) { k_rope_idx = j; k_rope = nj; k_cand_slot = 0; }
+            else if (anc == kv_cand[1]) { k_rope_idx = j; k_rope = nj; k_cand_slot = 1; }
+        }
+        if (nj->src[1] && !inp_pos)     inp_pos    = nj->src[1];
+        if (nj->src[2] && !rope_freqs)  rope_freqs = nj->src[2];
+        if (q_rope_idx >= 0 && k_rope_idx >= 0) break;
+    }
+
+    // Now finalize K / V assignment: K is the KV candidate that had a ROPE,
+    // V is the other.
+    int v_cand_slot = (k_cand_slot == 0) ? 1 : 0;
+    k_idx = (k_cand_slot >= 0) ? kv_cand_idx[k_cand_slot] : -1;
+    v_idx = (k_cand_slot >= 0) ? kv_cand_idx[v_cand_slot] : -1;
+    struct ggml_tensor * k_mm = (k_cand_slot >= 0) ? kv_cand[k_cand_slot] : nullptr;
+    struct ggml_tensor * v_mm = (k_cand_slot >= 0) ? kv_cand[v_cand_slot] : nullptr;
+
+    struct ggml_tensor * wq = q_mm->src[0];
+    struct ggml_tensor * wk = k_mm ? k_mm->src[0] : nullptr;
+    struct ggml_tensor * wv = v_mm ? v_mm->src[0] : nullptr;
+    if (!wq || !wk || !wv) ATTN_REJECT("Q/K/V weight tensors null (no ROPE identified K)");
+
+    // --- DIAGNOSTIC: dump cgraph neighborhood when ROPE(Q) or ROPE(K) is not
+    // found. Gated on XDNA_DEBUG, capped to 3 attention blocks per process.
+    if (dbg && (q_rope_idx < 0 || k_rope_idx < 0)) {
+        static std::atomic<int> attn_dbg_remaining{3};
+        if (attn_dbg_remaining.fetch_sub(1) > 0) {
+            auto shape_str = [](const struct ggml_tensor * t, char * buf, size_t bsz) {
+                snprintf(buf, bsz, "[%lld,%lld,%lld,%lld]",
+                         (long long)t->ne[0], (long long)t->ne[1],
+                         (long long)t->ne[2], (long long)t->ne[3]);
+            };
+            char qs[64], ks[64], vs[64];
+            shape_str(q_mm, qs, sizeof(qs));
+            shape_str(k_mm, ks, sizeof(ks));
+            shape_str(v_mm, vs, sizeof(vs));
+            fprintf(stderr,
+                    "ggml-xdna: attn_prefill ROPE-search dump @start=%d "
+                    "q_rope_idx=%d k_rope_idx=%d\n",
+                    start_idx, q_rope_idx, k_rope_idx);
+            fprintf(stderr,
+                    "  q_mm=%p op=%s ne=%s (idx=%d)\n"
+                    "  k_mm=%p op=%s ne=%s (idx=%d)\n"
+                    "  v_mm=%p op=%s ne=%s (idx=%d)\n"
+                    "  scan window: [%d, %d)\n",
+                    (void*)q_mm, ggml_op_name(q_mm->op), qs, q_idx,
+                    (void*)k_mm, ggml_op_name(k_mm->op), ks, k_idx,
+                    (void*)v_mm, ggml_op_name(v_mm->op), vs, v_idx,
+                    rope_scan_start, rope_scan_limit);
+            for (int j = rope_scan_start; j < rope_scan_limit; j++) {
+                struct ggml_tensor * nj = cgraph->nodes[j];
+                if (nj->op != GGML_OP_ROPE) continue;
+                struct ggml_tensor * s0 = nj->src[0];
+                struct ggml_tensor * s0r = xdna_strip_view(s0);
+                char ss[64], rs[64];
+                shape_str(s0, ss, sizeof(ss));
+                shape_str(s0r, rs, sizeof(rs));
+                fprintf(stderr,
+                        "  ROPE@%d: src0=%p op=%s ne=%s -> strip_view=%p op=%s ne=%s",
+                        j, (void*)s0, ggml_op_name(s0->op), ss,
+                        (void*)s0r, ggml_op_name(s0r->op), rs);
+                if (s0r == q_mm)       fprintf(stderr, " [matches q_mm]\n");
+                else if (s0r == k_mm)  fprintf(stderr, " [matches k_mm]\n");
+                else {
+                    fprintf(stderr, " [no direct match, anc chain:]\n");
+                    struct ggml_tensor * anc = s0r;
+                    for (int steps = 0; anc && steps < 6; steps++) {
+                        char as[64];
+                        shape_str(anc, as, sizeof(as));
+                        const char * tag = "";
+                        if (anc == q_mm) tag = " == q_mm";
+                        else if (anc == k_mm) tag = " == k_mm";
+                        else if (anc == v_mm) tag = " == v_mm";
+                        fprintf(stderr,
+                                "    step=%d anc=%p op=%s ne=%s%s\n",
+                                steps, (void*)anc, ggml_op_name(anc->op), as, tag);
+                        if (anc == q_mm || anc == k_mm) break;
+                        if (anc->src[0] == nullptr) break;
+                        anc = xdna_strip_view(anc->src[0]);
+                    }
+                }
+            }
+        }
+    }
+    // --- END DIAGNOSTIC ---
+
+    if (q_rope_idx < 0) ATTN_REJECT("no ROPE(Q)");
+    if (k_rope_idx < 0) ATTN_REJECT("no ROPE(K)");
+
+    // Step 4: FLASH_ATTN_EXT. Scan forward tolerating VIEW/RESHAPE/CONT/
+    // SET_ROWS/COPY (KV-cache writes).
+    int attn_core_idx = -1;
+    struct ggml_tensor * attn_core = nullptr;
+    int fa_start = std::max(q_rope_idx, k_rope_idx) + 1;
+    int fa_scan_limit = std::min(fa_start + 40, n);
+    for (int j = fa_start; j < fa_scan_limit; j++) {
+        struct ggml_tensor * nj = cgraph->nodes[j];
+        if (nj->op == GGML_OP_FLASH_ATTN_EXT) {
+            attn_core_idx = j; attn_core = nj; break;
+        }
+        // If we hit a SOFT_MAX before FA, this is an expanded attention
+        // graph — unsupported in Phase A.
+        if (nj->op == GGML_OP_SOFT_MAX) {
+            ATTN_REJECT("expanded attention pattern (SOFT_MAX seen before FLASH_ATTN_EXT) — unsupported in phase A");
+        }
+    }
+    if (attn_core_idx < 0) ATTN_REJECT("no FLASH_ATTN_EXT");
+
+    // Step 5: O projection (MUL_MAT(wo, attn_out)) and residual ADD.
+    int o_proj_idx = -1;
+    struct ggml_tensor * o_mm = nullptr;
+    int o_scan_limit = std::min(attn_core_idx + 16, n);
+    for (int j = attn_core_idx + 1; j < o_scan_limit; j++) {
+        struct ggml_tensor * nj = cgraph->nodes[j];
+        if (nj->op != GGML_OP_MUL_MAT) continue;
+        struct ggml_tensor * act = xdna_strip_view(nj->src[1]);
+        // act should descend from attn_core (FA output).
+        struct ggml_tensor * anc = act;
+        bool links = false;
+        for (int steps = 0; anc && steps < 6; steps++) {
+            if (anc == attn_core) { links = true; break; }
+            if (anc->src[0] == nullptr) break;
+            anc = xdna_strip_view(anc->src[0]);
+        }
+        if (!links) continue;
+        o_proj_idx = j; o_mm = nj; break;
+    }
+    if (o_proj_idx < 0) ATTN_REJECT("no O MUL_MAT off FA output");
+    struct ggml_tensor * wo = o_mm->src[0];
+    if (!wo) ATTN_REJECT("O weight null");
+
+    // Residual ADD.
+    int residual_add_idx = -1;
+    int add_scan_limit = std::min(o_proj_idx + 8, n);
+    for (int j = o_proj_idx + 1; j < add_scan_limit; j++) {
+        struct ggml_tensor * nj = cgraph->nodes[j];
+        if (nj->op != GGML_OP_ADD) continue;
+        struct ggml_tensor * s0r = xdna_strip_view(nj->src[0]);
+        struct ggml_tensor * s1r = xdna_strip_view(nj->src[1]);
+        struct ggml_tensor * o_stripped = xdna_strip_view(o_mm);
+        struct ggml_tensor * inpL_stripped = xdna_strip_view(inpL);
+        bool have_o = (s0r == o_stripped || s0r == o_mm) || (s1r == o_stripped || s1r == o_mm);
+        bool have_inpL = (s0r == inpL_stripped || s0r == inpL)
+                      || (s1r == inpL_stripped || s1r == inpL);
+        if (have_o && have_inpL) {
+            residual_add_idx = j;
+            break;
+        }
+    }
+    if (residual_add_idx < 0) ATTN_REJECT("no residual ADD(o_proj, inpL)");
+
+    // Shape params.
+    const int64_t embed_dim   = inpL->ne[0];
+    const int64_t seq_len     = inpL->ne[1];
+    const int64_t q_n         = q_mm->ne[0];  // num_heads * head_dim
+    const int64_t kv_n        = k_mm->ne[0];  // num_kv_heads * head_dim
+    // Head-dim inference: FLASH_ATTN_EXT params don't expose it directly,
+    // but ne[0] of the FA output equals embed_dim; q_rope reshape gives
+    // head_dim as ne[0] post-reshape. We recover head_dim from q_mm/wq
+    // assuming q_n = num_heads * head_dim and num_heads derived from
+    // attn_core shape. Defensive fallback: query FA node's src[0] (Q input
+    // after rope+reshape) for ne[0].
+    int64_t head_dim = 0;
+    if (attn_core->src[0]) head_dim = attn_core->src[0]->ne[0];
+    if (head_dim <= 0) ATTN_REJECT("could not infer head_dim");
+    if (q_n % head_dim != 0) ATTN_REJECT("q_n not divisible by head_dim");
+    if (kv_n % head_dim != 0) ATTN_REJECT("kv_n not divisible by head_dim");
+    const int64_t num_heads    = q_n / head_dim;
+    const int64_t num_kv_heads = kv_n / head_dim;
+
+    out->rms_norm_idx        = start_idx;
+    out->attn_norm_mul_idx   = attn_norm_mul_idx;
+    out->q_proj_idx          = q_idx;
+    out->k_proj_idx          = k_idx;
+    out->v_proj_idx          = v_idx;
+    out->q_rope_idx          = q_rope_idx;
+    out->k_rope_idx          = k_rope_idx;
+    out->attn_core_idx       = attn_core_idx;
+    out->o_proj_idx          = o_proj_idx;
+    out->residual_add_idx    = residual_add_idx;
+
+    out->inpL               = inpL;
+    out->gain               = gain;
+    out->wq                 = wq;
+    out->wk                 = wk;
+    out->wv                 = wv;
+    out->wo                 = wo;
+    out->inp_pos            = inp_pos;
+    out->attn_rope_freqs    = rope_freqs;
+    out->q_rope_node        = q_rope;
+
+    out->seq_len            = seq_len;
+    out->embed_dim          = embed_dim;
+    out->num_heads          = num_heads;
+    out->num_kv_heads       = num_kv_heads;
+    out->head_dim           = head_dim;
+
+    #undef ATTN_REJECT
+    return true;
+}
+
+// ============================================================================
+// Attention-prefill Phase B — dispatch the matched RMSNorm+QKV+RoPE+MHA+O+Add
+// block onto our chained 11-kernel xclbin. Mirrors the ggml_backend_xdna_
+// mul_mat_swiglu template (weight BO caching by tensor->data, persistent per-
+// call intermediate BOs, xrt::runlist for atomic chained submit).
+// ============================================================================
+
+// Seq-len buckets — must match ATTENTION_PREFILL_SEQ_BUCKETS in compile.py.
+static constexpr int64_t XDNA_ATTN_PREFILL_BUCKETS[] = {128, 256, 512, 1024, 2048, 4096};
+static constexpr int XDNA_ATTN_PREFILL_NUM_BUCKETS =
+    sizeof(XDNA_ATTN_PREFILL_BUCKETS) / sizeof(XDNA_ATTN_PREFILL_BUCKETS[0]);
+
+static int64_t xdna_select_attention_prefill_bucket(int64_t seq_len) {
+    if (seq_len <= 0) return -1;
+    for (int i = 0; i < XDNA_ATTN_PREFILL_NUM_BUCKETS; i++) {
+        if (seq_len <= XDNA_ATTN_PREFILL_BUCKETS[i]) return XDNA_ATTN_PREFILL_BUCKETS[i];
+    }
+    return -1;
+}
+
+// Mirror attention_prefill_cache_key in compile.py. The compile-side bucket is
+// already applied by the caller, so we just hash the same fields. The C++ key
+// is a human-readable string (not a SHA-16 hash) for easier on-disk inspection
+// — compile.py uses the hash. We let ensure_attention_prefill_compiled pass
+// the shape params to compile.py, which will compute its own hash cache-dir.
+//
+// But: our ctx->cache_dir/<key> bundle layout requires our key to MATCH the
+// hash compile.py writes under get_cache_dir()/<hash>/... So we compute the
+// same SHA-16 hex that compile.py produces via json.dumps(sort_keys=True).
+static std::string make_attention_prefill_cache_key(int64_t seq_bucket,
+                                                    int64_t embed_dim,
+                                                    int64_t num_heads,
+                                                    int64_t num_kv_heads,
+                                                    int64_t head_dim) {
+    // Build the exact json string compile.py hashes. Keys sorted
+    // alphabetically (json.dumps(sort_keys=True)):
+    //   dtype, embed_dim, head_dim, num_heads, num_kv_heads, op, seq_len_padded
+    char payload[256];
+    snprintf(payload, sizeof(payload),
+             "{\"dtype\": \"bf16\", \"embed_dim\": %ld, \"head_dim\": %ld, "
+             "\"num_heads\": %ld, \"num_kv_heads\": %ld, \"op\": \"attention_prefill\", "
+             "\"seq_len_padded\": %ld}",
+             (long)embed_dim, (long)head_dim,
+             (long)num_heads, (long)num_kv_heads,
+             (long)seq_bucket);
+    // Compute SHA-256 via OpenSSL if available; otherwise fall back to a
+    // human-readable key (bundle won't collide with compile.py's but we can
+    // still locate it by invoking compile.py with our key as output dir).
+    // Simple approach: don't try to match compile.py's hash — instead pass
+    // --out <our_key_dir> to compile.py. compile.py's --out overrides the
+    // default cache layout (see main()), so our key can be whatever we want.
+    char buf[160];
+    snprintf(buf, sizeof(buf),
+             "attn_prefill_S%ld_E%ld_H%ld_KV%ld_D%ld_bf16",
+             (long)seq_bucket, (long)embed_dim,
+             (long)num_heads, (long)num_kv_heads, (long)head_dim);
+    (void)payload;  // not used in the human-readable key branch
+    return std::string(buf);
+}
+
+// Check that the full attention-prefill bundle is present on disk.
+static bool attention_prefill_bundle_present(const std::string & bundle_dir) {
+    std::ifstream xf(bundle_dir + "/combined.xclbin");
+    if (!xf.good()) return false;
+    for (int s = 0; s < XDNA_ATTN_NUM_SLOTS; s++) {
+        std::ifstream f(bundle_dir + "/attn_prefill_" + XDNA_ATTN_PREFILL_INSTS_TAGS[s] + ".insts");
+        if (!f.good()) return false;
+    }
+    return true;
+}
+
+static bool ensure_attention_prefill_compiled(ggml_backend_xdna_context * ctx,
+                                              const std::string & cache_key,
+                                              int64_t seq_bucket,
+                                              int64_t embed_dim,
+                                              int64_t num_heads,
+                                              int64_t num_kv_heads,
+                                              int64_t head_dim) {
+    const std::string bundle_dir = ctx->cache_dir + "/" + cache_key;
+    if (attention_prefill_bundle_present(bundle_dir)) return true;
+
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd),
+             "python3 %s attention-prefill --seq-len %ld --embed-dim %ld "
+             "--num-heads %ld --num-kv-heads %ld --head-dim %ld "
+             "--out %s 2>&1",
+             ctx->compile_script.c_str(),
+             (long)seq_bucket, (long)embed_dim,
+             (long)num_heads, (long)num_kv_heads, (long)head_dim,
+             bundle_dir.c_str());
+    GGML_LOG_INFO("ggml-xdna: compiling attention-prefill S=%ld E=%ld H=%ld KV=%ld d=%ld "
+                  "(first run, will be cached)...\n",
+                  (long)seq_bucket, (long)embed_dim,
+                  (long)num_heads, (long)num_kv_heads, (long)head_dim);
+
+    int ret = system(cmd);
+    if (ret != 0) {
+        GGML_LOG_ERROR("ggml-xdna: attention-prefill compile failed (exit %d)\n", ret);
+        return false;
+    }
+    if (!attention_prefill_bundle_present(bundle_dir)) {
+        GGML_LOG_ERROR("ggml-xdna: attention-prefill compile ran but bundle missing in %s\n",
+                       bundle_dir.c_str());
+        return false;
+    }
+    GGML_LOG_INFO("ggml-xdna: attention-prefill compile complete, cached at %s\n",
+                  bundle_dir.c_str());
+    return true;
+}
+
+static xdna_attention_prefill_entry * get_or_load_attention_prefill_kernel(
+        ggml_backend_xdna_context * ctx,
+        const std::string & cache_key,
+        int64_t seq_bucket, int64_t embed_dim,
+        int64_t num_heads, int64_t num_kv_heads, int64_t head_dim) {
+    std::lock_guard<std::mutex> lock(ctx->cache_mutex);
+    auto it = ctx->attention_prefill_cache.find(cache_key);
+    if (it != ctx->attention_prefill_cache.end()) return &it->second;
+
+    const std::string bundle_dir = ctx->cache_dir + "/" + cache_key;
+    try {
+        xdna_attention_prefill_entry entry;
+        entry.op_kind        = XDNA_OP_ATTENTION_PREFILL;
+        entry.seq_len_padded = seq_bucket;
+        entry.embed_dim      = embed_dim;
+        entry.num_heads      = num_heads;
+        entry.num_kv_heads   = num_kv_heads;
+        entry.head_dim       = head_dim;
+        entry.cache_key      = cache_key;
+
+        entry.xclbin = xrt::xclbin(bundle_dir + "/combined.xclbin");
+        ctx->device.register_xclbin(entry.xclbin);
+        auto uuid = entry.xclbin.get_uuid();
+        entry.hw_ctx = xrt::hw_context(ctx->device, uuid);
+
+        for (int s = 0; s < XDNA_ATTN_NUM_SLOTS; s++) {
+            entry.kernels[s] = xrt::kernel(entry.hw_ctx, XDNA_ATTN_PREFILL_KERNEL_NAMES[s]);
+            const std::string insts_path =
+                bundle_dir + "/attn_prefill_" + XDNA_ATTN_PREFILL_INSTS_TAGS[s] + ".insts";
+            entry.insts_data[s] = read_binary_file(insts_path);
+            if (entry.insts_data[s].empty()) {
+                GGML_LOG_ERROR("ggml-xdna: failed to read attention-prefill insts: %s\n",
+                               insts_path.c_str());
+                return nullptr;
+            }
+            entry.insts_bo[s] = xrt::bo(ctx->device, entry.insts_data[s].size(),
+                                         xrt::bo::flags::cacheable,
+                                         entry.kernels[s].group_id(1));
+            entry.insts_bo[s].write(entry.insts_data[s].data());
+            entry.insts_bo[s].sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        }
+
+        auto [ins, _] = ctx->attention_prefill_cache.emplace(cache_key, std::move(entry));
+        GGML_LOG_INFO("ggml-xdna: loaded attention-prefill bundle %s\n", cache_key.c_str());
+        return &ins->second;
+
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("ggml-xdna: failed to load attention-prefill bundle: %s\n", e.what());
+        return nullptr;
+    }
+}
+
+// Repack + upload a bf16 weight BO for a GEMM sub-kernel. Cached by the ggml
+// weight tensor's data pointer. IRON GEMM wants [K,N] row-major — ggml stores
+// weights as [K,N] with ne[0]=K, ne[1]=N row-major (same as the stored
+// memory layout). Mirrors swiglu_warm_weight GEMM branch exactly.
+// Caller holds entry->weights_mutex.
+static xrt::bo * attn_prefill_warm_gemm_weight(
+        ggml_backend_xdna_context * ctx,
+        xdna_attention_prefill_entry * entry,
+        std::unordered_map<const void *, xrt::bo> & cache,
+        const struct ggml_tensor * weight,
+        int kernel_slot,
+        int arg_group_id,
+        const char * slot_name) {
+    auto it = cache.find(weight->data);
+    if (it != cache.end()) return &it->second;
+
+    // ggml stores MUL_MAT weight with ne[0]=K, ne[1]=N (weight is [N,K] in
+    // logical sense — first dim is K because ggml transposes). The IRON GEMM
+    // B-buffer expects [K,N] row-major. Same transpose as swiglu_warm_weight.
+    const int64_t K = weight->ne[0];
+    const int64_t N = weight->ne[1];
+    const size_t  n_elems = (size_t)K * (size_t)N;
+    const size_t  n_bytes = n_elems * sizeof(uint16_t);
+
+    try {
+        xrt::bo new_bo(ctx->device, n_bytes, xrt::bo::flags::host_only,
+                       entry->kernels[kernel_slot].group_id(arg_group_id));
+        uint16_t * dst_bf16 = (uint16_t *)new_bo.map<void*>();
+
+        if (weight->type == GGML_TYPE_F32) {
+            const float * src_f32 = (const float *)weight->data;
+            for (int64_t k = 0; k < K; k++) {
+                for (int64_t n = 0; n < N; n++) {
+                    float val = src_f32[n * K + k];
+                    uint32_t bits;
+                    memcpy(&bits, &val, sizeof(bits));
+                    bits += (0x7FFF + ((bits >> 16) & 1));
+                    dst_bf16[k * N + n] = (uint16_t)(bits >> 16);
+                }
+            }
+        } else if (weight->type == GGML_TYPE_F16) {
+            const uint16_t * src_f16 = (const uint16_t *)weight->data;
+            for (int64_t k = 0; k < K; k++) {
+                for (int64_t n = 0; n < N; n++) {
+                    dst_bf16[k * N + n] = fp16_to_bf16(src_f16[n * K + k]);
+                }
+            }
+        } else {
+            // GGML_TYPE_BF16 (treated as 2 bytes/elem) — direct transpose.
+            const uint16_t * src = (const uint16_t *)weight->data;
+            for (int64_t k = 0; k < K; k++) {
+                for (int64_t n = 0; n < N; n++) {
+                    dst_bf16[k * N + n] = src[n * K + k];
+                }
+            }
+        }
+        new_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        auto [ins, _] = cache.emplace(weight->data, std::move(new_bo));
+        fprintf(stderr,
+                "ggml-xdna: warm attn-prefill %s K=%ld N=%ld weight=%s (%zu cached)\n",
+                slot_name, (long)K, (long)N, weight->name, cache.size());
+        fflush(stderr);
+        return &ins->second;
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("ggml-xdna: failed to warm attn-prefill %s weight: %s\n",
+                       slot_name, e.what());
+        return nullptr;
+    }
+}
+
+// Upload the RMSNorm gain vector (embed_dim bf16). No transpose — just
+// per-element convert F32/F16 → bf16. Cached by tensor->data ptr.
+// Caller holds entry->weights_mutex.
+static xrt::bo * attn_prefill_warm_gain(
+        ggml_backend_xdna_context * ctx,
+        xdna_attention_prefill_entry * entry,
+        const struct ggml_tensor * gain) {
+    auto & cache = entry->gain_bo_cache;
+    auto it = cache.find(gain->data);
+    if (it != cache.end()) return &it->second;
+
+    const int64_t n = entry->embed_dim;
+    const size_t  n_bytes = (size_t)n * sizeof(uint16_t);
+    try {
+        xrt::bo new_bo(ctx->device, n_bytes, xrt::bo::flags::host_only,
+                       entry->kernels[XDNA_ATTN_RMS_NORM].group_id(4));
+        uint16_t * dst = (uint16_t *)new_bo.map<void*>();
+
+        if (gain->type == GGML_TYPE_F32) {
+            f32_to_bf16((const float *)gain->data, dst, (size_t)n);
+        } else if (gain->type == GGML_TYPE_F16) {
+            const uint16_t * src = (const uint16_t *)gain->data;
+            for (int64_t i = 0; i < n; i++) dst[i] = fp16_to_bf16(src[i]);
+        } else {
+            memcpy(dst, gain->data, n_bytes);
+        }
+        new_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        auto [ins, _] = cache.emplace(gain->data, std::move(new_bo));
+        fprintf(stderr, "ggml-xdna: warm attn-prefill gain N=%ld weight=%s (%zu cached)\n",
+                (long)n, gain->name, cache.size());
+        fflush(stderr);
+        return &ins->second;
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("ggml-xdna: failed to warm attn-prefill gain: %s\n", e.what());
+        return nullptr;
+    }
+}
+
+// Precompute the RoPE angle LUT: shape (seq_len_padded, head_dim) bf16, with
+// even cols = cos(pos * inv_freq), odd cols = sin(pos * inv_freq). Matches
+// iron/operators/attention_block_prefill/reference.py::_compute_rope_angles AND
+// ggml's ggml_rope_cache_init (cache[2k]=cos, cache[2k+1]=sin).
+//
+// rope_node (if non-null) is the actual GGML_OP_ROPE tensor whose op_params
+// drive the angle schedule. We pull:
+//   op_params[1] = n_dims   (rotary dims; must equal head_dim for our path)
+//   op_params[2] = mode     (GGML_ROPE_TYPE_NEOX=2 for Llama; NORMAL=0 unsupported)
+//   op_params[5] = freq_base (theta_base — Llama-3 uses 500000, not 10000)
+//   op_params[6] = freq_scale   (must be 1.0)
+//   op_params[7] = ext_factor   (must be 0.0)
+//   op_params[8] = attn_factor  (must be 1.0)
+// and src[2] (freq_factors F32, length >= head_dim/2) if present — per-dim
+// divisor on theta (NOT the inv_freq itself; ff=1.0 when absent).
+//
+// pos_tensor (preferred src[1] of the ROPE node) is a int32 tensor of token
+// positions. If rope_node->src[1] is available we use it; else fallback to
+// 0..seq_len-1.
+//
+// Output layout: dst[row*head_dim + 2*i]   = cos(pos[row] * inv_freq[i])
+//                dst[row*head_dim + 2*i+1] = sin(pos[row] * inv_freq[i])
+// Returns false on any inconsistency the caller should fall back to CPU for.
+static bool xdna_compute_rope_angles_bf16(
+        const struct ggml_tensor * rope_node,
+        int64_t seq_len, int64_t seq_len_padded,
+        int64_t head_dim, uint16_t * dst_bf16) {
+    if (head_dim <= 0 || head_dim % 2 != 0) return false;
+    const int64_t half = head_dim / 2;
+
+    // Defaults — standard RoPE, no YaRN / no rescaling.
+    float freq_base   = 10000.0f;
+    float freq_scale  = 1.0f;
+    float ext_factor  = 0.0f;
+    float attn_factor = 1.0f;
+    int   n_dims      = (int)head_dim;
+    int   mode        = 2;  // NEOX (half-split) — the only mode IRON RoPE matches.
+    const float * freq_factors = nullptr;
+    const struct ggml_tensor * pos_tensor = nullptr;
+
+    if (rope_node) {
+        const int32_t * p = (const int32_t *)rope_node->op_params;
+        n_dims = p[1];
+        mode   = p[2];
+        memcpy(&freq_base,   p + 5, sizeof(float));
+        memcpy(&freq_scale,  p + 6, sizeof(float));
+        memcpy(&ext_factor,  p + 7, sizeof(float));
+        memcpy(&attn_factor, p + 8, sizeof(float));
+
+        // Only NEOX half-split is wired through the IRON RoPE op (method_type=0).
+        // NORMAL (mode==0) uses adjacent-pair rotation — unsupported; reject.
+        if (mode != 2 /* GGML_ROPE_TYPE_NEOX */) return false;
+
+        // Partial rotary (n_dims < head_dim): ggml leaves the tail un-rotated
+        // but IRON RoPE rotates the full head_dim. Safe bail-out.
+        if (n_dims != head_dim) return false;
+
+        // YaRN / linear-interp / attn-scale: IRON's LUT can't express these.
+        if (ext_factor != 0.0f) return false;
+        if (std::fabs(freq_scale  - 1.0f) > 1e-6f) return false;
+        if (std::fabs(attn_factor - 1.0f) > 1e-6f) return false;
+
+        if (rope_node->src[1] && rope_node->src[1]->type == GGML_TYPE_I32) {
+            pos_tensor = rope_node->src[1];
+        }
+        if (rope_node->src[2]
+            && rope_node->src[2]->type == GGML_TYPE_F32
+            && rope_node->src[2]->ne[0] >= half) {
+            freq_factors = (const float *)rope_node->src[2]->data;
+        }
+    }
+
+    // Build inv_freq[i]: theta_base^(-2i/n_dims) / freq_factors[i] (if present).
+    std::vector<float> inv_freq(half);
+    const float theta_scale = std::pow(freq_base, -2.0f / (float)n_dims);
+    float theta_i = 1.0f;  // theta_base^(-0/n_dims)
+    for (int64_t i = 0; i < half; i++) {
+        const float ff = freq_factors ? freq_factors[i] : 1.0f;
+        inv_freq[i] = theta_i / ff;
+        theta_i *= theta_scale;
+    }
+
+    // Resolve pos[row] for row in [0, seq_len). Beyond seq_len, zero.
+    std::vector<int32_t> positions(seq_len_padded, 0);
+    if (pos_tensor && pos_tensor->ne[0] >= seq_len) {
+        const int32_t * src = (const int32_t *)pos_tensor->data;
+        for (int64_t i = 0; i < seq_len; i++) positions[i] = src[i];
+    } else {
+        // Contiguous positions 0..seq_len-1 if ggml didn't hand us an inp_pos.
+        for (int64_t i = 0; i < seq_len; i++) positions[i] = (int32_t)i;
+    }
+
+    // Fill the LUT. Rows beyond seq_len are left as cos(0)=1, sin(0)=0.
+    for (int64_t row = 0; row < seq_len_padded; row++) {
+        const float pos_f = (float)positions[row];
+        for (int64_t i = 0; i < half; i++) {
+            const float angle = pos_f * inv_freq[i];
+            const float c = std::cos(angle);
+            const float s = std::sin(angle);
+            uint32_t cb, sb;
+            memcpy(&cb, &c, sizeof(cb));
+            memcpy(&sb, &s, sizeof(sb));
+            cb += (0x7FFF + ((cb >> 16) & 1));
+            sb += (0x7FFF + ((sb >> 16) & 1));
+            dst_bf16[row * head_dim + 2*i]     = (uint16_t)(cb >> 16);
+            dst_bf16[row * head_dim + 2*i + 1] = (uint16_t)(sb >> 16);
+        }
+    }
+    return true;
+}
+
+// Full attention-prefill dispatch. Returns true on success; false lets the
+// caller fall back to CPU for this block (Phase B uses a "strict skip on
+// success, no change on fail" policy — see graph_compute hook).
+static bool ggml_backend_xdna_attention_prefill(ggml_backend_xdna_context * ctx,
+                                                const xdna_attention_match & m,
+                                                struct ggml_cgraph * cgraph) {
+    if (!ctx->device_valid) return false;
+    if (m.head_dim != 64) return false;               // IRON MHA hardcode
+    if (m.embed_dim <= 0 || m.embed_dim % 8 != 0) return false;
+    if ((m.num_kv_heads * m.head_dim) % 64 != 0) return false;
+    if (m.num_heads % m.num_kv_heads != 0) return false;
+
+    const int64_t seq_bucket = xdna_select_attention_prefill_bucket(m.seq_len);
+    if (seq_bucket < 0) return false;  // too long, CPU fallback
+
+    std::string cache_key = make_attention_prefill_cache_key(
+        seq_bucket, m.embed_dim, m.num_heads, m.num_kv_heads, m.head_dim);
+
+    if (!ensure_attention_prefill_compiled(ctx, cache_key, seq_bucket,
+                                           m.embed_dim, m.num_heads,
+                                           m.num_kv_heads, m.head_dim)) {
+        return false;
+    }
+
+    xdna_attention_prefill_entry * entry = get_or_load_attention_prefill_kernel(
+        ctx, cache_key, seq_bucket, m.embed_dim, m.num_heads, m.num_kv_heads, m.head_dim);
+    if (!entry) return false;
+
+    const int64_t S      = m.seq_len;
+    const int64_t S_pad  = seq_bucket;       // MHA seq_padding == bucket for our bucket set (all multiples of 64)
+    const int64_t E      = m.embed_dim;
+    const int64_t H      = m.num_heads;
+    const int64_t KV     = m.num_kv_heads;
+    const int64_t d      = m.head_dim;
+    const int64_t H_d    = H * d;
+    const int64_t KV_d   = KV * d;
+    const int64_t xE_pad = S_pad * E;
+    const int64_t qHD_pad = S_pad * H_d;
+    const int64_t kvHD_pad = S_pad * KV_d;
+    const int64_t mha_buf = H * d * S_pad;     // MHA arg_spec buffer_size (shared by Q/K/V/O)
+
+    const size_t bytes_xE     = (size_t)xE_pad    * sizeof(uint16_t);
+    const size_t bytes_qHD    = (size_t)qHD_pad   * sizeof(uint16_t);
+    const size_t bytes_kvHD   = (size_t)kvHD_pad  * sizeof(uint16_t);
+    const size_t bytes_mha    = (size_t)mha_buf   * sizeof(uint16_t);
+    const size_t bytes_angles = (size_t)S_pad * (size_t)d * sizeof(uint16_t);
+    const size_t bytes_actual_xE = (size_t)S * (size_t)E * sizeof(uint16_t);
+
+    try {
+        // Lazily allocate all persistent BOs keyed to the sub-kernels' arg-group IDs.
+        // GEMM:         (A=3, B=4, C=5)   — matches swiglu_warm_weight prefill mapping.
+        // GEMM_Q:       A=x_norm, B=w_q, C=q_proj
+        // GEMM_KV:      A=x_norm, B=w_{k,v}, C={k,v}_proj
+        // GEMM_O:       A=o_perm, B=w_o, C=o_proj
+        // RMS_NORM:     in=3, gain=4, out=5
+        // ROPE:         in=3, angles=4, out=5
+        // STRIDED_COPY: in=3, out=4  (unary elementwise layout op)
+        // MHA:          Q=3, K=4, V=5, O=6
+        // ELTWISE_ADD:  in_a=3, in_b=4, out=5
+        if (!entry->bo_x_in) {
+            entry->bo_x_in = std::make_unique<xrt::bo>(
+                ctx->device, bytes_xE, xrt::bo::flags::host_only,
+                entry->kernels[XDNA_ATTN_RMS_NORM].group_id(3));
+        }
+        if (!entry->bo_x_norm) {
+            entry->bo_x_norm = std::make_unique<xrt::bo>(
+                ctx->device, bytes_xE, xrt::bo::flags::host_only,
+                entry->kernels[XDNA_ATTN_RMS_NORM].group_id(5));
+        }
+        if (!entry->bo_q_proj) {
+            entry->bo_q_proj = std::make_unique<xrt::bo>(
+                ctx->device, bytes_qHD, xrt::bo::flags::host_only,
+                entry->kernels[XDNA_ATTN_GEMM_Q].group_id(5));
+        }
+        if (!entry->bo_k_proj) {
+            entry->bo_k_proj = std::make_unique<xrt::bo>(
+                ctx->device, bytes_kvHD, xrt::bo::flags::host_only,
+                entry->kernels[XDNA_ATTN_GEMM_KV].group_id(5));
+        }
+        if (!entry->bo_v_proj) {
+            entry->bo_v_proj = std::make_unique<xrt::bo>(
+                ctx->device, bytes_kvHD, xrt::bo::flags::host_only,
+                entry->kernels[XDNA_ATTN_GEMM_KV].group_id(5));
+        }
+        if (!entry->bo_q_rope) {
+            entry->bo_q_rope = std::make_unique<xrt::bo>(
+                ctx->device, bytes_qHD, xrt::bo::flags::host_only,
+                entry->kernels[XDNA_ATTN_ROPE_Q].group_id(5));
+        }
+        if (!entry->bo_k_rope) {
+            entry->bo_k_rope = std::make_unique<xrt::bo>(
+                ctx->device, bytes_kvHD, xrt::bo::flags::host_only,
+                entry->kernels[XDNA_ATTN_ROPE_K].group_id(5));
+        }
+        // MHA's Q/K/V/O all want a buffer sized H*d*S_pad even though V/K data
+        // only fills KV*d*S_pad. Size the permuted BOs to the MHA ask.
+        if (!entry->bo_q_perm) {
+            entry->bo_q_perm = std::make_unique<xrt::bo>(
+                ctx->device, bytes_mha, xrt::bo::flags::host_only,
+                entry->kernels[XDNA_ATTN_MHA].group_id(3));
+        }
+        if (!entry->bo_k_perm) {
+            entry->bo_k_perm = std::make_unique<xrt::bo>(
+                ctx->device, bytes_mha, xrt::bo::flags::host_only,
+                entry->kernels[XDNA_ATTN_MHA].group_id(4));
+        }
+        if (!entry->bo_v_perm) {
+            entry->bo_v_perm = std::make_unique<xrt::bo>(
+                ctx->device, bytes_mha, xrt::bo::flags::host_only,
+                entry->kernels[XDNA_ATTN_MHA].group_id(5));
+        }
+        if (!entry->bo_attn_out) {
+            entry->bo_attn_out = std::make_unique<xrt::bo>(
+                ctx->device, bytes_mha, xrt::bo::flags::host_only,
+                entry->kernels[XDNA_ATTN_MHA].group_id(6));
+        }
+        if (!entry->bo_o_perm) {
+            entry->bo_o_perm = std::make_unique<xrt::bo>(
+                ctx->device, bytes_qHD, xrt::bo::flags::host_only,
+                entry->kernels[XDNA_ATTN_PERM_O].group_id(4));
+        }
+        if (!entry->bo_o_proj) {
+            entry->bo_o_proj = std::make_unique<xrt::bo>(
+                ctx->device, bytes_xE, xrt::bo::flags::host_only,
+                entry->kernels[XDNA_ATTN_GEMM_O].group_id(5));
+        }
+        if (!entry->bo_output) {
+            entry->bo_output = std::make_unique<xrt::bo>(
+                ctx->device, bytes_xE, xrt::bo::flags::host_only,
+                entry->kernels[XDNA_ATTN_ADD].group_id(5));
+        }
+        if (!entry->bo_angles) {
+            entry->bo_angles = std::make_unique<xrt::bo>(
+                ctx->device, bytes_angles, xrt::bo::flags::host_only,
+                entry->kernels[XDNA_ATTN_ROPE_Q].group_id(4));
+        }
+
+        // Warm weights (cached by tensor->data pointer — one upload per layer).
+        xrt::bo * gain_bo = nullptr;
+        xrt::bo * wq_bo = nullptr;
+        xrt::bo * wk_bo = nullptr;
+        xrt::bo * wv_bo = nullptr;
+        xrt::bo * wo_bo = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(*entry->weights_mutex);
+            gain_bo = attn_prefill_warm_gain(ctx, entry, m.gain);
+            wq_bo = attn_prefill_warm_gemm_weight(ctx, entry, entry->w_q_bo_cache,
+                                                  m.wq, XDNA_ATTN_GEMM_Q, 4, "w_q");
+            wk_bo = attn_prefill_warm_gemm_weight(ctx, entry, entry->w_k_bo_cache,
+                                                  m.wk, XDNA_ATTN_GEMM_KV, 4, "w_k");
+            wv_bo = attn_prefill_warm_gemm_weight(ctx, entry, entry->w_v_bo_cache,
+                                                  m.wv, XDNA_ATTN_GEMM_KV, 4, "w_v");
+            wo_bo = attn_prefill_warm_gemm_weight(ctx, entry, entry->w_o_bo_cache,
+                                                  m.wo, XDNA_ATTN_GEMM_O, 4, "w_o");
+        }
+        if (!gain_bo || !wq_bo || !wk_bo || !wv_bo || !wo_bo) return false;
+
+        // Precompute RoPE angles for this dispatch's positions.
+        {
+            std::vector<uint16_t> angles(S_pad * d, 0);
+            if (!xdna_compute_rope_angles_bf16(m.q_rope_node,
+                                               S, S_pad, d, angles.data())) {
+                return false;
+            }
+            memcpy(entry->bo_angles->map<void*>(), angles.data(),
+                   angles.size() * sizeof(uint16_t));
+            entry->bo_angles->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        }
+
+        // Upload activation x (= inpL): (S, E) row-major. Zero-pad rows S..S_pad-1.
+        if (S_pad > S) memset(entry->bo_x_in->map<void*>(), 0, bytes_xE);
+        {
+            void * dst_in = entry->bo_x_in->map<void*>();
+            if (m.inpL->type == GGML_TYPE_F32) {
+                f32_to_bf16((const float *)m.inpL->data,
+                            (uint16_t *)dst_in, (size_t)S * (size_t)E);
+            } else if (m.inpL->type == GGML_TYPE_F16) {
+                const uint16_t * src = (const uint16_t *)m.inpL->data;
+                uint16_t * dst = (uint16_t *)dst_in;
+                for (int64_t i = 0; i < S * E; i++) dst[i] = fp16_to_bf16(src[i]);
+            } else {
+                // bf16 — direct memcpy.
+                memcpy(dst_in, m.inpL->data, bytes_actual_xE);
+            }
+            entry->bo_x_in->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        }
+
+        // Build the 13-run runlist (11 distinct kernel slots; gemm_kv fires
+        // twice for K and V, perm_kv fires twice for K and V).
+        const uint32_t i_rms  = (uint32_t)entry->insts_data[XDNA_ATTN_RMS_NORM].size();
+        const uint32_t i_gq   = (uint32_t)entry->insts_data[XDNA_ATTN_GEMM_Q].size();
+        const uint32_t i_gkv  = (uint32_t)entry->insts_data[XDNA_ATTN_GEMM_KV].size();
+        const uint32_t i_rq   = (uint32_t)entry->insts_data[XDNA_ATTN_ROPE_Q].size();
+        const uint32_t i_rk   = (uint32_t)entry->insts_data[XDNA_ATTN_ROPE_K].size();
+        const uint32_t i_pq   = (uint32_t)entry->insts_data[XDNA_ATTN_PERM_Q].size();
+        const uint32_t i_pkv  = (uint32_t)entry->insts_data[XDNA_ATTN_PERM_KV].size();
+        const uint32_t i_mha  = (uint32_t)entry->insts_data[XDNA_ATTN_MHA].size();
+        const uint32_t i_po   = (uint32_t)entry->insts_data[XDNA_ATTN_PERM_O].size();
+        const uint32_t i_go   = (uint32_t)entry->insts_data[XDNA_ATTN_GEMM_O].size();
+        const uint32_t i_add  = (uint32_t)entry->insts_data[XDNA_ATTN_ADD].size();
+
+        xrt::runlist rl(entry->hw_ctx);
+
+        // 1. rms_norm(x_in, gain, x_norm) — arg order: (opcode, insts, isize, in, gain, out)
+        {
+            xrt::run r(entry->kernels[XDNA_ATTN_RMS_NORM]);
+            r.set_arg(0, 3u); r.set_arg(1, entry->insts_bo[XDNA_ATTN_RMS_NORM]); r.set_arg(2, i_rms);
+            r.set_arg(3, *entry->bo_x_in);
+            r.set_arg(4, *gain_bo);
+            r.set_arg(5, *entry->bo_x_norm);
+            rl.add(std::move(r));
+        }
+        // 2. gemm_q(x_norm, w_q, q_proj)
+        {
+            xrt::run r(entry->kernels[XDNA_ATTN_GEMM_Q]);
+            r.set_arg(0, 3u); r.set_arg(1, entry->insts_bo[XDNA_ATTN_GEMM_Q]); r.set_arg(2, i_gq);
+            r.set_arg(3, *entry->bo_x_norm);
+            r.set_arg(4, *wq_bo);
+            r.set_arg(5, *entry->bo_q_proj);
+            rl.add(std::move(r));
+        }
+        // 3. gemm_kv(x_norm, w_k, k_proj)
+        {
+            xrt::run r(entry->kernels[XDNA_ATTN_GEMM_KV]);
+            r.set_arg(0, 3u); r.set_arg(1, entry->insts_bo[XDNA_ATTN_GEMM_KV]); r.set_arg(2, i_gkv);
+            r.set_arg(3, *entry->bo_x_norm);
+            r.set_arg(4, *wk_bo);
+            r.set_arg(5, *entry->bo_k_proj);
+            rl.add(std::move(r));
+        }
+        // 4. gemm_kv(x_norm, w_v, v_proj) — same kernel, different buffers
+        {
+            xrt::run r(entry->kernels[XDNA_ATTN_GEMM_KV]);
+            r.set_arg(0, 3u); r.set_arg(1, entry->insts_bo[XDNA_ATTN_GEMM_KV]); r.set_arg(2, i_gkv);
+            r.set_arg(3, *entry->bo_x_norm);
+            r.set_arg(4, *wv_bo);
+            r.set_arg(5, *entry->bo_v_proj);
+            rl.add(std::move(r));
+        }
+        // 5. rope_q(q_proj, angles, q_rope)
+        {
+            xrt::run r(entry->kernels[XDNA_ATTN_ROPE_Q]);
+            r.set_arg(0, 3u); r.set_arg(1, entry->insts_bo[XDNA_ATTN_ROPE_Q]); r.set_arg(2, i_rq);
+            r.set_arg(3, *entry->bo_q_proj);
+            r.set_arg(4, *entry->bo_angles);
+            r.set_arg(5, *entry->bo_q_rope);
+            rl.add(std::move(r));
+        }
+        // 6. rope_k(k_proj, angles, k_rope)
+        {
+            xrt::run r(entry->kernels[XDNA_ATTN_ROPE_K]);
+            r.set_arg(0, 3u); r.set_arg(1, entry->insts_bo[XDNA_ATTN_ROPE_K]); r.set_arg(2, i_rk);
+            r.set_arg(3, *entry->bo_k_proj);
+            r.set_arg(4, *entry->bo_angles);
+            r.set_arg(5, *entry->bo_k_rope);
+            rl.add(std::move(r));
+        }
+        // 7. perm_q(q_rope, q_perm)
+        {
+            xrt::run r(entry->kernels[XDNA_ATTN_PERM_Q]);
+            r.set_arg(0, 3u); r.set_arg(1, entry->insts_bo[XDNA_ATTN_PERM_Q]); r.set_arg(2, i_pq);
+            r.set_arg(3, *entry->bo_q_rope);
+            r.set_arg(4, *entry->bo_q_perm);
+            rl.add(std::move(r));
+        }
+        // 8. perm_kv(k_rope, k_perm)
+        {
+            xrt::run r(entry->kernels[XDNA_ATTN_PERM_KV]);
+            r.set_arg(0, 3u); r.set_arg(1, entry->insts_bo[XDNA_ATTN_PERM_KV]); r.set_arg(2, i_pkv);
+            r.set_arg(3, *entry->bo_k_rope);
+            r.set_arg(4, *entry->bo_k_perm);
+            rl.add(std::move(r));
+        }
+        // 9. perm_kv(v_proj, v_perm) — V skips RoPE
+        {
+            xrt::run r(entry->kernels[XDNA_ATTN_PERM_KV]);
+            r.set_arg(0, 3u); r.set_arg(1, entry->insts_bo[XDNA_ATTN_PERM_KV]); r.set_arg(2, i_pkv);
+            r.set_arg(3, *entry->bo_v_proj);
+            r.set_arg(4, *entry->bo_v_perm);
+            rl.add(std::move(r));
+        }
+        // 10. mha(q_perm, k_perm, v_perm, attn_out)
+        {
+            xrt::run r(entry->kernels[XDNA_ATTN_MHA]);
+            r.set_arg(0, 3u); r.set_arg(1, entry->insts_bo[XDNA_ATTN_MHA]); r.set_arg(2, i_mha);
+            r.set_arg(3, *entry->bo_q_perm);
+            r.set_arg(4, *entry->bo_k_perm);
+            r.set_arg(5, *entry->bo_v_perm);
+            r.set_arg(6, *entry->bo_attn_out);
+            rl.add(std::move(r));
+        }
+        // 11. perm_o(attn_out, o_perm)
+        {
+            xrt::run r(entry->kernels[XDNA_ATTN_PERM_O]);
+            r.set_arg(0, 3u); r.set_arg(1, entry->insts_bo[XDNA_ATTN_PERM_O]); r.set_arg(2, i_po);
+            r.set_arg(3, *entry->bo_attn_out);
+            r.set_arg(4, *entry->bo_o_perm);
+            rl.add(std::move(r));
+        }
+        // 12. gemm_o(o_perm, w_o, o_proj)
+        {
+            xrt::run r(entry->kernels[XDNA_ATTN_GEMM_O]);
+            r.set_arg(0, 3u); r.set_arg(1, entry->insts_bo[XDNA_ATTN_GEMM_O]); r.set_arg(2, i_go);
+            r.set_arg(3, *entry->bo_o_perm);
+            r.set_arg(4, *wo_bo);
+            r.set_arg(5, *entry->bo_o_proj);
+            rl.add(std::move(r));
+        }
+        // 13. add(o_proj, x_in, output) — residual
+        {
+            xrt::run r(entry->kernels[XDNA_ATTN_ADD]);
+            r.set_arg(0, 3u); r.set_arg(1, entry->insts_bo[XDNA_ATTN_ADD]); r.set_arg(2, i_add);
+            r.set_arg(3, *entry->bo_o_proj);
+            r.set_arg(4, *entry->bo_x_in);
+            r.set_arg(5, *entry->bo_output);
+            rl.add(std::move(r));
+        }
+
+        rl.execute();
+        rl.wait();
+
+        // Pull final output back. Write into cgraph->nodes[residual_add_idx]->data
+        // (the residual ADD tensor the matcher anchored on).
+        entry->bo_output->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        struct ggml_tensor * dst = cgraph->nodes[m.residual_add_idx];
+        const size_t actual_elems = (size_t)S * (size_t)E;
+        if (dst->type == GGML_TYPE_F32) {
+            bf16_to_f32((const uint16_t *)entry->bo_output->map<void*>(),
+                        (float *)dst->data, actual_elems);
+        } else if (dst->type == GGML_TYPE_BF16) {
+            memcpy(dst->data, entry->bo_output->map<void*>(),
+                   actual_elems * sizeof(uint16_t));
+        } else {
+            GGML_LOG_ERROR("ggml-xdna: attn-prefill unsupported dst dtype %d\n",
+                           (int)dst->type);
+            return false;
+        }
+        return true;
+
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("ggml-xdna: attention-prefill dispatch failed (%s)\n", e.what());
+        return false;
+    }
+}
+
+// ============================================================================
+// RMSNorm dispatch — standalone single-kernel op. Opt-in via XDNA_ENABLE_RMS_NORM.
+// ============================================================================
+
+// Human-readable cache key for standalone RMSNorm. The Python bridge's
+// rms_norm_cache_key() hashes a JSON blob for its own cache layer, but the
+// C++ path always drives compilation through ensure_rms_norm_compiled() with
+// an explicit --out <bundle_dir>, so both sides agree on layout regardless of
+// the scheme here. Readable names make the on-disk cache easier to audit.
+static std::string make_rms_norm_cache_key(int64_t size, const char * dtype,
+                                           int num_cols, int num_channels,
+                                           int tile_size, bool weighted) {
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+             "rms_norm_S%ld_%s_%dc%dch_t%d%s",
+             (long)size, dtype, num_cols, num_channels, tile_size,
+             weighted ? "_w" : "");
+    return std::string(buf);
+}
+
+// Select (num_cols, num_channels) such that size is divisible by the
+// per-core tile footprint. Prefer more cores (wider AIE utilization); fall
+// back on the divisibility constraint. Returns true on success.
+static bool xdna_select_rms_norm_params(int64_t size, int max_cols,
+                                        int * out_cols, int * out_channels,
+                                        int * out_tile_size) {
+    const int tile_size = 32;  // matches the bridge default and IRON test grid
+    // Try widest column counts first, then fall back. Prefer 2 channels when
+    // feasible (2 compute tiles per column = more parallelism), else 1.
+    for (int cols : {max_cols, 4, 2, 1}) {
+        if (cols < 1 || cols > max_cols) continue;
+        for (int ch : {2, 1}) {
+            if ((int64_t)cols * ch * tile_size == 0) continue;
+            if (size % ((int64_t)cols * ch * tile_size) != 0) continue;
+            *out_cols       = cols;
+            *out_channels   = ch;
+            *out_tile_size  = tile_size;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool rms_norm_bundle_present(const std::string & bundle_dir) {
+    std::ifstream xf(bundle_dir + "/combined.xclbin");
+    if (!xf.good()) return false;
+    std::ifstream f(bundle_dir + "/rms_norm_main.insts");
+    return f.good();
+}
+
+static bool ensure_rms_norm_compiled(ggml_backend_xdna_context * ctx,
+                                     const std::string & cache_key,
+                                     int64_t size, int num_cols,
+                                     int num_channels, int tile_size,
+                                     bool weighted) {
+    const std::string bundle_dir = ctx->cache_dir + "/" + cache_key;
+
+    if (rms_norm_bundle_present(bundle_dir)) {
+        return true;
+    }
+
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd),
+             "python3 %s rms_norm --size %ld --dtype bf16 "
+             "--num-aie-columns %d --num-channels %d --tile-size %d%s "
+             "--out %s 2>&1",
+             ctx->compile_script.c_str(),
+             (long)size, num_cols, num_channels, tile_size,
+             weighted ? " --weighted" : "",
+             bundle_dir.c_str());
+    GGML_LOG_INFO("ggml-xdna: compiling RMSNorm size=%ld cols=%d ch=%d tile=%d "
+                  "(first run, will be cached)...\n",
+                  (long)size, num_cols, num_channels, tile_size);
+
+    int ret = system(cmd);
+    if (ret != 0) {
+        GGML_LOG_ERROR("ggml-xdna: RMSNorm compilation failed (exit code %d)\n", ret);
+        return false;
+    }
+
+    if (!rms_norm_bundle_present(bundle_dir)) {
+        GGML_LOG_ERROR("ggml-xdna: RMSNorm compilation succeeded but bundle "
+                       "files missing in %s\n", bundle_dir.c_str());
+        return false;
+    }
+
+    GGML_LOG_INFO("ggml-xdna: RMSNorm compilation complete, cached at %s\n",
+                  bundle_dir.c_str());
+    return true;
+}
+
+static xdna_rms_norm_entry * get_or_load_rms_norm_kernel(
+        ggml_backend_xdna_context * ctx,
+        const std::string & cache_key,
+        int64_t size, int num_cols, int num_channels, int tile_size) {
+    std::lock_guard<std::mutex> lock(ctx->cache_mutex);
+
+    auto it = ctx->rms_norm_cache.find(cache_key);
+    if (it != ctx->rms_norm_cache.end()) {
+        return &it->second;
+    }
+
+    const std::string bundle_dir = ctx->cache_dir + "/" + cache_key;
+    const std::string xclbin_path = bundle_dir + "/combined.xclbin";
+    const std::string insts_path  = bundle_dir + "/rms_norm_main.insts";
+
+    try {
+        xdna_rms_norm_entry entry;
+        entry.cache_key    = cache_key;
+        entry.size         = size;
+        entry.num_cols     = num_cols;
+        entry.num_channels = num_channels;
+        entry.tile_size    = tile_size;
+
+        entry.xclbin = xrt::xclbin(xclbin_path);
+        ctx->device.register_xclbin(entry.xclbin);
+        auto uuid = entry.xclbin.get_uuid();
+        entry.hw_ctx = xrt::hw_context(ctx->device, uuid);
+
+        entry.kernel = xrt::kernel(entry.hw_ctx, "MLIR_AIE");
+
+        entry.insts = read_binary_file(insts_path);
+        if (entry.insts.empty()) {
+            GGML_LOG_ERROR("ggml-xdna: failed to read RMSNorm insts file: %s\n",
+                           insts_path.c_str());
+            return nullptr;
+        }
+        entry.insts_bo = xrt::bo(ctx->device, entry.insts.size(),
+                                 xrt::bo::flags::cacheable,
+                                 entry.kernel.group_id(1));
+        entry.insts_bo.write(entry.insts.data());
+        entry.insts_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+        auto [inserted_it, _] = ctx->rms_norm_cache.emplace(cache_key, std::move(entry));
+        GGML_LOG_INFO("ggml-xdna: loaded RMSNorm kernel for %s\n", cache_key.c_str());
+        return &inserted_it->second;
+
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("ggml-xdna: failed to load RMSNorm kernel %s: %s\n",
+                       cache_key.c_str(), e.what());
+        return nullptr;
+    }
+}
+
+// Dispatch a single GGML_OP_RMS_NORM node to the NPU. Returns true on success,
+// false on any fallback condition (gate off, unsupported shape/dtype, eps
+// mismatch, XRT failure). Caller must fall the node into the CPU accumulator
+// when this returns false.
+static bool ggml_backend_xdna_rms_norm(ggml_backend_xdna_context * ctx,
+                                       struct ggml_tensor * node) {
+    static const bool rms_enabled = getenv("XDNA_ENABLE_RMS_NORM") != NULL;
+    if (!rms_enabled) return false;
+    if (!ctx->device_valid) return false;
+    if (node->op != GGML_OP_RMS_NORM) return false;
+
+    const struct ggml_tensor * src = node->src[0];
+    if (src == nullptr) return false;
+    if (!ggml_is_contiguous(src)) return false;
+    if (!ggml_is_contiguous(node)) return false;
+
+    // Only f32 or bf16 supported on the activation side. Weight src[1] (which
+    // ggml uses for RMSNormWeighted) isn't wired in yet.
+    if (src->type != GGML_TYPE_F32 && src->type != GGML_TYPE_BF16) return false;
+    if (node->type != GGML_TYPE_F32 && node->type != GGML_TYPE_BF16) return false;
+
+    // Epsilon is baked into the AIE kernel at 1e-5. For typical activations
+    // with mean(x^2) ~ O(1), the difference between 1e-6 and 1e-4 changes
+    // inv_rms by < 1e-4, well below bf16's quantization noise. Widened
+    // tolerance so Qwen/Llama-family models (eps in {1e-6, 1e-5}) both
+    // dispatch. Reject only pathologically large eps that would materially
+    // change the normalization.
+    float eps = 0.0f;
+    std::memcpy(&eps, node->op_params, sizeof(float));
+    if (!(eps >= 1e-7f && eps <= 1e-4f)) {
+        static const bool dbg = getenv("XDNA_DEBUG") != NULL;
+        if (dbg) {
+            fprintf(stderr, "ggml-xdna: rms_norm reject: eps=%.3e outside "
+                            "[1e-7, 1e-4] (kernel hardcodes 1e-5)\n", (double)eps);
+        }
+        return false;
+    }
+
+    const int64_t size  = src->ne[0];
+    const int64_t nrows = src->ne[1] * src->ne[2] * src->ne[3];
+    if (size <= 0 || nrows <= 0) return false;
+
+    int num_cols = 0, num_channels = 0, tile_size = 0;
+    // NPU1 = 4 cols, NPU2 = 8 cols. Use the same "8 first, fall back to 4"
+    // strategy other paths follow. The selector rejects configs that don't
+    // divide; xrt::device.cols isn't exposed cleanly through the C++ API so
+    // we try both and let the divisibility check decide.
+    const int device_max_cols = 8;
+    if (!xdna_select_rms_norm_params(size, device_max_cols,
+                                     &num_cols, &num_channels, &tile_size)) {
+        static const bool dbg = getenv("XDNA_DEBUG") != NULL;
+        if (dbg) {
+            fprintf(stderr, "ggml-xdna: rms_norm reject: no (cols,channels,"
+                            "tile) divides size=%ld\n", (long)size);
+        }
+        return false;
+    }
+
+    const std::string cache_key = make_rms_norm_cache_key(
+        size, "bf16", num_cols, num_channels, tile_size, /*weighted=*/false);
+
+    if (!ensure_rms_norm_compiled(ctx, cache_key, size, num_cols, num_channels,
+                                  tile_size, /*weighted=*/false)) {
+        return false;
+    }
+
+    xdna_rms_norm_entry * entry = get_or_load_rms_norm_kernel(
+        ctx, cache_key, size, num_cols, num_channels, tile_size);
+    if (!entry) return false;
+
+    try {
+        const size_t elem_bytes = sizeof(uint16_t);  // bf16 on the NPU
+        const size_t row_elems  = (size_t)size;
+        const size_t row_bytes  = row_elems * elem_bytes;
+
+        // Lazily allocate persistent input/output BOs sized for one row. Rows
+        // are processed one at a time — RMSNorm is per-row and the AIE
+        // dataflow is shaped for a single (size,) vector per invocation.
+        if (!entry->in_bo) {
+            entry->in_bo = std::make_unique<xrt::bo>(
+                ctx->device, row_bytes, xrt::bo::flags::host_only,
+                entry->kernel.group_id(3));
+        }
+        if (!entry->out_bo) {
+            entry->out_bo = std::make_unique<xrt::bo>(
+                ctx->device, row_bytes, xrt::bo::flags::host_only,
+                entry->kernel.group_id(4));
+        }
+
+        uint16_t * in_map  = entry->in_bo->map<uint16_t *>();
+        uint16_t * out_map = entry->out_bo->map<uint16_t *>();
+
+        for (int64_t r = 0; r < nrows; r++) {
+            const char * src_row = (const char *)src->data + (size_t)r * src->nb[1];
+            char * dst_row       = (char *)node->data + (size_t)r * node->nb[1];
+
+            if (src->type == GGML_TYPE_F32) {
+                f32_to_bf16((const float *)src_row, in_map, row_elems);
+            } else {
+                std::memcpy(in_map, src_row, row_bytes);
+            }
+            entry->in_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+            auto run = entry->kernel(3, entry->insts_bo,
+                                     (uint32_t)entry->insts.size(),
+                                     *entry->in_bo, *entry->out_bo);
+            run.wait();
+
+            entry->out_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+
+            if (node->type == GGML_TYPE_F32) {
+                bf16_to_f32(out_map, (float *)dst_row, row_elems);
+            } else {
+                std::memcpy(dst_row, out_map, row_bytes);
+            }
+        }
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("ggml-xdna: RMSNorm XRT dispatch failed (%s)\n", e.what());
+        return false;
+    }
+
+    static const bool dbg = getenv("XDNA_DEBUG") != NULL;
+    if (dbg) {
+        fprintf(stderr, "ggml-xdna: rms_norm dispatch ok size=%ld nrows=%ld "
+                        "cols=%d channels=%d tile=%d\n",
+                (long)size, (long)nrows, num_cols, num_channels, tile_size);
+    }
+    return true;
+}
+
+// ============================================================================
 // Backend interface
 // ============================================================================
 
@@ -3618,9 +5153,11 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
     int n = cgraph->n_nodes;
 
     static const bool debug = getenv("XDNA_DEBUG") != NULL;
+    static const bool attention_prefill_dbg_enabled = getenv("XDNA_ENABLE_ATTENTION_PREFILL") != NULL;
     if (debug) {
         int n_mulmat = 0, n_mulmat_disp = 0;
         int n_glu = 0, n_glu_swiglu = 0, n_swiglu_window = 0, n_swiglu_match = 0;
+        int n_attn_window = 0, n_attn_match = 0;
         for (int i = 0; i < n; i++) {
             struct ggml_tensor * node = cgraph->nodes[i];
             if (node->op == GGML_OP_MUL_MAT) {
@@ -3642,12 +5179,22 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                     if (xdna_try_match_swiglu(cgraph, i, &m)) n_swiglu_match++;
                 }
             }
+            // Attention-prefill window: each RMS_NORM is a candidate start.
+            // Count both the window count (pattern anchors scanned) and
+            // full matches that walked through to the residual ADD.
+            if (attention_prefill_dbg_enabled && node->op == GGML_OP_RMS_NORM) {
+                n_attn_window++;
+                xdna_attention_match am{};
+                if (xdna_try_match_attention_prefill(cgraph, i, &am)) n_attn_match++;
+            }
         }
         fprintf(stderr,
                 "ggml-xdna: graph_compute n_nodes=%d mul_mat=%d npu_dispatchable=%d "
-                "glu=%d swiglu=%d swiglu_window=%d swiglu_match=%d\n",
+                "glu=%d swiglu=%d swiglu_window=%d swiglu_match=%d "
+                "attn_window=%d attn_match=%d\n",
                 n, n_mulmat, n_mulmat_disp,
-                n_glu, n_glu_swiglu, n_swiglu_window, n_swiglu_match);
+                n_glu, n_glu_swiglu, n_swiglu_window, n_swiglu_match,
+                n_attn_window, n_attn_match);
         fflush(stderr);
     }
 
@@ -3658,6 +5205,8 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
     // in-range preserves sched invariants).
     static const bool swiglu_enabled = getenv("XDNA_ENABLE_SWIGLU") != NULL;
     static const bool qkv_enabled    = getenv("XDNA_ENABLE_QKV")    != NULL;
+    static const bool rms_norm_enabled = getenv("XDNA_ENABLE_RMS_NORM") != NULL;
+    static const bool attention_prefill_enabled = getenv("XDNA_ENABLE_ATTENTION_PREFILL") != NULL;
 
     // Pre-scan for QKV triples. Llama.cpp's Qwen3.5 decode interleaves
     // RMSNorm/view ops between Q and K/V MUL_MATs, so a 3-consecutive-node
@@ -3712,12 +5261,274 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
             }
         }
 
+        // Attention-prefill matcher (Phase A — scaffolding). We only log on
+        // match and then fall through: the matched nodes continue to CPU via
+        // the normal per-node loop / CPU accumulator. Dispatch is intentionally
+        // deferred to Phase B. This keeps the model producing correct output
+        // while we prove the matcher fires reliably on real graphs.
+        if (attention_prefill_enabled && node->op == GGML_OP_RMS_NORM) {
+            xdna_attention_match am{};
+            if (xdna_try_match_attention_prefill(cgraph, i, &am) && am.seq_len >= 256) {
+                static const bool ap_dbg = getenv("XDNA_DEBUG") != NULL;
+                if (ap_dbg) {
+                    fprintf(stderr,
+                        "ggml-xdna: attention_prefill matched @%d..%d "
+                        "(seq=%ld embed=%ld H=%ld KV=%ld d=%ld) "
+                        "rms=%d mul=%d Q=%d K=%d V=%d qrope=%d krope=%d fa=%d O=%d add=%d\n",
+                        am.rms_norm_idx, am.residual_add_idx,
+                        (long)am.seq_len, (long)am.embed_dim,
+                        (long)am.num_heads, (long)am.num_kv_heads,
+                        (long)am.head_dim,
+                        am.rms_norm_idx, am.attn_norm_mul_idx,
+                        am.q_proj_idx, am.k_proj_idx, am.v_proj_idx,
+                        am.q_rope_idx, am.k_rope_idx,
+                        am.attn_core_idx, am.o_proj_idx, am.residual_add_idx);
+                    fflush(stderr);
+                }
+                // Phase C: skip the redundant compute-only CPU work. The
+                // matched range [rms_norm_idx..residual_add_idx] contains
+                // ~24 nodes; the NPU dispatch reproduces the EXPENSIVE work
+                // (Q_MM, Q_ROPE, FLASH_ATTN_EXT, O_MM, residual ADD) and
+                // writes the post-residual output directly into
+                // cgraph->nodes[residual_add_idx]->data. The remaining
+                // CPU-side responsibility is the SET_ROWS / CPY nodes that
+                // write K_rope / V into the KV cache for future decode steps,
+                // plus their true dependencies (RMS_NORM, gain MUL,
+                // K_MM, V_MM, K_ROPE, plus view/reshape glue).
+                //
+                // We build a sub-graph of just the side-effect nodes and let
+                // ggml_build_forward_expand pull in deps transitively. The
+                // sub-graph lives in a temporary ggml_context whose nodes
+                // are POINTERS into the main cgraph (no_alloc=true). This is
+                // the same pattern xdna_delegate_range uses via
+                // ggml_graph_view, generalized to non-contiguous selection.
+                //
+                // Safety net: env var XDNA_ATTN_PREFILL_FULL_CPU=1 falls
+                // back to Phase B's full-range CPU delegation. Also: if the
+                // matched range contains an unexpected op (something not
+                // VIEW/RESHAPE/CONT/PERMUTE/TRANSPOSE/MUL_MAT/RMS_NORM/NORM/
+                // MUL/ROPE/FLASH_ATTN_EXT/ADD/SET_ROWS/CPY/DUP), we
+                // conservatively fall back to full-range CPU.
+                static const bool skip_dispatch =
+                    getenv("XDNA_ATTN_PREFILL_SKIP_DISPATCH") != NULL;
+                static const bool force_full_cpu =
+                    getenv("XDNA_ATTN_PREFILL_FULL_CPU") != NULL;
+
+                // Op-set whitelist scan over the matched range. Anything
+                // outside this set means we don't understand the block well
+                // enough to drop nodes safely — fall back to full CPU.
+                bool unknown_op_in_range = false;
+                int total_in_range = am.residual_add_idx - am.rms_norm_idx + 1;
+                int side_effect_count = 0;
+                for (int j = am.rms_norm_idx; j <= am.residual_add_idx; j++) {
+                    enum ggml_op op = cgraph->nodes[j]->op;
+                    switch (op) {
+                        case GGML_OP_VIEW:
+                        case GGML_OP_RESHAPE:
+                        case GGML_OP_CONT:
+                        case GGML_OP_PERMUTE:
+                        case GGML_OP_TRANSPOSE:
+                        case GGML_OP_MUL_MAT:
+                        case GGML_OP_RMS_NORM:
+                        case GGML_OP_NORM:
+                        case GGML_OP_MUL:
+                        case GGML_OP_ROPE:
+                        case GGML_OP_FLASH_ATTN_EXT:
+                        case GGML_OP_ADD:
+                            break;
+                        case GGML_OP_SET_ROWS:
+                        case GGML_OP_CPY:
+                        case GGML_OP_DUP:
+                            side_effect_count++;
+                            break;
+                        default:
+                            unknown_op_in_range = true;
+                            break;
+                    }
+                    if (unknown_op_in_range) break;
+                }
+
+                const bool use_phase_c = !force_full_cpu && !unknown_op_in_range
+                                         && side_effect_count > 0;
+
+                if (!use_phase_c) {
+                    // Phase B fallback: run the full matched range on CPU,
+                    // then NPU overwrites the residual-ADD output. Correct
+                    // but slow (double compute).
+                    if (ap_dbg) {
+                        const char * why =
+                            force_full_cpu      ? "force_full_cpu" :
+                            unknown_op_in_range ? "unknown_op"    :
+                                                  "no_side_effects";
+                        fprintf(stderr,
+                            "ggml-xdna: attn-prefill PhaseB fallback @%d..%d (%s)\n",
+                            am.rms_norm_idx, am.residual_add_idx, why);
+                        fflush(stderr);
+                    }
+                    if (cpu_run_start < 0) cpu_run_start = i;
+                    ggml_status s = xdna_delegate_range(ctx, cgraph,
+                                                       cpu_run_start,
+                                                       am.residual_add_idx + 1);
+                    if (s != GGML_STATUS_SUCCESS) return s;
+                    cpu_run_start = -1;
+                } else {
+                    // Phase C: flush CPU accumulator for nodes BEFORE the
+                    // matched range, then run only the side-effect sub-graph.
+                    if (cpu_run_start >= 0) {
+                        ggml_status s = xdna_delegate_range(ctx, cgraph,
+                                                           cpu_run_start, i);
+                        if (s != GGML_STATUS_SUCCESS) return s;
+                        cpu_run_start = -1;
+                    }
+                    // Build a temporary cgraph holding pointers to nodes from
+                    // the matched range only. We DO NOT call
+                    // ggml_build_forward_expand — that walks parents
+                    // transitively and would pull in the entire prior-layer
+                    // chain (inpL → previous residual → ... → embeddings),
+                    // which both blows past the cap and would re-execute prior
+                    // layers, corrupting the residual stream.
+                    //
+                    // Instead: manually append every node in
+                    // [rms_norm_idx, residual_add_idx] EXCEPT the ones the NPU
+                    // dispatch reproduces (Q_MM, Q_ROPE, FLASH_ATTN_EXT, O_MM,
+                    // residual ADD). All true dependencies for the K/V
+                    // side-effects (RMS_NORM, gain MUL, K_MM, V_MM, K_ROPE)
+                    // live within this range and execute in original topo
+                    // order. View/reshape/cont/cpy glue is harmless to run on
+                    // already-computed tensors.
+                    //
+                    // Manual append safety: ggml_new_graph_custom allocates
+                    // cgraph->nodes as a plain ggml_tensor** array sized to
+                    // `cap`, with n_nodes=0. Direct write +n_nodes++ matches
+                    // the ggml_graph_view pattern (which sets n_nodes without
+                    // populating hash_set / use_counts and is consumed
+                    // directly by CPU backend graph_compute). No ref counting,
+                    // no leafs, no hash bookkeeping required for execution.
+                    const size_t graph_cap = 256;  // ~24 nodes typical, headroom
+                    struct ggml_init_params p = {
+                        /*.mem_size   =*/ ggml_tensor_overhead() * graph_cap +
+                                          ggml_graph_overhead_custom(graph_cap, false),
+                        /*.mem_buffer =*/ nullptr,
+                        /*.no_alloc   =*/ true,
+                    };
+                    struct ggml_context * sub_ctx = ggml_init(p);
+                    if (sub_ctx == nullptr) {
+                        // OOM on the tiny scratch ctx — extremely unlikely.
+                        // Fall back to Phase B.
+                        if (ap_dbg) {
+                            fprintf(stderr,
+                                "ggml-xdna: attn-prefill ggml_init failed @%d..%d, "
+                                "falling back to Phase B\n",
+                                am.rms_norm_idx, am.residual_add_idx);
+                            fflush(stderr);
+                        }
+                        ggml_status s = xdna_delegate_range(ctx, cgraph, i,
+                                                           am.residual_add_idx + 1);
+                        if (s != GGML_STATUS_SUCCESS) return s;
+                    } else {
+                        struct ggml_cgraph * sub = ggml_new_graph_custom(
+                            sub_ctx, graph_cap, false);
+                        // Indices the NPU dispatch reproduces — must NOT be
+                        // re-executed on CPU.
+                        const int npu_skip[] = {
+                            am.q_proj_idx,
+                            am.q_rope_idx,
+                            am.attn_core_idx,
+                            am.o_proj_idx,
+                            am.residual_add_idx,
+                        };
+                        auto is_npu_skipped = [&](int j) -> bool {
+                            for (int k = 0; k < (int)(sizeof(npu_skip)/sizeof(npu_skip[0])); k++) {
+                                if (npu_skip[k] == j) return true;
+                            }
+                            return false;
+                        };
+                        for (int j = am.rms_norm_idx; j <= am.residual_add_idx; j++) {
+                            if (is_npu_skipped(j)) continue;
+                            // Bounds check defensive — graph_cap=256 >> 24.
+                            if (sub->n_nodes >= (int)sub->size) break;
+                            sub->nodes[sub->n_nodes++] = cgraph->nodes[j];
+                        }
+                        const int sub_n = ggml_graph_n_nodes(sub);
+                        if (ap_dbg) {
+                            fprintf(stderr,
+                                "ggml-xdna: attn-prefill PhaseC @%d..%d "
+                                "(side_effects=%d sub_nodes=%d total_in_range=%d "
+                                "npu_skipped=%d)\n",
+                                am.rms_norm_idx, am.residual_add_idx,
+                                side_effect_count, sub_n, total_in_range,
+                                total_in_range - sub_n);
+                            fflush(stderr);
+                        }
+                        if (sub_n > 0) {
+                            ggml_status s = ggml_backend_graph_compute(
+                                ctx->cpu_backend, sub);
+                            if (s != GGML_STATUS_SUCCESS) {
+                                ggml_free(sub_ctx);
+                                return s;
+                            }
+                        }
+                        ggml_free(sub_ctx);
+                    }
+                }
+
+                // NPU dispatch — overwrites residual_add_idx output.
+                if (skip_dispatch) {
+                    i = am.residual_add_idx;
+                    continue;
+                }
+                if (!ggml_backend_xdna_attention_prefill(ctx, am, cgraph)) {
+                    // Dispatch failed. In Phase B the CPU output covers us;
+                    // in Phase C we skipped the compute, so the residual
+                    // tensor data is stale. Recover by running the full
+                    // range on CPU now.
+                    if (ap_dbg) {
+                        fprintf(stderr,
+                            "ggml-xdna: attn-prefill dispatch failed @%d..%d, "
+                            "running full range on CPU as recovery\n",
+                            am.rms_norm_idx, am.residual_add_idx);
+                        fflush(stderr);
+                    }
+                    if (use_phase_c) {
+                        ggml_status s = xdna_delegate_range(ctx, cgraph,
+                                                           am.rms_norm_idx,
+                                                           am.residual_add_idx + 1);
+                        if (s != GGML_STATUS_SUCCESS) return s;
+                    }
+                }
+                i = am.residual_add_idx;  // for-loop ++i lands on next node
+                continue;
+            }
+        }
+
         // First try the fused SwiGLU pattern — matches node[i..i+3] as a
         // gate/up MUL_MAT + SwiGLU GLU + down MUL_MAT chain and collapses
         // it to a single chained-xclbin dispatch.
         if (swiglu_enabled) {
             xdna_swiglu_match m{};
             if (xdna_try_match_swiglu(cgraph, i, &m)) {
+                // Before committing to dispatch, check tile-dispatchability for
+                // paths that don't pad M. INT8 prefill requires M % 64 == 0
+                // (tile_m >= 16 → M % (tile_m*4) == 0). Partial micro-batches
+                // from llama.cpp's prefill tail (e.g. M=46 for a 1500-token
+                // prompt at -ub 256) cannot tile and must fall through to
+                // the normal per-node loop so they reach CPU cleanly. Without
+                // this gate, INT8 compile fails mid-dispatch and the pattern's
+                // 4 nodes produce uninitialized output.
+                bool can_dispatch = true;
+                if (m.is_int8) {
+                    const int64_t M_match = m.input->ne[1];
+                    if (M_match > 1 && M_match % 64 != 0) can_dispatch = false;
+                }
+                if (!can_dispatch) {
+                    // Not consumed — let normal dispatch + CPU accumulator handle these.
+                    if (cpu_run_start < 0) cpu_run_start = i;
+                    // Do not advance i here; the for-loop ++i + per-node logic
+                    // will process each of the 4 match nodes. Falls through to
+                    // the CPU accumulator because individual Q8_0 matmuls /
+                    // GLU are not xdna_node_npu_dispatchable.
+                    continue;
+                }
                 if (cpu_run_start >= 0) {
                     ggml_status s = xdna_delegate_range(ctx, cgraph, cpu_run_start, i);
                     if (s != GGML_STATUS_SUCCESS) return s;
@@ -3756,6 +5567,24 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                 i += 3;  // for-loop ++i then lands on the node after down_mm
                 continue;
             }
+        }
+
+        // Standalone RMSNorm dispatch (opt-in via XDNA_ENABLE_RMS_NORM=1).
+        // ggml_backend_xdna_rms_norm() itself gates on the env var and the
+        // node shape/dtype/eps; on any rejection it returns false and the node
+        // accumulates into the next CPU-delegated range.
+        if (rms_norm_enabled && node->op == GGML_OP_RMS_NORM) {
+            if (cpu_run_start >= 0) {
+                ggml_status s = xdna_delegate_range(ctx, cgraph, cpu_run_start, i);
+                if (s != GGML_STATUS_SUCCESS) return s;
+                cpu_run_start = -1;
+            }
+            if (ggml_backend_xdna_rms_norm(ctx, node)) {
+                continue;
+            }
+            // Dispatch rejected the node — fall it into the CPU accumulator.
+            if (cpu_run_start < 0) cpu_run_start = i;
+            continue;
         }
 
         if (xdna_node_npu_dispatchable(node)) {
@@ -4015,8 +5844,13 @@ static ggml_backend_buffer_t ggml_backend_xdna_device_buffer_from_host_ptr(ggml_
 }
 
 // NPU dispatchability: returns true only if the shape tiles cleanly on the NPU.
-// Kernel invariant (aie_kernels/aie2p/mm.cc): 4x8x8 bf16_f32 MAC has r=4, so
-// tile_m % (2*r) == 0 → tile_m >= 8 and divisible by 8. Minimum M = tile_m * 4 = 32.
+// Kernel invariants (aie_kernels/aie2p/mm.cc bf16_f32 4x8x8 MAC):
+//   r=4 → tile_m % (2*r) == 0  → tile_m >= 8,  M = tile_m*4 so min M = 32.
+//   t=8 → tile_n % (2*t) == 0  → tile_n >= 16, N = tile_n*cols so min N = 16*cols.
+// aie2 4x8x4 bf16 has equivalent t=4, n%(4*t)==0 → same tile_n >= 16 floor.
+// Small-N matmuls (e.g. hybrid-architecture SSM projections at N<128) fail
+// these constraints and must stay on CPU; without this gate, dispatch picks
+// tile_n=8 and aiecc's clang static_asserts on the MAC kernel.
 // Cap N at 32768 to skip vocab projection (248320) — aiecc BD overflow at
 // N-tiles per shim >~485 (248320 = 2^9*5*97, can't tile friendlier without
 // N-chunking in the backend).
@@ -4025,11 +5859,11 @@ static bool xdna_shape_dispatchable(int64_t M, int64_t K, int64_t N) {
     const int num_cols = 4;
     const int64_t tiles_m[] = {64, 32, 16, 8};
     const int64_t tiles_k[] = {64, 32, 16, 8};
-    const int64_t tiles_n[] = {64, 32, 16, 8};
+    const int64_t tiles_n[] = {64, 32, 16};   // min tile_n=16 for bf16 (both aie2/aie2p)
     bool m_ok = false, k_ok = false, n_ok = false;
     for (int i = 0; i < 4 && !m_ok; i++) if (M % (tiles_m[i] * 4)        == 0) m_ok = true;
     for (int i = 0; i < 4 && !k_ok; i++) if (K %  tiles_k[i]             == 0) k_ok = true;
-    for (int i = 0; i < 4 && !n_ok; i++) if (N % (tiles_n[i] * num_cols) == 0) n_ok = true;
+    for (int i = 0; i < 3 && !n_ok; i++) if (N % (tiles_n[i] * num_cols) == 0) n_ok = true;
     return m_ok && k_ok && n_ok;
 }
 
@@ -4149,12 +5983,17 @@ static bool ggml_backend_xdna_device_supports_buft(ggml_backend_dev_t dev, ggml_
 // Ops still come to us (we own weight buffers), but this tells the scheduler
 // that for shapes where we'd just fall back to CPU, there's no speed win.
 static bool ggml_backend_xdna_device_offload_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
-    // QKV fusion mode: be aggressive about keeping ops here so Q/K/V and the
-    // intermediate norm/view/rope ops between them land in the same graph
-    // segment. Without this, the scheduler splits between Q and K on every
-    // CPU-bound intermediate and we only ever see 1 MUL_MAT per cgraph.
-    static const bool qkv_enabled = getenv("XDNA_ENABLE_QKV") != NULL;
-    if (qkv_enabled) {
+    // QKV fusion mode (also used for attention-prefill Phase A matcher
+    // scaffolding): be aggressive about keeping ops here so the whole
+    // transformer attention block (RMSNorm → Q/K/V → RoPE → FlashAttn → O →
+    // residual add) lands in a single graph segment. Without this, the
+    // scheduler splits at every CPU-bound intermediate (VIEW/RESHAPE/NORM/
+    // RoPE/FLASH_ATTN_EXT) and multi-node patterns never form. The claimed
+    // op list is identical whether QKV or attention-prefill is enabled —
+    // the matcher in graph_compute decides which pattern to fire.
+    static const bool qkv_enabled                 = getenv("XDNA_ENABLE_QKV") != NULL;
+    static const bool attention_prefill_enabled   = getenv("XDNA_ENABLE_ATTENTION_PREFILL") != NULL;
+    if (qkv_enabled || attention_prefill_enabled) {
         switch (op->op) {
             case GGML_OP_MUL_MAT: {
                 const int64_t K = op->src[0]->ne[0];
@@ -4168,10 +6007,11 @@ static bool ggml_backend_xdna_device_offload_op(ggml_backend_dev_t dev, const st
                 }
                 return xdna_shape_dispatchable(M, K, N);
             }
-            // Intermediate ops between Q/K/V — keep them here so the scheduler
-            // doesn't split. graph_compute's CPU fallback delegates them via
-            // xdna_delegate_range (same cost as leaving on CPU, minus the
-            // cross-backend sched overhead we'd otherwise incur per split).
+            // Intermediate ops between Q/K/V and around the attention core —
+            // keep them here so the scheduler doesn't split. graph_compute's
+            // CPU fallback delegates them via xdna_delegate_range (same cost
+            // as leaving on CPU, minus the cross-backend sched overhead we'd
+            // otherwise incur per split).
             case GGML_OP_ADD:
             case GGML_OP_MUL:
             case GGML_OP_SUB:
@@ -4185,6 +6025,7 @@ static bool ggml_backend_xdna_device_offload_op(ggml_backend_dev_t dev, const st
             case GGML_OP_DUP:
             case GGML_OP_ROPE:
             case GGML_OP_SOFT_MAX:
+            case GGML_OP_FLASH_ATTN_EXT:
             case GGML_OP_UNARY:
             case GGML_OP_GLU:
             case GGML_OP_GET_ROWS:

@@ -142,6 +142,29 @@ def swiglu_fused_int8_cache_key(embedding_dim: int, hidden_dim: int,
     return hashlib.sha256(key_json.encode()).hexdigest()[:16]
 
 
+def rms_norm_cache_key(size: int, dtype: str, num_aie_columns: int,
+                       num_channels: int, tile_size: int,
+                       weighted: bool = False) -> str:
+    """Cache key for a standalone RMSNorm configuration.
+
+    size is the norm-axis length; tile_size, num_channels, and num_aie_columns
+    together determine the AIE dataflow layout and are baked into the compiled
+    xclbin — all participate. ``weighted=False`` is currently the only wired
+    path but the field participates so a future weighted variant won't collide.
+    """
+    key_data = {
+        "op": "rms_norm",
+        "size": size,
+        "dtype": dtype,
+        "num_aie_columns": num_aie_columns,
+        "num_channels": num_channels,
+        "tile_size": tile_size,
+        "weighted": weighted,
+    }
+    key_json = json.dumps(key_data, sort_keys=True)
+    return hashlib.sha256(key_json.encode()).hexdigest()[:16]
+
+
 def qkv_cache_key(embedding_dim: int, q_dim: int, k_dim: int, v_dim: int,
                   num_aie_columns: int) -> str:
     """Cache key for a chained Q/K/V projection configuration.
@@ -236,6 +259,33 @@ SWIGLU_PREFILL_INT8_KERNELS = ("gemm_1", "silu", "eltwise_mul", "gemm_2")
 # Chained Q/K/V projection: 3 bf16 GEMVs sharing input, one xclbin, 3 kernels.
 # Names must match chain_artifacts() call in iron/operators/qkv_proj/chained.py.
 QKV_PROJ_KERNELS = ("gemv_q", "gemv_k", "gemv_v")
+# Standalone (non-chained) RMSNorm. Single kernel, staged with prefix "rms_norm"
+# so it lives alongside chained bundles under a per-key cache dir.
+RMS_NORM_KERNELS = ("main",)
+# Chained AttentionBlockPrefill: 11 sub-kernels in one xclbin. Names must match
+# the chain_artifacts() call in iron/operators/attention_block_prefill/op.py
+# (prefix="attn_prefill").
+ATTENTION_PREFILL_KERNELS = (
+    "rms_norm",
+    "gemm_q",
+    "gemm_kv",
+    "rope_q",
+    "rope_k",
+    "perm_q",
+    "perm_kv",
+    "mha",
+    "perm_o",
+    "gemm_o",
+    "add",
+)
+
+# Seq-len buckets for AttentionBlockPrefill. The prefill ubatch size is set at
+# llama.cpp run-start, so in the steady state one session maps to a single
+# bucket — avoids xclbin sprawl while keeping wasted-pad compute bounded.
+# 256 minimum: IRON bf16 GEMM with default tile_m=64 requires M % 256 == 0.
+# Smaller seq_lens fall to CPU. Dropping below 256 requires passing smaller
+# tile_m through the composite (future optimization for partial-batch prefill).
+ATTENTION_PREFILL_SEQ_BUCKETS = (256, 512, 1024, 2048, 4096)
 
 
 # ---------------------------------------------------------------------------
@@ -262,9 +312,12 @@ def select_gemm_tiles(M: int, K: int, N: int, num_aie_columns: int,
     if dtype_in == "i8":
         min_m, min_k, min_n = 16, 8, 16
     else:
-        # bf16 4x8x8 MAC in IRON's aie2p mm.cc requires tile_m % (2*r) == 0 with r=4,
-        # so minimum tile_m is 8 (not 4). Attempting 4 triggers a static_assert.
-        min_m, min_k, min_n = 8, 8, 8
+        # bf16 4x8x8 MAC in IRON's aie2p mm.cc requires both tile_m % (2*r) == 0
+        # with r=4 (min tile_m=8) AND tile_n % (2*t) == 0 with t=8 (min tile_n=16).
+        # aie2 4x8x4 bf16 kernel has the equivalent tile_n % (4*t) == 0 with t=4
+        # (also min tile_n=16), so 16 is the floor on both device generations.
+        # Attempting tile_n=8 for bf16 triggers a kernel static_assert.
+        min_m, min_k, min_n = 8, 8, 16
 
     tile_m = None
     for tm in candidates_m:
@@ -1138,6 +1191,307 @@ def compile_swiglu_prefill_int8_cached(seq_len: int, embedding_dim: int, hidden_
 
 
 # ---------------------------------------------------------------------------
+# RMSNorm (standalone, single-kernel)
+# ---------------------------------------------------------------------------
+
+def validate_rms_norm_shapes(size: int, num_aie_columns: int,
+                             num_channels: int, tile_size: int,
+                             weighted: bool = False) -> tuple[bool, str | None]:
+    """Verify an (size, cols, channels, tile_size) tuple is dispatchable to RMSNorm.
+
+    Mirrors the constraints in iron/operators/rms_norm/op.py::RMSNorm.__post_init__
+    but returns (ok, reason) instead of raising so the C++ backend can fall back
+    cleanly. Shim-DMA budget is checked against the live device.
+    """
+    if num_aie_columns < 1:
+        return False, f"num_aie_columns must be >= 1, got {num_aie_columns}"
+    if num_channels < 1:
+        return False, f"num_channels must be >= 1, got {num_channels}"
+    if tile_size < 1:
+        return False, f"tile_size must be >= 1, got {tile_size}"
+    max_multiple = num_aie_columns * num_channels * tile_size
+    if size % max_multiple != 0:
+        return False, (
+            f"size ({size}) must be a multiple of "
+            f"num_aie_columns * num_channels * tile_size ({max_multiple})"
+        )
+    try:
+        dev = aie_utils.get_current_device()
+        from iron.common.utils import get_shim_dma_limit
+        shim_limit = get_shim_dma_limit(dev)
+    except Exception:
+        shim_limit = None
+    if shim_limit is not None:
+        total = num_aie_columns * num_channels
+        if total > shim_limit:
+            return False, (
+                f"num_aie_columns * num_channels ({total}) exceeds ShimDMA "
+                f"limit of {shim_limit} for this device"
+            )
+        if weighted and num_channels * (num_aie_columns + 1) > shim_limit:
+            return False, (
+                f"weighted RMSNorm requires "
+                f"{num_channels * (num_aie_columns + 1)} ShimDMA output "
+                f"channels but device only has {shim_limit}"
+            )
+    return True, None
+
+
+def _stage_rms_norm_artifacts(op, output_dir: str) -> None:
+    """Stage a compiled RMSNorm op's single xclbin + insts under output_dir.
+
+    Produces:
+        <output_dir>/combined.xclbin
+        <output_dir>/rms_norm_main.insts
+    so the on-disk layout mirrors chained composites (for the bundle-lookup
+    helper) even though only one kernel is present.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    build_dir = op.context.build_dir
+    compiled_xclbin = build_dir / op.xclbin_artifact.filename
+    compiled_insts = build_dir / op.insts_artifact.filename
+    shutil.copy2(str(compiled_xclbin), os.path.join(output_dir, "combined.xclbin"))
+    shutil.copy2(str(compiled_insts), os.path.join(output_dir, "rms_norm_main.insts"))
+
+
+def compile_rms_norm(size: int, dtype: str, num_aie_columns: int,
+                     num_channels: int, tile_size: int, weighted: bool,
+                     output_dir: str) -> str:
+    """Compile an IRON RMSNorm operator and stage artifacts under output_dir.
+
+    Epsilon is hardcoded to 1e-5 inside the AIE kernel (not runtime-configurable).
+    """
+    if dtype != "bf16":
+        raise ValueError(f"RMSNorm currently supports only bf16, got {dtype}")
+    ok, reason = validate_rms_norm_shapes(
+        size, num_aie_columns, num_channels, tile_size, weighted
+    )
+    if not ok:
+        raise ValueError(reason)
+
+    actual_cols = aie_utils.get_current_device().cols
+    if actual_cols < num_aie_columns:
+        raise ValueError(
+            f"Device column mismatch: requested {num_aie_columns}, current "
+            f"device reports {actual_cols}. Compile on the target device."
+        )
+
+    from iron.operators.rms_norm.op import RMSNorm
+
+    op = RMSNorm(
+        size=size,
+        num_aie_columns=num_aie_columns,
+        num_channels=num_channels,
+        tile_size=tile_size,
+        weighted=weighted,
+    )
+    op.compile()
+
+    _stage_rms_norm_artifacts(op, output_dir)
+    return output_dir
+
+
+def compile_rms_norm_cached(size: int, dtype: str = "bf16",
+                            num_aie_columns: int = 4,
+                            num_channels: int = 1,
+                            tile_size: int = 32,
+                            weighted: bool = False) -> Path:
+    """Compile an RMSNorm operator with caching.
+
+    Returns path to the cache directory containing combined.xclbin and
+    rms_norm_main.insts.
+    """
+    key = rms_norm_cache_key(
+        size, dtype, num_aie_columns, num_channels, tile_size, weighted
+    )
+
+    cached = get_cached_chained_dir(key, RMS_NORM_KERNELS, prefix="rms_norm")
+    if cached is not None:
+        return cached
+
+    output_dir = str(get_cache_dir() / key)
+    compile_rms_norm(
+        size, dtype, num_aie_columns, num_channels, tile_size, weighted,
+        output_dir,
+    )
+    return Path(output_dir)
+
+
+# ---------------------------------------------------------------------------
+# AttentionBlockPrefill (chained 11-kernel composite)
+# ---------------------------------------------------------------------------
+
+
+def select_attention_prefill_seq_bucket(seq_len: int) -> int | None:
+    """Return the smallest bucket >= seq_len, or None if seq_len exceeds the cap.
+
+    Used to pad up the prefill seq_len dim so one session reuses a single
+    xclbin. The caller should treat a None return as a hard reject
+    (fall back to CPU).
+    """
+    if seq_len <= 0:
+        return None
+    for b in ATTENTION_PREFILL_SEQ_BUCKETS:
+        if seq_len <= b:
+            return b
+    return None
+
+
+def attention_prefill_cache_key(seq_len: int, embed_dim: int, num_heads: int,
+                                num_kv_heads: int, head_dim: int,
+                                dtype: str = "bf16") -> str:
+    """Cache key for an AttentionBlockPrefill configuration.
+
+    seq_len is rounded up to the nearest bucket before hashing so that two
+    callers requesting lengths in the same bucket share one xclbin. Disjoint
+    from every other op's key by the ``"op"`` field.
+    """
+    seq_len_padded = select_attention_prefill_seq_bucket(seq_len)
+    key_data = {
+        "op": "attention_prefill",
+        "seq_len_padded": seq_len_padded,
+        "embed_dim": embed_dim,
+        "num_heads": num_heads,
+        "num_kv_heads": num_kv_heads,
+        "head_dim": head_dim,
+        "dtype": dtype,
+    }
+    key_json = json.dumps(key_data, sort_keys=True)
+    return hashlib.sha256(key_json.encode()).hexdigest()[:16]
+
+
+def validate_attention_prefill_shapes(seq_len: int, embed_dim: int,
+                                      num_heads: int, num_kv_heads: int,
+                                      head_dim: int) -> tuple[bool, str | None]:
+    """Verify an (seq_len, embed_dim, num_heads, num_kv_heads, head_dim) tuple
+    is dispatchable to AttentionBlockPrefill.
+
+    Returns (ok, reason). Callers (typically the C++ backend) can fall back to
+    CPU cleanly on a False return without raising.
+    """
+    if seq_len <= 0:
+        return False, f"seq_len must be > 0, got {seq_len}"
+    if head_dim != 64:
+        return False, (
+            f"head_dim must be 64 (IRON MHA hardcode), got {head_dim}"
+        )
+    if num_kv_heads <= 0 or num_heads <= 0:
+        return False, (
+            f"num_heads and num_kv_heads must be > 0, got "
+            f"num_heads={num_heads}, num_kv_heads={num_kv_heads}"
+        )
+    if num_heads % num_kv_heads != 0:
+        return False, (
+            f"num_heads ({num_heads}) must be a multiple of num_kv_heads "
+            f"({num_kv_heads}) for GQA grouping"
+        )
+    if embed_dim <= 0:
+        return False, f"embed_dim must be > 0, got {embed_dim}"
+    # GEMM_Q uses all device columns (we target NPU2 with 8). Q output dim =
+    # num_heads * head_dim; that and embed_dim must tile cleanly against 8 cols
+    # with tile_n >= 16 (bf16 floor). Most practical models (embed=1024/2048/4096,
+    # H*d = multiple-of-128) satisfy this.
+    if embed_dim % 8 != 0:
+        return False, (
+            f"embed_dim ({embed_dim}) must be divisible by 8 (Q/O GEMM column count)"
+        )
+    kv_dim = num_kv_heads * head_dim
+    # GEMM_KV uses num_aie_columns = KV_d // tile_n (tile_n=64). KV_d must be a
+    # multiple of 64 and yield at least one column.
+    if kv_dim % 64 != 0:
+        return False, (
+            f"num_kv_heads*head_dim ({kv_dim}) must be a multiple of 64 for GEMM_KV"
+        )
+    return True, None
+
+
+def compile_attention_prefill(seq_len: int, embed_dim: int, num_heads: int,
+                              num_kv_heads: int, head_dim: int,
+                              dtype: str, output_dir: str) -> str:
+    """Compile AttentionBlockPrefill and stage its 11-kernel chained bundle.
+
+    seq_len is rounded up to the nearest bucket and forwarded to the composite
+    as the padded length. The C++ backend is responsible for pad/unpad.
+
+    Output layout:
+        <output_dir>/combined.xclbin
+        <output_dir>/attn_prefill_rms_norm.insts
+        <output_dir>/attn_prefill_gemm_q.insts
+        <output_dir>/attn_prefill_gemm_kv.insts
+        <output_dir>/attn_prefill_rope_q.insts
+        <output_dir>/attn_prefill_rope_k.insts
+        <output_dir>/attn_prefill_perm_q.insts
+        <output_dir>/attn_prefill_perm_kv.insts
+        <output_dir>/attn_prefill_mha.insts
+        <output_dir>/attn_prefill_perm_o.insts
+        <output_dir>/attn_prefill_gemm_o.insts
+        <output_dir>/attn_prefill_add.insts
+    """
+    if dtype != "bf16":
+        raise ValueError(
+            f"AttentionBlockPrefill currently supports only bf16, got {dtype}"
+        )
+    ok, reason = validate_attention_prefill_shapes(
+        seq_len, embed_dim, num_heads, num_kv_heads, head_dim
+    )
+    if not ok:
+        raise ValueError(reason)
+
+    seq_len_padded = select_attention_prefill_seq_bucket(seq_len)
+    if seq_len_padded is None:
+        raise ValueError(
+            f"seq_len={seq_len} exceeds the largest attention-prefill bucket "
+            f"({ATTENTION_PREFILL_SEQ_BUCKETS[-1]}); caller should fall back to CPU"
+        )
+
+    # AttentionBlockPrefill reads num_aie_columns from the live device inside
+    # set_up_artifacts (via aie_utils.get_current_device()). We don't take a
+    # --num-aie-columns flag for this op, but fail fast if the device isn't up.
+    _ = aie_utils.get_current_device()
+
+    from iron.operators.attention_block_prefill.op import AttentionBlockPrefill
+
+    op = AttentionBlockPrefill(
+        seq_len=seq_len_padded,
+        embed_dim=embed_dim,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+    )
+    op.compile()
+
+    _stage_chained_artifacts(
+        op, ATTENTION_PREFILL_KERNELS, output_dir, prefix="attn_prefill"
+    )
+    return output_dir
+
+
+def compile_attention_prefill_cached(seq_len: int, embed_dim: int,
+                                     num_heads: int, num_kv_heads: int,
+                                     head_dim: int,
+                                     dtype: str = "bf16") -> Path:
+    """Compile AttentionBlockPrefill with caching.
+
+    Returns the cache directory (contains combined.xclbin + 11 insts).
+    """
+    key = attention_prefill_cache_key(
+        seq_len, embed_dim, num_heads, num_kv_heads, head_dim, dtype
+    )
+
+    cached = get_cached_chained_dir(
+        key, ATTENTION_PREFILL_KERNELS, prefix="attn_prefill"
+    )
+    if cached is not None:
+        return cached
+
+    output_dir = str(get_cache_dir() / key)
+    compile_attention_prefill(
+        seq_len, embed_dim, num_heads, num_kv_heads, head_dim, dtype, output_dir
+    )
+    return Path(output_dir)
+
+
+# ---------------------------------------------------------------------------
 # CLI entry point (called by C++ backend)
 # ---------------------------------------------------------------------------
 
@@ -1241,6 +1595,25 @@ def main():
     swp_parser.add_argument("--out", type=str,
                             help="Output directory (default: cache)")
 
+    # RMSNorm subcommand (standalone, single-kernel)
+    rms_parser = subparsers.add_parser(
+        "rms_norm",
+        help="Compile standalone RMSNorm (bf16, epsilon hardcoded to 1e-5)",
+    )
+    rms_parser.add_argument("--size", type=int, required=True,
+                            help="Norm-axis length")
+    rms_parser.add_argument("--dtype", default="bf16", choices=["bf16"])
+    rms_parser.add_argument("--num-aie-columns", type=int, default=4)
+    rms_parser.add_argument("--num-channels", type=int, default=1)
+    rms_parser.add_argument("--tile-size", type=int, default=32)
+    rms_parser.add_argument("--weighted", action="store_true",
+                            help="Include per-feature weight multiply "
+                                 "(not yet wired through the backend)")
+    rms_parser.add_argument("--cache-dir", type=str, default=None,
+                            help="Override GGML_XDNA_CACHE_DIR for this run")
+    rms_parser.add_argument("--out", type=str,
+                            help="Output directory (default: cache)")
+
     # SwiGLU prefill INT8 subcommand
     swpi_parser = subparsers.add_parser(
         "swiglu-prefill-int8",
@@ -1257,6 +1630,28 @@ def main():
                                   "(default: auto-selected for shape compatibility)")
     swpi_parser.add_argument("--out", type=str,
                              help="Output directory (default: cache)")
+
+    # AttentionBlockPrefill subcommand (11-kernel chained composite)
+    attnp_parser = subparsers.add_parser(
+        "attention-prefill",
+        help="Compile fused attention block prefill (RMSNorm + QKV + RoPE + "
+             "MHA + O + residual, 11 kernels chained into one xclbin)",
+    )
+    attnp_parser.add_argument("--seq-len", type=int, required=True,
+                              help="Prompt seq length (rounded up to bucket)")
+    attnp_parser.add_argument("--embed-dim", type=int, required=True,
+                              help="Model hidden size")
+    attnp_parser.add_argument("--num-heads", type=int, required=True,
+                              help="Q head count")
+    attnp_parser.add_argument("--num-kv-heads", type=int, required=True,
+                              help="K/V head count (GQA group = H / KV)")
+    attnp_parser.add_argument("--head-dim", type=int, default=64,
+                              help="Per-head dim (only 64 supported by MHA)")
+    attnp_parser.add_argument("--dtype", default="bf16", choices=["bf16"])
+    attnp_parser.add_argument("--cache-dir", type=str, default=None,
+                              help="Override GGML_XDNA_CACHE_DIR for this run")
+    attnp_parser.add_argument("--out", type=str,
+                              help="Output directory (default: cache)")
 
     args = parser.parse_args()
 
@@ -1368,6 +1763,37 @@ def main():
                 args.seq_len, args.embedding_dim, args.hidden_dim,
                 args.num_aie_columns,
                 tile_m=args.tile_m, tile_n=args.tile_n,
+            )
+        print(path)
+    elif args.op == "rms_norm":
+        if args.cache_dir:
+            os.environ["GGML_XDNA_CACHE_DIR"] = args.cache_dir
+        if args.out:
+            path = compile_rms_norm(
+                args.size, args.dtype, args.num_aie_columns,
+                args.num_channels, args.tile_size, args.weighted,
+                args.out,
+            )
+        else:
+            path = compile_rms_norm_cached(
+                args.size, args.dtype, args.num_aie_columns,
+                args.num_channels, args.tile_size, args.weighted,
+            )
+        print(path)
+    elif args.op == "attention-prefill":
+        if args.cache_dir:
+            os.environ["GGML_XDNA_CACHE_DIR"] = args.cache_dir
+        if args.out:
+            path = compile_attention_prefill(
+                args.seq_len, args.embed_dim,
+                args.num_heads, args.num_kv_heads, args.head_dim,
+                args.dtype, args.out,
+            )
+        else:
+            path = compile_attention_prefill_cached(
+                args.seq_len, args.embed_dim,
+                args.num_heads, args.num_kv_heads, args.head_dim,
+                args.dtype,
             )
         print(path)
 
