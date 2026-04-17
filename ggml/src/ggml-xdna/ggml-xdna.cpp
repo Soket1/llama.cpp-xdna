@@ -3,6 +3,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-cpu.h"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -14,6 +15,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <unistd.h>
 
@@ -45,6 +47,7 @@ enum xdna_op_kind : int {
     XDNA_OP_SWIGLU_DECODE_INT8 = 4,  // M==1  W8A16 fused SwiGLU FFN (int8 weights, bf16 acts)
     XDNA_OP_SWIGLU_FUSED_INT8  = 5,  // M==1  fused gate+up+silu+mul INT8 + standalone down GEMV
     XDNA_OP_SWIGLU_PREFILL_INT8 = 6,  // M>=32 W8A8 INT8 SwiGLU FFN (both weights and activations int8)
+    XDNA_OP_QKV                 = 7,  // M==1 chained Q/K/V (3 bf16 GEMVs sharing input)
 };
 
 struct xdna_kernel_entry {
@@ -217,6 +220,42 @@ struct xdna_swiglu_fused_entry {
 };
 
 // ============================================================================
+// Fused QKV projection entry — single combined xclbin with 3 kernel entries
+// (Q, K, V GEMVs sharing one input activation), dispatched via xrt::runlist.
+// ============================================================================
+
+struct xdna_qkv_entry {
+    xdna_op_kind  op_kind;  // always XDNA_OP_QKV
+
+    xrt::xclbin     xclbin;
+    xrt::hw_context hw_ctx;
+    xrt::kernel     q_kernel;
+    xrt::kernel     k_kernel;
+    xrt::kernel     v_kernel;
+
+    std::vector<char> q_insts_data; xrt::bo q_insts_bo;
+    std::vector<char> k_insts_data; xrt::bo k_insts_bo;
+    std::vector<char> v_insts_data; xrt::bo v_insts_bo;
+
+    int64_t embedding_dim;  // K for all 3 GEMVs (input activation size)
+    int64_t q_dim, k_dim, v_dim;  // output dims per projection
+    int     num_cols;
+
+    // I/O BOs (lazy)
+    std::unique_ptr<xrt::bo> input_bo;     // embedding_dim bf16 (shared)
+    std::unique_ptr<xrt::bo> q_output_bo;  // q_dim bf16
+    std::unique_ptr<xrt::bo> k_output_bo;  // k_dim bf16
+    std::unique_ptr<xrt::bo> v_output_bo;  // v_dim bf16
+
+    // Weight BO caches — keyed by ggml weight tensor data ptr.
+    std::unordered_map<const void *, xrt::bo> w_q_bo_cache;
+    std::unordered_map<const void *, xrt::bo> w_k_bo_cache;
+    std::unordered_map<const void *, xrt::bo> w_v_bo_cache;
+
+    std::unique_ptr<std::mutex> weights_mutex = std::make_unique<std::mutex>();
+};
+
+// ============================================================================
 // Backend context — holds XRT device and kernel cache
 // ============================================================================
 
@@ -227,6 +266,7 @@ struct ggml_backend_xdna_context {
     std::unordered_map<std::string, xdna_kernel_entry> kernel_cache;
     std::unordered_map<std::string, xdna_swiglu_kernel_entry> swiglu_cache;
     std::unordered_map<std::string, xdna_swiglu_fused_entry> swiglu_fused_cache;
+    std::unordered_map<std::string, xdna_qkv_entry> qkv_cache;
     std::mutex cache_mutex;
     bool device_valid;
     // CPU backend for delegating ops we don't run on NPU.
@@ -950,10 +990,26 @@ static int xdna_pick_swiglu_prefill_tile_m(int64_t seq_len) {
     return 0;
 }
 
+// Pick the largest tile_n such that both inner GEMMs tile cleanly:
+//   GEMM1 (gate/up): hidden_dim  % (tile_n * cols) == 0
+//   GEMM2 (down):    embedding_dim % (tile_n * cols) == 0
+// Returns 0 if no candidate in {64, 32, 16, 8} works.
+static int xdna_pick_swiglu_prefill_tile_n(int64_t embedding_dim, int64_t hidden_dim,
+                                           int num_cols) {
+    static const int tns[] = {64, 32, 16, 8};
+    for (int i = 0; i < 4; i++) {
+        int64_t step = (int64_t)tns[i] * num_cols;
+        if (hidden_dim % step == 0 && embedding_dim % step == 0)
+            return tns[i];
+    }
+    return 0;
+}
+
 static std::string make_swiglu_cache_key(xdna_op_kind op_kind,
                                          int64_t embedding_dim, int64_t hidden_dim,
                                          int64_t seq_len, int num_cols,
-                                         int tile_m, int group_size = 0) {
+                                         int tile_m, int group_size = 0,
+                                         int tile_n = 64) {
     char buf[256];
     if (op_kind == XDNA_OP_SWIGLU_DECODE) {
         snprintf(buf, sizeof(buf), "swiglu_decode_K%ld_N%ld_bf16_%dcol",
@@ -966,15 +1022,27 @@ static std::string make_swiglu_cache_key(xdna_op_kind op_kind,
                  "swiglu_decode_int8_K%ld_N%ld_%dcol_g%d",
                  (long)embedding_dim, (long)hidden_dim, num_cols, group_size);
     } else if (op_kind == XDNA_OP_SWIGLU_PREFILL_INT8) {
-        snprintf(buf, sizeof(buf), "swiglu_prefill_int8_M%ld_K%ld_N%ld_tm%d_%dcol",
-                 (long)seq_len, (long)embedding_dim, (long)hidden_dim,
-                 tile_m, num_cols);
+        if (tile_n != 64) {
+            snprintf(buf, sizeof(buf), "swiglu_prefill_int8_M%ld_K%ld_N%ld_tm%d_tn%d_%dcol",
+                     (long)seq_len, (long)embedding_dim, (long)hidden_dim,
+                     tile_m, tile_n, num_cols);
+        } else {
+            snprintf(buf, sizeof(buf), "swiglu_prefill_int8_M%ld_K%ld_N%ld_tm%d_%dcol",
+                     (long)seq_len, (long)embedding_dim, (long)hidden_dim,
+                     tile_m, num_cols);
+        }
     } else {
-        // Include tile_m in the key so different prefill M values with different
-        // picked tile_m values get distinct xclbins.
-        snprintf(buf, sizeof(buf), "swiglu_prefill_M%ld_K%ld_N%ld_tm%d_bf16_%dcol",
-                 (long)seq_len, (long)embedding_dim, (long)hidden_dim,
-                 tile_m, num_cols);
+        // Include tile_m (and tile_n when non-default) in the key so different
+        // prefill configurations get distinct xclbins.
+        if (tile_n != 64) {
+            snprintf(buf, sizeof(buf), "swiglu_prefill_M%ld_K%ld_N%ld_tm%d_tn%d_bf16_%dcol",
+                     (long)seq_len, (long)embedding_dim, (long)hidden_dim,
+                     tile_m, tile_n, num_cols);
+        } else {
+            snprintf(buf, sizeof(buf), "swiglu_prefill_M%ld_K%ld_N%ld_tm%d_bf16_%dcol",
+                     (long)seq_len, (long)embedding_dim, (long)hidden_dim,
+                     tile_m, num_cols);
+        }
     }
     return std::string(buf);
 }
@@ -996,7 +1064,8 @@ static bool ensure_swiglu_compiled(ggml_backend_xdna_context * ctx,
                                    xdna_op_kind op_kind,
                                    int64_t embedding_dim, int64_t hidden_dim,
                                    int64_t seq_len, int num_cols,
-                                   int tile_m, int group_size = 0) {
+                                   int tile_m, int group_size = 0,
+                                   int tile_n = 64) {
     const std::string bundle_dir = ctx->cache_dir + "/" + cache_key;
     const char * const * insts_tags;
     switch (op_kind) {
@@ -1036,21 +1105,21 @@ static bool ensure_swiglu_compiled(ggml_backend_xdna_context * ctx,
     } else if (op_kind == XDNA_OP_SWIGLU_PREFILL_INT8) {
         snprintf(cmd, sizeof(cmd),
                  "python3 %s swiglu-prefill-int8 --seq-len %ld --embedding-dim %ld --hidden-dim %ld "
-                 "--num-aie-columns %d --tile-m %d --out %s 2>&1",
+                 "--num-aie-columns %d --tile-m %d --tile-n %d --out %s 2>&1",
                  ctx->compile_script.c_str(),
                  (long)seq_len, (long)embedding_dim, (long)hidden_dim,
-                 num_cols, tile_m, bundle_dir.c_str());
-        GGML_LOG_INFO("ggml-xdna: compiling SwiGLU prefill INT8 M=%ld K=%ld N=%ld tile_m=%d...\n",
-                      (long)seq_len, (long)embedding_dim, (long)hidden_dim, tile_m);
+                 num_cols, tile_m, tile_n, bundle_dir.c_str());
+        GGML_LOG_INFO("ggml-xdna: compiling SwiGLU prefill INT8 M=%ld K=%ld N=%ld tile_m=%d tile_n=%d...\n",
+                      (long)seq_len, (long)embedding_dim, (long)hidden_dim, tile_m, tile_n);
     } else {
         snprintf(cmd, sizeof(cmd),
                  "python3 %s swiglu-prefill --seq-len %ld --embedding-dim %ld --hidden-dim %ld "
-                 "--num-aie-columns %d --tile-m %d --out %s 2>&1",
+                 "--num-aie-columns %d --tile-m %d --tile-n %d --out %s 2>&1",
                  ctx->compile_script.c_str(),
                  (long)seq_len, (long)embedding_dim, (long)hidden_dim,
-                 num_cols, tile_m, bundle_dir.c_str());
-        GGML_LOG_INFO("ggml-xdna: compiling SwiGLU prefill M=%ld K=%ld N=%ld tile_m=%d (first run, will be cached)...\n",
-                      (long)seq_len, (long)embedding_dim, (long)hidden_dim, tile_m);
+                 num_cols, tile_m, tile_n, bundle_dir.c_str());
+        GGML_LOG_INFO("ggml-xdna: compiling SwiGLU prefill M=%ld K=%ld N=%ld tile_m=%d tile_n=%d (first run, will be cached)...\n",
+                      (long)seq_len, (long)embedding_dim, (long)hidden_dim, tile_m, tile_n);
     }
 
     int ret = system(cmd);
@@ -1333,7 +1402,15 @@ static xrt::bo * swiglu_warm_weight(ggml_backend_xdna_context * ctx,
                         dst_bf16[k * N + n] = (uint16_t)(bits >> 16);
                     }
                 }
+            } else if (weight->type == GGML_TYPE_F16) {
+                const uint16_t * src_f16 = (const uint16_t *)weight->data;
+                for (int64_t k = 0; k < K; k++) {
+                    for (int64_t n = 0; n < N; n++) {
+                        dst_bf16[k * N + n] = fp16_to_bf16(src_f16[n * K + k]);
+                    }
+                }
             } else {
+                // BF16: direct transpose, no conversion needed.
                 const uint16_t * src_bf16 = (const uint16_t *)weight->data;
                 for (int64_t k = 0; k < K; k++) {
                     for (int64_t n = 0; n < N; n++) {
@@ -1345,6 +1422,11 @@ static xrt::bo * swiglu_warm_weight(ggml_backend_xdna_context * ctx,
             // GEMV path: IRON GEMV expects [N,K] row-major — ggml's native layout.
             if (weight->type == GGML_TYPE_F32) {
                 f32_to_bf16((const float *)weight->data, dst_bf16, n_elems);
+            } else if (weight->type == GGML_TYPE_F16) {
+                const uint16_t * src_f16 = (const uint16_t *)weight->data;
+                for (int64_t i = 0; i < n_elems; i++) {
+                    dst_bf16[i] = fp16_to_bf16(src_f16[i]);
+                }
             } else {
                 memcpy(dst_bf16, weight->data, n_bytes);
             }
@@ -1381,7 +1463,8 @@ static void ggml_backend_xdna_mul_mat_swiglu(ggml_backend_xdna_context * ctx,
                                              const struct ggml_tensor * src0_gate_w,
                                              const struct ggml_tensor * src0_up_w,
                                              const struct ggml_tensor * src0_down_w,
-                                             const struct ggml_tensor * src1_input) {
+                                             const struct ggml_tensor * src1_input,
+                                             int num_cols) {
     if (!ctx->device_valid) {
         GGML_LOG_ERROR("ggml-xdna: SwiGLU called but XRT device invalid\n");
         return;
@@ -1391,24 +1474,29 @@ static void ggml_backend_xdna_mul_mat_swiglu(ggml_backend_xdna_context * ctx,
     const int64_t embedding_dim = src1_input->ne[0];
     const int64_t hidden_dim    = src0_gate_w->ne[1];
 
-    // TODO: detect device cols. NPU2 (8 cols) only for now — IRON SwiGLU
-    // constructors force device cols, and the bridge cross-checks. NPU1
-    // (4 cols) untested.
-    const int num_cols = 8;
-
     const xdna_op_kind op_kind = (M == 1) ? XDNA_OP_SWIGLU_DECODE : XDNA_OP_SWIGLU_PREFILL;
-    const int64_t seq_len      = (op_kind == XDNA_OP_SWIGLU_DECODE) ? 1 : M;
+    // Round M up to the next multiple of 64 for GEMM tiling. NPU2 GEMM
+    // kernel with emulate_bf16_mmul_with_bfp16 uses 8x8x8 MAC → tile_m >= 16
+    // → M must be a multiple of tile_m * 4 = 64. Input is zero-padded;
+    // output truncated to actual M rows.
+    const int64_t padded_M     = (op_kind == XDNA_OP_SWIGLU_PREFILL)
+        ? ((M + 63) / 64) * 64 : M;
+    const int64_t seq_len      = (op_kind == XDNA_OP_SWIGLU_DECODE) ? 1 : padded_M;
 
-    // tile_m only applies to the prefill inner GEMMs; decode (GEMV-based) ignores it.
+    // tile_m/tile_n only apply to the prefill inner GEMMs; decode (GEMV-based) ignores them.
     // The pattern matcher rejected M if no tile_m exists, so a 0 here would be a bug.
     const int tile_m = (op_kind == XDNA_OP_SWIGLU_PREFILL)
         ? xdna_pick_swiglu_prefill_tile_m(seq_len) : 0;
+    const int tile_n = (op_kind == XDNA_OP_SWIGLU_PREFILL)
+        ? xdna_pick_swiglu_prefill_tile_n(embedding_dim, hidden_dim, num_cols) : 64;
 
     std::string cache_key = make_swiglu_cache_key(op_kind, embedding_dim, hidden_dim,
-                                                  seq_len, num_cols, tile_m);
+                                                  seq_len, num_cols, tile_m,
+                                                  /*group_size=*/0, tile_n);
 
     if (!ensure_swiglu_compiled(ctx, cache_key, op_kind,
-                                embedding_dim, hidden_dim, seq_len, num_cols, tile_m)) {
+                                embedding_dim, hidden_dim, seq_len, num_cols, tile_m,
+                                /*group_size=*/0, tile_n)) {
         GGML_LOG_ERROR("ggml-xdna: SwiGLU compile failed for %s\n", cache_key.c_str());
         return;
     }
@@ -1418,12 +1506,17 @@ static void ggml_backend_xdna_mul_mat_swiglu(ggml_backend_xdna_context * ctx,
     if (!entry) return;
 
     try {
-        const size_t input_elems  = (size_t)embedding_dim * (size_t)M;
-        const size_t output_elems = (size_t)embedding_dim * (size_t)M;
-        const size_t hidden_elems = (size_t)hidden_dim    * (size_t)M;
-        const size_t input_bytes  = input_elems  * sizeof(uint16_t);
-        const size_t output_bytes = output_elems * sizeof(uint16_t);
-        const size_t hidden_bytes = hidden_elems * sizeof(uint16_t);
+        // BO sizes use padded_M (for NPU computation); data copies use actual M.
+        const size_t padded_input_elems  = (size_t)embedding_dim * (size_t)padded_M;
+        const size_t padded_output_elems = (size_t)embedding_dim * (size_t)padded_M;
+        const size_t padded_hidden_elems = (size_t)hidden_dim    * (size_t)padded_M;
+        const size_t input_bytes  = padded_input_elems  * sizeof(uint16_t);
+        const size_t output_bytes = padded_output_elems * sizeof(uint16_t);
+        const size_t hidden_bytes = padded_hidden_elems * sizeof(uint16_t);
+        // Actual (unpadded) element counts for host↔device data copies.
+        const size_t actual_input_elems  = (size_t)embedding_dim * (size_t)M;
+        const size_t actual_output_elems = (size_t)embedding_dim * (size_t)M;
+        const size_t actual_hidden_elems = (size_t)hidden_dim    * (size_t)M;
 
         // Lazily allocate the 6 persistent per-call BOs on first dispatch.
         // Group IDs follow the IRON arg_specs:
@@ -1497,11 +1590,16 @@ static void ggml_backend_xdna_mul_mat_swiglu(ggml_backend_xdna_context * ctx,
         auto t_in_s  = clk::now();
 
         // Load input activation (freshly computed per token/step).
+        // When M < padded_M (speculative decoding), zero-pad the extra rows.
+        if (padded_M > M) {
+            memset(entry->input_bo->map<void*>(), 0, input_bytes);
+        }
         if (src1_input->type == GGML_TYPE_F32) {
             f32_to_bf16((const float *)src1_input->data,
-                        (uint16_t *)entry->input_bo->map<void*>(), input_elems);
+                        (uint16_t *)entry->input_bo->map<void*>(), actual_input_elems);
         } else {
-            memcpy(entry->input_bo->map<void*>(), src1_input->data, input_bytes);
+            memcpy(entry->input_bo->map<void*>(), src1_input->data,
+                   actual_input_elems * sizeof(uint16_t));
         }
         entry->input_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
         auto t_in_e  = clk::now();
@@ -1601,10 +1699,11 @@ static void ggml_backend_xdna_mul_mat_swiglu(ggml_backend_xdna_context * ctx,
         auto t_wait_e = clk::now();
 
         // Pull the final output back to host (the only result downstream actually needs).
+        // When padded, only copy back the first M rows (actual_*_elems).
         auto t_out_s = clk::now();
         entry->output_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
         bf16_to_f32((const uint16_t *)entry->output_bo->map<void*>(),
-                    (float *)dst_final->data, output_elems);
+                    (float *)dst_final->data, actual_output_elems);
         auto t_out_e = clk::now();
 
         // Copy intermediates back so any downstream consumer that looked past
@@ -1613,19 +1712,19 @@ static void ggml_backend_xdna_mul_mat_swiglu(ggml_backend_xdna_context * ctx,
         auto t_wbl_s = clk::now();
         entry->left_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
         bf16_to_f32((const uint16_t *)entry->left_bo->map<void*>(),
-                    (float *)gate_dst->data, hidden_elems);
+                    (float *)gate_dst->data, actual_hidden_elems);
         auto t_wbl_e = clk::now();
 
         auto t_wbr_s = clk::now();
         entry->right_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
         bf16_to_f32((const uint16_t *)entry->right_bo->map<void*>(),
-                    (float *)up_dst->data, hidden_elems);
+                    (float *)up_dst->data, actual_hidden_elems);
         auto t_wbr_e = clk::now();
 
         auto t_wbi_s = clk::now();
         entry->intermediate_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
         bf16_to_f32((const uint16_t *)entry->intermediate_bo->map<void*>(),
-                    (float *)glu_dst->data, hidden_elems);
+                    (float *)glu_dst->data, actual_hidden_elems);
         auto t_wbi_e = clk::now();
 
         if (prof) {
@@ -2013,9 +2112,12 @@ static void ggml_backend_xdna_mul_mat_swiglu_prefill_int8(
     const int num_cols = 8;
     const xdna_op_kind op_kind = XDNA_OP_SWIGLU_PREFILL_INT8;
     const int tile_m = xdna_pick_swiglu_prefill_tile_m(M);
+    const int tile_n = xdna_pick_swiglu_prefill_tile_n(embedding_dim, hidden_dim, num_cols);
 
-    std::string cache_key = make_swiglu_cache_key(op_kind, embedding_dim, hidden_dim, M, num_cols, tile_m);
-    if (!ensure_swiglu_compiled(ctx, cache_key, op_kind, embedding_dim, hidden_dim, M, num_cols, tile_m))
+    std::string cache_key = make_swiglu_cache_key(op_kind, embedding_dim, hidden_dim, M, num_cols, tile_m,
+                                                  /*group_size=*/0, tile_n);
+    if (!ensure_swiglu_compiled(ctx, cache_key, op_kind, embedding_dim, hidden_dim, M, num_cols, tile_m,
+                                /*group_size=*/0, tile_n))
         return;
     auto * entry = get_or_load_swiglu_kernel(ctx, cache_key, op_kind, embedding_dim, hidden_dim, M, num_cols);
     if (!entry) return;
@@ -2664,6 +2766,399 @@ static void ggml_backend_xdna_mul_mat_swiglu_fused_int8(
     }
 }
 
+// ============================================================================
+// QKV fused projection — single combined xclbin, 3 bf16 GEMVs sharing input
+// ============================================================================
+
+static std::string make_qkv_cache_key(int64_t embedding_dim,
+                                      int64_t q_dim, int64_t k_dim, int64_t v_dim,
+                                      int num_cols) {
+    char buf[256];
+    snprintf(buf, sizeof(buf), "qkv_K%ld_Nq%ld_Nk%ld_Nv%ld_%dcol",
+             (long)embedding_dim, (long)q_dim, (long)k_dim, (long)v_dim, num_cols);
+    return std::string(buf);
+}
+
+static bool qkv_bundle_present(const std::string & bundle_dir) {
+    std::ifstream f1(bundle_dir + "/combined.xclbin");
+    if (!f1.good()) return false;
+    std::ifstream f2(bundle_dir + "/qkv_gemv_q.insts");
+    if (!f2.good()) return false;
+    std::ifstream f3(bundle_dir + "/qkv_gemv_k.insts");
+    if (!f3.good()) return false;
+    std::ifstream f4(bundle_dir + "/qkv_gemv_v.insts");
+    if (!f4.good()) return false;
+    return true;
+}
+
+static bool ensure_qkv_compiled(ggml_backend_xdna_context * ctx,
+                                const std::string & cache_key,
+                                int64_t embedding_dim,
+                                int64_t q_dim, int64_t k_dim, int64_t v_dim,
+                                int num_cols) {
+    const std::string bundle_dir = ctx->cache_dir + "/" + cache_key;
+    if (qkv_bundle_present(bundle_dir)) {
+        return true;
+    }
+
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd),
+             "python3 %s qkv --embedding-dim %ld --q-dim %ld --k-dim %ld --v-dim %ld "
+             "--num-aie-columns %d --out %s 2>&1",
+             ctx->compile_script.c_str(),
+             (long)embedding_dim, (long)q_dim, (long)k_dim, (long)v_dim,
+             num_cols, bundle_dir.c_str());
+    GGML_LOG_INFO("ggml-xdna: compiling QKV K=%ld Nq=%ld Nk=%ld Nv=%ld cols=%d (first run, will be cached)...\n",
+                  (long)embedding_dim, (long)q_dim, (long)k_dim, (long)v_dim, num_cols);
+
+    int ret = system(cmd);
+    if (ret != 0) {
+        GGML_LOG_ERROR("ggml-xdna: QKV compilation failed (exit code %d)\n", ret);
+        return false;
+    }
+
+    if (!qkv_bundle_present(bundle_dir)) {
+        GGML_LOG_ERROR("ggml-xdna: QKV compilation succeeded but bundle files missing in %s\n",
+                       bundle_dir.c_str());
+        return false;
+    }
+
+    GGML_LOG_INFO("ggml-xdna: QKV compilation complete, cached at %s\n", bundle_dir.c_str());
+    return true;
+}
+
+static xdna_qkv_entry * get_or_load_qkv_kernel(
+        ggml_backend_xdna_context * ctx,
+        const std::string & cache_key,
+        int64_t embedding_dim,
+        int64_t q_dim, int64_t k_dim, int64_t v_dim,
+        int num_cols) {
+    std::lock_guard<std::mutex> lock(ctx->cache_mutex);
+
+    auto it = ctx->qkv_cache.find(cache_key);
+    if (it != ctx->qkv_cache.end()) {
+        return &it->second;
+    }
+
+    const std::string bundle_dir = ctx->cache_dir + "/" + cache_key;
+
+    try {
+        xdna_qkv_entry entry;
+        entry.op_kind       = XDNA_OP_QKV;
+        entry.embedding_dim = embedding_dim;
+        entry.q_dim         = q_dim;
+        entry.k_dim         = k_dim;
+        entry.v_dim         = v_dim;
+        entry.num_cols      = num_cols;
+
+        // Load combined xclbin (Q + K + V GEMVs)
+        entry.xclbin = xrt::xclbin(bundle_dir + "/combined.xclbin");
+        ctx->device.register_xclbin(entry.xclbin);
+        auto uuid = entry.xclbin.get_uuid();
+        entry.hw_ctx = xrt::hw_context(ctx->device, uuid);
+        entry.q_kernel = xrt::kernel(entry.hw_ctx, "qkv_gemv_q");
+        entry.k_kernel = xrt::kernel(entry.hw_ctx, "qkv_gemv_k");
+        entry.v_kernel = xrt::kernel(entry.hw_ctx, "qkv_gemv_v");
+
+        // Load Q insts
+        entry.q_insts_data = read_binary_file(bundle_dir + "/qkv_gemv_q.insts");
+        if (entry.q_insts_data.empty()) {
+            GGML_LOG_ERROR("ggml-xdna: failed to read qkv_gemv_q insts file\n");
+            return nullptr;
+        }
+        entry.q_insts_bo = xrt::bo(ctx->device, entry.q_insts_data.size(),
+                                    xrt::bo::flags::cacheable,
+                                    entry.q_kernel.group_id(1));
+        entry.q_insts_bo.write(entry.q_insts_data.data());
+        entry.q_insts_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+        // Load K insts
+        entry.k_insts_data = read_binary_file(bundle_dir + "/qkv_gemv_k.insts");
+        if (entry.k_insts_data.empty()) {
+            GGML_LOG_ERROR("ggml-xdna: failed to read qkv_gemv_k insts file\n");
+            return nullptr;
+        }
+        entry.k_insts_bo = xrt::bo(ctx->device, entry.k_insts_data.size(),
+                                    xrt::bo::flags::cacheable,
+                                    entry.k_kernel.group_id(1));
+        entry.k_insts_bo.write(entry.k_insts_data.data());
+        entry.k_insts_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+        // Load V insts
+        entry.v_insts_data = read_binary_file(bundle_dir + "/qkv_gemv_v.insts");
+        if (entry.v_insts_data.empty()) {
+            GGML_LOG_ERROR("ggml-xdna: failed to read qkv_gemv_v insts file\n");
+            return nullptr;
+        }
+        entry.v_insts_bo = xrt::bo(ctx->device, entry.v_insts_data.size(),
+                                    xrt::bo::flags::cacheable,
+                                    entry.v_kernel.group_id(1));
+        entry.v_insts_bo.write(entry.v_insts_data.data());
+        entry.v_insts_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+        auto [inserted_it, _] = ctx->qkv_cache.emplace(cache_key, std::move(entry));
+        GGML_LOG_INFO("ggml-xdna: loaded QKV kernel bundle for %s\n", cache_key.c_str());
+        return &inserted_it->second;
+
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("ggml-xdna: failed to load QKV kernel %s: %s\n",
+                       cache_key.c_str(), e.what());
+        return nullptr;
+    }
+}
+
+// Warm (or look up) a bf16 weight BO for the QKV fused path. Matrix layout is
+// native ggml [N,K] row-major so no transpose — just convert or memcpy.
+static xrt::bo * qkv_warm_weight_bf16(ggml_backend_xdna_context * ctx,
+                                       xdna_qkv_entry * /*entry*/,
+                                       std::unordered_map<const void *, xrt::bo> & cache,
+                                       const struct ggml_tensor * weight,
+                                       xrt::kernel & kernel,
+                                       int arg_group_id,
+                                       const char * slot_name) {
+    auto it = cache.find(weight->data);
+    if (it != cache.end()) {
+        return &it->second;
+    }
+
+    const int64_t K = weight->ne[0];
+    const int64_t N = weight->ne[1];
+    const size_t  mat_elems = (size_t)N * (size_t)K;
+    const size_t  mat_bytes = mat_elems * sizeof(uint16_t);
+
+    try {
+        xrt::bo new_bo(ctx->device, mat_bytes, xrt::bo::flags::host_only,
+                       kernel.group_id(arg_group_id));
+
+        if (weight->type == GGML_TYPE_F32) {
+            f32_to_bf16((const float *)weight->data,
+                        (uint16_t *)new_bo.map<void*>(), mat_elems);
+        } else {
+            // GGML_TYPE_BF16 / GGML_TYPE_F16 both land here with 2 bytes/elem.
+            // bf16 is the direct case; f16 would need conversion but is filtered
+            // at matcher time so this branch only fires for bf16 in practice.
+            memcpy(new_bo.map<void*>(), weight->data, mat_bytes);
+        }
+        new_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+        auto [ins, _] = cache.emplace(weight->data, std::move(new_bo));
+
+        fprintf(stderr,
+                "ggml-xdna: warm QKV %s K=%ld N=%ld weight=%s (%zu cached)\n",
+                slot_name, (long)K, (long)N, weight->name, cache.size());
+        fflush(stderr);
+        return &ins->second;
+
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("ggml-xdna: failed to warm QKV %s weight: %s\n",
+                       slot_name, e.what());
+        return nullptr;
+    }
+}
+
+// Dispatch 3 bf16 Q/K/V GEMVs as one xrt::runlist (single combined xclbin).
+// All three kernels share a single hw_context, one shared input activation BO,
+// and 3 distinct output BOs. The runlist executes all 3 runs atomically — no
+// intermediate host sync required.
+static void ggml_backend_xdna_mul_mat_qkv(
+        ggml_backend_xdna_context * ctx,
+        struct ggml_tensor * q_dst,
+        struct ggml_tensor * k_dst,
+        struct ggml_tensor * v_dst,
+        const struct ggml_tensor * src0_w_q,
+        const struct ggml_tensor * src0_w_k,
+        const struct ggml_tensor * src0_w_v,
+        const struct ggml_tensor * src1_input) {
+    if (!ctx->device_valid) {
+        GGML_LOG_ERROR("ggml-xdna: QKV called but XRT device invalid\n");
+        return;
+    }
+
+    const int64_t embedding_dim = src1_input->ne[0];
+    const int64_t q_dim = src0_w_q->ne[1];
+    const int64_t k_dim = src0_w_k->ne[1];
+    const int64_t v_dim = src0_w_v->ne[1];
+
+    const int num_cols = 8;  // NPU2 default — matches SwiGLU fused INT8 path
+
+    std::string cache_key = make_qkv_cache_key(
+        embedding_dim, q_dim, k_dim, v_dim, num_cols);
+
+    if (!ensure_qkv_compiled(ctx, cache_key,
+                             embedding_dim, q_dim, k_dim, v_dim, num_cols)) {
+        GGML_LOG_ERROR("ggml-xdna: QKV compile failed for %s\n", cache_key.c_str());
+        return;
+    }
+
+    xdna_qkv_entry * entry = get_or_load_qkv_kernel(
+        ctx, cache_key, embedding_dim, q_dim, k_dim, v_dim, num_cols);
+    if (!entry) return;
+
+    try {
+        const size_t input_elems = (size_t)embedding_dim;
+        const size_t q_elems     = (size_t)q_dim;
+        const size_t k_elems     = (size_t)k_dim;
+        const size_t v_elems     = (size_t)v_dim;
+        const size_t input_bytes = input_elems * sizeof(uint16_t);
+        const size_t q_bytes     = q_elems     * sizeof(uint16_t);
+        const size_t k_bytes     = k_elems     * sizeof(uint16_t);
+        const size_t v_bytes     = v_elems     * sizeof(uint16_t);
+
+        // Lazily allocate persistent BOs.
+        // GEMV args per kernel: (opcode, insts, isize, matrix, vector, output)
+        //   matrix @ group_id(3), vector(input) @ group_id(4), output @ group_id(5)
+        if (!entry->input_bo) {
+            entry->input_bo = std::make_unique<xrt::bo>(
+                ctx->device, input_bytes, xrt::bo::flags::host_only,
+                entry->q_kernel.group_id(4));
+        }
+        if (!entry->q_output_bo) {
+            entry->q_output_bo = std::make_unique<xrt::bo>(
+                ctx->device, q_bytes, xrt::bo::flags::host_only,
+                entry->q_kernel.group_id(5));
+        }
+        if (!entry->k_output_bo) {
+            entry->k_output_bo = std::make_unique<xrt::bo>(
+                ctx->device, k_bytes, xrt::bo::flags::host_only,
+                entry->k_kernel.group_id(5));
+        }
+        if (!entry->v_output_bo) {
+            entry->v_output_bo = std::make_unique<xrt::bo>(
+                ctx->device, v_bytes, xrt::bo::flags::host_only,
+                entry->v_kernel.group_id(5));
+        }
+
+        // Warm (or look up) per-layer bf16 weight BOs.
+        xrt::bo * w_q_bo = nullptr;
+        xrt::bo * w_k_bo = nullptr;
+        xrt::bo * w_v_bo = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(*entry->weights_mutex);
+            w_q_bo = qkv_warm_weight_bf16(
+                ctx, entry, entry->w_q_bo_cache, src0_w_q,
+                entry->q_kernel, 3, "w_q");
+            w_k_bo = qkv_warm_weight_bf16(
+                ctx, entry, entry->w_k_bo_cache, src0_w_k,
+                entry->k_kernel, 3, "w_k");
+            w_v_bo = qkv_warm_weight_bf16(
+                ctx, entry, entry->w_v_bo_cache, src0_w_v,
+                entry->v_kernel, 3, "w_v");
+            if (!w_q_bo || !w_k_bo || !w_v_bo) return;
+        }
+
+        using clk = std::chrono::steady_clock;
+        static const bool prof = getenv("XDNA_DEBUG") != NULL;
+        auto t_in_s = clk::now();
+
+        // Load fresh input activation (bf16-from-f32 convert).
+        if (src1_input->type == GGML_TYPE_F32) {
+            f32_to_bf16((const float *)src1_input->data,
+                        (uint16_t *)entry->input_bo->map<void*>(), input_elems);
+        } else {
+            memcpy(entry->input_bo->map<void*>(), src1_input->data, input_bytes);
+        }
+        entry->input_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        auto t_in_e = clk::now();
+
+        // Build runlist: 3 GEMVs dispatched atomically.
+        auto t_rl_build_s = clk::now();
+        xrt::runlist rl(entry->hw_ctx);
+
+        // Run 1: Q projection. Args: (opcode=3, insts, isize, w_q, input, q_out)
+        {
+            xrt::run r(entry->q_kernel);
+            r.set_arg(0, 3u);
+            r.set_arg(1, entry->q_insts_bo);
+            r.set_arg(2, (uint32_t)entry->q_insts_data.size());
+            r.set_arg(3, *w_q_bo);
+            r.set_arg(4, *entry->input_bo);
+            r.set_arg(5, *entry->q_output_bo);
+            rl.add(std::move(r));
+        }
+
+        // Run 2: K projection.
+        {
+            xrt::run r(entry->k_kernel);
+            r.set_arg(0, 3u);
+            r.set_arg(1, entry->k_insts_bo);
+            r.set_arg(2, (uint32_t)entry->k_insts_data.size());
+            r.set_arg(3, *w_k_bo);
+            r.set_arg(4, *entry->input_bo);
+            r.set_arg(5, *entry->k_output_bo);
+            rl.add(std::move(r));
+        }
+
+        // Run 3: V projection.
+        {
+            xrt::run r(entry->v_kernel);
+            r.set_arg(0, 3u);
+            r.set_arg(1, entry->v_insts_bo);
+            r.set_arg(2, (uint32_t)entry->v_insts_data.size());
+            r.set_arg(3, *w_v_bo);
+            r.set_arg(4, *entry->input_bo);
+            r.set_arg(5, *entry->v_output_bo);
+            rl.add(std::move(r));
+        }
+        auto t_rl_build_e = clk::now();
+
+        auto t_rl_exec_s = clk::now();
+        rl.execute();
+        auto t_rl_exec_e = clk::now();
+
+        auto t_rl_wait_s = clk::now();
+        rl.wait();
+        auto t_rl_wait_e = clk::now();
+
+        // Sync outputs back and convert bf16 → f32.
+        auto t_out_s = clk::now();
+        entry->q_output_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        entry->k_output_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        entry->v_output_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        bf16_to_f32((const uint16_t *)entry->q_output_bo->map<void*>(),
+                    (float *)q_dst->data, q_elems);
+        bf16_to_f32((const uint16_t *)entry->k_output_bo->map<void*>(),
+                    (float *)k_dst->data, k_elems);
+        bf16_to_f32((const uint16_t *)entry->v_output_bo->map<void*>(),
+                    (float *)v_dst->data, v_elems);
+        auto t_out_e = clk::now();
+
+        if (prof) {
+            auto us = [](clk::time_point a, clk::time_point b) {
+                return (long)std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
+            };
+            GGML_LOG_INFO(
+                "ggml-xdna: qkv_prof K=%ld Nq=%ld Nk=%ld Nv=%ld in=%ld "
+                "rl_build=%ld rl_exec=%ld rl_wait=%ld out=%ld total=%ld us\n",
+                (long)embedding_dim, (long)q_dim, (long)k_dim, (long)v_dim,
+                us(t_in_s,       t_in_e),
+                us(t_rl_build_s, t_rl_build_e),
+                us(t_rl_exec_s,  t_rl_exec_e),
+                us(t_rl_wait_s,  t_rl_wait_e),
+                us(t_out_s,      t_out_e),
+                us(t_in_s,       t_out_e));
+        }
+
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("ggml-xdna: QKV XRT dispatch failed (%s)\n", e.what());
+    }
+}
+
+// Shape-dispatchability for chained QKV: mirror validate_qkv_shapes in compile.py.
+// All three GEMV stages must tile at num_cols and satisfy kernel_vector_size (64).
+static bool xdna_shape_dispatchable_qkv(int64_t K_emb, int64_t q_dim,
+                                         int64_t k_dim, int64_t v_dim,
+                                         int num_cols) {
+    if (num_cols != 4 && num_cols != 8) return false;
+    if (K_emb < 64 || K_emb % 64 != 0) return false;  // GEMV kernel_vector_size
+    for (int64_t m : {q_dim, k_dim, v_dim}) {
+        if (m <= 0) return false;
+        if (m % num_cols != 0) return false;
+        if ((m / num_cols) < 8) return false;
+        if (m > 32768) return false;  // BD-overflow cap
+    }
+    return true;
+}
+
 // Shape-dispatchability for fused SwiGLU decode. Must be a superset of
 // validate_swiglu_decode_shapes in compile.py.
 static bool xdna_shape_dispatchable_swiglu_decode(int64_t K_emb, int64_t N_hid, int num_cols) {
@@ -2680,20 +3175,19 @@ static bool xdna_shape_dispatchable_swiglu_decode(int64_t K_emb, int64_t N_hid, 
     return true;
 }
 
-// Shape-dispatchability for fused SwiGLU prefill. With tile_m-override support
-// now wired through the bridge (IRON PR: SwiGLUPrefill tile_m/k/n), we accept
-// any M for which xdna_pick_swiglu_prefill_tile_m returns a valid tile.
-// tile_k and tile_n still use IRON's default of 64.
+// Shape-dispatchability for fused SwiGLU prefill. With tile_m/tile_n override
+// support wired through the bridge, we accept any M for which
+// xdna_pick_swiglu_prefill_tile_m returns a valid tile, and any dims for which
+// xdna_pick_swiglu_prefill_tile_n finds a valid tile_n.
+// tile_k still uses IRON's default of 64.
 static bool xdna_shape_dispatchable_swiglu_prefill(int64_t M_seq, int64_t K_emb,
                                                    int64_t N_hid, int num_cols) {
     if (num_cols != 4 && num_cols != 8) return false;
     if (xdna_pick_swiglu_prefill_tile_m(M_seq) == 0) return false;
-    if (K_emb < 64  || K_emb % 64  != 0) return false;   // default tile_k=64
-    if (N_hid < (int64_t)num_cols * 64 || N_hid % ((int64_t)num_cols * 64) != 0) return false;  // default tile_n=64
+    if (K_emb < 64  || K_emb % 64  != 0) return false;   // tile_k=64
+    if (xdna_pick_swiglu_prefill_tile_n(K_emb, N_hid, num_cols) == 0) return false;
     if (N_hid > 32768 || K_emb > 32768) return false;
     if (N_hid % (num_cols * 2) != 0) return false;       // SiLU per-column tile
-    // gemm_2 swaps K and N: must ALSO satisfy embedding_dim divisibility for tile_n.
-    if (K_emb % ((int64_t)num_cols * 64) != 0) return false;
     return true;
 }
 
@@ -2716,6 +3210,159 @@ static bool xdna_shape_dispatchable_swiglu_decode_int8(int64_t K_emb, int64_t N_
     return true;
 }
 
+// Validate that (w_q, w_k, w_v, input) form a dispatchable QKV triple.
+// Checks types, contiguity, 2D, K-dim consistency, M=1, shape tileability.
+// Shared between the cgraph pre-scan (xdna_plan_qkv) and any future callers.
+static bool xdna_validate_qkv_triple(const struct ggml_tensor * w_q,
+                                      const struct ggml_tensor * w_k,
+                                      const struct ggml_tensor * w_v,
+                                      const struct ggml_tensor * input,
+                                      int * out_num_cols) {
+    for (const auto * w : {w_q, w_k, w_v}) {
+        if (w->type != GGML_TYPE_F32 && w->type != GGML_TYPE_BF16 && w->type != GGML_TYPE_F16) return false;
+        if (!ggml_is_contiguous(w)) return false;
+        if (w->ne[2] != 1 || w->ne[3] != 1) return false;
+    }
+    if (input->type != GGML_TYPE_F32) return false;
+    if (!ggml_is_contiguous(input)) return false;
+    if (input->ne[2] != 1 || input->ne[3] != 1) return false;
+
+    const int64_t embedding_dim = input->ne[0];
+    if (w_q->ne[0] != embedding_dim) return false;
+    if (w_k->ne[0] != embedding_dim) return false;
+    if (w_v->ne[0] != embedding_dim) return false;
+
+    if (input->ne[1] != 1) return false;  // M=1 only for now
+
+    int num_cols = 8;  // NPU2 default
+    if (!xdna_shape_dispatchable_qkv(embedding_dim, w_q->ne[1], w_k->ne[1], w_v->ne[1], num_cols))
+        return false;
+
+    if (out_num_cols) *out_num_cols = num_cols;
+    return true;
+}
+
+// Pre-scan result: QKV triples planned for fused dispatch.
+struct xdna_qkv_plan {
+    // Q node idx -> (Q idx, K idx, V idx). Looked up at Q's position during
+    // graph walk. The other 2 indices appear in skip_indices.
+    std::unordered_map<int, std::array<int,3>> triple_at;
+    // K and V node indices — skipped during main loop (already dispatched at Q).
+    std::unordered_set<int> skip_indices;
+};
+
+// Scan cgraph for QKV triples: MUL_MAT nodes grouped by src[1] that form
+// groups of exactly 3 and pass validation. The 3 node indices are stored in
+// ascending cgraph order; we dispatch all 3 at the first (lowest-index) node
+// position, then skip the other 2 when the main loop reaches them.
+//
+// The Qwen3.5 decode pattern places RMSNorm/view ops between Q and K/V, so a
+// linear 3-consecutive-node matcher never fires. This pre-scan sidesteps that
+// by grouping on shared src[1] across the whole graph.
+static void xdna_plan_qkv(const struct ggml_cgraph * cgraph, xdna_qkv_plan * out) {
+    static const bool dbg = getenv("XDNA_DEBUG") != NULL;
+    static std::atomic<int> dbg_remaining{dbg ? 3 : 0};  // cap verbose dumps
+    const bool verbose = dbg && dbg_remaining.fetch_sub(1) > 0;
+
+    std::unordered_map<const struct ggml_tensor *, std::vector<int>> by_src1;
+    int n_mulmat = 0;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const struct ggml_tensor * n = cgraph->nodes[i];
+        if (n->op == GGML_OP_MUL_MAT) {
+            by_src1[n->src[1]].push_back(i);
+            n_mulmat++;
+            if (verbose) {
+                const struct ggml_tensor * w = n->src[0];
+                const struct ggml_tensor * a = n->src[1];
+                fprintf(stderr,
+                        "ggml-xdna:   MUL_MAT[%d] w=%s(type=%d ne=[%ld,%ld]) "
+                        "a=%s(type=%d ne=[%ld,%ld,%ld,%ld]) dst=%s\n",
+                        i,
+                        w->name[0] ? w->name : "?", w->type,
+                        (long)w->ne[0], (long)w->ne[1],
+                        a->name[0] ? a->name : "?", a->type,
+                        (long)a->ne[0], (long)a->ne[1],
+                        (long)a->ne[2], (long)a->ne[3],
+                        n->name[0] ? n->name : "?");
+            }
+        }
+    }
+    if (verbose) {
+        // Also tally op-type counts so we know *what* is in these segments.
+        std::unordered_map<int, int> op_counts;
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            op_counts[cgraph->nodes[i]->op]++;
+        }
+        fprintf(stderr, "ggml-xdna:   op breakdown:");
+        for (auto & oc : op_counts) {
+            fprintf(stderr, " %s=%d", ggml_op_name((enum ggml_op)oc.first), oc.second);
+        }
+        fprintf(stderr, "\n");
+    }
+
+    int n_groups_2 = 0, n_groups_3 = 0, n_groups_other = 0;
+    int n_triples_validated = 0;
+    for (auto & kv : by_src1) {
+        const auto & indices = kv.second;
+        if      (indices.size() == 2) n_groups_2++;
+        else if (indices.size() == 3) n_groups_3++;
+        else if (indices.size() != 1) n_groups_other++;
+
+        if (verbose && indices.size() >= 2) {
+            const struct ggml_tensor * src1 = kv.first;
+            const struct ggml_tensor * n0 = cgraph->nodes[indices[0]];
+            fprintf(stderr,
+                    "ggml-xdna: QKV scan group sz=%zu src1=%p name=%s type=%d "
+                    "ne=[%ld,%ld,%ld,%ld] — n0 src0: type=%d ne=[%ld,%ld]\n",
+                    indices.size(), (const void*)src1,
+                    src1->name[0] ? src1->name : "(unnamed)", src1->type,
+                    (long)src1->ne[0], (long)src1->ne[1],
+                    (long)src1->ne[2], (long)src1->ne[3],
+                    n0->src[0]->type,
+                    (long)n0->src[0]->ne[0], (long)n0->src[0]->ne[1]);
+        }
+
+        if (indices.size() != 3) continue;
+
+        const int i_q = indices[0];
+        const int i_k = indices[1];
+        const int i_v = indices[2];
+        const struct ggml_tensor * n_q = cgraph->nodes[i_q];
+        const struct ggml_tensor * n_k = cgraph->nodes[i_k];
+        const struct ggml_tensor * n_v = cgraph->nodes[i_v];
+
+        int num_cols = 0;
+        bool ok = xdna_validate_qkv_triple(n_q->src[0], n_k->src[0], n_v->src[0],
+                                           n_q->src[1], &num_cols);
+        if (verbose) {
+            fprintf(stderr,
+                    "ggml-xdna:   group-3 validate=%d q_w ne=[%ld,%ld] k_w ne=[%ld,%ld] "
+                    "v_w ne=[%ld,%ld] input type=%d ne[1]=%ld contig(input)=%d\n",
+                    (int)ok,
+                    (long)n_q->src[0]->ne[0], (long)n_q->src[0]->ne[1],
+                    (long)n_k->src[0]->ne[0], (long)n_k->src[0]->ne[1],
+                    (long)n_v->src[0]->ne[0], (long)n_v->src[0]->ne[1],
+                    n_q->src[1]->type, (long)n_q->src[1]->ne[1],
+                    (int)ggml_is_contiguous(n_q->src[1]));
+        }
+        if (!ok) continue;
+
+        out->triple_at[i_q] = {i_q, i_k, i_v};
+        out->skip_indices.insert(i_k);
+        out->skip_indices.insert(i_v);
+        n_triples_validated++;
+    }
+
+    if (dbg) {
+        fprintf(stderr,
+                "ggml-xdna: QKV scan: n_nodes=%d n_mul_mat=%d unique_src1=%zu "
+                "groups(sz=2:%d sz=3:%d other:%d) triples_validated=%d\n",
+                cgraph->n_nodes, n_mulmat, by_src1.size(),
+                n_groups_2, n_groups_3, n_groups_other, n_triples_validated);
+        fflush(stderr);
+    }
+}
+
 // Matched SwiGLU pattern. Populated by xdna_try_match_swiglu.
 struct xdna_swiglu_match {
     struct ggml_tensor * gate_mm;    // node[i]   — MUL_MAT(gate_w, input)
@@ -2730,6 +3377,9 @@ struct xdna_swiglu_match {
     // (ggml_backend_xdna_mul_mat_swiglu_int8) should be used. Bf16 matches
     // leave this false for the existing bf16 dispatcher.
     bool is_int8;
+    // Number of AIE columns to use. Prefer 8 (full NPU2), fall back to 4
+    // when hidden_dim/embedding_dim don't tile at 8 cols.
+    int num_cols;
 };
 
 // Attempt to match a 4-node SwiGLU pattern starting at cgraph->nodes[i].
@@ -2804,7 +3454,7 @@ static bool xdna_try_match_swiglu(const struct ggml_cgraph * cgraph, int i,
     const char * ws_names[3] = { "gate_w", "up_w", "down_w" };
     for (int wi = 0; wi < 3; wi++) {
         const struct ggml_tensor * w = ws[wi];
-        const bool bf16_typed = (w->type == GGML_TYPE_F32 || w->type == GGML_TYPE_BF16);
+        const bool bf16_typed = (w->type == GGML_TYPE_F32 || w->type == GGML_TYPE_BF16 || w->type == GGML_TYPE_F16);
         const bool int8_typed = (w->type == GGML_TYPE_Q8_0) && allow_int8;
         if (!bf16_typed && !int8_typed) {
             if (dbg) fprintf(stderr, "ggml-xdna: swiglu reject @%d: %s type=%d\n",
@@ -2844,11 +3494,13 @@ static bool xdna_try_match_swiglu(const struct ggml_cgraph * cgraph, int i,
     }
 
     const int64_t M = input->ne[1];
-    const int num_cols = 8;
+
+    // NPU2 = 8 cols. IRON enforces num_aie_columns == device.cols, so we
+    // can't fall back to 4 cols on an 8-col device. Shapes must tile at 8 cols.
+    int num_cols = 8;
 
     if (M == 1) {
         if (allow_int8) {
-            // INT8 path: Q8_0 weights only, decode only, group_size fixed at 32.
             if (!xdna_shape_dispatchable_swiglu_decode_int8(
                     embedding_dim, hidden_dim, num_cols, /*group_size=*/32))
                 SWIGLU_REJECT("decode-int8 shape not dispatchable");
@@ -2857,27 +3509,34 @@ static bool xdna_try_match_swiglu(const struct ggml_cgraph * cgraph, int i,
                 SWIGLU_REJECT("decode shape not dispatchable");
         }
     } else if (M >= 32) {
-        // Prefill is opt-in *in addition* to the master XDNA_ENABLE_SWIGLU gate:
-        // it's correct but currently 3x slower than CPU at Qwen's FFN shape
-        // (M=64, K=1024, N=3584). Kept gated off until chained on-device submit
-        // or INT8 weights bring arithmetic intensity up.
+        // Prefill path. M is rounded up to the next multiple of 64 (NPU2 GEMM
+        // requires tile_m >= 16 → M % 64 == 0). The M >= 32 floor keeps the
+        // padding waste ≤ 2× (padded_M is always 64 for M ≤ 64). Below 32 the
+        // kernel is dominated by per-submit XRT overhead (~11ms/layer) on
+        // compute the user didn't ask for — catastrophic at spec-decode
+        // verify batches (M=2..8) where the overhead is paid ~28 times per
+        // token for zero net throughput. Keep this aligned with
+        // xdna_shape_dispatchable()'s M >= 32 floor for standalone GEMM.
         static const bool prefill_enabled = getenv("XDNA_ENABLE_SWIGLU_PREFILL") != NULL;
         if (!prefill_enabled) SWIGLU_REJECT("prefill disabled (set XDNA_ENABLE_SWIGLU_PREFILL=1 to opt in)");
+        const int64_t padded_M = ((M + 63) / 64) * 64;
         if (allow_int8) {
-            // W8A8 INT8 prefill. Gated behind XDNA_ENABLE_SWIGLU_PREFILL_INT8.
             static const bool prefill_int8_ok = getenv("XDNA_ENABLE_SWIGLU_PREFILL_INT8") != NULL;
             if (!prefill_int8_ok)
                 SWIGLU_REJECT("prefill-int8 disabled (set XDNA_ENABLE_SWIGLU_PREFILL_INT8=1)");
-            int tm = xdna_pick_swiglu_prefill_tile_m(M);
+            int tm = xdna_pick_swiglu_prefill_tile_m(padded_M);
             if (tm < 16) SWIGLU_REJECT("prefill-int8 tile_m < 16");
-            if (!xdna_shape_dispatchable_swiglu_prefill(M, embedding_dim, hidden_dim, num_cols))
+            if (!xdna_shape_dispatchable_swiglu_prefill(padded_M, embedding_dim, hidden_dim, num_cols))
                 SWIGLU_REJECT("prefill-int8 shape not dispatchable");
         } else {
-            if (!xdna_shape_dispatchable_swiglu_prefill(M, embedding_dim, hidden_dim, num_cols))
-                SWIGLU_REJECT("prefill shape not dispatchable");
+            if (!xdna_shape_dispatchable_swiglu_prefill(padded_M, embedding_dim, hidden_dim, num_cols)) {
+                if (dbg) fprintf(stderr, "ggml-xdna: swiglu reject @%d: prefill M=%ld(pad=%ld) K=%ld N=%ld not dispatchable\n",
+                                 i, (long)M, (long)padded_M, (long)embedding_dim, (long)hidden_dim);
+                return false;
+            }
         }
     } else {
-        if (dbg) fprintf(stderr, "ggml-xdna: swiglu reject @%d: M=%ld in (1, 32)\n",
+        if (dbg) fprintf(stderr, "ggml-xdna: swiglu reject @%d: M=%ld below prefill floor (M>=32 required; spec-decode verify batches fall to CPU)\n",
                          i, (long)M);
         return false;
     }
@@ -2892,6 +3551,7 @@ static bool xdna_try_match_swiglu(const struct ggml_cgraph * cgraph, int i,
     out->down_w  = down_w;
     out->input   = input;
     out->is_int8 = allow_int8;
+    out->num_cols = num_cols;
     return true;
 }
 
@@ -2997,9 +3657,60 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
     // (included in the CPU run — CPU handles them as no-ops but keeping them
     // in-range preserves sched invariants).
     static const bool swiglu_enabled = getenv("XDNA_ENABLE_SWIGLU") != NULL;
+    static const bool qkv_enabled    = getenv("XDNA_ENABLE_QKV")    != NULL;
+
+    // Pre-scan for QKV triples. Llama.cpp's Qwen3.5 decode interleaves
+    // RMSNorm/view ops between Q and K/V MUL_MATs, so a 3-consecutive-node
+    // matcher never fires. We group MUL_MATs by shared src[1] activation
+    // across the whole graph instead. Dispatch happens at the Q node
+    // position; K/V are skipped when the main loop reaches them.
+    xdna_qkv_plan qkv_plan;
+    if (qkv_enabled) {
+        xdna_plan_qkv(cgraph, &qkv_plan);
+        static const bool qkv_dbg = getenv("XDNA_DEBUG") != NULL;
+        if (qkv_dbg) {
+            fprintf(stderr, "ggml-xdna: QKV plan: %zu triples (%zu skip nodes)\n",
+                    qkv_plan.triple_at.size(), qkv_plan.skip_indices.size());
+            fflush(stderr);
+        }
+    }
+
     int cpu_run_start = -1;
     for (int i = 0; i < n; i++) {
         struct ggml_tensor * node = cgraph->nodes[i];
+
+        // QKV triple: dispatch Q+K+V as one xrt::runlist at Q's position.
+        // K/V indices come later in the linear walk and are in skip_indices.
+        if (qkv_enabled) {
+            auto it = qkv_plan.triple_at.find(i);
+            if (it != qkv_plan.triple_at.end()) {
+                if (cpu_run_start >= 0) {
+                    ggml_status s = xdna_delegate_range(ctx, cgraph, cpu_run_start, i);
+                    if (s != GGML_STATUS_SUCCESS) return s;
+                    cpu_run_start = -1;
+                }
+                const auto & trip = it->second;
+                struct ggml_tensor * q_mm = cgraph->nodes[trip[0]];
+                struct ggml_tensor * k_mm = cgraph->nodes[trip[1]];
+                struct ggml_tensor * v_mm = cgraph->nodes[trip[2]];
+                ggml_backend_xdna_mul_mat_qkv(
+                    ctx, q_mm, k_mm, v_mm,
+                    q_mm->src[0], k_mm->src[0], v_mm->src[0],
+                    q_mm->src[1]);
+                continue;  // natural ++i; intermediate CPU nodes still run via accumulator
+            }
+            if (qkv_plan.skip_indices.count(i)) {
+                // K or V — already dispatched as part of its QKV triple at Q's
+                // position. Flush any pending CPU run so delegate_range's
+                // contiguous view stops just before this node, then skip it.
+                if (cpu_run_start >= 0) {
+                    ggml_status s = xdna_delegate_range(ctx, cgraph, cpu_run_start, i);
+                    if (s != GGML_STATUS_SUCCESS) return s;
+                    cpu_run_start = -1;
+                }
+                continue;
+            }
+        }
 
         // First try the fused SwiGLU pattern — matches node[i..i+3] as a
         // gate/up MUL_MAT + SwiGLU GLU + down MUL_MAT chain and collapses
@@ -3039,7 +3750,8 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                     ggml_backend_xdna_mul_mat_swiglu(
                         ctx,
                         m.gate_mm, m.up_mm, m.glu, m.down_mm,
-                        m.gate_w, m.up_w, m.down_w, m.input);
+                        m.gate_w, m.up_w, m.down_w, m.input,
+                        m.num_cols);
                 }
                 i += 3;  // for-loop ++i then lands on the node after down_mm
                 continue;
@@ -3373,7 +4085,7 @@ static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const s
             // fallback inside graph_compute. Claiming it here keeps the
             // scheduler from splitting the FFN pattern across backends.
             static const bool int8_ok = getenv("XDNA_ENABLE_SWIGLU_INT8") != NULL;
-            if (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_BF16) return true;
+            if (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_BF16 || src0->type == GGML_TYPE_F16) return true;
             if (int8_ok && src0->type == GGML_TYPE_Q8_0) return true;
             return false;
         }
@@ -3437,6 +4149,57 @@ static bool ggml_backend_xdna_device_supports_buft(ggml_backend_dev_t dev, ggml_
 // Ops still come to us (we own weight buffers), but this tells the scheduler
 // that for shapes where we'd just fall back to CPU, there's no speed win.
 static bool ggml_backend_xdna_device_offload_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
+    // QKV fusion mode: be aggressive about keeping ops here so Q/K/V and the
+    // intermediate norm/view/rope ops between them land in the same graph
+    // segment. Without this, the scheduler splits between Q and K on every
+    // CPU-bound intermediate and we only ever see 1 MUL_MAT per cgraph.
+    static const bool qkv_enabled = getenv("XDNA_ENABLE_QKV") != NULL;
+    if (qkv_enabled) {
+        switch (op->op) {
+            case GGML_OP_MUL_MAT: {
+                const int64_t K = op->src[0]->ne[0];
+                const int64_t N = op->src[0]->ne[1];
+                const int64_t M = op->src[1]->ne[1];
+                if (M == 1) {
+                    if (K < 64 || K % 64 != 0) return false;
+                    if (N < 8  || N > 32768)   return false;
+                    if (N % 8 != 0)            return false;
+                    return true;
+                }
+                return xdna_shape_dispatchable(M, K, N);
+            }
+            // Intermediate ops between Q/K/V — keep them here so the scheduler
+            // doesn't split. graph_compute's CPU fallback delegates them via
+            // xdna_delegate_range (same cost as leaving on CPU, minus the
+            // cross-backend sched overhead we'd otherwise incur per split).
+            case GGML_OP_ADD:
+            case GGML_OP_MUL:
+            case GGML_OP_SUB:
+            case GGML_OP_DIV:
+            case GGML_OP_RMS_NORM:
+            case GGML_OP_NORM:
+            case GGML_OP_GROUP_NORM:
+            case GGML_OP_SCALE:
+            case GGML_OP_CPY:
+            case GGML_OP_CONT:
+            case GGML_OP_DUP:
+            case GGML_OP_ROPE:
+            case GGML_OP_SOFT_MAX:
+            case GGML_OP_UNARY:
+            case GGML_OP_GLU:
+            case GGML_OP_GET_ROWS:
+            case GGML_OP_SET_ROWS:
+            case GGML_OP_RESHAPE:
+            case GGML_OP_VIEW:
+            case GGML_OP_PERMUTE:
+            case GGML_OP_TRANSPOSE:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    // Default path (QKV disabled): only claim MUL_MATs with dispatchable shape.
     if (op->op != GGML_OP_MUL_MAT) return false;
     const int64_t K = op->src[0]->ne[0];
     const int64_t N = op->src[0]->ne[1];

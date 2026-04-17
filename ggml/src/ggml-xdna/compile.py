@@ -80,12 +80,13 @@ def swiglu_decode_cache_key(embedding_dim: int, hidden_dim: int,
 
 def swiglu_prefill_cache_key(seq_len: int, embedding_dim: int, hidden_dim: int,
                              dtype: str, num_aie_columns: int,
-                             tile_m: int | None = None) -> str:
+                             tile_m: int | None = None,
+                             tile_n: int | None = None) -> str:
     """Cache key for a SwiGLU prefill configuration.
 
-    tile_m is a distinguishing input because it changes the compiled xclbin
-    (different MAC tiling). tile_k/tile_n are left at IRON's defaults and
-    omitted from the key — revisit if we ever vary them too.
+    tile_m and tile_n are distinguishing inputs because they change the compiled
+    xclbin (different MAC tiling). tile_k is left at IRON's default (64) and
+    omitted from the key.
     """
     key_data = {
         "op": "swiglu_prefill",
@@ -96,6 +97,8 @@ def swiglu_prefill_cache_key(seq_len: int, embedding_dim: int, hidden_dim: int,
         "num_aie_columns": num_aie_columns,
         "tile_m": tile_m,
     }
+    if tile_n is not None and tile_n != 64:
+        key_data["tile_n"] = tile_n
     key_json = json.dumps(key_data, sort_keys=True)
     return hashlib.sha256(key_json.encode()).hexdigest()[:16]
 
@@ -139,13 +142,36 @@ def swiglu_fused_int8_cache_key(embedding_dim: int, hidden_dim: int,
     return hashlib.sha256(key_json.encode()).hexdigest()[:16]
 
 
+def qkv_cache_key(embedding_dim: int, q_dim: int, k_dim: int, v_dim: int,
+                  num_aie_columns: int) -> str:
+    """Cache key for a chained Q/K/V projection configuration.
+
+    Three bf16 GEMVs with shared input (K=embedding_dim) and distinct output
+    dims fused into one xclbin. Disjoint from gemm/gemv/swiglu keys by the
+    ``"op"`` field. Tile sizes are derived from shapes by IRON and so are
+    not part of the key.
+    """
+    key_data = {
+        "op": "qkv",
+        "embedding_dim": embedding_dim,
+        "q_dim": q_dim,
+        "k_dim": k_dim,
+        "v_dim": v_dim,
+        "num_aie_columns": num_aie_columns,
+    }
+    key_json = json.dumps(key_data, sort_keys=True)
+    return hashlib.sha256(key_json.encode()).hexdigest()[:16]
+
+
 def swiglu_prefill_int8_cache_key(seq_len: int, embedding_dim: int, hidden_dim: int,
                                    num_aie_columns: int,
-                                   tile_m: int | None = None) -> str:
+                                   tile_m: int | None = None,
+                                   tile_n: int | None = None) -> str:
     """Cache key for a W8A8 INT8 SwiGLU prefill configuration.
 
-    tile_m is a distinguishing input because it changes the compiled xclbin
-    (different MAC tiling). Disjoint from bf16 swiglu_prefill by the "op" field.
+    tile_m and tile_n are distinguishing inputs because they change the compiled
+    xclbin (different MAC tiling). Disjoint from bf16 swiglu_prefill by the
+    "op" field.
     """
     key_data = {
         "op": "swiglu_prefill_int8",
@@ -155,6 +181,8 @@ def swiglu_prefill_int8_cache_key(seq_len: int, embedding_dim: int, hidden_dim: 
         "num_aie_columns": num_aie_columns,
         "tile_m": tile_m,
     }
+    if tile_n is not None and tile_n != 64:
+        key_data["tile_n"] = tile_n
     key_json = json.dumps(key_data, sort_keys=True)
     return hashlib.sha256(key_json.encode()).hexdigest()[:16]
 
@@ -168,6 +196,22 @@ def select_swiglu_prefill_tile_m(seq_len: int) -> int:
     for tm in (64, 32, 16, 8):
         if seq_len % (tm * 4) == 0:
             return tm
+    return 0
+
+
+def select_swiglu_prefill_tile_n(embedding_dim: int, hidden_dim: int,
+                                 num_aie_columns: int) -> int:
+    """Pick the largest valid tile_n for SwiGLU prefill.
+
+    Both inner GEMMs must tile cleanly:
+      - GEMM1 (gate/up): N = hidden_dim  → hidden_dim  % (tile_n * cols) == 0
+      - GEMM2 (down):    N = embedding_dim → embedding_dim % (tile_n * cols) == 0
+    Returns 0 if no candidate works (caller should fall back / reject).
+    """
+    for tn in (64, 32, 16, 8):
+        if (hidden_dim % (tn * num_aie_columns) == 0 and
+                embedding_dim % (tn * num_aie_columns) == 0):
+            return tn
     return 0
 
 
@@ -189,6 +233,9 @@ SWIGLU_FUSED_CHAINED_KERNELS = ("fused", "down_gemv_int8")
 # GEMMs use dtype_in="i8", dtype_out="bf16s". Kernel names match the
 # chain_swiglu_artifacts() call in swiglu_prefill_int8/op.py.
 SWIGLU_PREFILL_INT8_KERNELS = ("gemm_1", "silu", "eltwise_mul", "gemm_2")
+# Chained Q/K/V projection: 3 bf16 GEMVs sharing input, one xclbin, 3 kernels.
+# Names must match chain_artifacts() call in iron/operators/qkv_proj/chained.py.
+QKV_PROJ_KERNELS = ("gemv_q", "gemv_k", "gemv_v")
 
 
 # ---------------------------------------------------------------------------
@@ -371,12 +418,14 @@ def validate_swiglu_decode_int8_shapes(embedding_dim: int, hidden_dim: int,
 
 def validate_swiglu_prefill_shapes(seq_len: int, embedding_dim: int, hidden_dim: int,
                                    num_aie_columns: int,
-                                   tile_m: int | None = None) -> None:
+                                   tile_m: int | None = None,
+                                   tile_n: int | None = None) -> None:
     """Verify a SwiGLU prefill shape is dispatchable.
 
     If tile_m is None, IRON defaults to 64 → min_M = 256. If overridden, the
-    constraint loosens to seq_len % (tile_m * 4) == 0. tile_k/tile_n remain
-    at IRON's default of 64.
+    constraint loosens to seq_len % (tile_m * 4) == 0. tile_k remains at
+    IRON's default of 64. tile_n defaults to auto-selected via
+    select_swiglu_prefill_tile_n when not provided.
     """
     if num_aie_columns not in (4, 8):
         raise ValueError(
@@ -401,24 +450,38 @@ def validate_swiglu_prefill_shapes(seq_len: int, embedding_dim: int, hidden_dim:
         raise ValueError(f"embedding_dim={embedding_dim} must be a multiple of 64")
     if hidden_dim % 64 != 0:
         raise ValueError(f"hidden_dim={hidden_dim} must be a multiple of 64")
-    if hidden_dim % (64 * num_aie_columns) != 0:
+    effective_tile_n = tile_n if tile_n is not None else select_swiglu_prefill_tile_n(
+        embedding_dim, hidden_dim, num_aie_columns
+    )
+    if effective_tile_n == 0:
         raise ValueError(
-            f"hidden_dim={hidden_dim} must be a multiple of 64*num_aie_columns="
-            f"{64 * num_aie_columns} (gemm_1 tile_n*cols)"
+            f"Cannot find valid tile_n for embedding_dim={embedding_dim} "
+            f"hidden_dim={hidden_dim} num_aie_columns={num_aie_columns}"
         )
-    if embedding_dim % (64 * num_aie_columns) != 0:
+    if effective_tile_n not in (64, 32, 16, 8):
         raise ValueError(
-            f"embedding_dim={embedding_dim} must be a multiple of 64*num_aie_columns="
-            f"{64 * num_aie_columns} (gemm_2 tile_n*cols)"
+            f"tile_n={effective_tile_n} must be one of 64, 32, 16, 8"
+        )
+    if hidden_dim % (effective_tile_n * num_aie_columns) != 0:
+        raise ValueError(
+            f"hidden_dim={hidden_dim} must be a multiple of tile_n*num_aie_columns="
+            f"{effective_tile_n * num_aie_columns} (gemm_1 tile_n*cols)"
+        )
+    if embedding_dim % (effective_tile_n * num_aie_columns) != 0:
+        raise ValueError(
+            f"embedding_dim={embedding_dim} must be a multiple of tile_n*num_aie_columns="
+            f"{effective_tile_n * num_aie_columns} (gemm_2 tile_n*cols)"
         )
 
 
 def validate_swiglu_prefill_int8_shapes(seq_len: int, embedding_dim: int,
                                          hidden_dim: int, num_aie_columns: int,
-                                         tile_m: int | None = None) -> None:
+                                         tile_m: int | None = None,
+                                         tile_n: int | None = None) -> None:
     """Verify a W8A8 INT8 SwiGLU prefill shape is dispatchable.
 
     INT8 GEMM requires tile_m >= 16, so min seq_len = 64 (vs 32 for bf16).
+    tile_n is auto-selected via select_swiglu_prefill_tile_n when not provided.
     """
     if num_aie_columns not in (4, 8):
         raise ValueError(
@@ -444,15 +507,28 @@ def validate_swiglu_prefill_int8_shapes(seq_len: int, embedding_dim: int,
         raise ValueError(f"embedding_dim={embedding_dim} must be a multiple of 64")
     if hidden_dim % 64 != 0:
         raise ValueError(f"hidden_dim={hidden_dim} must be a multiple of 64")
-    if hidden_dim % (64 * num_aie_columns) != 0:
+    effective_tile_n = tile_n if tile_n is not None else select_swiglu_prefill_tile_n(
+        embedding_dim, hidden_dim, num_aie_columns
+    )
+    if effective_tile_n == 0:
         raise ValueError(
-            f"hidden_dim={hidden_dim} must be a multiple of 64*num_aie_columns="
-            f"{64 * num_aie_columns}"
+            f"Cannot find valid tile_n for embedding_dim={embedding_dim} "
+            f"hidden_dim={hidden_dim} num_aie_columns={num_aie_columns}"
         )
-    if embedding_dim % (64 * num_aie_columns) != 0:
+    # INT8 GEMM min_tile_n is 16 (vs 8 for bf16)
+    if effective_tile_n not in (64, 32, 16):
         raise ValueError(
-            f"embedding_dim={embedding_dim} must be a multiple of 64*num_aie_columns="
-            f"{64 * num_aie_columns}"
+            f"tile_n={effective_tile_n} must be one of 64, 32, 16 for INT8 GEMM"
+        )
+    if hidden_dim % (effective_tile_n * num_aie_columns) != 0:
+        raise ValueError(
+            f"hidden_dim={hidden_dim} must be a multiple of tile_n*num_aie_columns="
+            f"{effective_tile_n * num_aie_columns}"
+        )
+    if embedding_dim % (effective_tile_n * num_aie_columns) != 0:
+        raise ValueError(
+            f"embedding_dim={embedding_dim} must be a multiple of tile_n*num_aie_columns="
+            f"{effective_tile_n * num_aie_columns}"
         )
 
 
@@ -671,18 +747,32 @@ def compile_swiglu_fused_int8(embedding_dim: int, hidden_dim: int,
 
 def compile_swiglu_prefill(seq_len: int, embedding_dim: int, hidden_dim: int,
                            dtype: str, num_aie_columns: int, output_dir: str,
-                           tile_m: int | None = None) -> str:
+                           tile_m: int | None = None,
+                           tile_n: int | None = None) -> str:
     """Compile an IRON SwiGLU prefill operator and stage its artifacts.
 
     Output layout mirrors compile_swiglu_decode but with gemm_1/gemm_2 kernel names.
-    When tile_m is provided it is forwarded to SwiGLUPrefill, overriding the
-    default (64) in both inner GEMMs. Requires the IRON PR adding tile
-    overrides on SwiGLUPrefill to be merged locally.
+    When tile_m/tile_n are provided they are forwarded to SwiGLUPrefill,
+    overriding the defaults (64) in both inner GEMMs. tile_n is auto-selected
+    when not explicitly provided, enabling models whose dims aren't multiples
+    of 512 (= 64 * 8 cols).
     """
     if dtype != "bf16":
         raise ValueError(f"SwiGLU currently supports only bf16, got {dtype}")
+
+    # Auto-select tile_n if not explicitly provided.
+    if tile_n is None:
+        tile_n = select_swiglu_prefill_tile_n(embedding_dim, hidden_dim,
+                                              num_aie_columns)
+        if tile_n == 0:
+            raise ValueError(
+                f"Cannot find valid tile_n for embedding_dim={embedding_dim} "
+                f"hidden_dim={hidden_dim} num_aie_columns={num_aie_columns}"
+            )
+
     validate_swiglu_prefill_shapes(seq_len, embedding_dim, hidden_dim,
-                                   num_aie_columns, tile_m=tile_m)
+                                   num_aie_columns, tile_m=tile_m,
+                                   tile_n=tile_n)
 
     actual_cols = aie_utils.get_current_device().cols
     if actual_cols != num_aie_columns:
@@ -698,6 +788,8 @@ def compile_swiglu_prefill(seq_len: int, embedding_dim: int, hidden_dim: int,
     )
     if tile_m is not None:
         kwargs["tile_m"] = tile_m
+    if tile_n != 64:
+        kwargs["tile_n"] = tile_n
 
     op = SwiGLUPrefill(**kwargs)
     op.compile()
@@ -708,14 +800,26 @@ def compile_swiglu_prefill(seq_len: int, embedding_dim: int, hidden_dim: int,
 
 def compile_swiglu_prefill_int8(seq_len: int, embedding_dim: int, hidden_dim: int,
                                  num_aie_columns: int, output_dir: str,
-                                 tile_m: int | None = None) -> str:
+                                 tile_m: int | None = None,
+                                 tile_n: int | None = None) -> str:
     """Compile a W8A8 INT8 SwiGLU prefill operator and stage its artifacts.
 
     Uses GEMM(dtype_in="i8", dtype_out="bf16s") for both matmul stages.
     The C++ backend handles dynamic activation quantization at runtime.
     """
+    # Auto-select tile_n if not explicitly provided.
+    if tile_n is None:
+        tile_n = select_swiglu_prefill_tile_n(embedding_dim, hidden_dim,
+                                              num_aie_columns)
+        if tile_n == 0:
+            raise ValueError(
+                f"Cannot find valid tile_n for embedding_dim={embedding_dim} "
+                f"hidden_dim={hidden_dim} num_aie_columns={num_aie_columns}"
+            )
+
     validate_swiglu_prefill_int8_shapes(seq_len, embedding_dim, hidden_dim,
-                                         num_aie_columns, tile_m=tile_m)
+                                         num_aie_columns, tile_m=tile_m,
+                                         tile_n=tile_n)
 
     actual_cols = aie_utils.get_current_device().cols
     if actual_cols != num_aie_columns:
@@ -731,6 +835,8 @@ def compile_swiglu_prefill_int8(seq_len: int, embedding_dim: int, hidden_dim: in
     )
     if tile_m is not None:
         kwargs["tile_m"] = tile_m
+    if tile_n != 64:
+        kwargs["tile_n"] = tile_n
 
     op = SwiGLUPrefillInt8(**kwargs)
     op.compile()
@@ -739,8 +845,13 @@ def compile_swiglu_prefill_int8(seq_len: int, embedding_dim: int, hidden_dim: in
     return output_dir
 
 
-def _stage_swiglu_artifacts(op, kernel_names: tuple[str, ...], output_dir: str) -> None:
-    """Copy a compiled SwiGLU op's combined xclbin + per-kernel insts to output_dir."""
+def _stage_chained_artifacts(op, kernel_names: tuple[str, ...], output_dir: str,
+                             prefix: str = "swiglu") -> None:
+    """Copy a chained composite op's combined xclbin + per-kernel insts to output_dir.
+
+    Insts filenames are ``{prefix}_{name}.insts`` so bundles under different
+    prefixes (swiglu, qkv, ...) cannot collide within the same cache dir.
+    """
     os.makedirs(output_dir, exist_ok=True)
     build_dir = op.context.build_dir
 
@@ -750,8 +861,13 @@ def _stage_swiglu_artifacts(op, kernel_names: tuple[str, ...], output_dir: str) 
     for name in kernel_names:
         insts_artifact = getattr(op, f"{name}_insts")
         src = build_dir / insts_artifact.filename
-        dst = os.path.join(output_dir, f"swiglu_{name}.insts")
+        dst = os.path.join(output_dir, f"{prefix}_{name}.insts")
         shutil.copy2(str(src), dst)
+
+
+def _stage_swiglu_artifacts(op, kernel_names: tuple[str, ...], output_dir: str) -> None:
+    """Backward-compatible wrapper: stages a SwiGLU bundle with ``prefix="swiglu"``."""
+    _stage_chained_artifacts(op, kernel_names, output_dir, prefix="swiglu")
 
 
 # ---------------------------------------------------------------------------
@@ -814,18 +930,25 @@ def compile_gemv_cached(N: int, K: int, dtype_in: str = "bf16",
     return Path(output_path)
 
 
-def get_cached_swiglu_dir(cache_key: str, kernel_names: tuple[str, ...]) -> Path | None:
-    """Check if a SwiGLU bundle is cached. Returns the directory if found, else None.
+def get_cached_chained_dir(cache_key: str, kernel_names: tuple[str, ...],
+                           prefix: str = "swiglu") -> Path | None:
+    """Check if a chained-composite bundle is cached. Returns directory if found.
 
-    The combined.xclbin and *all* expected per-kernel insts files must exist.
+    The combined.xclbin and *all* expected per-kernel insts files (named
+    ``{prefix}_{name}.insts``) must exist.
     """
     cache_dir = get_cache_dir() / cache_key
     if not (cache_dir / "combined.xclbin").exists():
         return None
     for name in kernel_names:
-        if not (cache_dir / f"swiglu_{name}.insts").exists():
+        if not (cache_dir / f"{prefix}_{name}.insts").exists():
             return None
     return cache_dir
+
+
+def get_cached_swiglu_dir(cache_key: str, kernel_names: tuple[str, ...]) -> Path | None:
+    """Backward-compatible wrapper: looks up a SwiGLU bundle with ``prefix="swiglu"``."""
+    return get_cached_chained_dir(cache_key, kernel_names, prefix="swiglu")
 
 
 def compile_swiglu_decode_cached(embedding_dim: int, hidden_dim: int,
@@ -893,16 +1016,91 @@ def compile_swiglu_fused_int8_cached(embedding_dim: int, hidden_dim: int,
     return Path(output_dir)
 
 
+def validate_qkv_shapes(embedding_dim: int, q_dim: int, k_dim: int, v_dim: int,
+                        num_aie_columns: int) -> None:
+    """Verify a Q/K/V projection tuple is dispatchable to QKVProjChained.
+
+    Each of the 3 inner GEMV stages must satisfy K % kernel_vector_size (64),
+    per-column tiling, and L1-budget constraints. Reuses ``select_gemv_tiles``
+    for the arithmetic checks so the rules stay in one place.
+    """
+    if num_aie_columns not in (4, 8):
+        raise ValueError(
+            f"num_aie_columns must be 4 (NPU1) or 8 (NPU2), got {num_aie_columns}"
+        )
+    for name, m in (("q", q_dim), ("k", k_dim), ("v", v_dim)):
+        if m <= 0:
+            raise ValueError(f"{name}_dim must be > 0, got {m}")
+        # GEMV calls N the matrix-row dim (== output length); validator uses N=m.
+        select_gemv_tiles(N=m, K=embedding_dim, num_aie_columns=num_aie_columns)
+
+
+def compile_qkv(embedding_dim: int, q_dim: int, k_dim: int, v_dim: int,
+                num_aie_columns: int, output_dir: str) -> str:
+    """Compile the chained Q/K/V projection composite (3 bf16 GEMVs).
+
+    Produces one combined xclbin with 3 kernel entries (Q, K, V projections)
+    plus 3 insts files, staged under output_dir. All three kernels share one
+    hw_context and can be batched via xrt::runlist.
+
+    Output layout:
+        <output_dir>/combined.xclbin
+        <output_dir>/qkv_gemv_q.insts
+        <output_dir>/qkv_gemv_k.insts
+        <output_dir>/qkv_gemv_v.insts
+    """
+    validate_qkv_shapes(embedding_dim, q_dim, k_dim, v_dim, num_aie_columns)
+
+    actual_cols = aie_utils.get_current_device().cols
+    if actual_cols != num_aie_columns:
+        raise ValueError(
+            f"Device column mismatch: requested {num_aie_columns}, current "
+            f"device reports {actual_cols}. Compile on the target device."
+        )
+
+    from iron.operators.qkv_proj.chained import QKVProjChained
+
+    op = QKVProjChained(
+        embedding_dim=embedding_dim,
+        q_dim=q_dim,
+        k_dim=k_dim,
+        v_dim=v_dim,
+    )
+    op.compile()
+
+    _stage_chained_artifacts(op, QKV_PROJ_KERNELS, output_dir, prefix="qkv")
+    return output_dir
+
+
+def compile_qkv_cached(embedding_dim: int, q_dim: int, k_dim: int, v_dim: int,
+                       num_aie_columns: int = 4) -> Path:
+    """Compile the chained Q/K/V projection with caching.
+
+    Returns path to the cache directory containing combined.xclbin + 3 insts files.
+    """
+    key = qkv_cache_key(embedding_dim, q_dim, k_dim, v_dim, num_aie_columns)
+
+    cached = get_cached_chained_dir(key, QKV_PROJ_KERNELS, prefix="qkv")
+    if cached is not None:
+        return cached
+
+    output_dir = str(get_cache_dir() / key)
+    compile_qkv(embedding_dim, q_dim, k_dim, v_dim, num_aie_columns, output_dir)
+    return Path(output_dir)
+
+
 def compile_swiglu_prefill_cached(seq_len: int, embedding_dim: int, hidden_dim: int,
                                   dtype: str = "bf16",
                                   num_aie_columns: int = 4,
-                                  tile_m: int | None = None) -> Path:
+                                  tile_m: int | None = None,
+                                  tile_n: int | None = None) -> Path:
     """Compile a SwiGLU prefill operator with caching.
 
     Returns path to the cache directory containing combined.xclbin + 4 insts files.
     """
     key = swiglu_prefill_cache_key(
-        seq_len, embedding_dim, hidden_dim, dtype, num_aie_columns, tile_m=tile_m
+        seq_len, embedding_dim, hidden_dim, dtype, num_aie_columns,
+        tile_m=tile_m, tile_n=tile_n,
     )
 
     cached = get_cached_swiglu_dir(key, SWIGLU_PREFILL_KERNELS)
@@ -912,17 +1110,19 @@ def compile_swiglu_prefill_cached(seq_len: int, embedding_dim: int, hidden_dim: 
     output_dir = str(get_cache_dir() / key)
     compile_swiglu_prefill(
         seq_len, embedding_dim, hidden_dim, dtype, num_aie_columns, output_dir,
-        tile_m=tile_m,
+        tile_m=tile_m, tile_n=tile_n,
     )
     return Path(output_dir)
 
 
 def compile_swiglu_prefill_int8_cached(seq_len: int, embedding_dim: int, hidden_dim: int,
                                         num_aie_columns: int = 4,
-                                        tile_m: int | None = None) -> Path:
+                                        tile_m: int | None = None,
+                                        tile_n: int | None = None) -> Path:
     """Compile a W8A8 INT8 SwiGLU prefill operator with caching."""
     key = swiglu_prefill_int8_cache_key(
-        seq_len, embedding_dim, hidden_dim, num_aie_columns, tile_m=tile_m
+        seq_len, embedding_dim, hidden_dim, num_aie_columns,
+        tile_m=tile_m, tile_n=tile_n,
     )
 
     cached = get_cached_swiglu_dir(key, SWIGLU_PREFILL_INT8_KERNELS)
@@ -932,7 +1132,7 @@ def compile_swiglu_prefill_int8_cached(seq_len: int, embedding_dim: int, hidden_
     output_dir = str(get_cache_dir() / key)
     compile_swiglu_prefill_int8(
         seq_len, embedding_dim, hidden_dim, num_aie_columns, output_dir,
-        tile_m=tile_m,
+        tile_m=tile_m, tile_n=tile_n,
     )
     return Path(output_dir)
 
@@ -1005,6 +1205,24 @@ def main():
     swfi_parser.add_argument("--out", type=str,
                              help="Output directory (default: cache)")
 
+    # QKV projection subcommand (3 chained bf16 GEMVs, shared input)
+    qkv_parser = subparsers.add_parser(
+        "qkv",
+        help="Compile chained Q/K/V projection (3 bf16 GEMVs sharing input, "
+             "one xclbin, one xrt::runlist dispatch)"
+    )
+    qkv_parser.add_argument("--embedding-dim", type=int, required=True,
+                            help="Input activation size (K for all 3 GEMVs)")
+    qkv_parser.add_argument("--q-dim", type=int, required=True,
+                            help="Q projection output size")
+    qkv_parser.add_argument("--k-dim", type=int, required=True,
+                            help="K projection output size")
+    qkv_parser.add_argument("--v-dim", type=int, required=True,
+                            help="V projection output size")
+    qkv_parser.add_argument("--num-aie-columns", type=int, default=4)
+    qkv_parser.add_argument("--out", type=str,
+                            help="Output directory (default: cache)")
+
     # SwiGLU prefill subcommand
     swp_parser = subparsers.add_parser(
         "swiglu-prefill", help="Compile fused SwiGLU FFN (M>=32 prefill path)"
@@ -1017,6 +1235,9 @@ def main():
     swp_parser.add_argument("--tile-m", type=int, default=None,
                             help="Override tile_m for both inner GEMMs "
                                  "(default: IRON SwiGLUPrefill default of 64)")
+    swp_parser.add_argument("--tile-n", type=int, default=None,
+                            help="Override tile_n for both inner GEMMs "
+                                 "(default: auto-selected for shape compatibility)")
     swp_parser.add_argument("--out", type=str,
                             help="Output directory (default: cache)")
 
@@ -1031,6 +1252,9 @@ def main():
     swpi_parser.add_argument("--num-aie-columns", type=int, default=4)
     swpi_parser.add_argument("--tile-m", type=int, default=None,
                              help="Override tile_m for both inner GEMMs (min 16 for INT8)")
+    swpi_parser.add_argument("--tile-n", type=int, default=None,
+                             help="Override tile_n for both inner GEMMs "
+                                  "(default: auto-selected for shape compatibility)")
     swpi_parser.add_argument("--out", type=str,
                              help="Output directory (default: cache)")
 
@@ -1106,18 +1330,30 @@ def main():
                 group_size=args.group_size,
             )
         print(path)
+    elif args.op == "qkv":
+        if args.out:
+            path = compile_qkv(
+                args.embedding_dim, args.q_dim, args.k_dim, args.v_dim,
+                args.num_aie_columns, args.out,
+            )
+        else:
+            path = compile_qkv_cached(
+                args.embedding_dim, args.q_dim, args.k_dim, args.v_dim,
+                args.num_aie_columns,
+            )
+        print(path)
     elif args.op == "swiglu-prefill":
         if args.out:
             path = compile_swiglu_prefill(
                 args.seq_len, args.embedding_dim, args.hidden_dim,
                 args.dtype, args.num_aie_columns, args.out,
-                tile_m=args.tile_m,
+                tile_m=args.tile_m, tile_n=args.tile_n,
             )
         else:
             path = compile_swiglu_prefill_cached(
                 args.seq_len, args.embedding_dim, args.hidden_dim,
                 args.dtype, args.num_aie_columns,
-                tile_m=args.tile_m,
+                tile_m=args.tile_m, tile_n=args.tile_n,
             )
         print(path)
     elif args.op == "swiglu-prefill-int8":
@@ -1125,13 +1361,13 @@ def main():
             path = compile_swiglu_prefill_int8(
                 args.seq_len, args.embedding_dim, args.hidden_dim,
                 args.num_aie_columns, args.out,
-                tile_m=args.tile_m,
+                tile_m=args.tile_m, tile_n=args.tile_n,
             )
         else:
             path = compile_swiglu_prefill_int8_cached(
                 args.seq_len, args.embedding_dim, args.hidden_dim,
                 args.num_aie_columns,
-                tile_m=args.tile_m,
+                tile_m=args.tile_m, tile_n=args.tile_n,
             )
         print(path)
 
