@@ -36,6 +36,8 @@ static std::atomic<size_t> g_cpy_tensor_calls{0};
 #include "xrt/xrt_kernel.h"
 #include "xrt/xrt_hw_context.h"
 #include "xrt/experimental/xrt_kernel.h"  // xrt::runlist (production-linked in libxrt_coreutil)
+#include "xrt/experimental/xrt_elf.h"     // xrt::elf — fused tblock single-ELF loader
+#include "xrt/experimental/xrt_ext.h"     // xrt::ext::kernel(ctx, "main:sequence")
 
 // ============================================================================
 // Cached kernel entry — one per unique (op, shape, dtype) tuple
@@ -364,6 +366,116 @@ struct xdna_attention_prefill_entry {
 };
 
 // ============================================================================
+// TransformerBlockPrefill chained entry — 17 sub-kernels (attention + SwiGLU
+// FFN + two residuals) in one combined.xclbin. Mirrors
+// iron/operators/transformer_block_prefill/op.py. Kernel names inside the
+// xclbin are "tblock_prefill_<slot>"; insts files are staged at
+// "<bundle_dir>/tblock_prefill_<slot>.insts".
+// ============================================================================
+
+enum xdna_tblock_prefill_slot : int {
+    XDNA_TBLOCK_RMS_NORM_ATTN = 0,
+    XDNA_TBLOCK_GEMM_Q        = 1,
+    XDNA_TBLOCK_GEMM_KV       = 2,  // shared K/V
+    XDNA_TBLOCK_ROPE_Q        = 3,
+    XDNA_TBLOCK_ROPE_K        = 4,
+    XDNA_TBLOCK_PERM_Q        = 5,
+    XDNA_TBLOCK_PERM_KV       = 6,  // shared K/V
+    XDNA_TBLOCK_MHA           = 7,
+    XDNA_TBLOCK_PERM_O        = 8,
+    XDNA_TBLOCK_GEMM_O        = 9,
+    XDNA_TBLOCK_ADD_ATTN      = 10,
+    XDNA_TBLOCK_RMS_NORM_FFN  = 11,
+    XDNA_TBLOCK_GEMM_GATE_UP  = 12,  // shared gate/up
+    XDNA_TBLOCK_SILU          = 13,
+    XDNA_TBLOCK_ELTWISE_MUL   = 14,
+    XDNA_TBLOCK_GEMM_DOWN     = 15,
+    XDNA_TBLOCK_ADD_FFN       = 16,
+    XDNA_TBLOCK_NUM_SLOTS     = 17,
+};
+
+static constexpr const char * XDNA_TBLOCK_PREFILL_KERNEL_NAMES[XDNA_TBLOCK_NUM_SLOTS] = {
+    "tblock_prefill_rms_norm_attn",
+    "tblock_prefill_gemm_q",
+    "tblock_prefill_gemm_kv",
+    "tblock_prefill_rope_q",
+    "tblock_prefill_rope_k",
+    "tblock_prefill_perm_q",
+    "tblock_prefill_perm_kv",
+    "tblock_prefill_mha",
+    "tblock_prefill_perm_o",
+    "tblock_prefill_gemm_o",
+    "tblock_prefill_add_attn",
+    "tblock_prefill_rms_norm_ffn",
+    "tblock_prefill_gemm_gate_up",
+    "tblock_prefill_silu",
+    "tblock_prefill_eltwise_mul",
+    "tblock_prefill_gemm_down",
+    "tblock_prefill_add_ffn",
+};
+
+static constexpr const char * XDNA_TBLOCK_PREFILL_INSTS_TAGS[XDNA_TBLOCK_NUM_SLOTS] = {
+    "rms_norm_attn", "gemm_q", "gemm_kv", "rope_q", "rope_k",
+    "perm_q", "perm_kv", "mha", "perm_o", "gemm_o", "add_attn",
+    "rms_norm_ffn", "gemm_gate_up", "silu", "eltwise_mul",
+    "gemm_down", "add_ffn",
+};
+
+struct xdna_transformer_block_prefill_entry {
+    xrt::xclbin     xclbin;
+    xrt::hw_context hw_ctx;
+    xrt::kernel     kernels[XDNA_TBLOCK_NUM_SLOTS];
+    std::vector<char> insts_data[XDNA_TBLOCK_NUM_SLOTS];
+    xrt::bo         insts_bo  [XDNA_TBLOCK_NUM_SLOTS];
+
+    int64_t seq_len_padded;
+    int64_t embed_dim;
+    int64_t num_heads;
+    int64_t num_kv_heads;
+    int64_t head_dim;
+    int64_t ffn_hidden_dim;
+
+    std::string cache_key;
+
+    // Attention-side persistent BOs (same layout as attn_prefill_entry).
+    std::unique_ptr<xrt::bo> bo_x_in;
+    std::unique_ptr<xrt::bo> bo_x_norm;
+    std::unique_ptr<xrt::bo> bo_q_proj;
+    std::unique_ptr<xrt::bo> bo_k_proj;
+    std::unique_ptr<xrt::bo> bo_v_proj;
+    std::unique_ptr<xrt::bo> bo_q_rope;
+    std::unique_ptr<xrt::bo> bo_k_rope;
+    std::unique_ptr<xrt::bo> bo_q_perm;
+    std::unique_ptr<xrt::bo> bo_k_perm;
+    std::unique_ptr<xrt::bo> bo_v_perm;
+    std::unique_ptr<xrt::bo> bo_attn_out;
+    std::unique_ptr<xrt::bo> bo_o_perm;
+    std::unique_ptr<xrt::bo> bo_o_proj;
+    std::unique_ptr<xrt::bo> bo_attn_residual;
+    std::unique_ptr<xrt::bo> bo_angles;
+    // FFN-side persistent BOs.
+    std::unique_ptr<xrt::bo> bo_ffn_norm;
+    std::unique_ptr<xrt::bo> bo_gate_out;
+    std::unique_ptr<xrt::bo> bo_up_out;
+    std::unique_ptr<xrt::bo> bo_silu_out;
+    std::unique_ptr<xrt::bo> bo_mul_out;
+    std::unique_ptr<xrt::bo> bo_down_out;
+    std::unique_ptr<xrt::bo> bo_output;
+
+    std::unordered_map<const void *, xrt::bo> w_q_bo_cache;
+    std::unordered_map<const void *, xrt::bo> w_k_bo_cache;
+    std::unordered_map<const void *, xrt::bo> w_v_bo_cache;
+    std::unordered_map<const void *, xrt::bo> w_o_bo_cache;
+    std::unordered_map<const void *, xrt::bo> gain_attn_bo_cache;
+    std::unordered_map<const void *, xrt::bo> w_gate_bo_cache;
+    std::unordered_map<const void *, xrt::bo> w_up_bo_cache;
+    std::unordered_map<const void *, xrt::bo> w_down_bo_cache;
+    std::unordered_map<const void *, xrt::bo> gain_ffn_bo_cache;
+
+    std::unique_ptr<std::mutex> weights_mutex = std::make_unique<std::mutex>();
+};
+
+// ============================================================================
 // Standalone RMSNorm entry — single-kernel xclbin, one kernel, one insts file.
 // Staged under a bundle dir (combined.xclbin + rms_norm_main.insts) so the
 // on-disk layout matches chained composites while the in-memory entry stays
@@ -405,10 +517,14 @@ struct ggml_backend_xdna_context {
     std::unordered_map<std::string, xdna_qkv_entry> qkv_cache;
     std::unordered_map<std::string, xdna_rms_norm_entry> rms_norm_cache;
     std::unordered_map<std::string, xdna_attention_prefill_entry> attention_prefill_cache;
+    std::unordered_map<std::string, xdna_transformer_block_prefill_entry> transformer_block_prefill_cache;
+    std::unordered_map<std::string, struct xdna_tblock_fused_entry> tblock_fused_cache;
     // Set of cgraph pointers for which attn_prefill_bulk_prewarm() has already
     // run. Purely an optimization guard — the dispatch path's per-weight cache
     // check covers correctness if we re-enter.
     std::unordered_set<const void *> attn_prewarmed_cgraphs;
+    std::unordered_set<const void *> tblock_prewarmed_cgraphs;
+    std::unordered_set<const void *> tblock_fused_prewarmed_cgraphs;
     std::mutex cache_mutex;
     bool device_valid;
     // CPU backend for delegating ops we don't run on NPU.
@@ -3659,8 +3775,11 @@ static bool xdna_try_match_swiglu(const struct ggml_cgraph * cgraph, int i,
         // verify batches (M=2..8) where the overhead is paid ~28 times per
         // token for zero net throughput. Keep this aligned with
         // xdna_shape_dispatchable()'s M >= 32 floor for standalone GEMM.
-        static const bool prefill_enabled = getenv("XDNA_ENABLE_SWIGLU_PREFILL") != NULL;
-        if (!prefill_enabled) SWIGLU_REJECT("prefill disabled (set XDNA_ENABLE_SWIGLU_PREFILL=1 to opt in)");
+        static const bool prefill_enabled =
+            (getenv("XDNA_ENABLE_SWIGLU_PREFILL") != NULL) ||
+            (getenv("XDNA_ENABLE_TRANSFORMER_BLOCK") != NULL) ||
+            (getenv("XDNA_ENABLE_TBLOCK_FUSED") != NULL);
+        if (!prefill_enabled) SWIGLU_REJECT("prefill disabled (set XDNA_ENABLE_SWIGLU_PREFILL=1 or XDNA_ENABLE_TRANSFORMER_BLOCK=1 or XDNA_ENABLE_TBLOCK_FUSED=1 to opt in)");
         const int64_t padded_M = ((M + 63) / 64) * 64;
         if (allow_int8) {
             static const bool prefill_int8_ok = getenv("XDNA_ENABLE_SWIGLU_PREFILL_INT8") != NULL;
@@ -5191,6 +5310,1775 @@ static bool ggml_backend_xdna_attention_prefill(ggml_backend_xdna_context * ctx,
 }
 
 // ============================================================================
+// TransformerBlockPrefill matcher + dispatch — attention block + SwiGLU FFN +
+// two residuals chained into a single combined.xclbin (17 kernels). Extends
+// xdna_try_match_attention_prefill by walking forward from the attn residual
+// ADD through ffn_norm -> gate/up GEMMs -> SwiGLU GLU -> down GEMM -> ffn
+// residual ADD. Dispatch path layers the FFN on top of the attention entry.
+// ============================================================================
+
+struct xdna_transformer_block_match {
+    xdna_attention_match attn;
+
+    int ffn_norm_idx;
+    int ffn_norm_mul_idx;
+    int gate_mm_idx;
+    int up_mm_idx;
+    int glu_idx;
+    int down_mm_idx;
+    int ffn_residual_add_idx;
+
+    struct ggml_tensor * ffn_gain;
+    struct ggml_tensor * w_gate;
+    struct ggml_tensor * w_up;
+    struct ggml_tensor * w_down;
+
+    int64_t ffn_hidden_dim;
+};
+
+static bool xdna_try_match_transformer_block_prefill(
+        const struct ggml_cgraph * cgraph, int start_idx,
+        xdna_transformer_block_match * out) {
+    static const bool dbg = getenv("XDNA_DEBUG") != NULL;
+    static std::atomic<int> dbg_remaining{dbg ? 64 : 0};
+    auto dbg_ok = [&]() { return dbg && dbg_remaining.fetch_sub(1) > 0; };
+
+    // Quick decode-shape early-reject. The dispatch gates on seq>=256, but
+    // this matcher runs per RMS_NORM per graph_compute (incl. all decode
+    // tokens). Cheap seq check avoids the ~40-node attn scan on every decode
+    // token.
+    {
+        struct ggml_tensor * rms = cgraph->nodes[start_idx];
+        if (rms->op == GGML_OP_RMS_NORM && rms->src[0] &&
+            rms->src[0]->ne[1] < 32) {
+            return false;
+        }
+    }
+
+    xdna_attention_match am{};
+    if (!xdna_try_match_attention_prefill(cgraph, start_idx, &am)) return false;
+
+    const int n = cgraph->n_nodes;
+
+    struct ggml_tensor * attn_res = cgraph->nodes[am.residual_add_idx];
+    int ffn_norm_idx = -1;
+    struct ggml_tensor * ffn_norm = nullptr;
+    for (int j = am.residual_add_idx + 1; j < std::min(am.residual_add_idx + 8, n); j++) {
+        struct ggml_tensor * nj = cgraph->nodes[j];
+        if (nj->op != GGML_OP_RMS_NORM) continue;
+        struct ggml_tensor * s0r = xdna_strip_view(nj->src[0]);
+        if (s0r == attn_res) { ffn_norm_idx = j; ffn_norm = nj; break; }
+    }
+    if (ffn_norm_idx < 0) {
+        if (dbg_ok()) fprintf(stderr, "ggml-xdna: tblock reject @%d: no ffn_norm after attn residual\n", start_idx);
+        return false;
+    }
+
+    int ffn_norm_mul_idx = -1;
+    struct ggml_tensor * ffn_norm_out = nullptr;
+    struct ggml_tensor * ffn_gain = nullptr;
+    for (int j = ffn_norm_idx + 1; j < std::min(ffn_norm_idx + 6, n); j++) {
+        struct ggml_tensor * nj = cgraph->nodes[j];
+        if (nj->op != GGML_OP_MUL) continue;
+        struct ggml_tensor * s0r = xdna_strip_view(nj->src[0]);
+        struct ggml_tensor * s1r = xdna_strip_view(nj->src[1]);
+        if (s0r == ffn_norm) { ffn_norm_mul_idx = j; ffn_norm_out = nj; ffn_gain = nj->src[1]; break; }
+        if (s1r == ffn_norm) { ffn_norm_mul_idx = j; ffn_norm_out = nj; ffn_gain = nj->src[0]; break; }
+    }
+    if (ffn_norm_mul_idx < 0) {
+        if (dbg_ok()) fprintf(stderr, "ggml-xdna: tblock reject @%d: no MUL(ffn_norm, gain)\n", start_idx);
+        return false;
+    }
+
+    int swiglu_anchor = -1;
+    xdna_swiglu_match sm{};
+    for (int j = ffn_norm_mul_idx + 1; j + 3 < std::min(ffn_norm_mul_idx + 32, n); j++) {
+        xdna_swiglu_match trial{};
+        if (!xdna_try_match_swiglu(cgraph, j, &trial)) continue;
+        struct ggml_tensor * inp = (struct ggml_tensor *)trial.input;
+        struct ggml_tensor * inp_stripped = xdna_strip_view(inp);
+        if (inp_stripped != ffn_norm_out && inp != ffn_norm_out) continue;
+        if (trial.is_int8) continue;
+        swiglu_anchor = j;
+        sm = trial;
+        break;
+    }
+    if (swiglu_anchor < 0) {
+        if (dbg_ok()) fprintf(stderr, "ggml-xdna: tblock reject @%d: no SwiGLU window after ffn_norm_mul\n", start_idx);
+        return false;
+    }
+
+    auto find_idx = [&](struct ggml_tensor * t) -> int {
+        for (int j = swiglu_anchor; j < std::min(swiglu_anchor + 16, n); j++) {
+            if (cgraph->nodes[j] == t) return j;
+        }
+        return -1;
+    };
+    int gate_mm_idx = find_idx(sm.gate_mm);
+    int up_mm_idx   = find_idx(sm.up_mm);
+    int glu_idx     = find_idx(sm.glu);
+    int down_mm_idx = find_idx(sm.down_mm);
+    if (gate_mm_idx < 0 || up_mm_idx < 0 || glu_idx < 0 || down_mm_idx < 0) {
+        if (dbg_ok()) fprintf(stderr, "ggml-xdna: tblock reject @%d: swiglu nodes not in cgraph\n", start_idx);
+        return false;
+    }
+
+    int ffn_residual_add_idx = -1;
+    for (int j = down_mm_idx + 1; j < std::min(down_mm_idx + 8, n); j++) {
+        struct ggml_tensor * nj = cgraph->nodes[j];
+        if (nj->op != GGML_OP_ADD) continue;
+        struct ggml_tensor * s0r = xdna_strip_view(nj->src[0]);
+        struct ggml_tensor * s1r = xdna_strip_view(nj->src[1]);
+        struct ggml_tensor * down_stripped = xdna_strip_view(sm.down_mm);
+        struct ggml_tensor * attn_stripped = xdna_strip_view(attn_res);
+        bool have_down = (s0r == down_stripped || s1r == down_stripped
+                       || s0r == sm.down_mm || s1r == sm.down_mm);
+        bool have_attn = (s0r == attn_stripped || s1r == attn_stripped
+                       || s0r == attn_res || s1r == attn_res);
+        if (have_down && have_attn) { ffn_residual_add_idx = j; break; }
+    }
+    if (ffn_residual_add_idx < 0) {
+        if (dbg_ok()) fprintf(stderr, "ggml-xdna: tblock reject @%d: no FFN residual ADD\n", start_idx);
+        return false;
+    }
+
+    const int64_t ffn_hidden = sm.gate_w->ne[1];
+    if (ffn_hidden % 64 != 0) {
+        if (dbg_ok()) fprintf(stderr, "ggml-xdna: tblock reject @%d: ffn_hidden=%ld not mod 64\n",
+                              start_idx, (long)ffn_hidden);
+        return false;
+    }
+
+    out->attn                 = am;
+    out->ffn_norm_idx         = ffn_norm_idx;
+    out->ffn_norm_mul_idx     = ffn_norm_mul_idx;
+    out->gate_mm_idx          = gate_mm_idx;
+    out->up_mm_idx            = up_mm_idx;
+    out->glu_idx              = glu_idx;
+    out->down_mm_idx          = down_mm_idx;
+    out->ffn_residual_add_idx = ffn_residual_add_idx;
+    out->ffn_gain             = ffn_gain;
+    out->w_gate               = (struct ggml_tensor *)sm.gate_w;
+    out->w_up                 = (struct ggml_tensor *)sm.up_w;
+    out->w_down               = (struct ggml_tensor *)sm.down_w;
+    out->ffn_hidden_dim       = ffn_hidden;
+    return true;
+}
+
+// ----------------------------------------------------------------------------
+// TransformerBlockPrefill cache-key + bundle checks + compile/load helpers.
+// Mirrors attention-prefill equivalents with the extended shape fingerprint
+// (embed_dim + ffn_hidden_dim).
+// ----------------------------------------------------------------------------
+
+static std::string make_transformer_block_prefill_cache_key(
+        int64_t seq_bucket, int64_t embed_dim, int64_t num_heads,
+        int64_t num_kv_heads, int64_t head_dim, int64_t ffn_hidden_dim,
+        int rope_method_type) {
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+             "tblock_prefill_S%ld_E%ld_H%ld_KV%ld_D%ld_F%ld_bf16_rope%d",
+             (long)seq_bucket, (long)embed_dim,
+             (long)num_heads, (long)num_kv_heads, (long)head_dim,
+             (long)ffn_hidden_dim, rope_method_type);
+    return std::string(buf);
+}
+
+static bool transformer_block_prefill_bundle_present(const std::string & bundle_dir) {
+    std::ifstream xf(bundle_dir + "/combined.xclbin");
+    if (!xf.good()) return false;
+    for (int s = 0; s < XDNA_TBLOCK_NUM_SLOTS; s++) {
+        std::ifstream f(bundle_dir + "/tblock_prefill_" + XDNA_TBLOCK_PREFILL_INSTS_TAGS[s] + ".insts");
+        if (!f.good()) return false;
+    }
+    return true;
+}
+
+static bool ensure_transformer_block_prefill_compiled(
+        ggml_backend_xdna_context * ctx,
+        const std::string & cache_key,
+        int64_t seq_bucket, int64_t embed_dim, int64_t num_heads,
+        int64_t num_kv_heads, int64_t head_dim, int64_t ffn_hidden_dim,
+        int rope_method_type) {
+    const std::string bundle_dir = ctx->cache_dir + "/" + cache_key;
+    if (transformer_block_prefill_bundle_present(bundle_dir)) return true;
+
+    char cmd[1280];
+    snprintf(cmd, sizeof(cmd),
+             "python3 %s transformer-block-prefill --seq-len %ld --embed-dim %ld "
+             "--num-heads %ld --num-kv-heads %ld --head-dim %ld --ffn-hidden %ld "
+             "--rope-method-type %d --out %s 2>&1",
+             ctx->compile_script.c_str(),
+             (long)seq_bucket, (long)embed_dim,
+             (long)num_heads, (long)num_kv_heads, (long)head_dim,
+             (long)ffn_hidden_dim, rope_method_type, bundle_dir.c_str());
+    GGML_LOG_INFO("ggml-xdna: compiling transformer-block-prefill S=%ld E=%ld H=%ld KV=%ld d=%ld F=%ld "
+                  "(first run, will be cached)...\n",
+                  (long)seq_bucket, (long)embed_dim,
+                  (long)num_heads, (long)num_kv_heads, (long)head_dim,
+                  (long)ffn_hidden_dim);
+
+    int ret = system(cmd);
+    if (ret != 0) {
+        GGML_LOG_ERROR("ggml-xdna: transformer-block-prefill compile failed (exit %d)\n", ret);
+        return false;
+    }
+    if (!transformer_block_prefill_bundle_present(bundle_dir)) {
+        GGML_LOG_ERROR("ggml-xdna: transformer-block-prefill compile ran but bundle missing in %s\n",
+                       bundle_dir.c_str());
+        return false;
+    }
+    GGML_LOG_INFO("ggml-xdna: transformer-block-prefill compile complete, cached at %s\n",
+                  bundle_dir.c_str());
+    return true;
+}
+
+static xdna_transformer_block_prefill_entry * get_or_load_transformer_block_prefill_kernel(
+        ggml_backend_xdna_context * ctx,
+        const std::string & cache_key,
+        int64_t seq_bucket, int64_t embed_dim,
+        int64_t num_heads, int64_t num_kv_heads, int64_t head_dim,
+        int64_t ffn_hidden_dim) {
+    std::lock_guard<std::mutex> lock(ctx->cache_mutex);
+    auto it = ctx->transformer_block_prefill_cache.find(cache_key);
+    if (it != ctx->transformer_block_prefill_cache.end()) return &it->second;
+
+    const std::string bundle_dir = ctx->cache_dir + "/" + cache_key;
+    try {
+        xdna_transformer_block_prefill_entry entry;
+        entry.seq_len_padded = seq_bucket;
+        entry.embed_dim      = embed_dim;
+        entry.num_heads      = num_heads;
+        entry.num_kv_heads   = num_kv_heads;
+        entry.head_dim       = head_dim;
+        entry.ffn_hidden_dim = ffn_hidden_dim;
+        entry.cache_key      = cache_key;
+
+        entry.xclbin = xrt::xclbin(bundle_dir + "/combined.xclbin");
+        ctx->device.register_xclbin(entry.xclbin);
+        auto uuid = entry.xclbin.get_uuid();
+        entry.hw_ctx = xrt::hw_context(ctx->device, uuid);
+
+        for (int s = 0; s < XDNA_TBLOCK_NUM_SLOTS; s++) {
+            entry.kernels[s] = xrt::kernel(entry.hw_ctx, XDNA_TBLOCK_PREFILL_KERNEL_NAMES[s]);
+            const std::string insts_path =
+                bundle_dir + "/tblock_prefill_" + XDNA_TBLOCK_PREFILL_INSTS_TAGS[s] + ".insts";
+            entry.insts_data[s] = read_binary_file(insts_path);
+            if (entry.insts_data[s].empty()) {
+                GGML_LOG_ERROR("ggml-xdna: failed to read tblock-prefill insts: %s\n", insts_path.c_str());
+                return nullptr;
+            }
+            entry.insts_bo[s] = xrt::bo(ctx->device, entry.insts_data[s].size(),
+                                         xrt::bo::flags::cacheable,
+                                         entry.kernels[s].group_id(1));
+            entry.insts_bo[s].write(entry.insts_data[s].data());
+            entry.insts_bo[s].sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        }
+
+        auto [ins, _] = ctx->transformer_block_prefill_cache.emplace(cache_key, std::move(entry));
+        GGML_LOG_INFO("ggml-xdna: loaded transformer-block-prefill bundle %s\n", cache_key.c_str());
+        return &ins->second;
+
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("ggml-xdna: failed to load transformer-block-prefill bundle: %s\n", e.what());
+        return nullptr;
+    }
+}
+
+// ============================================================================
+// Layer 4A Phase 3.2 — Fused transformer-block ELF loader.
+//
+// Single ELF produced by FusedMLIROperator contains the whole transformer
+// block (attn + SwiGLU FFN, 20 sub-ops) as a single @main runtime_sequence.
+// Runtime: load ELF → hw_context from ELF → xrt::ext::kernel(ctx,
+// "main:sequence"). The kernel takes exactly 3 BO args: (input_bo,
+// output_bo, scratch_bo). Named tensors (x, w_q, w_k, ..., y) live at
+// fixed offsets inside those 3 BOs described by a sidecar JSON layout.
+// ============================================================================
+
+// Named buffers in the fused bundle. Order matches layout.json "buffers" dict.
+// X / Y are the per-layer activation and the block output; the rest are
+// weights that stay in place once written.
+static constexpr const char * XDNA_TBF_X           = "x";
+static constexpr const char * XDNA_TBF_Y           = "y";
+static constexpr const char * XDNA_TBF_W_NORM_ATTN = "w_norm_attn";
+static constexpr const char * XDNA_TBF_W_Q         = "w_q";
+static constexpr const char * XDNA_TBF_W_K         = "w_k";
+static constexpr const char * XDNA_TBF_W_V         = "w_v";
+static constexpr const char * XDNA_TBF_W_O         = "w_o";
+static constexpr const char * XDNA_TBF_ANGLES      = "angles";
+static constexpr const char * XDNA_TBF_W_NORM_FFN  = "w_norm_ffn";
+static constexpr const char * XDNA_TBF_W_GATE      = "w_gate";
+static constexpr const char * XDNA_TBF_W_UP        = "w_up";
+static constexpr const char * XDNA_TBF_W_DOWN      = "w_down";
+
+struct xdna_tblock_fused_layout {
+    std::string kernel_name;   // "main:sequence"
+    size_t      input_bytes   = 0;
+    size_t      output_bytes  = 0;
+    size_t      scratch_bytes = 0;
+
+    struct buf_info {
+        std::string buf_type;  // "input" / "output" / "scratch"
+        size_t      offset = 0;
+        size_t      length = 0;
+    };
+    std::unordered_map<std::string, buf_info> buffers;
+};
+
+struct xdna_tblock_fused_entry {
+    xrt::elf        elf;
+    xrt::hw_context hw_ctx;
+    xrt::kernel     kernel;   // xrt::ext::kernel for "main:sequence"
+
+    xdna_tblock_fused_layout layout;
+
+    // 3 persistent BOs reused across every dispatch of this entry.
+    // input_bo holds x + all weights laid out per layout.buffers[name].offset.
+    // output_bo receives y. scratch_bo is internal only.
+    std::unique_ptr<xrt::bo> input_bo;
+    std::unique_ptr<xrt::bo> output_bo;
+    std::unique_ptr<xrt::bo> scratch_bo;
+
+    int64_t seq_len_padded  = 0;
+    int64_t embed_dim       = 0;
+    int64_t num_heads       = 0;
+    int64_t num_kv_heads    = 0;
+    int64_t head_dim        = 0;
+    int64_t ffn_hidden_dim  = 0;
+    int     rope_method_type = 0;
+    std::string cache_key;
+
+    // Dedup: for each named buffer, the src pointer whose contents were last
+    // written to it. Lets Phase 3.3 skip redundant weight copies when a
+    // weight tensor is re-used across iterations.
+    std::unordered_map<std::string, const void *> loaded_srcs;
+
+    std::unique_ptr<std::mutex> mu = std::make_unique<std::mutex>();
+};
+
+static std::string make_tblock_fused_cache_key(
+        int64_t seq_bucket, int64_t embed_dim, int64_t num_heads,
+        int64_t num_kv_heads, int64_t head_dim, int64_t ffn_hidden_dim,
+        int rope_method_type) {
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+             "tblock_fused_S%ld_E%ld_H%ld_KV%ld_D%ld_F%ld_bf16_rope%d",
+             (long)seq_bucket, (long)embed_dim,
+             (long)num_heads, (long)num_kv_heads, (long)head_dim,
+             (long)ffn_hidden_dim, rope_method_type);
+    return std::string(buf);
+}
+
+static bool tblock_fused_bundle_present(const std::string & bundle_dir) {
+    std::ifstream elf_f(bundle_dir + "/tblock_fused.elf", std::ios::binary);
+    std::ifstream lay_f(bundle_dir + "/tblock_fused.layout.json");
+    return elf_f.good() && lay_f.good();
+}
+
+static bool ensure_tblock_fused_compiled(
+        ggml_backend_xdna_context * ctx,
+        const std::string & cache_key,
+        int64_t seq_bucket, int64_t embed_dim, int64_t num_heads,
+        int64_t num_kv_heads, int64_t head_dim, int64_t ffn_hidden_dim,
+        int rope_method_type) {
+    const std::string bundle_dir = ctx->cache_dir + "/" + cache_key;
+    if (tblock_fused_bundle_present(bundle_dir)) return true;
+
+    char cmd[1280];
+    snprintf(cmd, sizeof(cmd),
+             "python3 %s transformer-block-prefill-fused --seq-len %ld --embed-dim %ld "
+             "--num-heads %ld --num-kv-heads %ld --head-dim %ld --ffn-hidden %ld "
+             "--rope-method-type %d --out %s 2>&1",
+             ctx->compile_script.c_str(),
+             (long)seq_bucket, (long)embed_dim,
+             (long)num_heads, (long)num_kv_heads, (long)head_dim,
+             (long)ffn_hidden_dim, rope_method_type, bundle_dir.c_str());
+    GGML_LOG_INFO("ggml-xdna: compiling fused tblock S=%ld E=%ld H=%ld KV=%ld d=%ld F=%ld rope=%d "
+                  "(first run, will be cached)...\n",
+                  (long)seq_bucket, (long)embed_dim,
+                  (long)num_heads, (long)num_kv_heads, (long)head_dim,
+                  (long)ffn_hidden_dim, rope_method_type);
+
+    int ret = system(cmd);
+    if (ret != 0) {
+        GGML_LOG_ERROR("ggml-xdna: fused tblock compile failed (exit %d)\n", ret);
+        return false;
+    }
+    if (!tblock_fused_bundle_present(bundle_dir)) {
+        GGML_LOG_ERROR("ggml-xdna: fused tblock compile ran but bundle missing in %s\n",
+                       bundle_dir.c_str());
+        return false;
+    }
+    GGML_LOG_INFO("ggml-xdna: fused tblock compile complete, cached at %s\n",
+                  bundle_dir.c_str());
+    return true;
+}
+
+// Tiny hand-rolled JSON parser for tblock_fused.layout.json. The producer is
+// `json.dump(layout, indent=2, sort_keys=True)` in compile.py, so the input
+// is always well-formed ASCII JSON with no nested escapes beyond basic ones.
+// We only need a narrow subset of values; generality isn't worth pulling in
+// nlohmann/json as a dependency of ggml-xdna.
+namespace tblock_fused_json {
+
+struct cursor {
+    const char * p;
+    const char * end;
+    void skip_ws() {
+        while (p < end) {
+            char c = *p;
+            if (c==' '||c=='\t'||c=='\n'||c=='\r'||c==',') { p++; continue; }
+            break;
+        }
+    }
+    bool at(char c) { skip_ws(); return p < end && *p == c; }
+    bool eat(char c) { if (at(c)) { p++; return true; } return false; }
+};
+
+static bool parse_string(cursor & c, std::string & out) {
+    c.skip_ws();
+    if (c.p >= c.end || *c.p != '"') return false;
+    c.p++;
+    out.clear();
+    while (c.p < c.end && *c.p != '"') {
+        if (*c.p == '\\' && c.p + 1 < c.end) {
+            char esc = *(c.p + 1);
+            c.p += 2;
+            switch (esc) {
+                case 'n':  out.push_back('\n'); break;
+                case 't':  out.push_back('\t'); break;
+                case 'r':  out.push_back('\r'); break;
+                case '"':  out.push_back('"'); break;
+                case '\\': out.push_back('\\'); break;
+                case '/':  out.push_back('/'); break;
+                default:   out.push_back(esc); break;
+            }
+        } else {
+            out.push_back(*c.p++);
+        }
+    }
+    if (c.p >= c.end) return false;
+    c.p++;  // closing quote
+    return true;
+}
+
+static bool parse_int64(cursor & c, int64_t & out) {
+    c.skip_ws();
+    if (c.p >= c.end) return false;
+    char * ep = nullptr;
+    long long v = strtoll(c.p, &ep, 10);
+    if (ep == c.p) return false;
+    out = (int64_t)v;
+    c.p = ep;
+    return true;
+}
+
+// Skip a JSON value at the cursor — object, array, string, number, true/false/null.
+static bool skip_value(cursor & c) {
+    c.skip_ws();
+    if (c.p >= c.end) return false;
+    char ch = *c.p;
+    if (ch == '"') { std::string tmp; return parse_string(c, tmp); }
+    if (ch == '{' || ch == '[') {
+        char open = ch, close = (ch == '{') ? '}' : ']';
+        int depth = 1;
+        c.p++;
+        while (c.p < c.end && depth > 0) {
+            char x = *c.p;
+            if (x == '"') { std::string tmp; if (!parse_string(c, tmp)) return false; continue; }
+            if (x == open)  depth++;
+            else if (x == close) depth--;
+            c.p++;
+        }
+        return depth == 0;
+    }
+    // number / bool / null — scan until JSON punctuation.
+    while (c.p < c.end) {
+        char x = *c.p;
+        if (x == ',' || x == '}' || x == ']' || x == '\n' || x == ' ' || x == '\t' || x == '\r') break;
+        c.p++;
+    }
+    return true;
+}
+
+// Apply `fn(key)` for each `"key":` entry in the object the cursor starts at.
+// `fn` is responsible for consuming the value; if it returns false the scan
+// falls back to skip_value for that key.
+template <typename Fn>
+static bool foreach_object(cursor & c, Fn fn) {
+    c.skip_ws();
+    if (!c.eat('{')) return false;
+    while (true) {
+        c.skip_ws();
+        if (c.eat('}')) return true;
+        std::string key;
+        if (!parse_string(c, key)) return false;
+        c.skip_ws();
+        if (!c.eat(':')) return false;
+        // Snapshot before fn in case it fails / refuses the value, so
+        // skip_value can resume from the same point.
+        const char * before = c.p;
+        if (!fn(c, key)) {
+            c.p = before;
+            if (!skip_value(c)) return false;
+        }
+    }
+}
+
+}  // namespace tblock_fused_json
+
+static bool parse_tblock_fused_layout(
+        const std::string & path,
+        xdna_tblock_fused_layout & out) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f.good()) return false;
+    std::string data((std::istreambuf_iterator<char>(f)),
+                     std::istreambuf_iterator<char>());
+    tblock_fused_json::cursor c{ data.data(), data.data() + data.size() };
+
+    bool ok = tblock_fused_json::foreach_object(c, [&](tblock_fused_json::cursor & cc, const std::string & key) {
+        using namespace tblock_fused_json;
+        if (key == "kernel_name") {
+            return parse_string(cc, out.kernel_name);
+        }
+        if (key == "buffer_sizes") {
+            return foreach_object(cc, [&](cursor & cc2, const std::string & bk) {
+                int64_t v = 0;
+                if (!parse_int64(cc2, v)) return false;
+                if      (bk == "input_bytes")   out.input_bytes   = (size_t)v;
+                else if (bk == "output_bytes")  out.output_bytes  = (size_t)v;
+                else if (bk == "scratch_bytes") out.scratch_bytes = (size_t)v;
+                return true;
+            });
+        }
+        if (key == "buffers") {
+            return foreach_object(cc, [&](cursor & cc2, const std::string & bname) {
+                xdna_tblock_fused_layout::buf_info info;
+                bool ok2 = foreach_object(cc2, [&](cursor & cc3, const std::string & fk) {
+                    if (fk == "buf_type")     return parse_string(cc3, info.buf_type);
+                    int64_t v = 0;
+                    if (fk == "offset_bytes") { if (!parse_int64(cc3, v)) return false; info.offset = (size_t)v; return true; }
+                    if (fk == "length_bytes") { if (!parse_int64(cc3, v)) return false; info.length = (size_t)v; return true; }
+                    return false;  // unknown field → skip_value
+                });
+                if (!ok2) return false;
+                out.buffers.emplace(bname, std::move(info));
+                return true;
+            });
+        }
+        return false;  // other top-level keys (input_args, output_args, meta, slices, version) → skip_value
+    });
+    return ok && !out.kernel_name.empty() && out.input_bytes > 0 && out.output_bytes > 0;
+}
+
+// The fused bundle is keyed by shape only on disk, but every model layer
+// has its own weights. We therefore want one *entry* per layer (so the
+// in-BO weight write happens once per process, not once per batch). The
+// in-memory map key is the layer-specific key (shape + a weight-tensor
+// fingerprint); the on-disk bundle name is just the shape key. Pass both.
+static xdna_tblock_fused_entry * get_or_load_tblock_fused_kernel(
+        ggml_backend_xdna_context * ctx,
+        const std::string & cache_key,       // in-memory map key (layer-specific)
+        const std::string & bundle_dir_key,  // on-disk bundle dir name (shape)
+        int64_t seq_bucket, int64_t embed_dim,
+        int64_t num_heads, int64_t num_kv_heads, int64_t head_dim,
+        int64_t ffn_hidden_dim, int rope_method_type) {
+    std::lock_guard<std::mutex> lock(ctx->cache_mutex);
+    auto it = ctx->tblock_fused_cache.find(cache_key);
+    if (it != ctx->tblock_fused_cache.end()) return &it->second;
+
+    const std::string bundle_dir = ctx->cache_dir + "/" + bundle_dir_key;
+    const std::string elf_path    = bundle_dir + "/tblock_fused.elf";
+    const std::string layout_path = bundle_dir + "/tblock_fused.layout.json";
+
+    try {
+        xdna_tblock_fused_entry entry;
+        entry.seq_len_padded   = seq_bucket;
+        entry.embed_dim        = embed_dim;
+        entry.num_heads        = num_heads;
+        entry.num_kv_heads     = num_kv_heads;
+        entry.head_dim         = head_dim;
+        entry.ffn_hidden_dim   = ffn_hidden_dim;
+        entry.rope_method_type = rope_method_type;
+        entry.cache_key        = cache_key;
+
+        if (!parse_tblock_fused_layout(layout_path, entry.layout)) {
+            GGML_LOG_ERROR("ggml-xdna: failed to parse fused tblock layout JSON: %s\n",
+                           layout_path.c_str());
+            return nullptr;
+        }
+
+        // Load the ELF and build the hw_context + kernel directly from it.
+        // This is the xclbin-free fast path for full-ELF FusedMLIROperator
+        // artifacts. "main:sequence" matches the @main runtime_sequence
+        // emitted by FusedMLIROperator; compile.py writes it into
+        // layout.json but it's fixed by the IRON side and we assert here.
+        entry.elf    = xrt::elf(elf_path);
+        entry.hw_ctx = xrt::hw_context(ctx->device, entry.elf);
+        const std::string & kname = entry.layout.kernel_name.empty()
+            ? std::string("main:sequence") : entry.layout.kernel_name;
+        entry.kernel = xrt::ext::kernel(entry.hw_ctx, kname);
+
+        // Allocate the 3 persistent BOs via xrt::ext::bo bound to the
+        // hw_context — matches FusedMLIROperator's XRTTensor pattern
+        // (host_only; cheap sync / unified memory on NPU2). Sizes come
+        // straight from the layout JSON.
+        entry.input_bo = std::make_unique<xrt::bo>(
+            xrt::ext::bo(entry.hw_ctx, entry.layout.input_bytes));
+        entry.output_bo = std::make_unique<xrt::bo>(
+            xrt::ext::bo(entry.hw_ctx, entry.layout.output_bytes));
+        entry.scratch_bo = std::make_unique<xrt::bo>(
+            xrt::ext::bo(entry.hw_ctx, entry.layout.scratch_bytes));
+
+        auto [ins, _] = ctx->tblock_fused_cache.emplace(cache_key, std::move(entry));
+        GGML_LOG_INFO("ggml-xdna: loaded fused tblock ELF %s (in=%zu out=%zu scratch=%zu, %zu named bufs)\n",
+                      cache_key.c_str(),
+                      ins->second.layout.input_bytes,
+                      ins->second.layout.output_bytes,
+                      ins->second.layout.scratch_bytes,
+                      ins->second.layout.buffers.size());
+        return &ins->second;
+
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("ggml-xdna: failed to load fused tblock bundle: %s\n", e.what());
+        return nullptr;
+    }
+}
+
+// Weight/gain warm helpers — duplicated from attn_prefill variants with the
+// entry type swapped. Caller holds entry->weights_mutex.
+static xrt::bo * tblock_prefill_warm_gemm_weight(
+        ggml_backend_xdna_context * ctx,
+        xdna_transformer_block_prefill_entry * entry,
+        std::unordered_map<const void *, xrt::bo> & cache,
+        const struct ggml_tensor * weight,
+        int kernel_slot,
+        int arg_group_id,
+        const char * slot_name) {
+    auto it = cache.find(weight->data);
+    if (it != cache.end()) return &it->second;
+
+    const int64_t K = weight->ne[0];
+    const int64_t N = weight->ne[1];
+    const size_t  n_elems = (size_t)K * (size_t)N;
+    const size_t  n_bytes = n_elems * sizeof(uint16_t);
+
+    try {
+        xrt::bo new_bo(ctx->device, n_bytes, xrt::bo::flags::host_only,
+                       entry->kernels[kernel_slot].group_id(arg_group_id));
+        uint16_t * dst_bf16 = (uint16_t *)new_bo.map<void*>();
+
+        if (weight->type == GGML_TYPE_F32) {
+            const float * src_f32 = (const float *)weight->data;
+            for (int64_t k = 0; k < K; k++) {
+                for (int64_t nn = 0; nn < N; nn++) {
+                    float val = src_f32[nn * K + k];
+                    uint32_t bits;
+                    memcpy(&bits, &val, sizeof(bits));
+                    bits += (0x7FFF + ((bits >> 16) & 1));
+                    dst_bf16[k * N + nn] = (uint16_t)(bits >> 16);
+                }
+            }
+        } else if (weight->type == GGML_TYPE_F16) {
+            const uint16_t * src_f16 = (const uint16_t *)weight->data;
+            for (int64_t k = 0; k < K; k++) {
+                for (int64_t nn = 0; nn < N; nn++) {
+                    dst_bf16[k * N + nn] = fp16_to_bf16(src_f16[nn * K + k]);
+                }
+            }
+        } else {
+            const uint16_t * src = (const uint16_t *)weight->data;
+            for (int64_t k = 0; k < K; k++) {
+                for (int64_t nn = 0; nn < N; nn++) {
+                    dst_bf16[k * N + nn] = src[nn * K + k];
+                }
+            }
+        }
+        new_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        auto [ins, _] = cache.emplace(weight->data, std::move(new_bo));
+        fprintf(stderr,
+                "ggml-xdna: warm tblock-prefill %s K=%ld N=%ld weight=%s (%zu cached)\n",
+                slot_name, (long)K, (long)N, weight->name, cache.size());
+        fflush(stderr);
+        return &ins->second;
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("ggml-xdna: failed to warm tblock-prefill %s weight: %s\n",
+                       slot_name, e.what());
+        return nullptr;
+    }
+}
+
+static xrt::bo * tblock_prefill_warm_gain(
+        ggml_backend_xdna_context * ctx,
+        xdna_transformer_block_prefill_entry * entry,
+        std::unordered_map<const void *, xrt::bo> & cache,
+        const struct ggml_tensor * gain,
+        int64_t n_elems,
+        int kernel_slot,
+        int arg_group_id) {
+    auto it = cache.find(gain->data);
+    if (it != cache.end()) return &it->second;
+
+    const size_t n_bytes = (size_t)n_elems * sizeof(uint16_t);
+    try {
+        xrt::bo new_bo(ctx->device, n_bytes, xrt::bo::flags::host_only,
+                       entry->kernels[kernel_slot].group_id(arg_group_id));
+        uint16_t * dst = (uint16_t *)new_bo.map<void*>();
+
+        if (gain->type == GGML_TYPE_F32) {
+            f32_to_bf16((const float *)gain->data, dst, (size_t)n_elems);
+        } else if (gain->type == GGML_TYPE_F16) {
+            const uint16_t * src = (const uint16_t *)gain->data;
+            for (int64_t i = 0; i < n_elems; i++) dst[i] = fp16_to_bf16(src[i]);
+        } else {
+            memcpy(dst, gain->data, n_bytes);
+        }
+        new_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        auto [ins, _] = cache.emplace(gain->data, std::move(new_bo));
+        fprintf(stderr, "ggml-xdna: warm tblock-prefill gain N=%ld weight=%s (%zu cached)\n",
+                (long)n_elems, gain->name, cache.size());
+        fflush(stderr);
+        return &ins->second;
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("ggml-xdna: failed to warm tblock-prefill gain: %s\n", e.what());
+        return nullptr;
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Bulk tblock-prefill weight pre-warm. Mirrors attn_prefill_bulk_prewarm but
+// walks the graph through xdna_try_match_transformer_block_prefill so the FFN
+// weights (w_gate/w_up/w_down + gain_ffn) are uploaded in parallel as well.
+// ----------------------------------------------------------------------------
+static void tblock_prefill_bulk_prewarm(ggml_backend_xdna_context * ctx,
+                                        const struct ggml_cgraph * cgraph) {
+    std::vector<xdna_transformer_block_match> matches;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        struct ggml_tensor * node = cgraph->nodes[i];
+        if (node->op != GGML_OP_RMS_NORM) continue;
+        xdna_transformer_block_match tm{};
+        if (xdna_try_match_transformer_block_prefill(cgraph, i, &tm) && tm.attn.seq_len >= 256) {
+            matches.push_back(tm);
+        }
+    }
+    if (matches.empty()) return;
+
+    struct task_t {
+        std::function<void()> run;
+    };
+    std::vector<task_t> tasks;
+    tasks.reserve(matches.size() * 9);
+
+    std::unordered_set<uint64_t> seen;
+    auto key_of = [](const xdna_transformer_block_prefill_entry * e, const void * p) {
+        return ((uint64_t)(uintptr_t)e) ^ (uint64_t)(uintptr_t)p;
+    };
+
+    for (const auto & tm : matches) {
+        const auto & m = tm.attn;
+        const int64_t seq_bucket = xdna_select_attention_prefill_bucket(m.seq_len);
+        if (seq_bucket < 0) continue;
+        if (m.head_dim != 64) continue;
+        if (m.embed_dim <= 0 || m.embed_dim % 8 != 0) continue;
+        if ((m.num_kv_heads * m.head_dim) % 64 != 0) continue;
+        if (m.num_heads % m.num_kv_heads != 0) continue;
+        if (tm.ffn_hidden_dim <= 0 || tm.ffn_hidden_dim % 64 != 0) continue;
+
+        std::string cache_key = make_transformer_block_prefill_cache_key(
+            seq_bucket, m.embed_dim, m.num_heads, m.num_kv_heads, m.head_dim,
+            tm.ffn_hidden_dim, m.rope_method_type);
+
+        if (!ensure_transformer_block_prefill_compiled(
+                ctx, cache_key, seq_bucket, m.embed_dim, m.num_heads,
+                m.num_kv_heads, m.head_dim, tm.ffn_hidden_dim, m.rope_method_type)) {
+            continue;
+        }
+        xdna_transformer_block_prefill_entry * entry =
+            get_or_load_transformer_block_prefill_kernel(
+                ctx, cache_key, seq_bucket, m.embed_dim, m.num_heads,
+                m.num_kv_heads, m.head_dim, tm.ffn_hidden_dim);
+        if (!entry) continue;
+
+        struct slot_desc {
+            std::unordered_map<const void *, xrt::bo> * cache;
+            const struct ggml_tensor * weight;
+            int kernel_slot;
+            int arg_group_id;
+            const char * slot_name;
+            bool is_gain;
+            int64_t gain_nelems;
+        };
+        const slot_desc slots[] = {
+            { &entry->gain_attn_bo_cache, m.gain,       XDNA_TBLOCK_RMS_NORM_ATTN, 4, "gain_attn", true,  m.embed_dim       },
+            { &entry->w_q_bo_cache,       m.wq,         XDNA_TBLOCK_GEMM_Q,        4, "w_q",       false, 0                 },
+            { &entry->w_k_bo_cache,       m.wk,         XDNA_TBLOCK_GEMM_KV,       4, "w_k",       false, 0                 },
+            { &entry->w_v_bo_cache,       m.wv,         XDNA_TBLOCK_GEMM_KV,       4, "w_v",       false, 0                 },
+            { &entry->w_o_bo_cache,       m.wo,         XDNA_TBLOCK_GEMM_O,        4, "w_o",       false, 0                 },
+            { &entry->gain_ffn_bo_cache,  tm.ffn_gain,  XDNA_TBLOCK_RMS_NORM_FFN,  4, "gain_ffn",  true,  m.embed_dim       },
+            { &entry->w_gate_bo_cache,    tm.w_gate,    XDNA_TBLOCK_GEMM_GATE_UP,  4, "w_gate",    false, 0                 },
+            { &entry->w_up_bo_cache,      tm.w_up,      XDNA_TBLOCK_GEMM_GATE_UP,  4, "w_up",      false, 0                 },
+            { &entry->w_down_bo_cache,    tm.w_down,    XDNA_TBLOCK_GEMM_DOWN,     4, "w_down",    false, 0                 },
+        };
+        for (const auto & s : slots) {
+            if (!s.weight || !s.weight->data) continue;
+            uint64_t k = key_of(entry, s.weight->data);
+            if (!seen.insert(k).second) continue;
+            {
+                std::lock_guard<std::mutex> lock(*entry->weights_mutex);
+                if (s.cache->count(s.weight->data)) continue;
+            }
+            task_t t;
+            auto cache_ptr    = s.cache;
+            auto weight_ptr   = s.weight;
+            int  kslot        = s.kernel_slot;
+            int  arg_group    = s.arg_group_id;
+            const char * name = s.slot_name;
+            bool gain         = s.is_gain;
+            int64_t gn        = s.gain_nelems;
+            t.run = [ctx, entry, cache_ptr, weight_ptr, kslot, arg_group, name, gain, gn]() {
+                if (gain) {
+                    const int64_t n = gn;
+                    const size_t  n_bytes = (size_t)n * sizeof(uint16_t);
+                    try {
+                        xrt::bo new_bo(ctx->device, n_bytes, xrt::bo::flags::host_only,
+                                       entry->kernels[kslot].group_id(arg_group));
+                        uint16_t * dst = (uint16_t *)new_bo.map<void*>();
+                        if (weight_ptr->type == GGML_TYPE_F32) {
+                            f32_to_bf16((const float *)weight_ptr->data, dst, (size_t)n);
+                        } else if (weight_ptr->type == GGML_TYPE_F16) {
+                            const uint16_t * src = (const uint16_t *)weight_ptr->data;
+                            for (int64_t i = 0; i < n; i++) dst[i] = fp16_to_bf16(src[i]);
+                        } else {
+                            memcpy(dst, weight_ptr->data, n_bytes);
+                        }
+                        new_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                        std::lock_guard<std::mutex> lock(*entry->weights_mutex);
+                        if (cache_ptr->count(weight_ptr->data) == 0) {
+                            cache_ptr->emplace(weight_ptr->data, std::move(new_bo));
+                        }
+                    } catch (const std::exception & e) {
+                        GGML_LOG_ERROR("ggml-xdna: prewarm tblock %s failed: %s\n", name, e.what());
+                    }
+                } else {
+                    const int64_t K = weight_ptr->ne[0];
+                    const int64_t N = weight_ptr->ne[1];
+                    const size_t  n_elems = (size_t)K * (size_t)N;
+                    const size_t  n_bytes = n_elems * sizeof(uint16_t);
+                    try {
+                        xrt::bo new_bo(ctx->device, n_bytes, xrt::bo::flags::host_only,
+                                       entry->kernels[kslot].group_id(arg_group));
+                        uint16_t * dst_bf16 = (uint16_t *)new_bo.map<void*>();
+                        if (weight_ptr->type == GGML_TYPE_F32) {
+                            const float * src_f32 = (const float *)weight_ptr->data;
+                            for (int64_t k2 = 0; k2 < K; k2++) {
+                                for (int64_t nn = 0; nn < N; nn++) {
+                                    float val = src_f32[nn * K + k2];
+                                    uint32_t bits;
+                                    memcpy(&bits, &val, sizeof(bits));
+                                    bits += (0x7FFF + ((bits >> 16) & 1));
+                                    dst_bf16[k2 * N + nn] = (uint16_t)(bits >> 16);
+                                }
+                            }
+                        } else if (weight_ptr->type == GGML_TYPE_F16) {
+                            const uint16_t * src_f16 = (const uint16_t *)weight_ptr->data;
+                            for (int64_t k2 = 0; k2 < K; k2++) {
+                                for (int64_t nn = 0; nn < N; nn++) {
+                                    dst_bf16[k2 * N + nn] = fp16_to_bf16(src_f16[nn * K + k2]);
+                                }
+                            }
+                        } else {
+                            const uint16_t * src = (const uint16_t *)weight_ptr->data;
+                            for (int64_t k2 = 0; k2 < K; k2++) {
+                                for (int64_t nn = 0; nn < N; nn++) {
+                                    dst_bf16[k2 * N + nn] = src[nn * K + k2];
+                                }
+                            }
+                        }
+                        new_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                        std::lock_guard<std::mutex> lock(*entry->weights_mutex);
+                        if (cache_ptr->count(weight_ptr->data) == 0) {
+                            cache_ptr->emplace(weight_ptr->data, std::move(new_bo));
+                        }
+                    } catch (const std::exception & e) {
+                        GGML_LOG_ERROR("ggml-xdna: prewarm tblock %s failed: %s\n", name, e.what());
+                    }
+                }
+            };
+            tasks.push_back(std::move(t));
+        }
+    }
+
+    if (tasks.empty()) return;
+
+    unsigned hw = std::thread::hardware_concurrency();
+    if (hw == 0) hw = 4;
+    unsigned nworkers = (unsigned)std::min<size_t>(hw, tasks.size());
+
+    std::atomic<size_t> next{0};
+    std::vector<std::future<void>> futs;
+    futs.reserve(nworkers);
+    for (unsigned w = 0; w < nworkers; w++) {
+        futs.push_back(std::async(std::launch::async, [&tasks, &next]() {
+            for (;;) {
+                size_t idx = next.fetch_add(1, std::memory_order_relaxed);
+                if (idx >= tasks.size()) break;
+                try {
+                    tasks[idx].run();
+                } catch (const std::exception & e) {
+                    GGML_LOG_ERROR("ggml-xdna: tblock-prefill bulk prewarm task failed: %s\n",
+                                   e.what());
+                }
+            }
+        }));
+    }
+    for (auto & f : futs) f.wait();
+
+    static const bool tp_dbg = getenv("XDNA_DEBUG") != NULL;
+    if (tp_dbg) {
+        fprintf(stderr,
+                "ggml-xdna: tblock-prefill bulk pre-warm done: %zu matches, "
+                "%zu uploads, %u workers\n",
+                matches.size(), tasks.size(), nworkers);
+        fflush(stderr);
+    }
+}
+
+// ----------------------------------------------------------------------------
+// TransformerBlockPrefill dispatch — full 20-run chained submit covering the
+// attention block + SwiGLU FFN + two residuals.
+// ----------------------------------------------------------------------------
+static bool ggml_backend_xdna_transformer_block_prefill(
+        ggml_backend_xdna_context * ctx,
+        const xdna_transformer_block_match & tm,
+        struct ggml_cgraph * cgraph) {
+    if (!ctx->device_valid) return false;
+    const auto & m = tm.attn;
+    if (m.head_dim != 64) return false;
+    if (m.embed_dim <= 0 || m.embed_dim % 8 != 0) return false;
+    if ((m.num_kv_heads * m.head_dim) % 64 != 0) return false;
+    if (m.num_heads % m.num_kv_heads != 0) return false;
+    if (tm.ffn_hidden_dim <= 0 || tm.ffn_hidden_dim % 64 != 0) return false;
+
+    const int64_t seq_bucket = xdna_select_attention_prefill_bucket(m.seq_len);
+    if (seq_bucket < 0) return false;
+
+    std::string cache_key = make_transformer_block_prefill_cache_key(
+        seq_bucket, m.embed_dim, m.num_heads, m.num_kv_heads, m.head_dim,
+        tm.ffn_hidden_dim, m.rope_method_type);
+
+    if (!ensure_transformer_block_prefill_compiled(
+            ctx, cache_key, seq_bucket, m.embed_dim, m.num_heads,
+            m.num_kv_heads, m.head_dim, tm.ffn_hidden_dim, m.rope_method_type)) {
+        return false;
+    }
+
+    xdna_transformer_block_prefill_entry * entry =
+        get_or_load_transformer_block_prefill_kernel(
+            ctx, cache_key, seq_bucket, m.embed_dim, m.num_heads,
+            m.num_kv_heads, m.head_dim, tm.ffn_hidden_dim);
+    if (!entry) return false;
+
+    const int64_t S      = m.seq_len;
+    const int64_t S_pad  = seq_bucket;
+    const int64_t E      = m.embed_dim;
+    const int64_t H      = m.num_heads;
+    const int64_t KV     = m.num_kv_heads;
+    const int64_t d      = m.head_dim;
+    const int64_t F      = tm.ffn_hidden_dim;
+    const int64_t H_d    = H * d;
+    const int64_t KV_d   = KV * d;
+    const int64_t xE_pad   = S_pad * E;
+    const int64_t qHD_pad  = S_pad * H_d;
+    const int64_t kvHD_pad = S_pad * KV_d;
+    const int64_t mha_buf  = H * d * S_pad;
+    const int64_t xF_pad   = S_pad * F;
+
+    const size_t bytes_xE     = (size_t)xE_pad    * sizeof(uint16_t);
+    const size_t bytes_qHD    = (size_t)qHD_pad   * sizeof(uint16_t);
+    const size_t bytes_kvHD   = (size_t)kvHD_pad  * sizeof(uint16_t);
+    const size_t bytes_mha    = (size_t)mha_buf   * sizeof(uint16_t);
+    const size_t bytes_angles = (size_t)S_pad * (size_t)d * sizeof(uint16_t);
+    const size_t bytes_xF     = (size_t)xF_pad    * sizeof(uint16_t);
+    const size_t bytes_actual_xE = (size_t)S * (size_t)E * sizeof(uint16_t);
+
+    const bool _ap_prof = xdna_attn_prof_enabled();
+    using _ap_clock = std::chrono::steady_clock;
+    auto _ap_now = []() { return _ap_clock::now(); };
+    auto _ap_us = [](_ap_clock::time_point a, _ap_clock::time_point b) {
+        return (int64_t)std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
+    };
+    const auto _ap_t_dispatch_begin = _ap_prof ? _ap_now() : _ap_clock::time_point{};
+
+    try {
+        // Attention-side BOs.
+        if (!entry->bo_x_in) {
+            entry->bo_x_in = std::make_unique<xrt::bo>(
+                ctx->device, bytes_xE, xrt::bo::flags::host_only,
+                entry->kernels[XDNA_TBLOCK_RMS_NORM_ATTN].group_id(3));
+        }
+        if (!entry->bo_x_norm) {
+            entry->bo_x_norm = std::make_unique<xrt::bo>(
+                ctx->device, bytes_xE, xrt::bo::flags::host_only,
+                entry->kernels[XDNA_TBLOCK_RMS_NORM_ATTN].group_id(5));
+        }
+        if (!entry->bo_q_proj) {
+            entry->bo_q_proj = std::make_unique<xrt::bo>(
+                ctx->device, bytes_qHD, xrt::bo::flags::host_only,
+                entry->kernels[XDNA_TBLOCK_GEMM_Q].group_id(5));
+        }
+        if (!entry->bo_k_proj) {
+            entry->bo_k_proj = std::make_unique<xrt::bo>(
+                ctx->device, bytes_kvHD, xrt::bo::flags::host_only,
+                entry->kernels[XDNA_TBLOCK_GEMM_KV].group_id(5));
+        }
+        if (!entry->bo_v_proj) {
+            entry->bo_v_proj = std::make_unique<xrt::bo>(
+                ctx->device, bytes_kvHD, xrt::bo::flags::host_only,
+                entry->kernels[XDNA_TBLOCK_GEMM_KV].group_id(5));
+        }
+        if (!entry->bo_q_rope) {
+            entry->bo_q_rope = std::make_unique<xrt::bo>(
+                ctx->device, bytes_qHD, xrt::bo::flags::host_only,
+                entry->kernels[XDNA_TBLOCK_ROPE_Q].group_id(5));
+        }
+        if (!entry->bo_k_rope) {
+            entry->bo_k_rope = std::make_unique<xrt::bo>(
+                ctx->device, bytes_kvHD, xrt::bo::flags::host_only,
+                entry->kernels[XDNA_TBLOCK_ROPE_K].group_id(5));
+        }
+        if (!entry->bo_q_perm) {
+            entry->bo_q_perm = std::make_unique<xrt::bo>(
+                ctx->device, bytes_mha, xrt::bo::flags::host_only,
+                entry->kernels[XDNA_TBLOCK_MHA].group_id(3));
+        }
+        if (!entry->bo_k_perm) {
+            entry->bo_k_perm = std::make_unique<xrt::bo>(
+                ctx->device, bytes_mha, xrt::bo::flags::host_only,
+                entry->kernels[XDNA_TBLOCK_MHA].group_id(4));
+        }
+        if (!entry->bo_v_perm) {
+            entry->bo_v_perm = std::make_unique<xrt::bo>(
+                ctx->device, bytes_mha, xrt::bo::flags::host_only,
+                entry->kernels[XDNA_TBLOCK_MHA].group_id(5));
+        }
+        if (!entry->bo_attn_out) {
+            entry->bo_attn_out = std::make_unique<xrt::bo>(
+                ctx->device, bytes_mha, xrt::bo::flags::host_only,
+                entry->kernels[XDNA_TBLOCK_MHA].group_id(6));
+        }
+        if (!entry->bo_o_perm) {
+            entry->bo_o_perm = std::make_unique<xrt::bo>(
+                ctx->device, bytes_qHD, xrt::bo::flags::host_only,
+                entry->kernels[XDNA_TBLOCK_PERM_O].group_id(4));
+        }
+        if (!entry->bo_o_proj) {
+            entry->bo_o_proj = std::make_unique<xrt::bo>(
+                ctx->device, bytes_xE, xrt::bo::flags::host_only,
+                entry->kernels[XDNA_TBLOCK_GEMM_O].group_id(5));
+        }
+        if (!entry->bo_attn_residual) {
+            entry->bo_attn_residual = std::make_unique<xrt::bo>(
+                ctx->device, bytes_xE, xrt::bo::flags::host_only,
+                entry->kernels[XDNA_TBLOCK_ADD_ATTN].group_id(5));
+        }
+        if (!entry->bo_angles) {
+            entry->bo_angles = std::make_unique<xrt::bo>(
+                ctx->device, bytes_angles, xrt::bo::flags::host_only,
+                entry->kernels[XDNA_TBLOCK_ROPE_Q].group_id(4));
+        }
+        // FFN-side BOs.
+        if (!entry->bo_ffn_norm) {
+            entry->bo_ffn_norm = std::make_unique<xrt::bo>(
+                ctx->device, bytes_xE, xrt::bo::flags::host_only,
+                entry->kernels[XDNA_TBLOCK_RMS_NORM_FFN].group_id(5));
+        }
+        if (!entry->bo_gate_out) {
+            entry->bo_gate_out = std::make_unique<xrt::bo>(
+                ctx->device, bytes_xF, xrt::bo::flags::host_only,
+                entry->kernels[XDNA_TBLOCK_GEMM_GATE_UP].group_id(5));
+        }
+        if (!entry->bo_up_out) {
+            entry->bo_up_out = std::make_unique<xrt::bo>(
+                ctx->device, bytes_xF, xrt::bo::flags::host_only,
+                entry->kernels[XDNA_TBLOCK_GEMM_GATE_UP].group_id(5));
+        }
+        if (!entry->bo_silu_out) {
+            entry->bo_silu_out = std::make_unique<xrt::bo>(
+                ctx->device, bytes_xF, xrt::bo::flags::host_only,
+                entry->kernels[XDNA_TBLOCK_SILU].group_id(4));
+        }
+        if (!entry->bo_mul_out) {
+            entry->bo_mul_out = std::make_unique<xrt::bo>(
+                ctx->device, bytes_xF, xrt::bo::flags::host_only,
+                entry->kernels[XDNA_TBLOCK_ELTWISE_MUL].group_id(5));
+        }
+        if (!entry->bo_down_out) {
+            entry->bo_down_out = std::make_unique<xrt::bo>(
+                ctx->device, bytes_xE, xrt::bo::flags::host_only,
+                entry->kernels[XDNA_TBLOCK_GEMM_DOWN].group_id(5));
+        }
+        if (!entry->bo_output) {
+            entry->bo_output = std::make_unique<xrt::bo>(
+                ctx->device, bytes_xE, xrt::bo::flags::host_only,
+                entry->kernels[XDNA_TBLOCK_ADD_FFN].group_id(5));
+        }
+
+        xrt::bo * gain_attn_bo = nullptr;
+        xrt::bo * wq_bo = nullptr;
+        xrt::bo * wk_bo = nullptr;
+        xrt::bo * wv_bo = nullptr;
+        xrt::bo * wo_bo = nullptr;
+        xrt::bo * gain_ffn_bo = nullptr;
+        xrt::bo * wgate_bo = nullptr;
+        xrt::bo * wup_bo = nullptr;
+        xrt::bo * wdown_bo = nullptr;
+        const auto _ap_t_ww_begin = _ap_prof ? _ap_now() : _ap_clock::time_point{};
+        {
+            std::lock_guard<std::mutex> lock(*entry->weights_mutex);
+            gain_attn_bo = tblock_prefill_warm_gain(
+                ctx, entry, entry->gain_attn_bo_cache, m.gain, E,
+                XDNA_TBLOCK_RMS_NORM_ATTN, 4);
+            wq_bo = tblock_prefill_warm_gemm_weight(
+                ctx, entry, entry->w_q_bo_cache, m.wq,
+                XDNA_TBLOCK_GEMM_Q, 4, "w_q");
+            wk_bo = tblock_prefill_warm_gemm_weight(
+                ctx, entry, entry->w_k_bo_cache, m.wk,
+                XDNA_TBLOCK_GEMM_KV, 4, "w_k");
+            wv_bo = tblock_prefill_warm_gemm_weight(
+                ctx, entry, entry->w_v_bo_cache, m.wv,
+                XDNA_TBLOCK_GEMM_KV, 4, "w_v");
+            wo_bo = tblock_prefill_warm_gemm_weight(
+                ctx, entry, entry->w_o_bo_cache, m.wo,
+                XDNA_TBLOCK_GEMM_O, 4, "w_o");
+            gain_ffn_bo = tblock_prefill_warm_gain(
+                ctx, entry, entry->gain_ffn_bo_cache, tm.ffn_gain, E,
+                XDNA_TBLOCK_RMS_NORM_FFN, 4);
+            wgate_bo = tblock_prefill_warm_gemm_weight(
+                ctx, entry, entry->w_gate_bo_cache, tm.w_gate,
+                XDNA_TBLOCK_GEMM_GATE_UP, 4, "w_gate");
+            wup_bo = tblock_prefill_warm_gemm_weight(
+                ctx, entry, entry->w_up_bo_cache, tm.w_up,
+                XDNA_TBLOCK_GEMM_GATE_UP, 4, "w_up");
+            wdown_bo = tblock_prefill_warm_gemm_weight(
+                ctx, entry, entry->w_down_bo_cache, tm.w_down,
+                XDNA_TBLOCK_GEMM_DOWN, 4, "w_down");
+        }
+        if (_ap_prof) {
+            xdna_attn_prof_record(XDNA_AP_WEIGHT_WARM, _ap_us(_ap_t_ww_begin, _ap_now()));
+        }
+        if (!gain_attn_bo || !wq_bo || !wk_bo || !wv_bo || !wo_bo
+            || !gain_ffn_bo || !wgate_bo || !wup_bo || !wdown_bo) return false;
+
+        const auto _ap_t_rope_begin = _ap_prof ? _ap_now() : _ap_clock::time_point{};
+        {
+            std::vector<uint16_t> angles(S_pad * d, 0);
+            if (!xdna_compute_rope_angles_bf16(m.q_rope_node,
+                                               S, S_pad, d, angles.data())) {
+                return false;
+            }
+            memcpy(entry->bo_angles->map<void*>(), angles.data(),
+                   angles.size() * sizeof(uint16_t));
+            entry->bo_angles->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        }
+        if (_ap_prof) {
+            xdna_attn_prof_record(XDNA_AP_ROPE_PRECOMPUTE, _ap_us(_ap_t_rope_begin, _ap_now()));
+        }
+
+        const auto _ap_t_in_begin = _ap_prof ? _ap_now() : _ap_clock::time_point{};
+        if (S_pad > S) memset(entry->bo_x_in->map<void*>(), 0, bytes_xE);
+        {
+            void * dst_in = entry->bo_x_in->map<void*>();
+            if (m.inpL->type == GGML_TYPE_F32) {
+                f32_to_bf16((const float *)m.inpL->data,
+                            (uint16_t *)dst_in, (size_t)S * (size_t)E);
+            } else if (m.inpL->type == GGML_TYPE_F16) {
+                const uint16_t * src = (const uint16_t *)m.inpL->data;
+                uint16_t * dst = (uint16_t *)dst_in;
+                for (int64_t i = 0; i < S * E; i++) dst[i] = fp16_to_bf16(src[i]);
+            } else {
+                memcpy(dst_in, m.inpL->data, bytes_actual_xE);
+            }
+            entry->bo_x_in->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        }
+        if (_ap_prof) {
+            xdna_attn_prof_record(XDNA_AP_BO_SYNC_TO_DEV, _ap_us(_ap_t_in_begin, _ap_now()));
+        }
+
+        const uint32_t i_rms_a  = (uint32_t)entry->insts_data[XDNA_TBLOCK_RMS_NORM_ATTN].size();
+        const uint32_t i_gq     = (uint32_t)entry->insts_data[XDNA_TBLOCK_GEMM_Q].size();
+        const uint32_t i_gkv    = (uint32_t)entry->insts_data[XDNA_TBLOCK_GEMM_KV].size();
+        const uint32_t i_rq     = (uint32_t)entry->insts_data[XDNA_TBLOCK_ROPE_Q].size();
+        const uint32_t i_rk     = (uint32_t)entry->insts_data[XDNA_TBLOCK_ROPE_K].size();
+        const uint32_t i_pq     = (uint32_t)entry->insts_data[XDNA_TBLOCK_PERM_Q].size();
+        const uint32_t i_pkv    = (uint32_t)entry->insts_data[XDNA_TBLOCK_PERM_KV].size();
+        const uint32_t i_mha    = (uint32_t)entry->insts_data[XDNA_TBLOCK_MHA].size();
+        const uint32_t i_po     = (uint32_t)entry->insts_data[XDNA_TBLOCK_PERM_O].size();
+        const uint32_t i_go     = (uint32_t)entry->insts_data[XDNA_TBLOCK_GEMM_O].size();
+        const uint32_t i_add_a  = (uint32_t)entry->insts_data[XDNA_TBLOCK_ADD_ATTN].size();
+        const uint32_t i_rms_f  = (uint32_t)entry->insts_data[XDNA_TBLOCK_RMS_NORM_FFN].size();
+        const uint32_t i_ggu    = (uint32_t)entry->insts_data[XDNA_TBLOCK_GEMM_GATE_UP].size();
+        const uint32_t i_silu   = (uint32_t)entry->insts_data[XDNA_TBLOCK_SILU].size();
+        const uint32_t i_emul   = (uint32_t)entry->insts_data[XDNA_TBLOCK_ELTWISE_MUL].size();
+        const uint32_t i_gdn    = (uint32_t)entry->insts_data[XDNA_TBLOCK_GEMM_DOWN].size();
+        const uint32_t i_add_f  = (uint32_t)entry->insts_data[XDNA_TBLOCK_ADD_FFN].size();
+
+        const auto _ap_t_rlbuild_begin = _ap_prof ? _ap_now() : _ap_clock::time_point{};
+        xrt::runlist rl(entry->hw_ctx);
+
+        // 1. rms_norm_attn(x_in, gain_attn, x_norm)
+        {
+            xrt::run r(entry->kernels[XDNA_TBLOCK_RMS_NORM_ATTN]);
+            r.set_arg(0, 3u); r.set_arg(1, entry->insts_bo[XDNA_TBLOCK_RMS_NORM_ATTN]); r.set_arg(2, i_rms_a);
+            r.set_arg(3, *entry->bo_x_in);
+            r.set_arg(4, *gain_attn_bo);
+            r.set_arg(5, *entry->bo_x_norm);
+            rl.add(std::move(r));
+        }
+        // 2. gemm_q(x_norm, w_q, q_proj)
+        {
+            xrt::run r(entry->kernels[XDNA_TBLOCK_GEMM_Q]);
+            r.set_arg(0, 3u); r.set_arg(1, entry->insts_bo[XDNA_TBLOCK_GEMM_Q]); r.set_arg(2, i_gq);
+            r.set_arg(3, *entry->bo_x_norm);
+            r.set_arg(4, *wq_bo);
+            r.set_arg(5, *entry->bo_q_proj);
+            rl.add(std::move(r));
+        }
+        // 3. gemm_kv(x_norm, w_k, k_proj)
+        {
+            xrt::run r(entry->kernels[XDNA_TBLOCK_GEMM_KV]);
+            r.set_arg(0, 3u); r.set_arg(1, entry->insts_bo[XDNA_TBLOCK_GEMM_KV]); r.set_arg(2, i_gkv);
+            r.set_arg(3, *entry->bo_x_norm);
+            r.set_arg(4, *wk_bo);
+            r.set_arg(5, *entry->bo_k_proj);
+            rl.add(std::move(r));
+        }
+        // 4. gemm_kv(x_norm, w_v, v_proj)
+        {
+            xrt::run r(entry->kernels[XDNA_TBLOCK_GEMM_KV]);
+            r.set_arg(0, 3u); r.set_arg(1, entry->insts_bo[XDNA_TBLOCK_GEMM_KV]); r.set_arg(2, i_gkv);
+            r.set_arg(3, *entry->bo_x_norm);
+            r.set_arg(4, *wv_bo);
+            r.set_arg(5, *entry->bo_v_proj);
+            rl.add(std::move(r));
+        }
+        // 5. rope_q(q_proj, angles, q_rope)
+        {
+            xrt::run r(entry->kernels[XDNA_TBLOCK_ROPE_Q]);
+            r.set_arg(0, 3u); r.set_arg(1, entry->insts_bo[XDNA_TBLOCK_ROPE_Q]); r.set_arg(2, i_rq);
+            r.set_arg(3, *entry->bo_q_proj);
+            r.set_arg(4, *entry->bo_angles);
+            r.set_arg(5, *entry->bo_q_rope);
+            rl.add(std::move(r));
+        }
+        // 6. rope_k(k_proj, angles, k_rope)
+        {
+            xrt::run r(entry->kernels[XDNA_TBLOCK_ROPE_K]);
+            r.set_arg(0, 3u); r.set_arg(1, entry->insts_bo[XDNA_TBLOCK_ROPE_K]); r.set_arg(2, i_rk);
+            r.set_arg(3, *entry->bo_k_proj);
+            r.set_arg(4, *entry->bo_angles);
+            r.set_arg(5, *entry->bo_k_rope);
+            rl.add(std::move(r));
+        }
+        // 7. perm_q(q_rope, q_perm)
+        {
+            xrt::run r(entry->kernels[XDNA_TBLOCK_PERM_Q]);
+            r.set_arg(0, 3u); r.set_arg(1, entry->insts_bo[XDNA_TBLOCK_PERM_Q]); r.set_arg(2, i_pq);
+            r.set_arg(3, *entry->bo_q_rope);
+            r.set_arg(4, *entry->bo_q_perm);
+            rl.add(std::move(r));
+        }
+        // 8. perm_kv(k_rope, k_perm)
+        {
+            xrt::run r(entry->kernels[XDNA_TBLOCK_PERM_KV]);
+            r.set_arg(0, 3u); r.set_arg(1, entry->insts_bo[XDNA_TBLOCK_PERM_KV]); r.set_arg(2, i_pkv);
+            r.set_arg(3, *entry->bo_k_rope);
+            r.set_arg(4, *entry->bo_k_perm);
+            rl.add(std::move(r));
+        }
+        // 9. perm_kv(v_proj, v_perm)
+        {
+            xrt::run r(entry->kernels[XDNA_TBLOCK_PERM_KV]);
+            r.set_arg(0, 3u); r.set_arg(1, entry->insts_bo[XDNA_TBLOCK_PERM_KV]); r.set_arg(2, i_pkv);
+            r.set_arg(3, *entry->bo_v_proj);
+            r.set_arg(4, *entry->bo_v_perm);
+            rl.add(std::move(r));
+        }
+        // 10. mha(q_perm, k_perm, v_perm, attn_out)
+        {
+            xrt::run r(entry->kernels[XDNA_TBLOCK_MHA]);
+            r.set_arg(0, 3u); r.set_arg(1, entry->insts_bo[XDNA_TBLOCK_MHA]); r.set_arg(2, i_mha);
+            r.set_arg(3, *entry->bo_q_perm);
+            r.set_arg(4, *entry->bo_k_perm);
+            r.set_arg(5, *entry->bo_v_perm);
+            r.set_arg(6, *entry->bo_attn_out);
+            rl.add(std::move(r));
+        }
+        // 11. perm_o(attn_out, o_perm)
+        {
+            xrt::run r(entry->kernels[XDNA_TBLOCK_PERM_O]);
+            r.set_arg(0, 3u); r.set_arg(1, entry->insts_bo[XDNA_TBLOCK_PERM_O]); r.set_arg(2, i_po);
+            r.set_arg(3, *entry->bo_attn_out);
+            r.set_arg(4, *entry->bo_o_perm);
+            rl.add(std::move(r));
+        }
+        // 12. gemm_o(o_perm, w_o, o_proj)
+        {
+            xrt::run r(entry->kernels[XDNA_TBLOCK_GEMM_O]);
+            r.set_arg(0, 3u); r.set_arg(1, entry->insts_bo[XDNA_TBLOCK_GEMM_O]); r.set_arg(2, i_go);
+            r.set_arg(3, *entry->bo_o_perm);
+            r.set_arg(4, *wo_bo);
+            r.set_arg(5, *entry->bo_o_proj);
+            rl.add(std::move(r));
+        }
+        // 13. add_attn(o_proj, x_in, attn_residual)
+        {
+            xrt::run r(entry->kernels[XDNA_TBLOCK_ADD_ATTN]);
+            r.set_arg(0, 3u); r.set_arg(1, entry->insts_bo[XDNA_TBLOCK_ADD_ATTN]); r.set_arg(2, i_add_a);
+            r.set_arg(3, *entry->bo_o_proj);
+            r.set_arg(4, *entry->bo_x_in);
+            r.set_arg(5, *entry->bo_attn_residual);
+            rl.add(std::move(r));
+        }
+        // 14. rms_norm_ffn(attn_residual, gain_ffn, ffn_norm)
+        {
+            xrt::run r(entry->kernels[XDNA_TBLOCK_RMS_NORM_FFN]);
+            r.set_arg(0, 3u); r.set_arg(1, entry->insts_bo[XDNA_TBLOCK_RMS_NORM_FFN]); r.set_arg(2, i_rms_f);
+            r.set_arg(3, *entry->bo_attn_residual);
+            r.set_arg(4, *gain_ffn_bo);
+            r.set_arg(5, *entry->bo_ffn_norm);
+            rl.add(std::move(r));
+        }
+        // 15. gemm_gate_up(ffn_norm, w_gate, gate_out)
+        {
+            xrt::run r(entry->kernels[XDNA_TBLOCK_GEMM_GATE_UP]);
+            r.set_arg(0, 3u); r.set_arg(1, entry->insts_bo[XDNA_TBLOCK_GEMM_GATE_UP]); r.set_arg(2, i_ggu);
+            r.set_arg(3, *entry->bo_ffn_norm);
+            r.set_arg(4, *wgate_bo);
+            r.set_arg(5, *entry->bo_gate_out);
+            rl.add(std::move(r));
+        }
+        // 16. gemm_gate_up(ffn_norm, w_up, up_out)
+        {
+            xrt::run r(entry->kernels[XDNA_TBLOCK_GEMM_GATE_UP]);
+            r.set_arg(0, 3u); r.set_arg(1, entry->insts_bo[XDNA_TBLOCK_GEMM_GATE_UP]); r.set_arg(2, i_ggu);
+            r.set_arg(3, *entry->bo_ffn_norm);
+            r.set_arg(4, *wup_bo);
+            r.set_arg(5, *entry->bo_up_out);
+            rl.add(std::move(r));
+        }
+        // 17. silu(gate_out, silu_out) — unary: in=3, out=4
+        {
+            xrt::run r(entry->kernels[XDNA_TBLOCK_SILU]);
+            r.set_arg(0, 3u); r.set_arg(1, entry->insts_bo[XDNA_TBLOCK_SILU]); r.set_arg(2, i_silu);
+            r.set_arg(3, *entry->bo_gate_out);
+            r.set_arg(4, *entry->bo_silu_out);
+            rl.add(std::move(r));
+        }
+        // 18. eltwise_mul(silu_out, up_out, mul_out)
+        {
+            xrt::run r(entry->kernels[XDNA_TBLOCK_ELTWISE_MUL]);
+            r.set_arg(0, 3u); r.set_arg(1, entry->insts_bo[XDNA_TBLOCK_ELTWISE_MUL]); r.set_arg(2, i_emul);
+            r.set_arg(3, *entry->bo_silu_out);
+            r.set_arg(4, *entry->bo_up_out);
+            r.set_arg(5, *entry->bo_mul_out);
+            rl.add(std::move(r));
+        }
+        // 19. gemm_down(mul_out, w_down, down_out)
+        {
+            xrt::run r(entry->kernels[XDNA_TBLOCK_GEMM_DOWN]);
+            r.set_arg(0, 3u); r.set_arg(1, entry->insts_bo[XDNA_TBLOCK_GEMM_DOWN]); r.set_arg(2, i_gdn);
+            r.set_arg(3, *entry->bo_mul_out);
+            r.set_arg(4, *wdown_bo);
+            r.set_arg(5, *entry->bo_down_out);
+            rl.add(std::move(r));
+        }
+        // 20. add_ffn(down_out, attn_residual, output)
+        {
+            xrt::run r(entry->kernels[XDNA_TBLOCK_ADD_FFN]);
+            r.set_arg(0, 3u); r.set_arg(1, entry->insts_bo[XDNA_TBLOCK_ADD_FFN]); r.set_arg(2, i_add_f);
+            r.set_arg(3, *entry->bo_down_out);
+            r.set_arg(4, *entry->bo_attn_residual);
+            r.set_arg(5, *entry->bo_output);
+            rl.add(std::move(r));
+        }
+
+        if (_ap_prof) {
+            xdna_attn_prof_record(XDNA_AP_RL_BUILD, _ap_us(_ap_t_rlbuild_begin, _ap_now()));
+        }
+        const auto _ap_t_exec_begin = _ap_prof ? _ap_now() : _ap_clock::time_point{};
+        rl.execute();
+        if (_ap_prof) {
+            xdna_attn_prof_record(XDNA_AP_RL_EXEC, _ap_us(_ap_t_exec_begin, _ap_now()));
+        }
+        const auto _ap_t_wait_begin = _ap_prof ? _ap_now() : _ap_clock::time_point{};
+        rl.wait();
+        if (_ap_prof) {
+            xdna_attn_prof_record(XDNA_AP_RL_WAIT, _ap_us(_ap_t_wait_begin, _ap_now()));
+        }
+
+        const auto _ap_t_out_begin = _ap_prof ? _ap_now() : _ap_clock::time_point{};
+        entry->bo_output->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        if (_ap_prof) {
+            xdna_attn_prof_record(XDNA_AP_BO_SYNC_FROM_DEV, _ap_us(_ap_t_out_begin, _ap_now()));
+        }
+        struct ggml_tensor * dst = cgraph->nodes[tm.ffn_residual_add_idx];
+        const size_t actual_elems = (size_t)S * (size_t)E;
+        if (dst->type == GGML_TYPE_F32) {
+            bf16_to_f32((const uint16_t *)entry->bo_output->map<void*>(),
+                        (float *)dst->data, actual_elems);
+        } else if (dst->type == GGML_TYPE_BF16) {
+            memcpy(dst->data, entry->bo_output->map<void*>(),
+                   actual_elems * sizeof(uint16_t));
+        } else {
+            GGML_LOG_ERROR("ggml-xdna: tblock-prefill unsupported dst dtype %d\n",
+                           (int)dst->type);
+            return false;
+        }
+        if (_ap_prof) {
+            xdna_attn_prof_record(XDNA_AP_TOTAL_PER_LAYER,
+                                  _ap_us(_ap_t_dispatch_begin, _ap_now()));
+        }
+        return true;
+
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("ggml-xdna: transformer-block-prefill dispatch failed (%s)\n", e.what());
+        return false;
+    }
+}
+
+// ============================================================================
+// Layer 4A Phase 3.3 — Fused transformer-block dispatch.
+//
+// Same matcher as Layer 3A (attn + SwiGLU FFN window), but the whole block
+// runs as a SINGLE xrt::run against one ELF. Host work per layer collapses
+// to: write x at its input_bo offset, compute + write RoPE angles, sync
+// input_bo, run, sync output_bo, copy y out.
+//
+// Weights (w_q, w_k, w_v, w_o, w_gate, w_up, w_down, w_norm_attn,
+// w_norm_ffn) are uploaded once per layer-lifetime at the entry's
+// input_bo offsets. To get that, we key the in-memory cache by layer
+// (shape + w_q->data ptr) while keeping a single on-disk bundle per
+// shape — the ELF + layout are identical across layers.
+// ============================================================================
+
+static std::string make_tblock_fused_layer_cache_key(
+        const std::string & shape_key, const void * wq_ptr) {
+    char buf[48];
+    snprintf(buf, sizeof(buf), "_wq%lx", (unsigned long)(uintptr_t)wq_ptr);
+    return shape_key + buf;
+}
+
+// Write the weight tensor (ggml-native [N, K] layout in src->data) into
+// entry->input_bo at layout.buffers[name].offset as bf16 [K, N] row-major.
+// That is what FusedMLIROperator's internal GEMM sub-ops consume directly
+// (IRON GEMM default b_col_maj=False).
+static bool tblock_fused_upload_gemm_weight(
+        xdna_tblock_fused_entry * entry,
+        const char * name,
+        const struct ggml_tensor * weight) {
+    auto it = entry->layout.buffers.find(name);
+    if (it == entry->layout.buffers.end()) {
+        GGML_LOG_ERROR("ggml-xdna: fused tblock weight '%s' missing from layout\n", name);
+        return false;
+    }
+    if (it->second.buf_type != "input") {
+        GGML_LOG_ERROR("ggml-xdna: fused tblock weight '%s' in unexpected buf_type=%s\n",
+                       name, it->second.buf_type.c_str());
+        return false;
+    }
+    const int64_t K = weight->ne[0];
+    const int64_t N = weight->ne[1];
+    const size_t  n_elems = (size_t)K * (size_t)N;
+    const size_t  need_bytes = n_elems * sizeof(uint16_t);
+    if (it->second.length < need_bytes) {
+        GGML_LOG_ERROR("ggml-xdna: fused tblock weight '%s' layout length %zu < needed %zu\n",
+                       name, it->second.length, need_bytes);
+        return false;
+    }
+    uint16_t * dst = (uint16_t *)((char *)entry->input_bo->map<void*>() + it->second.offset);
+    if (weight->type == GGML_TYPE_F32) {
+        const float * src = (const float *)weight->data;
+        for (int64_t k = 0; k < K; k++) {
+            for (int64_t nn = 0; nn < N; nn++) {
+                float v = src[nn * K + k];
+                uint32_t bits;
+                memcpy(&bits, &v, sizeof(bits));
+                bits += (0x7FFF + ((bits >> 16) & 1));
+                dst[k * N + nn] = (uint16_t)(bits >> 16);
+            }
+        }
+    } else if (weight->type == GGML_TYPE_F16) {
+        const uint16_t * src = (const uint16_t *)weight->data;
+        for (int64_t k = 0; k < K; k++) {
+            for (int64_t nn = 0; nn < N; nn++) {
+                dst[k * N + nn] = fp16_to_bf16(src[nn * K + k]);
+            }
+        }
+    } else if (weight->type == GGML_TYPE_BF16) {
+        const uint16_t * src = (const uint16_t *)weight->data;
+        for (int64_t k = 0; k < K; k++) {
+            for (int64_t nn = 0; nn < N; nn++) {
+                dst[k * N + nn] = src[nn * K + k];
+            }
+        }
+    } else {
+        GGML_LOG_ERROR("ggml-xdna: fused tblock weight '%s' unsupported dtype %d\n",
+                       name, (int)weight->type);
+        return false;
+    }
+    return true;
+}
+
+// Write an RMSNorm gain vector (1-D, no transpose) to input_bo at layout offset.
+static bool tblock_fused_upload_gain(
+        xdna_tblock_fused_entry * entry,
+        const char * name,
+        const struct ggml_tensor * gain) {
+    auto it = entry->layout.buffers.find(name);
+    if (it == entry->layout.buffers.end()) {
+        GGML_LOG_ERROR("ggml-xdna: fused tblock gain '%s' missing from layout\n", name);
+        return false;
+    }
+    const int64_t E = gain->ne[0];
+    const size_t need_bytes = (size_t)E * sizeof(uint16_t);
+    if (it->second.length < need_bytes) return false;
+    uint16_t * dst = (uint16_t *)((char *)entry->input_bo->map<void*>() + it->second.offset);
+    if (gain->type == GGML_TYPE_F32) {
+        f32_to_bf16((const float *)gain->data, dst, (size_t)E);
+    } else if (gain->type == GGML_TYPE_F16) {
+        const uint16_t * src = (const uint16_t *)gain->data;
+        for (int64_t i = 0; i < E; i++) dst[i] = fp16_to_bf16(src[i]);
+    } else if (gain->type == GGML_TYPE_BF16) {
+        memcpy(dst, gain->data, need_bytes);
+    } else {
+        return false;
+    }
+    return true;
+}
+
+// Single dispatch of the fused transformer block for one layer. Analog of
+// ggml_backend_xdna_transformer_block_prefill but replaces the 20-kernel
+// runlist with a single xrt::run on a 3-BO (input/output/scratch) kernel
+// loaded from a full ELF.
+static bool ggml_backend_xdna_transformer_block_prefill_fused(
+        ggml_backend_xdna_context * ctx,
+        const xdna_transformer_block_match & tm,
+        struct ggml_cgraph * cgraph) {
+    if (!ctx->device_valid) return false;
+    const auto & m = tm.attn;
+    if (m.head_dim != 64) return false;
+    if (m.embed_dim <= 0 || m.embed_dim % 8 != 0) return false;
+    if ((m.num_kv_heads * m.head_dim) % 64 != 0) return false;
+    if (m.num_heads % m.num_kv_heads != 0) return false;
+    if (tm.ffn_hidden_dim <= 0 || tm.ffn_hidden_dim % 64 != 0) return false;
+
+    const int64_t seq_bucket = xdna_select_attention_prefill_bucket(m.seq_len);
+    if (seq_bucket < 0) return false;
+
+    const std::string shape_key = make_tblock_fused_cache_key(
+        seq_bucket, m.embed_dim, m.num_heads, m.num_kv_heads, m.head_dim,
+        tm.ffn_hidden_dim, m.rope_method_type);
+    const std::string layer_key = make_tblock_fused_layer_cache_key(
+        shape_key, m.wq->data);
+
+    if (!ensure_tblock_fused_compiled(
+            ctx, shape_key, seq_bucket, m.embed_dim, m.num_heads,
+            m.num_kv_heads, m.head_dim, tm.ffn_hidden_dim, m.rope_method_type)) {
+        return false;
+    }
+
+    xdna_tblock_fused_entry * entry = get_or_load_tblock_fused_kernel(
+        ctx, layer_key, shape_key,
+        seq_bucket, m.embed_dim, m.num_heads, m.num_kv_heads,
+        m.head_dim, tm.ffn_hidden_dim, m.rope_method_type);
+    if (!entry) return false;
+
+    const int64_t S     = m.seq_len;
+    const int64_t S_pad = seq_bucket;
+    const int64_t E     = m.embed_dim;
+    const int64_t d     = m.head_dim;
+    const size_t  bytes_x_actual = (size_t)S * (size_t)E * sizeof(uint16_t);
+    const size_t  bytes_x_pad    = (size_t)S_pad * (size_t)E * sizeof(uint16_t);
+
+    const bool _ap_prof = xdna_attn_prof_enabled();
+    using _ap_clock = std::chrono::steady_clock;
+    auto _ap_now = []() { return _ap_clock::now(); };
+    auto _ap_us = [](_ap_clock::time_point a, _ap_clock::time_point b) {
+        return (int64_t)std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
+    };
+    const auto _ap_t_disp_begin = _ap_prof ? _ap_now() : _ap_clock::time_point{};
+
+    try {
+        // Upload weights + gains once per layer-entry.
+        {
+            std::lock_guard<std::mutex> lock(*entry->mu);
+            const auto _ap_t_ww_begin = _ap_prof ? _ap_now() : _ap_clock::time_point{};
+
+            auto needs_upload = [&](const char * name, const void * src_ptr) {
+                auto it = entry->loaded_srcs.find(name);
+                return it == entry->loaded_srcs.end() || it->second != src_ptr;
+            };
+            auto mark_uploaded = [&](const char * name, const void * src_ptr) {
+                entry->loaded_srcs[name] = src_ptr;
+            };
+
+            struct gemm_w { const char * name; const struct ggml_tensor * t; };
+            const gemm_w gemm_weights[] = {
+                { XDNA_TBF_W_Q,    m.wq       },
+                { XDNA_TBF_W_K,    m.wk       },
+                { XDNA_TBF_W_V,    m.wv       },
+                { XDNA_TBF_W_O,    m.wo       },
+                { XDNA_TBF_W_GATE, tm.w_gate  },
+                { XDNA_TBF_W_UP,   tm.w_up    },
+                { XDNA_TBF_W_DOWN, tm.w_down  },
+            };
+            for (const auto & gw : gemm_weights) {
+                if (!needs_upload(gw.name, gw.t->data)) continue;
+                if (!tblock_fused_upload_gemm_weight(entry, gw.name, gw.t)) return false;
+                mark_uploaded(gw.name, gw.t->data);
+            }
+
+            struct gain_w { const char * name; const struct ggml_tensor * t; };
+            const gain_w gain_weights[] = {
+                { XDNA_TBF_W_NORM_ATTN, m.gain     },
+                { XDNA_TBF_W_NORM_FFN,  tm.ffn_gain },
+            };
+            for (const auto & g : gain_weights) {
+                if (!needs_upload(g.name, g.t->data)) continue;
+                if (!tblock_fused_upload_gain(entry, g.name, g.t)) return false;
+                mark_uploaded(g.name, g.t->data);
+            }
+
+            if (_ap_prof) {
+                xdna_attn_prof_record(XDNA_AP_WEIGHT_WARM,
+                                      _ap_us(_ap_t_ww_begin, _ap_now()));
+            }
+        }
+
+        // RoPE angles — precomputed per-call (cheap, ~us-scale).
+        const auto _ap_t_rope_begin = _ap_prof ? _ap_now() : _ap_clock::time_point{};
+        {
+            auto it = entry->layout.buffers.find(XDNA_TBF_ANGLES);
+            if (it == entry->layout.buffers.end() || it->second.buf_type != "input") {
+                GGML_LOG_ERROR("ggml-xdna: fused tblock 'angles' missing from layout\n");
+                return false;
+            }
+            const size_t need = (size_t)S_pad * (size_t)d * sizeof(uint16_t);
+            if (it->second.length < need) return false;
+            uint16_t * dst = (uint16_t *)((char *)entry->input_bo->map<void*>()
+                                          + it->second.offset);
+            // Zero the full padded region; RoPE helper writes only the first S rows.
+            memset(dst, 0, it->second.length);
+            if (!xdna_compute_rope_angles_bf16(m.q_rope_node, S, S_pad, d, dst)) {
+                return false;
+            }
+        }
+        if (_ap_prof) {
+            xdna_attn_prof_record(XDNA_AP_ROPE_PRECOMPUTE,
+                                  _ap_us(_ap_t_rope_begin, _ap_now()));
+        }
+
+        // Activation x — write into input_bo at its offset.
+        const auto _ap_t_in_begin = _ap_prof ? _ap_now() : _ap_clock::time_point{};
+        {
+            auto it = entry->layout.buffers.find(XDNA_TBF_X);
+            if (it == entry->layout.buffers.end() || it->second.buf_type != "input") {
+                GGML_LOG_ERROR("ggml-xdna: fused tblock 'x' missing from layout\n");
+                return false;
+            }
+            if (it->second.length < bytes_x_pad) return false;
+            uint16_t * dst = (uint16_t *)((char *)entry->input_bo->map<void*>()
+                                          + it->second.offset);
+            if (S_pad > S) memset(dst, 0, bytes_x_pad);
+            if (m.inpL->type == GGML_TYPE_F32) {
+                f32_to_bf16((const float *)m.inpL->data, dst, (size_t)S * (size_t)E);
+            } else if (m.inpL->type == GGML_TYPE_F16) {
+                const uint16_t * src = (const uint16_t *)m.inpL->data;
+                for (int64_t i = 0; i < S * E; i++) dst[i] = fp16_to_bf16(src[i]);
+            } else {
+                memcpy(dst, m.inpL->data, bytes_x_actual);
+            }
+            // Single sync for the whole input_bo — all weights + x + angles
+            // live in it. Weights on repeat layers are already bytes-identical
+            // so the sync is still correct; the only new bytes each call are
+            // x + angles, but XRT has no partial-range sync on host_only BOs.
+            entry->input_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        }
+        if (_ap_prof) {
+            xdna_attn_prof_record(XDNA_AP_BO_SYNC_TO_DEV,
+                                  _ap_us(_ap_t_in_begin, _ap_now()));
+        }
+
+        // Single xrt::run on the fused kernel — one NPU submission for the
+        // whole transformer block. This is the entire point of Layer 4A.
+        const auto _ap_t_rlbuild_begin = _ap_prof ? _ap_now() : _ap_clock::time_point{};
+        xrt::run run(entry->kernel);
+        run.set_arg(0, *entry->input_bo);
+        run.set_arg(1, *entry->output_bo);
+        run.set_arg(2, *entry->scratch_bo);
+        if (_ap_prof) {
+            xdna_attn_prof_record(XDNA_AP_RL_BUILD,
+                                  _ap_us(_ap_t_rlbuild_begin, _ap_now()));
+        }
+        const auto _ap_t_exec_begin = _ap_prof ? _ap_now() : _ap_clock::time_point{};
+        run.start();
+        if (_ap_prof) {
+            xdna_attn_prof_record(XDNA_AP_RL_EXEC,
+                                  _ap_us(_ap_t_exec_begin, _ap_now()));
+        }
+        const auto _ap_t_wait_begin = _ap_prof ? _ap_now() : _ap_clock::time_point{};
+        ert_cmd_state st = run.wait();
+        if (st != ERT_CMD_STATE_COMPLETED) {
+            GGML_LOG_ERROR("ggml-xdna: fused tblock xrt::run.wait() returned %d\n", (int)st);
+            return false;
+        }
+        if (_ap_prof) {
+            xdna_attn_prof_record(XDNA_AP_RL_WAIT,
+                                  _ap_us(_ap_t_wait_begin, _ap_now()));
+        }
+
+        // Pull output back and copy into the dst tensor.
+        const auto _ap_t_out_begin = _ap_prof ? _ap_now() : _ap_clock::time_point{};
+        entry->output_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        if (_ap_prof) {
+            xdna_attn_prof_record(XDNA_AP_BO_SYNC_FROM_DEV,
+                                  _ap_us(_ap_t_out_begin, _ap_now()));
+        }
+        {
+            auto it = entry->layout.buffers.find(XDNA_TBF_Y);
+            if (it == entry->layout.buffers.end() || it->second.buf_type != "output") {
+                GGML_LOG_ERROR("ggml-xdna: fused tblock 'y' missing from layout\n");
+                return false;
+            }
+            const uint16_t * src = (const uint16_t *)((const char *)entry->output_bo->map<void*>()
+                                                      + it->second.offset);
+            struct ggml_tensor * dst = cgraph->nodes[tm.ffn_residual_add_idx];
+            const size_t actual_elems = (size_t)S * (size_t)E;
+            if (it->second.length < actual_elems * sizeof(uint16_t)) return false;
+            if (dst->type == GGML_TYPE_F32) {
+                bf16_to_f32(src, (float *)dst->data, actual_elems);
+            } else if (dst->type == GGML_TYPE_BF16) {
+                memcpy(dst->data, src, actual_elems * sizeof(uint16_t));
+            } else {
+                GGML_LOG_ERROR("ggml-xdna: fused tblock unsupported dst dtype %d\n",
+                               (int)dst->type);
+                return false;
+            }
+        }
+        if (_ap_prof) {
+            xdna_attn_prof_record(XDNA_AP_TOTAL_PER_LAYER,
+                                  _ap_us(_ap_t_disp_begin, _ap_now()));
+        }
+        return true;
+
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("ggml-xdna: fused tblock dispatch failed: %s\n", e.what());
+        return false;
+    }
+}
+
+// ============================================================================
 // RMSNorm dispatch — standalone single-kernel op. Opt-in via XDNA_ENABLE_RMS_NORM.
 // ============================================================================
 
@@ -5531,10 +7419,14 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
 
     static const bool debug = getenv("XDNA_DEBUG") != NULL;
     static const bool attention_prefill_dbg_enabled = getenv("XDNA_ENABLE_ATTENTION_PREFILL") != NULL;
+    static const bool transformer_block_dbg_enabled =
+        (getenv("XDNA_ENABLE_TRANSFORMER_BLOCK") != NULL) ||
+        (getenv("XDNA_ENABLE_TBLOCK_FUSED") != NULL);
     if (debug) {
         int n_mulmat = 0, n_mulmat_disp = 0;
         int n_glu = 0, n_glu_swiglu = 0, n_swiglu_window = 0, n_swiglu_match = 0;
         int n_attn_window = 0, n_attn_match = 0;
+        int n_tblock_window = 0, n_tblock_match = 0;
         for (int i = 0; i < n; i++) {
             struct ggml_tensor * node = cgraph->nodes[i];
             if (node->op == GGML_OP_MUL_MAT) {
@@ -5564,14 +7456,21 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                 xdna_attention_match am{};
                 if (xdna_try_match_attention_prefill(cgraph, i, &am)) n_attn_match++;
             }
+            if (transformer_block_dbg_enabled && node->op == GGML_OP_RMS_NORM) {
+                n_tblock_window++;
+                xdna_transformer_block_match tm{};
+                if (xdna_try_match_transformer_block_prefill(cgraph, i, &tm)) n_tblock_match++;
+            }
         }
         fprintf(stderr,
                 "ggml-xdna: graph_compute n_nodes=%d mul_mat=%d npu_dispatchable=%d "
                 "glu=%d swiglu=%d swiglu_window=%d swiglu_match=%d "
-                "attn_window=%d attn_match=%d\n",
+                "attn_window=%d attn_match=%d "
+                "tblock_window=%d tblock_match=%d\n",
                 n, n_mulmat, n_mulmat_disp,
                 n_glu, n_glu_swiglu, n_swiglu_window, n_swiglu_match,
-                n_attn_window, n_attn_match);
+                n_attn_window, n_attn_match,
+                n_tblock_window, n_tblock_match);
         fflush(stderr);
     }
 
@@ -5584,6 +7483,9 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
     static const bool qkv_enabled    = getenv("XDNA_ENABLE_QKV")    != NULL;
     static const bool rms_norm_enabled = getenv("XDNA_ENABLE_RMS_NORM") != NULL;
     static const bool attention_prefill_enabled = getenv("XDNA_ENABLE_ATTENTION_PREFILL") != NULL;
+    static const bool transformer_block_enabled =
+        (getenv("XDNA_ENABLE_TRANSFORMER_BLOCK") != NULL) ||
+        (getenv("XDNA_ENABLE_TBLOCK_FUSED") != NULL);
 
     // Pre-scan for QKV triples. Llama.cpp's Qwen3.5 decode interleaves
     // RMSNorm/view ops between Q and K/V MUL_MATs, so a 3-consecutive-node
@@ -5614,6 +7516,12 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
         // The scan itself is cheap (~33 RMS_NORMs); the per-weight cache check
         // inside attn_prefill_warm_gemm_weight skips already-uploaded weights.
         attn_prefill_bulk_prewarm(ctx, cgraph);
+    }
+    if (transformer_block_enabled && getenv("XDNA_ENABLE_TBLOCK_FUSED") == NULL) {
+        // L3A prewarm uploads per-kernel weight BOs that the fused path
+        // doesn't use. Skip it in fused mode — fused weights are written
+        // at first dispatch per layer, into the single input_bo.
+        tblock_prefill_bulk_prewarm(ctx, cgraph);
     }
 
     int cpu_run_start = -1;
@@ -5649,6 +7557,199 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                     if (s != GGML_STATUS_SUCCESS) return s;
                     cpu_run_start = -1;
                 }
+                continue;
+            }
+        }
+
+        // TransformerBlockPrefill matcher — tries to consume the entire
+        // attention+FFN range as one chained xclbin dispatch. Takes precedence
+        // over the attention-prefill branch below when XDNA_ENABLE_TRANSFORMER_BLOCK
+        // is set. Same Phase-C sub-graph filter pattern but extended over the
+        // FFN nodes as well.
+        if (transformer_block_enabled && node->op == GGML_OP_RMS_NORM) {
+            xdna_transformer_block_match tm{};
+            if (xdna_try_match_transformer_block_prefill(cgraph, i, &tm)
+                && tm.attn.seq_len >= 256) {
+                static const bool tp_dbg = getenv("XDNA_DEBUG") != NULL;
+                const auto & am = tm.attn;
+                if (tp_dbg) {
+                    fprintf(stderr,
+                        "ggml-xdna: transformer_block matched @%d..%d "
+                        "(seq=%ld embed=%ld H=%ld KV=%ld d=%ld F=%ld) "
+                        "rms=%d qmm=%d kmm=%d vmm=%d fa=%d omm=%d attn_add=%d "
+                        "ffn_norm=%d gate=%d up=%d glu=%d down=%d ffn_add=%d\n",
+                        am.rms_norm_idx, tm.ffn_residual_add_idx,
+                        (long)am.seq_len, (long)am.embed_dim,
+                        (long)am.num_heads, (long)am.num_kv_heads,
+                        (long)am.head_dim, (long)tm.ffn_hidden_dim,
+                        am.rms_norm_idx, am.q_proj_idx, am.k_proj_idx,
+                        am.v_proj_idx, am.attn_core_idx, am.o_proj_idx,
+                        am.residual_add_idx, tm.ffn_norm_idx,
+                        tm.gate_mm_idx, tm.up_mm_idx, tm.glu_idx,
+                        tm.down_mm_idx, tm.ffn_residual_add_idx);
+                    fflush(stderr);
+                }
+
+                static const bool tp_skip_dispatch =
+                    getenv("XDNA_TBLOCK_PREFILL_SKIP_DISPATCH") != NULL;
+                static const bool tp_force_full_cpu =
+                    getenv("XDNA_TBLOCK_PREFILL_FULL_CPU") != NULL;
+
+                const int range_end = tm.ffn_residual_add_idx;
+                bool unknown_op_in_range = false;
+                int total_in_range = range_end - am.rms_norm_idx + 1;
+                int side_effect_count = 0;
+                for (int j = am.rms_norm_idx; j <= range_end; j++) {
+                    enum ggml_op op = cgraph->nodes[j]->op;
+                    switch (op) {
+                        case GGML_OP_VIEW:
+                        case GGML_OP_RESHAPE:
+                        case GGML_OP_CONT:
+                        case GGML_OP_PERMUTE:
+                        case GGML_OP_TRANSPOSE:
+                        case GGML_OP_MUL_MAT:
+                        case GGML_OP_RMS_NORM:
+                        case GGML_OP_NORM:
+                        case GGML_OP_MUL:
+                        case GGML_OP_ROPE:
+                        case GGML_OP_FLASH_ATTN_EXT:
+                        case GGML_OP_ADD:
+                        case GGML_OP_GLU:
+                            break;
+                        case GGML_OP_SET_ROWS:
+                        case GGML_OP_CPY:
+                        case GGML_OP_DUP:
+                            side_effect_count++;
+                            break;
+                        default:
+                            unknown_op_in_range = true;
+                            break;
+                    }
+                    if (unknown_op_in_range) break;
+                }
+
+                const bool use_phase_c = !tp_force_full_cpu && !unknown_op_in_range
+                                         && side_effect_count > 0;
+
+                if (!use_phase_c) {
+                    if (tp_dbg) {
+                        const char * why =
+                            tp_force_full_cpu   ? "force_full_cpu" :
+                            unknown_op_in_range ? "unknown_op"    :
+                                                  "no_side_effects";
+                        fprintf(stderr,
+                            "ggml-xdna: tblock-prefill PhaseB fallback @%d..%d (%s)\n",
+                            am.rms_norm_idx, range_end, why);
+                        fflush(stderr);
+                    }
+                    if (cpu_run_start < 0) cpu_run_start = i;
+                    ggml_status s = xdna_delegate_range(ctx, cgraph,
+                                                       cpu_run_start,
+                                                       range_end + 1);
+                    if (s != GGML_STATUS_SUCCESS) return s;
+                    cpu_run_start = -1;
+                } else {
+                    if (cpu_run_start >= 0) {
+                        ggml_status s = xdna_delegate_range(ctx, cgraph,
+                                                           cpu_run_start, i);
+                        if (s != GGML_STATUS_SUCCESS) return s;
+                        cpu_run_start = -1;
+                    }
+                    const size_t graph_cap = 512;
+                    struct ggml_init_params p = {
+                        /*.mem_size   =*/ ggml_tensor_overhead() * graph_cap +
+                                          ggml_graph_overhead_custom(graph_cap, false),
+                        /*.mem_buffer =*/ nullptr,
+                        /*.no_alloc   =*/ true,
+                    };
+                    struct ggml_context * sub_ctx = ggml_init(p);
+                    if (sub_ctx == nullptr) {
+                        if (tp_dbg) {
+                            fprintf(stderr,
+                                "ggml-xdna: tblock-prefill ggml_init failed @%d..%d, "
+                                "falling back to Phase B\n",
+                                am.rms_norm_idx, range_end);
+                            fflush(stderr);
+                        }
+                        ggml_status s = xdna_delegate_range(ctx, cgraph, i,
+                                                           range_end + 1);
+                        if (s != GGML_STATUS_SUCCESS) return s;
+                    } else {
+                        struct ggml_cgraph * sub = ggml_new_graph_custom(
+                            sub_ctx, graph_cap, false);
+                        const int npu_skip[] = {
+                            am.q_proj_idx,
+                            am.q_rope_idx,
+                            am.attn_core_idx,
+                            am.o_proj_idx,
+                            am.residual_add_idx,
+                            tm.ffn_norm_idx,
+                            tm.ffn_norm_mul_idx,
+                            tm.gate_mm_idx,
+                            tm.up_mm_idx,
+                            tm.glu_idx,
+                            tm.down_mm_idx,
+                            tm.ffn_residual_add_idx,
+                        };
+                        auto is_npu_skipped = [&](int j) -> bool {
+                            for (int k = 0; k < (int)(sizeof(npu_skip)/sizeof(npu_skip[0])); k++) {
+                                if (npu_skip[k] == j) return true;
+                            }
+                            return false;
+                        };
+                        for (int j = am.rms_norm_idx; j <= range_end; j++) {
+                            if (is_npu_skipped(j)) continue;
+                            if (sub->n_nodes >= (int)sub->size) break;
+                            sub->nodes[sub->n_nodes++] = cgraph->nodes[j];
+                        }
+                        const int sub_n = ggml_graph_n_nodes(sub);
+                        if (tp_dbg) {
+                            fprintf(stderr,
+                                "ggml-xdna: tblock-prefill PhaseC @%d..%d "
+                                "(side_effects=%d sub_nodes=%d total_in_range=%d "
+                                "npu_skipped=%d)\n",
+                                am.rms_norm_idx, range_end,
+                                side_effect_count, sub_n, total_in_range,
+                                total_in_range - sub_n);
+                            fflush(stderr);
+                        }
+                        if (sub_n > 0) {
+                            ggml_status s = ggml_backend_graph_compute(
+                                ctx->cpu_backend, sub);
+                            if (s != GGML_STATUS_SUCCESS) {
+                                ggml_free(sub_ctx);
+                                return s;
+                            }
+                        }
+                        ggml_free(sub_ctx);
+                    }
+                }
+
+                if (tp_skip_dispatch) {
+                    i = range_end;
+                    continue;
+                }
+                static const bool tp_fused_enabled =
+                    getenv("XDNA_ENABLE_TBLOCK_FUSED") != NULL;
+                const bool dispatched = tp_fused_enabled
+                    ? ggml_backend_xdna_transformer_block_prefill_fused(ctx, tm, cgraph)
+                    : ggml_backend_xdna_transformer_block_prefill(ctx, tm, cgraph);
+                if (!dispatched) {
+                    if (tp_dbg) {
+                        fprintf(stderr,
+                            "ggml-xdna: tblock-prefill dispatch failed @%d..%d, "
+                            "running full range on CPU as recovery\n",
+                            am.rms_norm_idx, range_end);
+                        fflush(stderr);
+                    }
+                    if (use_phase_c) {
+                        ggml_status s = xdna_delegate_range(ctx, cgraph,
+                                                           am.rms_norm_idx,
+                                                           range_end + 1);
+                        if (s != GGML_STATUS_SUCCESS) return s;
+                    }
+                }
+                i = range_end;
                 continue;
             }
         }
@@ -6388,13 +8489,32 @@ static bool ggml_backend_xdna_device_offload_op(ggml_backend_dev_t dev, const st
     // the matcher in graph_compute decides which pattern to fire.
     static const bool qkv_enabled                 = getenv("XDNA_ENABLE_QKV") != NULL;
     static const bool attention_prefill_enabled   = getenv("XDNA_ENABLE_ATTENTION_PREFILL") != NULL;
-    if (qkv_enabled || attention_prefill_enabled) {
+    static const bool transformer_block_enabled   =
+        (getenv("XDNA_ENABLE_TRANSFORMER_BLOCK") != NULL) ||
+        (getenv("XDNA_ENABLE_TBLOCK_FUSED") != NULL);
+    if (qkv_enabled || attention_prefill_enabled || transformer_block_enabled) {
+        // Gate aggressive non-MUL_MAT claims on prefill shape. During decode
+        // (seq=1), claiming intermediates like ADD/MUL/RMS_NORM/ROPE just
+        // fragments scheduling with delegate_range round-trips and has no
+        // fused-pattern benefit (the matcher gates on seq>=256). Heuristic:
+        // look at this op's ne[1]; fall back to src[0]->ne[1]. Prefill ops
+        // carry the seq dim here; decode ops carry 1.
+        auto is_prefill_op = [](const struct ggml_tensor * op) -> bool {
+            int64_t seq = op->ne[1];
+            if (seq <= 1 && op->src[0] != nullptr) seq = op->src[0]->ne[1];
+            return seq >= 32;
+        };
         switch (op->op) {
             case GGML_OP_MUL_MAT: {
                 const int64_t K = op->src[0]->ne[0];
                 const int64_t N = op->src[0]->ne[1];
                 const int64_t M = op->src[1]->ne[1];
                 if (M == 1) {
+                    // Aggressive M=1 claim only makes sense for QKV (decode
+                    // matmul fusion). Attention-prefill and transformer-block
+                    // are prefill-only; claiming M=1 MUL_MATs for them
+                    // fragments decode scheduling without benefit.
+                    if (!qkv_enabled) return false;
                     if (K < 64 || K % 64 != 0) return false;
                     if (N < 8  || N > 32768)   return false;
                     if (N % 8 != 0)            return false;
@@ -6403,10 +8523,10 @@ static bool ggml_backend_xdna_device_offload_op(ggml_backend_dev_t dev, const st
                 return xdna_shape_dispatchable(M, K, N);
             }
             // Intermediate ops between Q/K/V and around the attention core —
-            // keep them here so the scheduler doesn't split. graph_compute's
-            // CPU fallback delegates them via xdna_delegate_range (same cost
-            // as leaving on CPU, minus the cross-backend sched overhead we'd
-            // otherwise incur per split).
+            // keep them here DURING PREFILL so the scheduler doesn't split.
+            // graph_compute's CPU fallback delegates them via
+            // xdna_delegate_range (cheap during prefill). During decode,
+            // return false to let them stay on CPU natively.
             case GGML_OP_ADD:
             case GGML_OP_MUL:
             case GGML_OP_SUB:
@@ -6429,7 +8549,7 @@ static bool ggml_backend_xdna_device_offload_op(ggml_backend_dev_t dev, const st
             case GGML_OP_VIEW:
             case GGML_OP_PERMUTE:
             case GGML_OP_TRANSPOSE:
-                return true;
+                return is_prefill_op(op);
             default:
                 return false;
         }

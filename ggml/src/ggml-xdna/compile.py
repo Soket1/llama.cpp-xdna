@@ -288,6 +288,34 @@ ATTENTION_PREFILL_KERNELS = (
 ATTENTION_PREFILL_SEQ_BUCKETS = (256, 512, 1024, 2048, 4096)
 
 
+# Chained TransformerBlockPrefill: 17 sub-kernels in one xclbin (attention +
+# SwiGLU FFN + two residuals). Names must match the chain_artifacts() call in
+# iron/operators/transformer_block_prefill/op.py (prefix="tblock_prefill").
+TRANSFORMER_BLOCK_PREFILL_KERNELS = (
+    "rms_norm_attn",
+    "gemm_q",
+    "gemm_kv",
+    "rope_q",
+    "rope_k",
+    "perm_q",
+    "perm_kv",
+    "mha",
+    "perm_o",
+    "gemm_o",
+    "add_attn",
+    "rms_norm_ffn",
+    "gemm_gate_up",
+    "silu",
+    "eltwise_mul",
+    "gemm_down",
+    "add_ffn",
+)
+
+# Seq-len buckets shared with AttentionBlockPrefill: prefill ubatch is a
+# run-start constant, so one session maps to one bucket.
+TRANSFORMER_BLOCK_PREFILL_SEQ_BUCKETS = ATTENTION_PREFILL_SEQ_BUCKETS
+
+
 # ---------------------------------------------------------------------------
 # Tile size selection
 # ---------------------------------------------------------------------------
@@ -1501,6 +1529,337 @@ def compile_attention_prefill_cached(seq_len: int, embed_dim: int,
 
 
 # ---------------------------------------------------------------------------
+# TransformerBlockPrefill (chained 17-kernel composite: attn + SwiGLU FFN)
+# ---------------------------------------------------------------------------
+
+
+def select_transformer_block_prefill_seq_bucket(seq_len: int) -> int | None:
+    if seq_len <= 0:
+        return None
+    for b in TRANSFORMER_BLOCK_PREFILL_SEQ_BUCKETS:
+        if seq_len <= b:
+            return b
+    return None
+
+
+def transformer_block_prefill_cache_key(
+    seq_len: int, embed_dim: int, num_heads: int, num_kv_heads: int,
+    head_dim: int, ffn_hidden_dim: int,
+    dtype: str = "bf16",
+    rope_method_type: int = 0,
+) -> str:
+    seq_len_padded = select_transformer_block_prefill_seq_bucket(seq_len)
+    key_data = {
+        "op": "transformer_block_prefill",
+        "seq_len_padded": seq_len_padded,
+        "embed_dim": embed_dim,
+        "num_heads": num_heads,
+        "num_kv_heads": num_kv_heads,
+        "head_dim": head_dim,
+        "ffn_hidden_dim": ffn_hidden_dim,
+        "dtype": dtype,
+        "rope_method_type": rope_method_type,
+    }
+    key_json = json.dumps(key_data, sort_keys=True)
+    return hashlib.sha256(key_json.encode()).hexdigest()[:16]
+
+
+def validate_transformer_block_prefill_shapes(
+    seq_len: int, embed_dim: int, num_heads: int, num_kv_heads: int,
+    head_dim: int, ffn_hidden_dim: int,
+) -> tuple[bool, str | None]:
+    ok, reason = validate_attention_prefill_shapes(
+        seq_len, embed_dim, num_heads, num_kv_heads, head_dim
+    )
+    if not ok:
+        return False, reason
+    if ffn_hidden_dim <= 0:
+        return False, f"ffn_hidden_dim must be > 0, got {ffn_hidden_dim}"
+    # gemm_gate_up: N=ffn_hidden_dim; gemm_down: K=ffn_hidden_dim. Both use
+    # num_aie_columns=n_cols (typically 8 on NPU2) with tile_n=64. Require
+    # ffn_hidden_dim divisible by (64 * 8)=512 (aligns with 4-col NPU1 too).
+    if ffn_hidden_dim % 64 != 0:
+        return False, (
+            f"ffn_hidden_dim ({ffn_hidden_dim}) must be a multiple of 64 "
+            f"(tile_n) for gemm_gate_up / gemm_down"
+        )
+    return True, None
+
+
+def compile_transformer_block_prefill(
+    seq_len: int, embed_dim: int, num_heads: int, num_kv_heads: int,
+    head_dim: int, ffn_hidden_dim: int,
+    dtype: str, output_dir: str,
+    rope_method_type: int = 0,
+) -> str:
+    if dtype != "bf16":
+        raise ValueError(
+            f"TransformerBlockPrefill currently supports only bf16, got {dtype}"
+        )
+    ok, reason = validate_transformer_block_prefill_shapes(
+        seq_len, embed_dim, num_heads, num_kv_heads, head_dim, ffn_hidden_dim
+    )
+    if not ok:
+        raise ValueError(reason)
+
+    seq_len_padded = select_transformer_block_prefill_seq_bucket(seq_len)
+    if seq_len_padded is None:
+        raise ValueError(
+            f"seq_len={seq_len} exceeds the largest transformer-block-prefill "
+            f"bucket ({TRANSFORMER_BLOCK_PREFILL_SEQ_BUCKETS[-1]}); caller "
+            f"should fall back to CPU"
+        )
+
+    _ = aie_utils.get_current_device()
+
+    from iron.operators.transformer_block_prefill.op import TransformerBlockPrefill
+
+    op = TransformerBlockPrefill(
+        seq_len=seq_len_padded,
+        embed_dim=embed_dim,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        ffn_hidden_dim=ffn_hidden_dim,
+        rope_method_type=rope_method_type,
+    )
+    op.compile()
+
+    _stage_chained_artifacts(
+        op, TRANSFORMER_BLOCK_PREFILL_KERNELS, output_dir, prefix="tblock_prefill"
+    )
+    return output_dir
+
+
+def compile_transformer_block_prefill_cached(
+    seq_len: int, embed_dim: int, num_heads: int, num_kv_heads: int,
+    head_dim: int, ffn_hidden_dim: int,
+    dtype: str = "bf16",
+    rope_method_type: int = 0,
+) -> Path:
+    key = transformer_block_prefill_cache_key(
+        seq_len, embed_dim, num_heads, num_kv_heads, head_dim, ffn_hidden_dim,
+        dtype, rope_method_type=rope_method_type,
+    )
+    cached = get_cached_chained_dir(
+        key, TRANSFORMER_BLOCK_PREFILL_KERNELS, prefix="tblock_prefill"
+    )
+    if cached is not None:
+        return cached
+    output_dir = str(get_cache_dir() / key)
+    compile_transformer_block_prefill(
+        seq_len, embed_dim, num_heads, num_kv_heads, head_dim, ffn_hidden_dim,
+        dtype, output_dir, rope_method_type=rope_method_type,
+    )
+    return Path(output_dir)
+
+
+# ---------------------------------------------------------------------------
+# TransformerBlockPrefillFused (Layer 4A Phase 2: monolithic single-ELF)
+#
+# Unlike the chained TransformerBlockPrefill above (17 separate xclbin kernels
+# chained by host-side dispatch), this bundles the entire attn+FFN block into
+# ONE ELF with ONE kernel entry ("main:sequence") taking 3 BO args:
+# input_buffer, output_buffer, scratch_buffer. The C++ backend allocates
+# those 3 BOs once, writes named tensors (x / w_q / w_norm_ffn / ...) at
+# offsets from the sidecar layout JSON, and issues a SINGLE xrt::run per
+# layer instead of 17. Target: recover the per-dispatch overhead that Layer
+# 3A chained dispatch cannot avoid.
+# ---------------------------------------------------------------------------
+
+
+TRANSFORMER_BLOCK_PREFILL_FUSED_SEQ_BUCKETS = ATTENTION_PREFILL_SEQ_BUCKETS
+
+
+def select_transformer_block_prefill_fused_seq_bucket(seq_len: int) -> int | None:
+    if seq_len <= 0:
+        return None
+    for b in TRANSFORMER_BLOCK_PREFILL_FUSED_SEQ_BUCKETS:
+        if seq_len <= b:
+            return b
+    return None
+
+
+def transformer_block_prefill_fused_cache_key(
+    seq_len: int, embed_dim: int, num_heads: int, num_kv_heads: int,
+    head_dim: int, ffn_hidden_dim: int,
+    dtype: str = "bf16",
+    rope_method_type: int = 0,
+) -> str:
+    seq_len_padded = select_transformer_block_prefill_fused_seq_bucket(seq_len)
+    key_data = {
+        "op": "transformer_block_prefill_fused",
+        "seq_len_padded": seq_len_padded,
+        "embed_dim": embed_dim,
+        "num_heads": num_heads,
+        "num_kv_heads": num_kv_heads,
+        "head_dim": head_dim,
+        "ffn_hidden_dim": ffn_hidden_dim,
+        "dtype": dtype,
+        "rope_method_type": rope_method_type,
+    }
+    key_json = json.dumps(key_data, sort_keys=True)
+    return hashlib.sha256(key_json.encode()).hexdigest()[:16]
+
+
+def _tblock_fused_bundle_filenames(output_dir: str) -> dict:
+    """Canonical filenames produced by the fused staging helper.
+
+    Kept in one place so both the producer and the C++-side consumer (via
+    the bundle_present check) reference the same strings.
+    """
+    return {
+        "elf": os.path.join(output_dir, "tblock_fused.elf"),
+        "layout": os.path.join(output_dir, "tblock_fused.layout.json"),
+    }
+
+
+def _stage_tblock_fused_artifacts(op, output_dir: str) -> None:
+    """Copy the FusedMLIROperator ELF and write its buffer layout as JSON.
+
+    FusedMLIROperator produces a single ``{name}.elf`` artifact in
+    ``op.context.build_dir`` plus an in-memory ``subbuffer_layout`` dict
+    ``{name: (buf_type, offset_bytes, length_bytes)}`` where buf_type is
+    one of ``input``, ``output``, ``scratch``. The C++ backend needs the
+    ELF to load the kernel and the layout to know where to write each
+    named tensor. Serialize both to predictable filenames under
+    ``output_dir``.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    names = _tblock_fused_bundle_filenames(output_dir)
+
+    # ELF
+    elf_artifact = op.artifacts[0]
+    build_dir = op.context.build_dir
+    elf_src = build_dir / elf_artifact.filename
+    shutil.copy2(str(elf_src), names["elf"])
+
+    # Layout JSON
+    input_sz, output_sz, scratch_sz = op.buffer_sizes
+    buffers = {
+        bname: {
+            "buf_type": btype,
+            "offset_bytes": int(off),
+            "length_bytes": int(length),
+        }
+        for bname, (btype, off, length) in op.subbuffer_layout.items()
+    }
+    # Preserve slice_info too so the C++ side can resolve sliced buffer
+    # names if a future runlist uses slice notation (currently none do,
+    # but it's cheap to emit).
+    slices = {
+        sname: {"parent": parent, "start": int(s), "end": int(e)}
+        for sname, (parent, s, e) in op.slice_info.items()
+    }
+    layout = {
+        "version": 1,
+        "kernel_name": "main:sequence",
+        "buffer_sizes": {
+            "input_bytes": int(input_sz),
+            "output_bytes": int(output_sz),
+            "scratch_bytes": int(scratch_sz),
+        },
+        "input_args": list(op.input_args),
+        "output_args": list(op.output_args),
+        "buffers": buffers,
+        "slices": slices,
+        "meta": {
+            "seq_len": op.seq_len,
+            "embed_dim": op.embed_dim,
+            "num_heads": op.num_heads,
+            "num_kv_heads": op.num_kv_heads,
+            "head_dim": op.head_dim,
+            "ffn_hidden_dim": op.ffn_hidden_dim,
+            "rope_method_type": op.rope_method_type,
+        },
+    }
+    with open(names["layout"], "w") as f:
+        json.dump(layout, f, indent=2, sort_keys=True)
+
+
+def tblock_fused_bundle_present(output_dir: str) -> bool:
+    names = _tblock_fused_bundle_filenames(output_dir)
+    return all(os.path.exists(p) for p in names.values())
+
+
+def validate_transformer_block_prefill_fused_shapes(
+    seq_len: int, embed_dim: int, num_heads: int, num_kv_heads: int,
+    head_dim: int, ffn_hidden_dim: int,
+) -> tuple[bool, str | None]:
+    # Same guard rails as the chained composite — the fused op wraps the
+    # same sub-ops, so the same divisibility constraints apply.
+    return validate_transformer_block_prefill_shapes(
+        seq_len, embed_dim, num_heads, num_kv_heads, head_dim, ffn_hidden_dim
+    )
+
+
+def compile_transformer_block_prefill_fused(
+    seq_len: int, embed_dim: int, num_heads: int, num_kv_heads: int,
+    head_dim: int, ffn_hidden_dim: int,
+    dtype: str, output_dir: str,
+    rope_method_type: int = 0,
+) -> str:
+    if dtype != "bf16":
+        raise ValueError(
+            f"TransformerBlockPrefillFused currently supports only bf16, "
+            f"got {dtype}"
+        )
+    ok, reason = validate_transformer_block_prefill_fused_shapes(
+        seq_len, embed_dim, num_heads, num_kv_heads, head_dim, ffn_hidden_dim
+    )
+    if not ok:
+        raise ValueError(reason)
+
+    seq_len_padded = select_transformer_block_prefill_fused_seq_bucket(seq_len)
+    if seq_len_padded is None:
+        raise ValueError(
+            f"seq_len={seq_len} exceeds the largest transformer-block-prefill-"
+            f"fused bucket ({TRANSFORMER_BLOCK_PREFILL_FUSED_SEQ_BUCKETS[-1]}); "
+            f"caller should fall back to CPU"
+        )
+
+    _ = aie_utils.get_current_device()
+
+    from iron.operators.transformer_block_prefill_fused.op import (
+        AttentionBlockPrefillFused,
+    )
+
+    op = AttentionBlockPrefillFused(
+        seq_len=seq_len_padded,
+        embed_dim=embed_dim,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        ffn_hidden_dim=ffn_hidden_dim,
+        rope_method_type=rope_method_type,
+    )
+    op.compile()
+
+    _stage_tblock_fused_artifacts(op, output_dir)
+    return output_dir
+
+
+def compile_transformer_block_prefill_fused_cached(
+    seq_len: int, embed_dim: int, num_heads: int, num_kv_heads: int,
+    head_dim: int, ffn_hidden_dim: int,
+    dtype: str = "bf16",
+    rope_method_type: int = 0,
+) -> Path:
+    key = transformer_block_prefill_fused_cache_key(
+        seq_len, embed_dim, num_heads, num_kv_heads, head_dim, ffn_hidden_dim,
+        dtype, rope_method_type=rope_method_type,
+    )
+    output_dir = str(get_cache_dir() / key)
+    if tblock_fused_bundle_present(output_dir):
+        return Path(output_dir)
+    compile_transformer_block_prefill_fused(
+        seq_len, embed_dim, num_heads, num_kv_heads, head_dim, ffn_hidden_dim,
+        dtype, output_dir, rope_method_type=rope_method_type,
+    )
+    return Path(output_dir)
+
+
+# ---------------------------------------------------------------------------
 # CLI entry point (called by C++ backend)
 # ---------------------------------------------------------------------------
 
@@ -1666,6 +2025,65 @@ def main():
     attnp_parser.add_argument("--out", type=str,
                               help="Output directory (default: cache)")
 
+    # TransformerBlockPrefill subcommand (17-kernel chained composite)
+    tblockp_parser = subparsers.add_parser(
+        "transformer-block-prefill",
+        help="Compile fused transformer block prefill (attention + SwiGLU FFN "
+             "+ two residuals, 17 kernels chained into one xclbin)",
+    )
+    tblockp_parser.add_argument("--seq-len", type=int, required=True,
+                                help="Prompt seq length (rounded up to bucket)")
+    tblockp_parser.add_argument("--embed-dim", type=int, required=True,
+                                help="Model hidden size")
+    tblockp_parser.add_argument("--num-heads", type=int, required=True,
+                                help="Q head count")
+    tblockp_parser.add_argument("--num-kv-heads", type=int, required=True,
+                                help="K/V head count (GQA group = H / KV)")
+    tblockp_parser.add_argument("--head-dim", type=int, default=64,
+                                help="Per-head dim (only 64 supported by MHA)")
+    tblockp_parser.add_argument("--ffn-hidden", type=int, required=True,
+                                help="FFN intermediate dim (gate/up N, down K)")
+    tblockp_parser.add_argument("--dtype", default="bf16", choices=["bf16"])
+    tblockp_parser.add_argument("--rope-method-type", type=int, default=0,
+                                choices=[0, 1],
+                                help="RoPE rotation: 0=TWO_HALVES (HF/ggml NEOX), "
+                                     "1=INTERLEAVED (ggml NORMAL adjacent-pair)")
+    tblockp_parser.add_argument("--cache-dir", type=str, default=None,
+                                help="Override GGML_XDNA_CACHE_DIR for this run")
+    tblockp_parser.add_argument("--out", type=str,
+                                help="Output directory (default: cache)")
+
+    # TransformerBlockPrefillFused subcommand — Layer 4A Phase 2 monolithic
+    # ELF variant of the above. Produces a single-ELF bundle (tblock_fused.elf
+    # + tblock_fused.layout.json) instead of chained combined.xclbin + N insts.
+    tblockf_parser = subparsers.add_parser(
+        "transformer-block-prefill-fused",
+        help="Compile fully-fused monolithic transformer block prefill "
+             "(attn + SwiGLU FFN, single @main runtime_sequence -> single "
+             "xrt::run per layer).",
+    )
+    tblockf_parser.add_argument("--seq-len", type=int, required=True,
+                                help="Prompt seq length (rounded up to bucket)")
+    tblockf_parser.add_argument("--embed-dim", type=int, required=True,
+                                help="Model hidden size")
+    tblockf_parser.add_argument("--num-heads", type=int, required=True,
+                                help="Q head count")
+    tblockf_parser.add_argument("--num-kv-heads", type=int, required=True,
+                                help="K/V head count (GQA group = H / KV)")
+    tblockf_parser.add_argument("--head-dim", type=int, default=64,
+                                help="Per-head dim (only 64 supported by MHA)")
+    tblockf_parser.add_argument("--ffn-hidden", type=int, required=True,
+                                help="FFN intermediate dim (gate/up N, down K)")
+    tblockf_parser.add_argument("--dtype", default="bf16", choices=["bf16"])
+    tblockf_parser.add_argument("--rope-method-type", type=int, default=0,
+                                choices=[0, 1],
+                                help="RoPE rotation: 0=TWO_HALVES (HF/ggml NEOX), "
+                                     "1=INTERLEAVED (ggml NORMAL adjacent-pair)")
+    tblockf_parser.add_argument("--cache-dir", type=str, default=None,
+                                help="Override GGML_XDNA_CACHE_DIR for this run")
+    tblockf_parser.add_argument("--out", type=str,
+                                help="Output directory (default: cache)")
+
     args = parser.parse_args()
 
     if args.op == "gemm":
@@ -1807,6 +2225,46 @@ def main():
             path = compile_attention_prefill_cached(
                 args.seq_len, args.embed_dim,
                 args.num_heads, args.num_kv_heads, args.head_dim,
+                args.dtype,
+                rope_method_type=args.rope_method_type,
+            )
+        print(path)
+    elif args.op == "transformer-block-prefill":
+        if args.cache_dir:
+            os.environ["GGML_XDNA_CACHE_DIR"] = args.cache_dir
+        if args.out:
+            path = compile_transformer_block_prefill(
+                args.seq_len, args.embed_dim,
+                args.num_heads, args.num_kv_heads, args.head_dim,
+                args.ffn_hidden,
+                args.dtype, args.out,
+                rope_method_type=args.rope_method_type,
+            )
+        else:
+            path = compile_transformer_block_prefill_cached(
+                args.seq_len, args.embed_dim,
+                args.num_heads, args.num_kv_heads, args.head_dim,
+                args.ffn_hidden,
+                args.dtype,
+                rope_method_type=args.rope_method_type,
+            )
+        print(path)
+    elif args.op == "transformer-block-prefill-fused":
+        if args.cache_dir:
+            os.environ["GGML_XDNA_CACHE_DIR"] = args.cache_dir
+        if args.out:
+            path = compile_transformer_block_prefill_fused(
+                args.seq_len, args.embed_dim,
+                args.num_heads, args.num_kv_heads, args.head_dim,
+                args.ffn_hidden,
+                args.dtype, args.out,
+                rope_method_type=args.rope_method_type,
+            )
+        else:
+            path = compile_transformer_block_prefill_fused_cached(
+                args.seq_len, args.embed_dim,
+                args.num_heads, args.num_kv_heads, args.head_dim,
+                args.ffn_hidden,
                 args.dtype,
                 rope_method_type=args.rope_method_type,
             )
