@@ -3,6 +3,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-cpu.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -3751,6 +3752,12 @@ struct xdna_attention_match {
     int64_t num_heads;
     int64_t num_kv_heads;
     int64_t head_dim;
+
+    // IRON RoPE method_type derived from ggml RoPE op_params[2]:
+    //   ggml mode 0 (NORMAL/adjacent-pair) -> 1 (INTERLEAVED)
+    //   ggml mode 2 (NEOX/half-split)      -> 0 (TWO_HALVES)
+    // Set by xdna_try_match_attention_prefill from the q_rope node.
+    int rope_method_type;
 };
 
 // Walk backwards through VIEW/RESHAPE/CONT/PERMUTE/TRANSPOSE/CPY/DUP nodes to
@@ -4086,6 +4093,24 @@ static bool xdna_try_match_attention_prefill(const struct ggml_cgraph * cgraph, 
     out->num_kv_heads       = num_kv_heads;
     out->head_dim           = head_dim;
 
+    // Translate ggml RoPE mode -> IRON RoPE method_type. Both Q and K rope
+    // nodes share the same mode in any sane attention block; we read from Q.
+    {
+        const int32_t * rp = (const int32_t *)q_rope->op_params;
+        const int ggml_mode = rp[2];
+        if (ggml_mode == 0) {
+            out->rope_method_type = 1;  // ggml NORMAL (adjacent-pair) -> INTERLEAVED
+        } else if (ggml_mode == 2) {
+            out->rope_method_type = 0;  // ggml NEOX (half-split) -> TWO_HALVES
+        } else {
+            if (dbg_ok()) fprintf(stderr,
+                "ggml-xdna: attn_prefill reject @%d: unsupported RoPE mode %d "
+                "(only 0=NORMAL and 2=NEOX supported)\n",
+                start_idx, ggml_mode);
+            return false;
+        }
+    }
+
     #undef ATTN_REJECT
     return true;
 }
@@ -4123,30 +4148,18 @@ static std::string make_attention_prefill_cache_key(int64_t seq_bucket,
                                                     int64_t embed_dim,
                                                     int64_t num_heads,
                                                     int64_t num_kv_heads,
-                                                    int64_t head_dim) {
-    // Build the exact json string compile.py hashes. Keys sorted
-    // alphabetically (json.dumps(sort_keys=True)):
-    //   dtype, embed_dim, head_dim, num_heads, num_kv_heads, op, seq_len_padded
-    char payload[256];
-    snprintf(payload, sizeof(payload),
-             "{\"dtype\": \"bf16\", \"embed_dim\": %ld, \"head_dim\": %ld, "
-             "\"num_heads\": %ld, \"num_kv_heads\": %ld, \"op\": \"attention_prefill\", "
-             "\"seq_len_padded\": %ld}",
-             (long)embed_dim, (long)head_dim,
-             (long)num_heads, (long)num_kv_heads,
-             (long)seq_bucket);
-    // Compute SHA-256 via OpenSSL if available; otherwise fall back to a
-    // human-readable key (bundle won't collide with compile.py's but we can
-    // still locate it by invoking compile.py with our key as output dir).
-    // Simple approach: don't try to match compile.py's hash — instead pass
-    // --out <our_key_dir> to compile.py. compile.py's --out overrides the
-    // default cache layout (see main()), so our key can be whatever we want.
-    char buf[160];
+                                                    int64_t head_dim,
+                                                    int rope_method_type) {
+    // We don't try to match compile.py's SHA — instead we pass --out <our_dir>
+    // to compile.py so the bundle layout follows our human-readable key.
+    // rope_method_type is included so the two RoPE rotations get distinct
+    // bundles and never collide on disk.
+    char buf[192];
     snprintf(buf, sizeof(buf),
-             "attn_prefill_S%ld_E%ld_H%ld_KV%ld_D%ld_bf16",
+             "attn_prefill_S%ld_E%ld_H%ld_KV%ld_D%ld_bf16_rope%d",
              (long)seq_bucket, (long)embed_dim,
-             (long)num_heads, (long)num_kv_heads, (long)head_dim);
-    (void)payload;  // not used in the human-readable key branch
+             (long)num_heads, (long)num_kv_heads, (long)head_dim,
+             rope_method_type);
     return std::string(buf);
 }
 
@@ -4167,7 +4180,8 @@ static bool ensure_attention_prefill_compiled(ggml_backend_xdna_context * ctx,
                                               int64_t embed_dim,
                                               int64_t num_heads,
                                               int64_t num_kv_heads,
-                                              int64_t head_dim) {
+                                              int64_t head_dim,
+                                              int rope_method_type) {
     const std::string bundle_dir = ctx->cache_dir + "/" + cache_key;
     if (attention_prefill_bundle_present(bundle_dir)) return true;
 
@@ -4175,10 +4189,12 @@ static bool ensure_attention_prefill_compiled(ggml_backend_xdna_context * ctx,
     snprintf(cmd, sizeof(cmd),
              "python3 %s attention-prefill --seq-len %ld --embed-dim %ld "
              "--num-heads %ld --num-kv-heads %ld --head-dim %ld "
+             "--rope-method-type %d "
              "--out %s 2>&1",
              ctx->compile_script.c_str(),
              (long)seq_bucket, (long)embed_dim,
              (long)num_heads, (long)num_kv_heads, (long)head_dim,
+             rope_method_type,
              bundle_dir.c_str());
     GGML_LOG_INFO("ggml-xdna: compiling attention-prefill S=%ld E=%ld H=%ld KV=%ld d=%ld "
                   "(first run, will be cached)...\n",
@@ -4396,7 +4412,7 @@ static bool xdna_compute_rope_angles_bf16(
     float ext_factor  = 0.0f;
     float attn_factor = 1.0f;
     int   n_dims      = (int)head_dim;
-    int   mode        = 2;  // NEOX (half-split) — the only mode IRON RoPE matches.
+    int   mode        = 2;  // ggml RoPE mode — does not affect angle LUT layout.
     const float * freq_factors = nullptr;
     const struct ggml_tensor * pos_tensor = nullptr;
 
@@ -4409,9 +4425,10 @@ static bool xdna_compute_rope_angles_bf16(
         memcpy(&ext_factor,  p + 7, sizeof(float));
         memcpy(&attn_factor, p + 8, sizeof(float));
 
-        // Only NEOX half-split is wired through the IRON RoPE op (method_type=0).
-        // NORMAL (mode==0) uses adjacent-pair rotation — unsupported; reject.
-        if (mode != 2 /* GGML_ROPE_TYPE_NEOX */) return false;
+        // mode is dispatched at the IRON RoPE kernel level (method_type 0/1
+        // selected at compile time). The angle LUT layout (cos/sin interleaved
+        // per row) is identical for both, so we don't gate on mode here.
+        (void)mode;
 
         // Partial rotary (n_dims < head_dim): ggml leaves the tail un-rotated
         // but IRON RoPE rotates the full head_dim. Safe bail-out.
@@ -4474,24 +4491,104 @@ static bool xdna_compute_rope_angles_bf16(
 // Full attention-prefill dispatch. Returns true on success; false lets the
 // caller fall back to CPU for this block (Phase B uses a "strict skip on
 // success, no change on fail" policy — see graph_compute hook).
+// ============================================================================
+// Attention-prefill per-phase profiling (gated on XDNA_ATTN_PREFILL_PROFILE=1).
+// All buffers and helpers are no-cost when the env var is unset.
+//   - Phase samples are aggregated per call to ggml_backend_xdna_graph_compute,
+//     reset at entry and printed at exit.
+//   - Each sample is in microseconds (int64_t).
+// ============================================================================
+enum xdna_attn_prof_phase {
+    XDNA_AP_ROPE_PRECOMPUTE = 0,
+    XDNA_AP_WEIGHT_WARM,
+    XDNA_AP_BO_SYNC_TO_DEV,
+    XDNA_AP_RL_BUILD,
+    XDNA_AP_RL_EXEC,
+    XDNA_AP_RL_WAIT,
+    XDNA_AP_BO_SYNC_FROM_DEV,
+    XDNA_AP_TOTAL_PER_LAYER,
+    XDNA_AP_NUM_PHASES,
+};
+
+static const char * xdna_attn_prof_phase_label(xdna_attn_prof_phase p) {
+    switch (p) {
+        case XDNA_AP_ROPE_PRECOMPUTE:  return "rope_precompute  ";
+        case XDNA_AP_WEIGHT_WARM:      return "weight_warm      ";
+        case XDNA_AP_BO_SYNC_TO_DEV:   return "bo_sync_to_dev   ";
+        case XDNA_AP_RL_BUILD:         return "rl_build         ";
+        case XDNA_AP_RL_EXEC:          return "rl_exec          ";
+        case XDNA_AP_RL_WAIT:          return "rl_wait          ";
+        case XDNA_AP_BO_SYNC_FROM_DEV: return "bo_sync_from_dev ";
+        case XDNA_AP_TOTAL_PER_LAYER:  return "total_per_layer  ";
+        default:                       return "unknown          ";
+    }
+}
+
+static std::vector<int64_t> g_xdna_attn_prof_samples[XDNA_AP_NUM_PHASES];
+
+static inline bool xdna_attn_prof_enabled() {
+    static const bool e = getenv("XDNA_ATTN_PREFILL_PROFILE") != NULL;
+    return e;
+}
+
+static inline void xdna_attn_prof_reset() {
+    if (!xdna_attn_prof_enabled()) return;
+    for (int i = 0; i < XDNA_AP_NUM_PHASES; i++) {
+        g_xdna_attn_prof_samples[i].clear();
+    }
+}
+
+static inline void xdna_attn_prof_record(xdna_attn_prof_phase p, int64_t us) {
+    g_xdna_attn_prof_samples[p].push_back(us);
+}
+
+static void xdna_attn_prof_print() {
+    if (!xdna_attn_prof_enabled()) return;
+    const size_t n = g_xdna_attn_prof_samples[XDNA_AP_TOTAL_PER_LAYER].size();
+    if (n == 0) return;
+
+    fprintf(stderr, "[xdna attn-prefill profile] N=%zu dispatches\n", n);
+    for (int p = 0; p < XDNA_AP_NUM_PHASES; p++) {
+        auto & v = g_xdna_attn_prof_samples[p];
+        if (v.empty()) continue;
+        std::vector<int64_t> sorted = v;
+        std::sort(sorted.begin(), sorted.end());
+        const int64_t med = sorted[sorted.size() / 2];
+        const int64_t mn  = sorted.front();
+        const int64_t mx  = sorted.back();
+        if ((xdna_attn_prof_phase)p == XDNA_AP_TOTAL_PER_LAYER) {
+            fprintf(stderr, "  %s: median=%6.2f ms\n",
+                    xdna_attn_prof_phase_label((xdna_attn_prof_phase)p),
+                    med / 1000.0);
+        } else {
+            fprintf(stderr, "  %s: median=%6.2f ms   (min=%6.2f  max=%6.2f)\n",
+                    xdna_attn_prof_phase_label((xdna_attn_prof_phase)p),
+                    med / 1000.0, mn / 1000.0, mx / 1000.0);
+        }
+    }
+    fflush(stderr);
+}
+
 static bool ggml_backend_xdna_attention_prefill(ggml_backend_xdna_context * ctx,
                                                 const xdna_attention_match & m,
                                                 struct ggml_cgraph * cgraph) {
     if (!ctx->device_valid) return false;
-    if (m.head_dim != 64) return false;               // IRON MHA hardcode
+    if (m.head_dim != 64) return false;
     if (m.embed_dim <= 0 || m.embed_dim % 8 != 0) return false;
     if ((m.num_kv_heads * m.head_dim) % 64 != 0) return false;
     if (m.num_heads % m.num_kv_heads != 0) return false;
 
     const int64_t seq_bucket = xdna_select_attention_prefill_bucket(m.seq_len);
-    if (seq_bucket < 0) return false;  // too long, CPU fallback
+    if (seq_bucket < 0) return false;
 
     std::string cache_key = make_attention_prefill_cache_key(
-        seq_bucket, m.embed_dim, m.num_heads, m.num_kv_heads, m.head_dim);
+        seq_bucket, m.embed_dim, m.num_heads, m.num_kv_heads, m.head_dim,
+        m.rope_method_type);
 
     if (!ensure_attention_prefill_compiled(ctx, cache_key, seq_bucket,
                                            m.embed_dim, m.num_heads,
-                                           m.num_kv_heads, m.head_dim)) {
+                                           m.num_kv_heads, m.head_dim,
+                                           m.rope_method_type)) {
         return false;
     }
 
@@ -4518,6 +4615,15 @@ static bool ggml_backend_xdna_attention_prefill(ggml_backend_xdna_context * ctx,
     const size_t bytes_mha    = (size_t)mha_buf   * sizeof(uint16_t);
     const size_t bytes_angles = (size_t)S_pad * (size_t)d * sizeof(uint16_t);
     const size_t bytes_actual_xE = (size_t)S * (size_t)E * sizeof(uint16_t);
+
+    // Per-phase profiling clock (gated on XDNA_ATTN_PREFILL_PROFILE=1; cheap when off).
+    const bool _ap_prof = xdna_attn_prof_enabled();
+    using _ap_clock = std::chrono::steady_clock;
+    auto _ap_now = []() { return _ap_clock::now(); };
+    auto _ap_us = [](_ap_clock::time_point a, _ap_clock::time_point b) {
+        return (int64_t)std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
+    };
+    const auto _ap_t_dispatch_begin = _ap_prof ? _ap_now() : _ap_clock::time_point{};
 
     try {
         // Lazily allocate all persistent BOs keyed to the sub-kernels' arg-group IDs.
@@ -4614,6 +4720,7 @@ static bool ggml_backend_xdna_attention_prefill(ggml_backend_xdna_context * ctx,
         xrt::bo * wk_bo = nullptr;
         xrt::bo * wv_bo = nullptr;
         xrt::bo * wo_bo = nullptr;
+        const auto _ap_t_ww_begin = _ap_prof ? _ap_now() : _ap_clock::time_point{};
         {
             std::lock_guard<std::mutex> lock(*entry->weights_mutex);
             gain_bo = attn_prefill_warm_gain(ctx, entry, m.gain);
@@ -4626,9 +4733,13 @@ static bool ggml_backend_xdna_attention_prefill(ggml_backend_xdna_context * ctx,
             wo_bo = attn_prefill_warm_gemm_weight(ctx, entry, entry->w_o_bo_cache,
                                                   m.wo, XDNA_ATTN_GEMM_O, 4, "w_o");
         }
+        if (_ap_prof) {
+            xdna_attn_prof_record(XDNA_AP_WEIGHT_WARM, _ap_us(_ap_t_ww_begin, _ap_now()));
+        }
         if (!gain_bo || !wq_bo || !wk_bo || !wv_bo || !wo_bo) return false;
 
         // Precompute RoPE angles for this dispatch's positions.
+        const auto _ap_t_rope_begin = _ap_prof ? _ap_now() : _ap_clock::time_point{};
         {
             std::vector<uint16_t> angles(S_pad * d, 0);
             if (!xdna_compute_rope_angles_bf16(m.q_rope_node,
@@ -4639,8 +4750,12 @@ static bool ggml_backend_xdna_attention_prefill(ggml_backend_xdna_context * ctx,
                    angles.size() * sizeof(uint16_t));
             entry->bo_angles->sync(XCL_BO_SYNC_BO_TO_DEVICE);
         }
+        if (_ap_prof) {
+            xdna_attn_prof_record(XDNA_AP_ROPE_PRECOMPUTE, _ap_us(_ap_t_rope_begin, _ap_now()));
+        }
 
         // Upload activation x (= inpL): (S, E) row-major. Zero-pad rows S..S_pad-1.
+        const auto _ap_t_in_begin = _ap_prof ? _ap_now() : _ap_clock::time_point{};
         if (S_pad > S) memset(entry->bo_x_in->map<void*>(), 0, bytes_xE);
         {
             void * dst_in = entry->bo_x_in->map<void*>();
@@ -4657,6 +4772,9 @@ static bool ggml_backend_xdna_attention_prefill(ggml_backend_xdna_context * ctx,
             }
             entry->bo_x_in->sync(XCL_BO_SYNC_BO_TO_DEVICE);
         }
+        if (_ap_prof) {
+            xdna_attn_prof_record(XDNA_AP_BO_SYNC_TO_DEV, _ap_us(_ap_t_in_begin, _ap_now()));
+        }
 
         // Build the 13-run runlist (11 distinct kernel slots; gemm_kv fires
         // twice for K and V, perm_kv fires twice for K and V).
@@ -4672,6 +4790,7 @@ static bool ggml_backend_xdna_attention_prefill(ggml_backend_xdna_context * ctx,
         const uint32_t i_go   = (uint32_t)entry->insts_data[XDNA_ATTN_GEMM_O].size();
         const uint32_t i_add  = (uint32_t)entry->insts_data[XDNA_ATTN_ADD].size();
 
+        const auto _ap_t_rlbuild_begin = _ap_prof ? _ap_now() : _ap_clock::time_point{};
         xrt::runlist rl(entry->hw_ctx);
 
         // 1. rms_norm(x_in, gain, x_norm) — arg order: (opcode, insts, isize, in, gain, out)
@@ -4789,12 +4908,27 @@ static bool ggml_backend_xdna_attention_prefill(ggml_backend_xdna_context * ctx,
             rl.add(std::move(r));
         }
 
+        if (_ap_prof) {
+            xdna_attn_prof_record(XDNA_AP_RL_BUILD, _ap_us(_ap_t_rlbuild_begin, _ap_now()));
+        }
+        const auto _ap_t_exec_begin = _ap_prof ? _ap_now() : _ap_clock::time_point{};
         rl.execute();
+        if (_ap_prof) {
+            xdna_attn_prof_record(XDNA_AP_RL_EXEC, _ap_us(_ap_t_exec_begin, _ap_now()));
+        }
+        const auto _ap_t_wait_begin = _ap_prof ? _ap_now() : _ap_clock::time_point{};
         rl.wait();
+        if (_ap_prof) {
+            xdna_attn_prof_record(XDNA_AP_RL_WAIT, _ap_us(_ap_t_wait_begin, _ap_now()));
+        }
 
         // Pull final output back. Write into cgraph->nodes[residual_add_idx]->data
         // (the residual ADD tensor the matcher anchored on).
+        const auto _ap_t_out_begin = _ap_prof ? _ap_now() : _ap_clock::time_point{};
         entry->bo_output->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        if (_ap_prof) {
+            xdna_attn_prof_record(XDNA_AP_BO_SYNC_FROM_DEV, _ap_us(_ap_t_out_begin, _ap_now()));
+        }
         struct ggml_tensor * dst = cgraph->nodes[m.residual_add_idx];
         const size_t actual_elems = (size_t)S * (size_t)E;
         if (dst->type == GGML_TYPE_F32) {
@@ -4807,6 +4941,10 @@ static bool ggml_backend_xdna_attention_prefill(ggml_backend_xdna_context * ctx,
             GGML_LOG_ERROR("ggml-xdna: attn-prefill unsupported dst dtype %d\n",
                            (int)dst->type);
             return false;
+        }
+        if (_ap_prof) {
+            xdna_attn_prof_record(XDNA_AP_TOTAL_PER_LAYER,
+                                  _ap_us(_ap_t_dispatch_begin, _ap_now()));
         }
         return true;
 
@@ -5151,6 +5289,9 @@ static ggml_status xdna_delegate_range(ggml_backend_xdna_context * ctx,
 static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     ggml_backend_xdna_context * ctx = (ggml_backend_xdna_context *)backend->context;
     int n = cgraph->n_nodes;
+
+    // Reset attention-prefill per-phase profiling samples (no-op when gate off).
+    xdna_attn_prof_reset();
 
     static const bool debug = getenv("XDNA_DEBUG") != NULL;
     static const bool attention_prefill_dbg_enabled = getenv("XDNA_ENABLE_ATTENTION_PREFILL") != NULL;
@@ -5609,6 +5750,9 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
         ggml_status s = xdna_delegate_range(ctx, cgraph, cpu_run_start, n);
         if (s != GGML_STATUS_SUCCESS) return s;
     }
+
+    // Print per-phase attention-prefill profile (no-op when gate off / no samples).
+    xdna_attn_prof_print();
 
     return GGML_STATUS_SUCCESS;
 

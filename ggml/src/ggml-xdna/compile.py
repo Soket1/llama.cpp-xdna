@@ -1339,12 +1339,15 @@ def select_attention_prefill_seq_bucket(seq_len: int) -> int | None:
 
 def attention_prefill_cache_key(seq_len: int, embed_dim: int, num_heads: int,
                                 num_kv_heads: int, head_dim: int,
-                                dtype: str = "bf16") -> str:
+                                dtype: str = "bf16",
+                                rope_method_type: int = 0) -> str:
     """Cache key for an AttentionBlockPrefill configuration.
 
     seq_len is rounded up to the nearest bucket before hashing so that two
     callers requesting lengths in the same bucket share one xclbin. Disjoint
-    from every other op's key by the ``"op"`` field.
+    from every other op's key by the ``"op"`` field. ``rope_method_type``
+    must be 0 (TWO_HALVES / ggml NEOX) or 1 (INTERLEAVED / ggml NORMAL); it
+    is included in the key so each rotation method gets its own bundle.
     """
     seq_len_padded = select_attention_prefill_seq_bucket(seq_len)
     key_data = {
@@ -1355,6 +1358,7 @@ def attention_prefill_cache_key(seq_len: int, embed_dim: int, num_heads: int,
         "num_kv_heads": num_kv_heads,
         "head_dim": head_dim,
         "dtype": dtype,
+        "rope_method_type": rope_method_type,
     }
     key_json = json.dumps(key_data, sort_keys=True)
     return hashlib.sha256(key_json.encode()).hexdigest()[:16]
@@ -1407,7 +1411,8 @@ def validate_attention_prefill_shapes(seq_len: int, embed_dim: int,
 
 def compile_attention_prefill(seq_len: int, embed_dim: int, num_heads: int,
                               num_kv_heads: int, head_dim: int,
-                              dtype: str, output_dir: str) -> str:
+                              dtype: str, output_dir: str,
+                              rope_method_type: int = 0) -> str:
     """Compile AttentionBlockPrefill and stage its 11-kernel chained bundle.
 
     seq_len is rounded up to the nearest bucket and forwarded to the composite
@@ -1457,6 +1462,7 @@ def compile_attention_prefill(seq_len: int, embed_dim: int, num_heads: int,
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
+        rope_method_type=rope_method_type,
     )
     op.compile()
 
@@ -1469,13 +1475,15 @@ def compile_attention_prefill(seq_len: int, embed_dim: int, num_heads: int,
 def compile_attention_prefill_cached(seq_len: int, embed_dim: int,
                                      num_heads: int, num_kv_heads: int,
                                      head_dim: int,
-                                     dtype: str = "bf16") -> Path:
+                                     dtype: str = "bf16",
+                                     rope_method_type: int = 0) -> Path:
     """Compile AttentionBlockPrefill with caching.
 
     Returns the cache directory (contains combined.xclbin + 11 insts).
     """
     key = attention_prefill_cache_key(
-        seq_len, embed_dim, num_heads, num_kv_heads, head_dim, dtype
+        seq_len, embed_dim, num_heads, num_kv_heads, head_dim, dtype,
+        rope_method_type=rope_method_type,
     )
 
     cached = get_cached_chained_dir(
@@ -1486,7 +1494,8 @@ def compile_attention_prefill_cached(seq_len: int, embed_dim: int,
 
     output_dir = str(get_cache_dir() / key)
     compile_attention_prefill(
-        seq_len, embed_dim, num_heads, num_kv_heads, head_dim, dtype, output_dir
+        seq_len, embed_dim, num_heads, num_kv_heads, head_dim, dtype, output_dir,
+        rope_method_type=rope_method_type,
     )
     return Path(output_dir)
 
@@ -1648,6 +1657,10 @@ def main():
     attnp_parser.add_argument("--head-dim", type=int, default=64,
                               help="Per-head dim (only 64 supported by MHA)")
     attnp_parser.add_argument("--dtype", default="bf16", choices=["bf16"])
+    attnp_parser.add_argument("--rope-method-type", type=int, default=0,
+                              choices=[0, 1],
+                              help="RoPE rotation: 0=TWO_HALVES (HF/ggml NEOX), "
+                                   "1=INTERLEAVED (ggml NORMAL adjacent-pair)")
     attnp_parser.add_argument("--cache-dir", type=str, default=None,
                               help="Override GGML_XDNA_CACHE_DIR for this run")
     attnp_parser.add_argument("--out", type=str,
@@ -1788,12 +1801,14 @@ def main():
                 args.seq_len, args.embed_dim,
                 args.num_heads, args.num_kv_heads, args.head_dim,
                 args.dtype, args.out,
+                rope_method_type=args.rope_method_type,
             )
         else:
             path = compile_attention_prefill_cached(
                 args.seq_len, args.embed_dim,
                 args.num_heads, args.num_kv_heads, args.head_dim,
                 args.dtype,
+                rope_method_type=args.rope_method_type,
             )
         print(path)
 
