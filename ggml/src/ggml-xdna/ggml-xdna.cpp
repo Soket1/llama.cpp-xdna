@@ -6857,6 +6857,161 @@ static bool tblock_fused_upload_gain(
     return true;
 }
 
+// Bulk fused-tblock weight pre-warm. Mirrors tblock_prefill_bulk_prewarm but
+// writes into each layer-entry's single input_bo at the layout offsets
+// documented in entry->layout.buffers (as the per-dispatch upload path does).
+// The expensive step is the per-weight bf16 transpose — parallelizing it
+// across CPU cores converts first-batch ~27 t/s into steady-state throughput.
+//
+// Guarded per-cgraph pointer. The dispatch path's loaded_srcs check still
+// covers correctness if this ever runs twice on overlapping matches.
+// ----------------------------------------------------------------------------
+static void tblock_fused_bulk_prewarm(ggml_backend_xdna_context * ctx,
+                                      const struct ggml_cgraph * cgraph) {
+    {
+        std::lock_guard<std::mutex> lock(ctx->cache_mutex);
+        if (ctx->tblock_fused_prewarmed_cgraphs.count(cgraph)) return;
+    }
+
+    std::vector<xdna_transformer_block_match> matches;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        struct ggml_tensor * node = cgraph->nodes[i];
+        if (node->op != GGML_OP_RMS_NORM) continue;
+        xdna_transformer_block_match tm{};
+        if (xdna_try_match_transformer_block_prefill(cgraph, i, &tm) &&
+            tm.attn.seq_len >= 256) {
+            matches.push_back(tm);
+        }
+    }
+    if (matches.empty()) return;
+
+    struct weight_task {
+        xdna_tblock_fused_entry * entry;
+        const char * slot_name;
+        const struct ggml_tensor * weight;
+        bool is_gain;
+    };
+    std::vector<weight_task> tasks;
+    std::unordered_set<xdna_tblock_fused_entry *> entries_seen;
+
+    for (const auto & tm : matches) {
+        const auto & m = tm.attn;
+        const int64_t seq_bucket = xdna_select_attention_prefill_bucket(m.seq_len);
+        if (seq_bucket < 0) continue;
+        if (m.head_dim != 64) continue;
+        if (m.embed_dim <= 0 || m.embed_dim % 8 != 0) continue;
+        if ((m.num_kv_heads * m.head_dim) % 64 != 0) continue;
+        if (m.num_heads % m.num_kv_heads != 0) continue;
+        if (tm.ffn_hidden_dim <= 0 || tm.ffn_hidden_dim % 64 != 0) continue;
+
+        const std::string shape_key = make_tblock_fused_cache_key(
+            seq_bucket, m.embed_dim, m.num_heads, m.num_kv_heads, m.head_dim,
+            tm.ffn_hidden_dim, m.rope_method_type);
+        const std::string layer_key = make_tblock_fused_layer_cache_key(
+            shape_key, m.wq->data);
+
+        if (!ensure_tblock_fused_compiled(
+                ctx, shape_key, seq_bucket, m.embed_dim, m.num_heads,
+                m.num_kv_heads, m.head_dim, tm.ffn_hidden_dim, m.rope_method_type)) {
+            continue;
+        }
+        xdna_tblock_fused_entry * entry = get_or_load_tblock_fused_kernel(
+            ctx, layer_key, shape_key,
+            seq_bucket, m.embed_dim, m.num_heads, m.num_kv_heads,
+            m.head_dim, tm.ffn_hidden_dim, m.rope_method_type);
+        if (!entry) continue;
+
+        struct slot_desc {
+            const char * name;
+            const struct ggml_tensor * weight;
+            bool is_gain;
+        };
+        const slot_desc slots[] = {
+            { XDNA_TBF_W_NORM_ATTN, m.gain,      true  },
+            { XDNA_TBF_W_Q,         m.wq,        false },
+            { XDNA_TBF_W_K,         m.wk,        false },
+            { XDNA_TBF_W_V,         m.wv,        false },
+            { XDNA_TBF_W_O,         m.wo,        false },
+            { XDNA_TBF_W_NORM_FFN,  tm.ffn_gain, true  },
+            { XDNA_TBF_W_GATE,      tm.w_gate,   false },
+            { XDNA_TBF_W_UP,        tm.w_up,     false },
+            { XDNA_TBF_W_DOWN,      tm.w_down,   false },
+        };
+        bool any_needed = false;
+        for (const auto & s : slots) {
+            if (!s.weight || !s.weight->data) continue;
+            {
+                std::lock_guard<std::mutex> lock(*entry->mu);
+                auto it = entry->loaded_srcs.find(s.name);
+                if (it != entry->loaded_srcs.end() && it->second == s.weight->data) continue;
+            }
+            tasks.push_back({entry, s.name, s.weight, s.is_gain});
+            any_needed = true;
+        }
+        if (any_needed) entries_seen.insert(entry);
+    }
+
+    if (tasks.empty()) {
+        std::lock_guard<std::mutex> lock(ctx->cache_mutex);
+        ctx->tblock_fused_prewarmed_cgraphs.insert(cgraph);
+        return;
+    }
+
+    unsigned hw = std::thread::hardware_concurrency();
+    if (hw == 0) hw = 4;
+    unsigned nworkers = (unsigned)std::min<size_t>(hw, tasks.size());
+
+    std::atomic<size_t> next{0};
+    std::vector<std::future<void>> futs;
+    futs.reserve(nworkers);
+    for (unsigned w = 0; w < nworkers; w++) {
+        futs.push_back(std::async(std::launch::async, [&tasks, &next]() {
+            for (;;) {
+                size_t idx = next.fetch_add(1, std::memory_order_relaxed);
+                if (idx >= tasks.size()) break;
+                const auto & t = tasks[idx];
+                bool ok = t.is_gain
+                    ? tblock_fused_upload_gain(t.entry, t.slot_name, t.weight)
+                    : tblock_fused_upload_gemm_weight(t.entry, t.slot_name, t.weight);
+                if (ok) {
+                    std::lock_guard<std::mutex> lock(*t.entry->mu);
+                    t.entry->loaded_srcs[t.slot_name] = t.weight->data;
+                } else {
+                    GGML_LOG_ERROR("ggml-xdna: fused tblock prewarm upload '%s' failed\n",
+                                   t.slot_name);
+                }
+            }
+        }));
+    }
+    for (auto & f : futs) f.wait();
+
+    // One sync per unique entry — the dispatch path still re-syncs after
+    // writing x+angles each call (whole-BO sync is unavoidable on host-only
+    // BOs), but this initial sync makes the first dispatch's weight bytes
+    // already resident and shifts nothing to the critical path.
+    for (auto * entry : entries_seen) {
+        try {
+            entry->input_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        } catch (const std::exception & e) {
+            GGML_LOG_ERROR("ggml-xdna: fused tblock prewarm sync failed: %s\n", e.what());
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(ctx->cache_mutex);
+        ctx->tblock_fused_prewarmed_cgraphs.insert(cgraph);
+    }
+
+    static const bool tpf_dbg = getenv("XDNA_DEBUG") != NULL;
+    if (tpf_dbg) {
+        fprintf(stderr,
+                "ggml-xdna: fused tblock bulk pre-warm done: %zu matches, "
+                "%zu uploads, %zu entries, %u workers\n",
+                matches.size(), tasks.size(), entries_seen.size(), nworkers);
+        fflush(stderr);
+    }
+}
+
 // Single dispatch of the fused transformer block for one layer. Analog of
 // ggml_backend_xdna_transformer_block_prefill but replaces the 20-kernel
 // runlist with a single xrt::run on a 3-BO (input/output/scratch) kernel
@@ -7522,6 +7677,12 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
         // doesn't use. Skip it in fused mode — fused weights are written
         // at first dispatch per layer, into the single input_bo.
         tblock_prefill_bulk_prewarm(ctx, cgraph);
+    }
+    if (transformer_block_enabled && getenv("XDNA_ENABLE_TBLOCK_FUSED") != NULL) {
+        // Fused path: upload all per-layer weights/gains into each entry's
+        // input_bo in parallel before the first dispatch of this cgraph,
+        // eliminating the first-batch 27→150 t/s cliff.
+        tblock_fused_bulk_prewarm(ctx, cgraph);
     }
 
     int cpu_run_start = -1;
