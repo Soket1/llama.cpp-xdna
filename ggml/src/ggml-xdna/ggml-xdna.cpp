@@ -4247,7 +4247,7 @@ static bool xdna_try_match_attention_prefill(const struct ggml_cgraph * cgraph, 
 // ============================================================================
 
 // Seq-len buckets — must match ATTENTION_PREFILL_SEQ_BUCKETS in compile.py.
-static constexpr int64_t XDNA_ATTN_PREFILL_BUCKETS[] = {128, 256, 512, 1024, 2048, 4096};
+static constexpr int64_t XDNA_ATTN_PREFILL_BUCKETS[] = {128, 256, 512, 768, 1024, 1536, 2048, 4096};
 static constexpr int XDNA_ATTN_PREFILL_NUM_BUCKETS =
     sizeof(XDNA_ATTN_PREFILL_BUCKETS) / sizeof(XDNA_ATTN_PREFILL_BUCKETS[0]);
 

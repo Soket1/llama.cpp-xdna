@@ -285,7 +285,7 @@ ATTENTION_PREFILL_KERNELS = (
 # 256 minimum: IRON bf16 GEMM with default tile_m=64 requires M % 256 == 0.
 # Smaller seq_lens fall to CPU. Dropping below 256 requires passing smaller
 # tile_m through the composite (future optimization for partial-batch prefill).
-ATTENTION_PREFILL_SEQ_BUCKETS = (256, 512, 1024, 2048, 4096)
+ATTENTION_PREFILL_SEQ_BUCKETS = (256, 512, 768, 1024, 1536, 2048, 4096)
 
 
 # Chained TransformerBlockPrefill: 17 sub-kernels in one xclbin (attention +
