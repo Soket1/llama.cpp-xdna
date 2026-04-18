@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -404,6 +405,10 @@ struct ggml_backend_xdna_context {
     std::unordered_map<std::string, xdna_qkv_entry> qkv_cache;
     std::unordered_map<std::string, xdna_rms_norm_entry> rms_norm_cache;
     std::unordered_map<std::string, xdna_attention_prefill_entry> attention_prefill_cache;
+    // Set of cgraph pointers for which attn_prefill_bulk_prewarm() has already
+    // run. Purely an optimization guard — the dispatch path's per-weight cache
+    // check covers correctness if we re-enter.
+    std::unordered_set<const void *> attn_prewarmed_cgraphs;
     std::mutex cache_mutex;
     bool device_valid;
     // CPU backend for delegating ops we don't run on NPU.
@@ -4376,6 +4381,237 @@ static xrt::bo * attn_prefill_warm_gain(
     }
 }
 
+// ----------------------------------------------------------------------------
+// Bulk attention-prefill weight pre-warm.
+//
+// The per-dispatch path above uploads one weight BO at a time, serialized with
+// kernel dispatches. On Llama-3.2-1B that's 4 GEMM weights + 1 gain × 16 layers
+// × ~44ms/weight ≈ ~700ms of wall time on the critical path per prefill.
+//
+// attn_prefill_bulk_prewarm() scans the cgraph for ALL attention-prefill
+// matches up-front, resolves each to its entry's cache, and uploads every
+// missing weight+gain BO in parallel using std::async. Subsequent dispatch-path
+// calls to attn_prefill_warm_gemm_weight/attn_prefill_warm_gain find every
+// weight cached and return immediately.
+//
+// Guarded per-cgraph on ctx->attn_prewarmed_cgraphs so we only scan once.
+// ----------------------------------------------------------------------------
+struct xdna_attn_prewarm_task {
+    xdna_attention_prefill_entry * entry;
+    std::unordered_map<const void *, xrt::bo> * cache;
+    const struct ggml_tensor * weight;
+    int kernel_slot;
+    int arg_group_id;
+    const char * slot_name;
+    bool is_gain;  // gain has its own code path (no transpose)
+};
+
+static void attn_prefill_bulk_prewarm(ggml_backend_xdna_context * ctx,
+                                      const struct ggml_cgraph * cgraph) {
+    // Attention-prefill is only meaningful on a first-pass scan per cgraph ptr.
+    // Scan the graph for every RMS_NORM start-index that matches a full attn
+    // block with seq_len >= 256 (same gate as the dispatch site).
+    std::vector<xdna_attention_match> matches;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        struct ggml_tensor * node = cgraph->nodes[i];
+        if (node->op != GGML_OP_RMS_NORM) continue;
+        xdna_attention_match am{};
+        if (xdna_try_match_attention_prefill(cgraph, i, &am) && am.seq_len >= 256) {
+            matches.push_back(am);
+        }
+    }
+    if (matches.empty()) return;
+
+    // Resolve each match to its entry. Different layers of one model share the
+    // same shape → one entry covers them all, but we still build a task per
+    // (entry, weight) pair because each weight has a distinct data pointer.
+    struct task_t {
+        std::function<void()> run;
+    };
+    std::vector<task_t> tasks;
+    tasks.reserve(matches.size() * 5);
+
+    // Dedupe (entry, weight->data) so we don't schedule the same upload twice
+    // across matches — paranoia (all 16 Llama layers have distinct weight ptrs,
+    // but tied-weight models could collide).
+    std::unordered_set<uint64_t> seen;
+    auto key_of = [](const xdna_attention_prefill_entry * e, const void * p) {
+        return ((uint64_t)(uintptr_t)e) ^ (uint64_t)(uintptr_t)p;
+    };
+
+    for (const auto & m : matches) {
+        const int64_t seq_bucket = xdna_select_attention_prefill_bucket(m.seq_len);
+        if (seq_bucket < 0) continue;
+        if (m.head_dim != 64) continue;
+        if (m.embed_dim <= 0 || m.embed_dim % 8 != 0) continue;
+        if ((m.num_kv_heads * m.head_dim) % 64 != 0) continue;
+        if (m.num_heads % m.num_kv_heads != 0) continue;
+
+        std::string cache_key = make_attention_prefill_cache_key(
+            seq_bucket, m.embed_dim, m.num_heads, m.num_kv_heads, m.head_dim,
+            m.rope_method_type);
+
+        // Make sure the xclbin bundle is compiled + loaded into ctx->
+        // attention_prefill_cache. This acquires ctx->cache_mutex internally.
+        if (!ensure_attention_prefill_compiled(
+                ctx, cache_key, seq_bucket, m.embed_dim, m.num_heads,
+                m.num_kv_heads, m.head_dim, m.rope_method_type)) {
+            continue;
+        }
+        xdna_attention_prefill_entry * entry = get_or_load_attention_prefill_kernel(
+            ctx, cache_key, seq_bucket, m.embed_dim, m.num_heads,
+            m.num_kv_heads, m.head_dim);
+        if (!entry) continue;
+
+        struct slot_desc {
+            std::unordered_map<const void *, xrt::bo> * cache;
+            const struct ggml_tensor * weight;
+            int kernel_slot;
+            int arg_group_id;
+            const char * slot_name;
+            bool is_gain;
+        };
+        const slot_desc slots[] = {
+            { &entry->gain_bo_cache, m.gain, XDNA_ATTN_RMS_NORM, 4, "gain", true  },
+            { &entry->w_q_bo_cache,  m.wq,   XDNA_ATTN_GEMM_Q,   4, "w_q",  false },
+            { &entry->w_k_bo_cache,  m.wk,   XDNA_ATTN_GEMM_KV,  4, "w_k",  false },
+            { &entry->w_v_bo_cache,  m.wv,   XDNA_ATTN_GEMM_KV,  4, "w_v",  false },
+            { &entry->w_o_bo_cache,  m.wo,   XDNA_ATTN_GEMM_O,   4, "w_o",  false },
+        };
+        for (const auto & s : slots) {
+            if (!s.weight || !s.weight->data) continue;
+            uint64_t k = key_of(entry, s.weight->data);
+            if (!seen.insert(k).second) continue;
+            // Skip if already cached (can happen across repeat prefill calls
+            // if our per-cgraph guard missed — e.g. same cgraph ptr reused).
+            {
+                std::lock_guard<std::mutex> lock(*entry->weights_mutex);
+                if (s.cache->count(s.weight->data)) continue;
+            }
+            task_t t;
+            auto cache_ptr    = s.cache;
+            auto weight_ptr   = s.weight;
+            int  kslot        = s.kernel_slot;
+            int  arg_group    = s.arg_group_id;
+            const char * name = s.slot_name;
+            bool gain         = s.is_gain;
+            t.run = [ctx, entry, cache_ptr, weight_ptr, kslot, arg_group, name, gain]() {
+                // Build BO + do the expensive transpose/convert/sync WITHOUT
+                // holding entry->weights_mutex — every task gets a distinct
+                // weight->data ptr (deduped earlier), so the BO construction
+                // and sync are mutually independent and XRT is thread-safe
+                // for distinct BOs. Lock only at the very end for the brief
+                // cache.emplace, with a re-check in case another worker won.
+                if (gain) {
+                    const int64_t n = entry->embed_dim;
+                    const size_t  n_bytes = (size_t)n * sizeof(uint16_t);
+                    try {
+                        xrt::bo new_bo(ctx->device, n_bytes, xrt::bo::flags::host_only,
+                                       entry->kernels[XDNA_ATTN_RMS_NORM].group_id(4));
+                        uint16_t * dst = (uint16_t *)new_bo.map<void*>();
+                        if (weight_ptr->type == GGML_TYPE_F32) {
+                            f32_to_bf16((const float *)weight_ptr->data, dst, (size_t)n);
+                        } else if (weight_ptr->type == GGML_TYPE_F16) {
+                            const uint16_t * src = (const uint16_t *)weight_ptr->data;
+                            for (int64_t i = 0; i < n; i++) dst[i] = fp16_to_bf16(src[i]);
+                        } else {
+                            memcpy(dst, weight_ptr->data, n_bytes);
+                        }
+                        new_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                        std::lock_guard<std::mutex> lock(*entry->weights_mutex);
+                        if (entry->gain_bo_cache.count(weight_ptr->data) == 0) {
+                            entry->gain_bo_cache.emplace(weight_ptr->data, std::move(new_bo));
+                        }
+                    } catch (const std::exception & e) {
+                        GGML_LOG_ERROR("ggml-xdna: prewarm gain failed: %s\n", e.what());
+                    }
+                } else {
+                    const int64_t K = weight_ptr->ne[0];
+                    const int64_t N = weight_ptr->ne[1];
+                    const size_t  n_elems = (size_t)K * (size_t)N;
+                    const size_t  n_bytes = n_elems * sizeof(uint16_t);
+                    try {
+                        xrt::bo new_bo(ctx->device, n_bytes, xrt::bo::flags::host_only,
+                                       entry->kernels[kslot].group_id(arg_group));
+                        uint16_t * dst_bf16 = (uint16_t *)new_bo.map<void*>();
+                        if (weight_ptr->type == GGML_TYPE_F32) {
+                            const float * src_f32 = (const float *)weight_ptr->data;
+                            for (int64_t k = 0; k < K; k++) {
+                                for (int64_t nn = 0; nn < N; nn++) {
+                                    float val = src_f32[nn * K + k];
+                                    uint32_t bits;
+                                    memcpy(&bits, &val, sizeof(bits));
+                                    bits += (0x7FFF + ((bits >> 16) & 1));
+                                    dst_bf16[k * N + nn] = (uint16_t)(bits >> 16);
+                                }
+                            }
+                        } else if (weight_ptr->type == GGML_TYPE_F16) {
+                            const uint16_t * src_f16 = (const uint16_t *)weight_ptr->data;
+                            for (int64_t k = 0; k < K; k++) {
+                                for (int64_t nn = 0; nn < N; nn++) {
+                                    dst_bf16[k * N + nn] = fp16_to_bf16(src_f16[nn * K + k]);
+                                }
+                            }
+                        } else {
+                            const uint16_t * src = (const uint16_t *)weight_ptr->data;
+                            for (int64_t k = 0; k < K; k++) {
+                                for (int64_t nn = 0; nn < N; nn++) {
+                                    dst_bf16[k * N + nn] = src[nn * K + k];
+                                }
+                            }
+                        }
+                        new_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                        std::lock_guard<std::mutex> lock(*entry->weights_mutex);
+                        if (cache_ptr->count(weight_ptr->data) == 0) {
+                            cache_ptr->emplace(weight_ptr->data, std::move(new_bo));
+                        }
+                    } catch (const std::exception & e) {
+                        GGML_LOG_ERROR("ggml-xdna: prewarm %s failed: %s\n", name, e.what());
+                    }
+                }
+            };
+            tasks.push_back(std::move(t));
+        }
+    }
+
+    if (tasks.empty()) return;
+
+    // Spawn up to hardware_concurrency() workers and feed tasks through a
+    // shared atomic index. Keep it simple: one wave of futures, each worker
+    // pulls until the queue is drained.
+    unsigned hw = std::thread::hardware_concurrency();
+    if (hw == 0) hw = 4;
+    unsigned nworkers = (unsigned)std::min<size_t>(hw, tasks.size());
+
+    std::atomic<size_t> next{0};
+    std::vector<std::future<void>> futs;
+    futs.reserve(nworkers);
+    for (unsigned w = 0; w < nworkers; w++) {
+        futs.push_back(std::async(std::launch::async, [&tasks, &next]() {
+            for (;;) {
+                size_t idx = next.fetch_add(1, std::memory_order_relaxed);
+                if (idx >= tasks.size()) break;
+                try {
+                    tasks[idx].run();
+                } catch (const std::exception & e) {
+                    GGML_LOG_ERROR("ggml-xdna: attn-prefill bulk prewarm task failed: %s\n",
+                                   e.what());
+                }
+            }
+        }));
+    }
+    for (auto & f : futs) f.wait();
+
+    static const bool ap_dbg = getenv("XDNA_DEBUG") != NULL;
+    if (ap_dbg) {
+        fprintf(stderr,
+                "ggml-xdna: attn-prefill bulk pre-warm done: %zu matches, "
+                "%zu uploads, %u workers\n",
+                matches.size(), tasks.size(), nworkers);
+        fflush(stderr);
+    }
+}
+
 // Precompute the RoPE angle LUT: shape (seq_len_padded, head_dim) bf16, with
 // even cols = cos(pos * inv_freq), odd cols = sin(pos * inv_freq). Matches
 // iron/operators/attention_block_prefill/reference.py::_compute_rope_angles AND
@@ -5363,6 +5599,21 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                     qkv_plan.triple_at.size(), qkv_plan.skip_indices.size());
             fflush(stderr);
         }
+    }
+
+    // Bulk pre-warm all attention-prefill weights for this cgraph before the
+    // per-node loop walks it serially. Without this, each of the N attention
+    // layers' first dispatch pays ~44ms of host-side transpose+DMA on the
+    // critical path. Uploads run in parallel across CPU cores; the per-weight
+    // cache check in the dispatch path then finds each BO already resident
+    // and becomes a pointer lookup. Guarded per-cgraph so repeated prefills
+    // on the same cgraph ptr don't re-scan.
+    if (attention_prefill_enabled) {
+        // No per-cgraph guard: ggml-backend-sched reuses cgraph pointers across
+        // calls with different shapes (warmup probe at M=2, then real prefill).
+        // The scan itself is cheap (~33 RMS_NORMs); the per-weight cache check
+        // inside attn_prefill_warm_gemm_weight skips already-uploaded weights.
+        attn_prefill_bulk_prewarm(ctx, cgraph);
     }
 
     int cpu_run_start = -1;
