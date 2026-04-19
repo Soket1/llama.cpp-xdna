@@ -18,6 +18,7 @@ import sys
 from pathlib import Path
 
 import aie.utils as aie_utils
+import numpy as np
 
 
 # ---------------------------------------------------------------------------
@@ -1686,6 +1687,7 @@ def transformer_block_prefill_fused_cache_key(
     dtype: str = "bf16",
     rope_method_type: int = 0,
     num_layers: int = 1,
+    w8a16: bool = False,
 ) -> str:
     seq_len_padded = select_transformer_block_prefill_fused_seq_bucket(seq_len)
     key_data = {
@@ -1703,35 +1705,46 @@ def transformer_block_prefill_fused_cache_key(
     # remain bit-identical to pre-Layer-4B bundles (no thrash).
     if num_layers > 1:
         key_data["num_layers"] = num_layers
+    # Only fold w8a16 when True so the bf16 cache entries remain
+    # bit-identical to pre-W8A16 bundles (no thrash).
+    if w8a16:
+        key_data["w8a16"] = True
     key_json = json.dumps(key_data, sort_keys=True)
     return hashlib.sha256(key_json.encode()).hexdigest()[:16]
 
 
-def _tblock_fused_bundle_filenames(output_dir: str) -> dict:
+def _tblock_fused_bundle_filenames(output_dir: str, w8a16: bool = False) -> dict:
     """Canonical filenames produced by the fused staging helper.
 
     Kept in one place so both the producer and the C++-side consumer (via
     the bundle_present check) reference the same strings.
     """
+    if w8a16:
+        return {
+            "elf": os.path.join(output_dir, "tblock_fused_w8a16.elf"),
+            "layout": os.path.join(output_dir, "tblock_fused_w8a16.layout.json"),
+        }
     return {
         "elf": os.path.join(output_dir, "tblock_fused.elf"),
         "layout": os.path.join(output_dir, "tblock_fused.layout.json"),
     }
 
 
-def _stage_tblock_fused_artifacts(op, output_dir: str) -> None:
+def _stage_tblock_fused_artifacts(op, output_dir: str, w8a16: bool = False) -> None:
     """Copy the FusedMLIROperator ELF and write its buffer layout as JSON.
 
     FusedMLIROperator produces a single ``{name}.elf`` artifact in
     ``op.context.build_dir`` plus an in-memory ``subbuffer_layout`` dict
-    ``{name: (buf_type, offset_bytes, length_bytes)}`` where buf_type is
-    one of ``input``, ``output``, ``scratch``. The C++ backend needs the
-    ELF to load the kernel and the layout to know where to write each
+    ``{name: (buf_type, offset_bytes, length_bytes, dtype)}`` where buf_type
+    is one of ``input``, ``output``, ``scratch`` and dtype is the numpy
+    dtype (bfloat16 for activations/bf16 weights/scales, uint8 for the
+    packed INT8+scales weight buffers under W8A16). The C++ backend needs
+    the ELF to load the kernel and the layout to know where to write each
     named tensor. Serialize both to predictable filenames under
     ``output_dir``.
     """
     os.makedirs(output_dir, exist_ok=True)
-    names = _tblock_fused_bundle_filenames(output_dir)
+    names = _tblock_fused_bundle_filenames(output_dir, w8a16=w8a16)
 
     # ELF
     elf_artifact = op.artifacts[0]
@@ -1746,14 +1759,21 @@ def _stage_tblock_fused_artifacts(op, output_dir: str) -> None:
     else:
         input_sz, output_sz, scratch_sz = op.buffer_sizes
         dynamic_input_sz = 0
-    buffers = {
-        bname: {
+    buffers = {}
+    for bname, entry in op.subbuffer_layout.items():
+        # IRON subbuffer_layout entries are 4-tuples:
+        # (buf_type, offset_bytes, length_bytes, dtype). The dtype is a
+        # numpy dtype (bfloat16 for fp activations / scales / bf16 weights,
+        # uint8 for packed INT8+scales buffers). Normalize to the numpy
+        # dtype name so the C++ side can reason about it as a plain string
+        # ("bfloat16", "uint8", ...).
+        btype, off, length, dtype = entry
+        buffers[bname] = {
             "buf_type": btype,
             "offset_bytes": int(off),
             "length_bytes": int(length),
+            "dtype": np.dtype(dtype).name,
         }
-        for bname, (btype, off, length) in op.subbuffer_layout.items()
-    }
     # Preserve slice_info too so the C++ side can resolve sliced buffer
     # names if a future runlist uses slice notation (currently none do,
     # but it's cheap to emit).
@@ -1790,8 +1810,8 @@ def _stage_tblock_fused_artifacts(op, output_dir: str) -> None:
         json.dump(layout, f, indent=2, sort_keys=True)
 
 
-def tblock_fused_bundle_present(output_dir: str) -> bool:
-    names = _tblock_fused_bundle_filenames(output_dir)
+def tblock_fused_bundle_present(output_dir: str, w8a16: bool = False) -> bool:
+    names = _tblock_fused_bundle_filenames(output_dir, w8a16=w8a16)
     return all(os.path.exists(p) for p in names.values())
 
 
@@ -1812,6 +1832,7 @@ def compile_transformer_block_prefill_fused(
     dtype: str, output_dir: str,
     rope_method_type: int = 0,
     num_layers: int = 1,
+    w8a16: bool = False,
 ) -> str:
     if dtype != "bf16":
         raise ValueError(
@@ -1840,6 +1861,13 @@ def compile_transformer_block_prefill_fused(
         AttentionBlockPrefillFused,
     )
 
+    # Note: the current IRON AttentionBlockPrefillFused class always uses
+    # FusedDequantGEMMi8 for the four attention projections (W8A16), so
+    # the --w8a16 flag does NOT toggle the IRON operator shape. It solely
+    # controls the bundle filenames + cache key so the C++ backend can
+    # keep W8A16 bundles segregated from any legacy bf16 bundles that
+    # may still be lying around in the cache dir. The IRON op signature
+    # is unchanged.
     op = AttentionBlockPrefillFused(
         seq_len=seq_len_padded,
         embed_dim=embed_dim,
@@ -1852,7 +1880,7 @@ def compile_transformer_block_prefill_fused(
     )
     op.compile()
 
-    _stage_tblock_fused_artifacts(op, output_dir)
+    _stage_tblock_fused_artifacts(op, output_dir, w8a16=w8a16)
     return output_dir
 
 
@@ -1862,18 +1890,20 @@ def compile_transformer_block_prefill_fused_cached(
     dtype: str = "bf16",
     rope_method_type: int = 0,
     num_layers: int = 1,
+    w8a16: bool = False,
 ) -> Path:
     key = transformer_block_prefill_fused_cache_key(
         seq_len, embed_dim, num_heads, num_kv_heads, head_dim, ffn_hidden_dim,
         dtype, rope_method_type=rope_method_type, num_layers=num_layers,
+        w8a16=w8a16,
     )
     output_dir = str(get_cache_dir() / key)
-    if tblock_fused_bundle_present(output_dir):
+    if tblock_fused_bundle_present(output_dir, w8a16=w8a16):
         return Path(output_dir)
     compile_transformer_block_prefill_fused(
         seq_len, embed_dim, num_heads, num_kv_heads, head_dim, ffn_hidden_dim,
         dtype, output_dir, rope_method_type=rope_method_type,
-        num_layers=num_layers,
+        num_layers=num_layers, w8a16=w8a16,
     )
     return Path(output_dir)
 
@@ -2103,6 +2133,14 @@ def main():
                                      "packed into one ELF (Layer 4B multi-layer "
                                      "packing). Default 1 preserves the Phase "
                                      "3.7 bundle format.")
+    tblockf_parser.add_argument("--w8a16", action="store_true",
+                                help="W8A16 mode: the bundle is named "
+                                     "tblock_fused_w8a16.{elf,layout.json} "
+                                     "and its cache key is disambiguated from "
+                                     "the bf16 variant. The IRON operator "
+                                     "itself always produces an INT8-attn "
+                                     "composite right now; this flag is the "
+                                     "on-disk/naming switch.")
     tblockf_parser.add_argument("--cache-dir", type=str, default=None,
                                 help="Override GGML_XDNA_CACHE_DIR for this run")
     tblockf_parser.add_argument("--out", type=str,
@@ -2284,6 +2322,7 @@ def main():
                 args.dtype, args.out,
                 rope_method_type=args.rope_method_type,
                 num_layers=args.num_layers,
+                w8a16=args.w8a16,
             )
         else:
             path = compile_transformer_block_prefill_fused_cached(
@@ -2293,6 +2332,7 @@ def main():
                 args.dtype,
                 rope_method_type=args.rope_method_type,
                 num_layers=args.num_layers,
+                w8a16=args.w8a16,
             )
         print(path)
 

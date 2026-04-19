@@ -5633,6 +5633,7 @@ struct xdna_tblock_fused_layout {
         std::string buf_type;  // "input" / "dynamic_input" / "output" / "scratch"
         size_t      offset = 0;
         size_t      length = 0;
+        std::string dtype;     // "bfloat16" / "uint8" / ... (from layout JSON)
     };
     std::unordered_map<std::string, buf_info> buffers;
 };
@@ -5670,6 +5671,11 @@ struct xdna_tblock_fused_entry {
     // (backwards-compat with Phase 3.7 bundles). N>1 means weight slot
     // names are per-layer suffixed (w_q_0, w_q_1, ...).
     int     num_layers       = 1;
+    // W8A16 attention path: the four attention projection weights
+    // (w_q/w_k/w_v/w_o, and their per-layer suffixes for N>1) are
+    // stored as packed INT8 + bf16 scales in uint8 BO slots. Detected
+    // from layout.json via buf_info::dtype == "uint8".
+    bool    w8a16            = false;
     std::string cache_key;
 
     // Dedup: for each named buffer, the src pointer whose contents were last
@@ -5712,10 +5718,20 @@ static std::string tblock_fused_slot_name(const char * base, int layer_idx, int 
     return std::string(buf);
 }
 
+// Returns true when the process is configured to use W8A16 fused tblock
+// bundles (INT8 attention projections + bf16 activations). Gated behind
+// XDNA_ENABLE_TBLOCK_FUSED_W8A16=1; requires XDNA_ENABLE_TBLOCK_FUSED=1
+// (the base tblock-fused path).
+static bool xdna_tblock_fused_w8a16_enabled() {
+    static const bool v = (getenv("XDNA_ENABLE_TBLOCK_FUSED_W8A16") != NULL) &&
+                          (getenv("XDNA_ENABLE_TBLOCK_FUSED")        != NULL);
+    return v;
+}
+
 static std::string make_tblock_fused_cache_key(
         int64_t seq_bucket, int64_t embed_dim, int64_t num_heads,
         int64_t num_kv_heads, int64_t head_dim, int64_t ffn_hidden_dim,
-        int rope_method_type, int num_layers = 1) {
+        int rope_method_type, int num_layers = 1, bool w8a16 = false) {
     char buf[256];
     // v2 = 4-BO split_dynamic layout (x+angles carved into dynamic_input_bo);
     // cache-key bump forces regeneration of pre-split bundles. Bundles
@@ -5724,20 +5740,26 @@ static std::string make_tblock_fused_cache_key(
     // Layer 4B multi-layer packing appends _N{N} when num_layers > 1.
     // N=1 entries preserve the v2 hash format so existing cached bundles
     // are reused without recompile.
+    //
+    // W8A16 attention variant appends a _w8a16 tag; that keeps the bf16
+    // attention-projection cache entries untouched (they remain reusable
+    // when the user flips the W8A16 gate off).
+    const char * w8_tag = w8a16 ? "_w8a16" : "";
     if (num_layers > 1) {
         // v3 = multi-layer packing with intermediate y_L exposed as output
         // BO slots (required by the split Phase-C interleaved CPU/NPU
         // dispatch). Pre-v3 N>1 bundles had y_L as scratch and corrupted
         // CPU Phase-C downstream work; v3 bumps force a recompile.
         snprintf(buf, sizeof(buf),
-                 "tblock_fused_v3_N%d_S%ld_E%ld_H%ld_KV%ld_D%ld_F%ld_bf16_rope%d",
-                 num_layers,
+                 "tblock_fused_v3%s_N%d_S%ld_E%ld_H%ld_KV%ld_D%ld_F%ld_bf16_rope%d",
+                 w8_tag, num_layers,
                  (long)seq_bucket, (long)embed_dim,
                  (long)num_heads, (long)num_kv_heads, (long)head_dim,
                  (long)ffn_hidden_dim, rope_method_type);
     } else {
         snprintf(buf, sizeof(buf),
-                 "tblock_fused_v2_S%ld_E%ld_H%ld_KV%ld_D%ld_F%ld_bf16_rope%d",
+                 "tblock_fused_v2%s_S%ld_E%ld_H%ld_KV%ld_D%ld_F%ld_bf16_rope%d",
+                 w8_tag,
                  (long)seq_bucket, (long)embed_dim,
                  (long)num_heads, (long)num_kv_heads, (long)head_dim,
                  (long)ffn_hidden_dim, rope_method_type);
@@ -5745,9 +5767,10 @@ static std::string make_tblock_fused_cache_key(
     return std::string(buf);
 }
 
-static bool tblock_fused_bundle_present(const std::string & bundle_dir) {
-    std::ifstream elf_f(bundle_dir + "/tblock_fused.elf", std::ios::binary);
-    std::ifstream lay_f(bundle_dir + "/tblock_fused.layout.json");
+static bool tblock_fused_bundle_present(const std::string & bundle_dir, bool w8a16 = false) {
+    const std::string suf = w8a16 ? std::string("_w8a16") : std::string("");
+    std::ifstream elf_f(bundle_dir + "/tblock_fused" + suf + ".elf", std::ios::binary);
+    std::ifstream lay_f(bundle_dir + "/tblock_fused" + suf + ".layout.json");
     return elf_f.good() && lay_f.good();
 }
 
@@ -5756,31 +5779,34 @@ static bool ensure_tblock_fused_compiled(
         const std::string & cache_key,
         int64_t seq_bucket, int64_t embed_dim, int64_t num_heads,
         int64_t num_kv_heads, int64_t head_dim, int64_t ffn_hidden_dim,
-        int rope_method_type, int num_layers = 1) {
+        int rope_method_type, int num_layers = 1, bool w8a16 = false) {
     const std::string bundle_dir = ctx->cache_dir + "/" + cache_key;
-    if (tblock_fused_bundle_present(bundle_dir)) return true;
+    if (tblock_fused_bundle_present(bundle_dir, w8a16)) return true;
 
     char cmd[1280];
+    const char * w8_flag = w8a16 ? " --w8a16" : "";
     snprintf(cmd, sizeof(cmd),
              "python3 %s transformer-block-prefill-fused --seq-len %ld --embed-dim %ld "
              "--num-heads %ld --num-kv-heads %ld --head-dim %ld --ffn-hidden %ld "
-             "--rope-method-type %d --num-layers %d --out %s 2>&1",
+             "--rope-method-type %d --num-layers %d%s --out %s 2>&1",
              ctx->compile_script.c_str(),
              (long)seq_bucket, (long)embed_dim,
              (long)num_heads, (long)num_kv_heads, (long)head_dim,
-             (long)ffn_hidden_dim, rope_method_type, num_layers, bundle_dir.c_str());
-    GGML_LOG_INFO("ggml-xdna: compiling fused tblock S=%ld E=%ld H=%ld KV=%ld d=%ld F=%ld rope=%d N=%d "
+             (long)ffn_hidden_dim, rope_method_type, num_layers, w8_flag,
+             bundle_dir.c_str());
+    GGML_LOG_INFO("ggml-xdna: compiling fused tblock S=%ld E=%ld H=%ld KV=%ld d=%ld F=%ld rope=%d N=%d%s "
                   "(first run, will be cached)...\n",
                   (long)seq_bucket, (long)embed_dim,
                   (long)num_heads, (long)num_kv_heads, (long)head_dim,
-                  (long)ffn_hidden_dim, rope_method_type, num_layers);
+                  (long)ffn_hidden_dim, rope_method_type, num_layers,
+                  w8a16 ? " W8A16" : "");
 
     int ret = system(cmd);
     if (ret != 0) {
         GGML_LOG_ERROR("ggml-xdna: fused tblock compile failed (exit %d)\n", ret);
         return false;
     }
-    if (!tblock_fused_bundle_present(bundle_dir)) {
+    if (!tblock_fused_bundle_present(bundle_dir, w8a16)) {
         GGML_LOG_ERROR("ggml-xdna: fused tblock compile ran but bundle missing in %s\n",
                        bundle_dir.c_str());
         return false;
@@ -5933,12 +5959,16 @@ static bool parse_tblock_fused_layout(
                 xdna_tblock_fused_layout::buf_info info;
                 bool ok2 = foreach_object(cc2, [&](cursor & cc3, const std::string & fk) {
                     if (fk == "buf_type")     return parse_string(cc3, info.buf_type);
+                    if (fk == "dtype")        return parse_string(cc3, info.dtype);
                     int64_t v = 0;
                     if (fk == "offset_bytes") { if (!parse_int64(cc3, v)) return false; info.offset = (size_t)v; return true; }
                     if (fk == "length_bytes") { if (!parse_int64(cc3, v)) return false; info.length = (size_t)v; return true; }
                     return false;  // unknown field → skip_value
                 });
                 if (!ok2) return false;
+                // Default to bfloat16 if dtype absent (legacy bundles predate the
+                // dtype field in layout.json).
+                if (info.dtype.empty()) info.dtype = "bfloat16";
                 out.buffers.emplace(bname, std::move(info));
                 return true;
             });
@@ -5959,14 +5989,16 @@ static xdna_tblock_fused_entry * get_or_load_tblock_fused_kernel(
         const std::string & bundle_dir_key,  // on-disk bundle dir name (shape)
         int64_t seq_bucket, int64_t embed_dim,
         int64_t num_heads, int64_t num_kv_heads, int64_t head_dim,
-        int64_t ffn_hidden_dim, int rope_method_type, int num_layers = 1) {
+        int64_t ffn_hidden_dim, int rope_method_type, int num_layers = 1,
+        bool w8a16 = false) {
     std::lock_guard<std::mutex> lock(ctx->cache_mutex);
     auto it = ctx->tblock_fused_cache.find(cache_key);
     if (it != ctx->tblock_fused_cache.end()) return &it->second;
 
     const std::string bundle_dir = ctx->cache_dir + "/" + bundle_dir_key;
-    const std::string elf_path    = bundle_dir + "/tblock_fused.elf";
-    const std::string layout_path = bundle_dir + "/tblock_fused.layout.json";
+    const std::string suf = w8a16 ? std::string("_w8a16") : std::string("");
+    const std::string elf_path    = bundle_dir + "/tblock_fused" + suf + ".elf";
+    const std::string layout_path = bundle_dir + "/tblock_fused" + suf + ".layout.json";
 
     try {
         xdna_tblock_fused_entry entry;
@@ -5978,6 +6010,7 @@ static xdna_tblock_fused_entry * get_or_load_tblock_fused_kernel(
         entry.ffn_hidden_dim   = ffn_hidden_dim;
         entry.rope_method_type = rope_method_type;
         entry.num_layers       = num_layers;
+        entry.w8a16            = w8a16;
         entry.cache_key        = cache_key;
 
         if (!parse_tblock_fused_layout(layout_path, entry.layout)) {
@@ -6854,10 +6887,272 @@ static std::string make_tblock_fused_layer_cache_key(
     return shape_key + buf;
 }
 
+// ============================================================================
+// W8A16 host-side weight packer.
+//
+// Mirrors the IRON reference packer at
+//   iron/operators/fused_dequant_gemm_i8/reference.py::pack_weights
+// byte-for-byte. The packed buffer is a uint8 byte stream laid out as:
+//
+//   for col in [0, cols):
+//     for n_tile in [0, n_per_col / tile_n):
+//       for k_tile in [0, K / tile_k):
+//         [tile_k * tile_n bytes int8, row-major (k_in_tile, n_in_tile)]
+//         [(tile_k/G) * tile_n bytes bf16, row-major (g_in_tile, n_in_tile)]
+//
+// Per group g, per n: scale = max(|B[g*G:(g+1)*G, n]|) / 127.
+// Symmetric, zero-point=0. All-zero groups pick scale=1.0 to avoid
+// divide-by-zero. int8 = round(B / scale) clamped to [-128, 127].
+//
+// Input B is supplied as the `(K, N)` bf16 "logical" orientation (K along
+// axis 0). ggml stores weights as (N, K), so callers transpose on the
+// fly when converting F16/F32 -> bf16 (K, N) below.
+//
+// NOTE: tile_k / tile_n / group_size are pinned to the defaults the IRON
+// FusedDequantGEMMi8 op uses (64, 64, 32). If IRON ever changes those
+// defaults this packer will silently desync — keep them in agreement.
+// ============================================================================
+
+static constexpr int XDNA_TBF_W8A16_TILE_K     = 64;
+static constexpr int XDNA_TBF_W8A16_TILE_N     = 64;
+static constexpr int XDNA_TBF_W8A16_GROUP_SIZE = 32;
+
+// Convert fp32 -> bf16 raw bits with round-to-nearest-even.
+static inline uint16_t xdna_f32_to_bf16_bits(float f) {
+    uint32_t bits;
+    memcpy(&bits, &f, sizeof(bits));
+    // Round-to-nearest-even: bump by 0x7FFF + lsb of the truncated high half.
+    bits += (0x7FFFu + ((bits >> 16) & 1u));
+    return (uint16_t)(bits >> 16);
+}
+
+// Compute the total packed byte length for a W8A16 weight of shape (K, N)
+// with given cols. Matches the byte count the IRON op's uint8 arg_spec
+// reports. Used to size-check layout.json entries.
+static size_t xdna_tblock_fused_w8a16_packed_bytes(
+        int64_t K, int64_t N, int cols) {
+    const int tile_k = XDNA_TBF_W8A16_TILE_K;
+    const int tile_n = XDNA_TBF_W8A16_TILE_N;
+    const int G      = XDNA_TBF_W8A16_GROUP_SIZE;
+    const int64_t num_groups_per_tile = tile_k / G;
+    const int64_t num_k_tiles         = K / tile_k;
+    const int64_t n_per_col           = N / cols;
+    const int64_t num_n_tiles_per_col = n_per_col / tile_n;
+    const int64_t packed_tile_bytes =
+        (int64_t)tile_k * (int64_t)tile_n +
+        num_groups_per_tile * (int64_t)tile_n * 2;
+    const int64_t bytes_per_col = num_n_tiles_per_col * num_k_tiles * packed_tile_bytes;
+    return (size_t)((int64_t)cols * bytes_per_col);
+}
+
+// Infer the `cols` parameter from K, N, and the packed byte length stored
+// in layout.json. Since tile_k/tile_n/G are fixed, cols is the only free
+// knob on the layout.length side of the equation. Returns 0 on failure.
+static int xdna_tblock_fused_w8a16_infer_cols(
+        int64_t K, int64_t N, size_t layout_length) {
+    const int candidates[] = { 8, 4, 2, 1 };
+    for (int c : candidates) {
+        if (N % c != 0) continue;
+        if ((N / c) % XDNA_TBF_W8A16_TILE_N != 0) continue;
+        if (K % XDNA_TBF_W8A16_TILE_K != 0) continue;
+        const size_t need = xdna_tblock_fused_w8a16_packed_bytes(K, N, c);
+        if (need == layout_length) return c;
+    }
+    return 0;
+}
+
+// Core packer. Input K×N fp32 weight (row-major, axis-0 = K, axis-1 = N).
+// Writes the packed uint8 stream into `out` (exactly `packed_bytes` bytes).
+// OpenMP-parallel across `col`.
+static void xdna_tblock_fused_w8a16_pack_from_f32(
+        const float * __restrict__ B_kn,
+        int64_t K, int64_t N, int cols,
+        uint8_t * __restrict__ out) {
+    const int tile_k = XDNA_TBF_W8A16_TILE_K;
+    const int tile_n = XDNA_TBF_W8A16_TILE_N;
+    const int G      = XDNA_TBF_W8A16_GROUP_SIZE;
+    const int64_t num_groups_per_col  = K / G;
+    const int64_t num_groups_per_tile = tile_k / G;
+    const int64_t num_k_tiles         = K / tile_k;
+    const int64_t n_per_col           = N / cols;
+    const int64_t num_n_tiles_per_col = n_per_col / tile_n;
+
+    const int64_t packed_tile_bytes =
+        (int64_t)tile_k * (int64_t)tile_n +
+        num_groups_per_tile * (int64_t)tile_n * 2;
+    const int64_t bytes_per_col = num_n_tiles_per_col * num_k_tiles * packed_tile_bytes;
+
+    // Per-column scales buffer reused across n_tiles (G_count × N_col).
+    // Serial loop: bulk_prewarm already parallelises per-weight across its
+    // std::async worker pool, so each packer invocation running single-
+    // threaded is fine. Adding OpenMP here would double-dip on CPU cores
+    // and worsen cache thrash during the init prewarm.
+    for (int col = 0; col < cols; col++) {
+        const int64_t n_col_start = (int64_t)col * n_per_col;
+        uint8_t * col_out = out + (int64_t)col * bytes_per_col;
+
+        // Per-group scales for this column. Two parallel arrays:
+        //   scales_f32 — used directly for quantization (matches the
+        //                reference which uses torch.float32 scales).
+        //   scales_u16 — bf16 raw bits, written into the packed tile bytes
+        //                exactly as the device MAC will read them.
+        // The reference does INT8 quant with fp32 scales AND dequant with
+        // fp32 scales (the bf16 conversion happens only on the packed-byte
+        // copy path + on-device dequant). We mirror that.
+        std::vector<float>    scales_f32((size_t)num_groups_per_col * (size_t)n_per_col);
+        std::vector<uint16_t> scales_u16((size_t)num_groups_per_col * (size_t)n_per_col);
+
+        for (int64_t g = 0; g < num_groups_per_col; g++) {
+            const int64_t k_base = g * G;
+            for (int64_t nn_local = 0; nn_local < n_per_col; nn_local++) {
+                const int64_t nn = n_col_start + nn_local;
+                float amax = 0.0f;
+                for (int gi = 0; gi < G; gi++) {
+                    float v = B_kn[(k_base + gi) * N + nn];
+                    float a = v < 0.0f ? -v : v;
+                    if (a > amax) amax = a;
+                }
+                float scale = (amax > 0.0f) ? (amax / 127.0f) : 1.0f;
+                const size_t idx =
+                    (size_t)g * (size_t)n_per_col + (size_t)nn_local;
+                scales_f32[idx] = scale;
+                scales_u16[idx] = xdna_f32_to_bf16_bits(scale);
+            }
+        }
+
+        int64_t byte_offset = 0;
+        for (int64_t n_tile_idx = 0; n_tile_idx < num_n_tiles_per_col; n_tile_idx++) {
+            const int64_t n_start_local = n_tile_idx * tile_n;
+            const int64_t n_start = n_col_start + n_start_local;
+
+            for (int64_t k_tile_idx = 0; k_tile_idx < num_k_tiles; k_tile_idx++) {
+                const int64_t k_start = k_tile_idx * tile_k;
+
+                // 1) INT8 weights block.
+                int8_t * tile_int8 = (int8_t *)(col_out + byte_offset);
+                for (int ki = 0; ki < tile_k; ki++) {
+                    const int64_t k = k_start + ki;
+                    const int64_t g = k / G;
+                    for (int ni = 0; ni < tile_n; ni++) {
+                        const int64_t nn = n_start + ni;
+                        float v = B_kn[k * N + nn];
+                        // Use the fp32 scale for quantization; matches the
+                        // reference's `torch.round(B / scales_f32)`.
+                        float scale = scales_f32[(size_t)g * (size_t)n_per_col +
+                                                 (size_t)(nn - n_col_start)];
+                        // rint() honors FE_TONEAREST (round-half-to-even by
+                        // default) which matches torch.round().
+                        int32_t qi = (int32_t)rintf(v / scale);
+                        if (qi < -128) qi = -128;
+                        else if (qi > 127) qi = 127;
+                        tile_int8[ki * tile_n + ni] = (int8_t)qi;
+                    }
+                }
+                byte_offset += (int64_t)tile_k * (int64_t)tile_n;
+
+                // 2) bf16 scales block, shape (num_groups_per_tile, tile_n).
+                uint16_t * tile_scales = (uint16_t *)(col_out + byte_offset);
+                const int64_t g_start = k_start / G;
+                for (int64_t gi = 0; gi < num_groups_per_tile; gi++) {
+                    for (int ni = 0; ni < tile_n; ni++) {
+                        const int64_t nn = n_start + ni;
+                        tile_scales[gi * tile_n + ni] =
+                            scales_u16[(size_t)(g_start + gi) * (size_t)n_per_col +
+                                       (size_t)(nn - n_col_start)];
+                    }
+                }
+                byte_offset += num_groups_per_tile * (int64_t)tile_n * 2;
+            }
+        }
+        (void)byte_offset;  // matches bytes_per_col by construction
+    }
+}
+
+// Write a W8A16 attention projection weight into entry->input_bo. Accepts
+// F16, F32, BF16 ggml tensors; internally builds a (K, N) fp32 staging
+// buffer (so the packer sees a single unified input), runs the packer
+// into the BO at the layout offset.
+//
+// ggml stores B as (N, K) row-major (B_ggml[n, k] at offset n*K + k).
+// The packer expects (K, N) row-major: B_kn[k, n] = B_ggml[n, k].
+static bool tblock_fused_upload_w8a16_weight(
+        xdna_tblock_fused_entry * entry,
+        const char * name,
+        const struct ggml_tensor * weight) {
+    auto it = entry->layout.buffers.find(name);
+    if (it == entry->layout.buffers.end()) {
+        GGML_LOG_ERROR("ggml-xdna: fused tblock W8A16 weight '%s' missing from layout\n", name);
+        return false;
+    }
+    if (it->second.buf_type != "input") {
+        GGML_LOG_ERROR("ggml-xdna: fused tblock W8A16 weight '%s' in unexpected buf_type=%s\n",
+                       name, it->second.buf_type.c_str());
+        return false;
+    }
+    if (it->second.dtype != "uint8") {
+        GGML_LOG_ERROR("ggml-xdna: fused tblock W8A16 weight '%s' dtype=%s (expected uint8)\n",
+                       name, it->second.dtype.c_str());
+        return false;
+    }
+
+    const int64_t K = weight->ne[0];
+    const int64_t N = weight->ne[1];
+
+    const int cols = xdna_tblock_fused_w8a16_infer_cols(K, N, it->second.length);
+    if (cols == 0) {
+        GGML_LOG_ERROR("ggml-xdna: fused tblock W8A16 weight '%s' K=%ld N=%ld: can't infer cols "
+                       "from layout length %zu\n", name, (long)K, (long)N, it->second.length);
+        return false;
+    }
+
+    // Staging fp32 (K, N).
+    std::vector<float> B_kn((size_t)K * (size_t)N);
+    if (weight->type == GGML_TYPE_F32) {
+        const float * src = (const float *)weight->data;
+        for (int64_t k = 0; k < K; k++) {
+            for (int64_t nn = 0; nn < N; nn++) {
+                B_kn[(size_t)k * (size_t)N + (size_t)nn] = src[nn * K + k];
+            }
+        }
+    } else if (weight->type == GGML_TYPE_F16) {
+        const uint16_t * src = (const uint16_t *)weight->data;
+        for (int64_t k = 0; k < K; k++) {
+            for (int64_t nn = 0; nn < N; nn++) {
+                ggml_fp16_t h;
+                memcpy(&h, &src[nn * K + k], sizeof(h));
+                B_kn[(size_t)k * (size_t)N + (size_t)nn] = ggml_fp16_to_fp32(h);
+            }
+        }
+    } else if (weight->type == GGML_TYPE_BF16) {
+        const uint16_t * src = (const uint16_t *)weight->data;
+        for (int64_t k = 0; k < K; k++) {
+            for (int64_t nn = 0; nn < N; nn++) {
+                uint32_t bits = ((uint32_t)src[nn * K + k]) << 16;
+                float v;
+                memcpy(&v, &bits, sizeof(v));
+                B_kn[(size_t)k * (size_t)N + (size_t)nn] = v;
+            }
+        }
+    } else {
+        GGML_LOG_ERROR("ggml-xdna: fused tblock W8A16 weight '%s' unsupported dtype %d\n",
+                       name, (int)weight->type);
+        return false;
+    }
+
+    uint8_t * dst = (uint8_t *)((char *)entry->input_bo->map<void*>() + it->second.offset);
+    xdna_tblock_fused_w8a16_pack_from_f32(B_kn.data(), K, N, cols, dst);
+    return true;
+}
+
 // Write the weight tensor (ggml-native [N, K] layout in src->data) into
 // entry->input_bo at layout.buffers[name].offset as bf16 [K, N] row-major.
 // That is what FusedMLIROperator's internal GEMM sub-ops consume directly
 // (IRON GEMM default b_col_maj=False).
+//
+// W8A16 dispatch: if layout.json says the slot dtype is uint8, route
+// through the INT8+scales packer instead of the bf16 transpose below.
+// Only attention projection slots (w_q/w_k/w_v/w_o) carry uint8 in
+// Phase A; FFN weights stay bf16.
 static bool tblock_fused_upload_gemm_weight(
         xdna_tblock_fused_entry * entry,
         const char * name,
@@ -6871,6 +7166,9 @@ static bool tblock_fused_upload_gemm_weight(
         GGML_LOG_ERROR("ggml-xdna: fused tblock weight '%s' in unexpected buf_type=%s\n",
                        name, it->second.buf_type.c_str());
         return false;
+    }
+    if (it->second.dtype == "uint8") {
+        return tblock_fused_upload_w8a16_weight(entry, name, weight);
     }
     const int64_t K = weight->ne[0];
     const int64_t N = weight->ne[1];
@@ -7076,9 +7374,10 @@ static void tblock_fused_bulk_prewarm(ggml_backend_xdna_context * ctx,
         if (head.ffn_hidden_dim <= 0 || head.ffn_hidden_dim % 64 != 0) continue;
 
         const int group_N = (int)g.size();
+        const bool w8a16_gated = xdna_tblock_fused_w8a16_enabled();
         const std::string shape_key = make_tblock_fused_cache_key(
             seq_bucket, m.embed_dim, m.num_heads, m.num_kv_heads, m.head_dim,
-            head.ffn_hidden_dim, m.rope_method_type, group_N);
+            head.ffn_hidden_dim, m.rope_method_type, group_N, w8a16_gated);
         // Layer key uses the FIRST block's wq ptr so distinct groups get
         // distinct in-memory entries (separate BOs) even when sharing the
         // same on-disk N-block bundle.
@@ -7088,13 +7387,14 @@ static void tblock_fused_bulk_prewarm(ggml_backend_xdna_context * ctx,
         if (!ensure_tblock_fused_compiled(
                 ctx, shape_key, seq_bucket, m.embed_dim, m.num_heads,
                 m.num_kv_heads, m.head_dim, head.ffn_hidden_dim,
-                m.rope_method_type, group_N)) {
+                m.rope_method_type, group_N, w8a16_gated)) {
             continue;
         }
         xdna_tblock_fused_entry * entry = get_or_load_tblock_fused_kernel(
             ctx, layer_key, shape_key,
             seq_bucket, m.embed_dim, m.num_heads, m.num_kv_heads,
-            m.head_dim, head.ffn_hidden_dim, m.rope_method_type, group_N);
+            m.head_dim, head.ffn_hidden_dim, m.rope_method_type, group_N,
+            w8a16_gated);
         if (!entry) continue;
 
         xdna_tblock_fused_group gd;
@@ -7140,21 +7440,24 @@ static void tblock_fused_bulk_prewarm(ggml_backend_xdna_context * ctx,
         if (m.num_heads % m.num_kv_heads != 0) continue;
         if (tm.ffn_hidden_dim <= 0 || tm.ffn_hidden_dim % 64 != 0) continue;
 
+        const bool w8a16_gated = xdna_tblock_fused_w8a16_enabled();
         const std::string shape_key = make_tblock_fused_cache_key(
             seq_bucket, m.embed_dim, m.num_heads, m.num_kv_heads, m.head_dim,
-            tm.ffn_hidden_dim, m.rope_method_type);
+            tm.ffn_hidden_dim, m.rope_method_type, /*num_layers=*/1, w8a16_gated);
         const std::string layer_key = make_tblock_fused_layer_cache_key(
             shape_key, m.wq->data);
 
         if (!ensure_tblock_fused_compiled(
                 ctx, shape_key, seq_bucket, m.embed_dim, m.num_heads,
-                m.num_kv_heads, m.head_dim, tm.ffn_hidden_dim, m.rope_method_type)) {
+                m.num_kv_heads, m.head_dim, tm.ffn_hidden_dim, m.rope_method_type,
+                /*num_layers=*/1, w8a16_gated)) {
             continue;
         }
         xdna_tblock_fused_entry * entry = get_or_load_tblock_fused_kernel(
             ctx, layer_key, shape_key,
             seq_bucket, m.embed_dim, m.num_heads, m.num_kv_heads,
-            m.head_dim, tm.ffn_hidden_dim, m.rope_method_type);
+            m.head_dim, tm.ffn_hidden_dim, m.rope_method_type,
+            /*num_layers=*/1, w8a16_gated);
         if (!entry) continue;
 
         bool any_needed = false;
@@ -7269,22 +7572,25 @@ static bool ggml_backend_xdna_transformer_block_prefill_fused(
     const int64_t seq_bucket = xdna_select_attention_prefill_bucket(m.seq_len);
     if (seq_bucket < 0) return false;
 
+    const bool w8a16_gated = xdna_tblock_fused_w8a16_enabled();
     const std::string shape_key = make_tblock_fused_cache_key(
         seq_bucket, m.embed_dim, m.num_heads, m.num_kv_heads, m.head_dim,
-        tm.ffn_hidden_dim, m.rope_method_type);
+        tm.ffn_hidden_dim, m.rope_method_type, /*num_layers=*/1, w8a16_gated);
     const std::string layer_key = make_tblock_fused_layer_cache_key(
         shape_key, m.wq->data);
 
     if (!ensure_tblock_fused_compiled(
             ctx, shape_key, seq_bucket, m.embed_dim, m.num_heads,
-            m.num_kv_heads, m.head_dim, tm.ffn_hidden_dim, m.rope_method_type)) {
+            m.num_kv_heads, m.head_dim, tm.ffn_hidden_dim, m.rope_method_type,
+            /*num_layers=*/1, w8a16_gated)) {
         return false;
     }
 
     xdna_tblock_fused_entry * entry = get_or_load_tblock_fused_kernel(
         ctx, layer_key, shape_key,
         seq_bucket, m.embed_dim, m.num_heads, m.num_kv_heads,
-        m.head_dim, tm.ffn_hidden_dim, m.rope_method_type);
+        m.head_dim, tm.ffn_hidden_dim, m.rope_method_type,
+        /*num_layers=*/1, w8a16_gated);
     if (!entry) return false;
 
     const int64_t S     = m.seq_len;
