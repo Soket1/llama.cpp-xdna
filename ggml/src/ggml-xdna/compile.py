@@ -1734,8 +1734,13 @@ def _stage_tblock_fused_artifacts(op, output_dir: str) -> None:
     elf_src = build_dir / elf_artifact.filename
     shutil.copy2(str(elf_src), names["elf"])
 
-    # Layout JSON
-    input_sz, output_sz, scratch_sz = op.buffer_sizes
+    # Layout JSON. buffer_sizes is a 4-tuple when split_dynamic is True
+    # (x/angles carved into a separate dynamic-input BO), 3-tuple otherwise.
+    if len(op.buffer_sizes) == 4:
+        input_sz, dynamic_input_sz, output_sz, scratch_sz = op.buffer_sizes
+    else:
+        input_sz, output_sz, scratch_sz = op.buffer_sizes
+        dynamic_input_sz = 0
     buffers = {
         bname: {
             "buf_type": btype,
@@ -1756,10 +1761,12 @@ def _stage_tblock_fused_artifacts(op, output_dir: str) -> None:
         "kernel_name": "main:sequence",
         "buffer_sizes": {
             "input_bytes": int(input_sz),
+            "dynamic_input_bytes": int(dynamic_input_sz),
             "output_bytes": int(output_sz),
             "scratch_bytes": int(scratch_sz),
         },
         "input_args": list(op.input_args),
+        "dynamic_input_args": list(getattr(op, "dynamic_input_args", []) or []),
         "output_args": list(op.output_args),
         "buffers": buffers,
         "slices": slices,

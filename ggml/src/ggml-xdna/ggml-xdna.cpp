@@ -5614,12 +5614,13 @@ static constexpr const char * XDNA_TBF_W_DOWN      = "w_down";
 
 struct xdna_tblock_fused_layout {
     std::string kernel_name;   // "main:sequence"
-    size_t      input_bytes   = 0;
-    size_t      output_bytes  = 0;
-    size_t      scratch_bytes = 0;
+    size_t      input_bytes         = 0;
+    size_t      dynamic_input_bytes = 0;  // 0 when kernel is 3-BO (legacy)
+    size_t      output_bytes        = 0;
+    size_t      scratch_bytes       = 0;
 
     struct buf_info {
-        std::string buf_type;  // "input" / "output" / "scratch"
+        std::string buf_type;  // "input" / "dynamic_input" / "output" / "scratch"
         size_t      offset = 0;
         size_t      length = 0;
     };
@@ -5633,10 +5634,17 @@ struct xdna_tblock_fused_entry {
 
     xdna_tblock_fused_layout layout;
 
-    // 3 persistent BOs reused across every dispatch of this entry.
-    // input_bo holds x + all weights laid out per layout.buffers[name].offset.
-    // output_bo receives y. scratch_bo is internal only.
+    // Up to 4 persistent BOs reused across every dispatch of this entry.
+    // input_bo         = static weights (norm gains + 7 GEMMs), synced once
+    //                    at prewarm and never re-synced per dispatch.
+    // dynamic_input_bo = x + RoPE angles (the only inputs that change per
+    //                    call). Small (~3 MB) so its per-dispatch sync is
+    //                    cheap. When null (legacy 3-BO kernel), x and
+    //                    angles live in input_bo instead.
+    // output_bo        = y, synced device→host per dispatch.
+    // scratch_bo       = on-device only.
     std::unique_ptr<xrt::bo> input_bo;
+    std::unique_ptr<xrt::bo> dynamic_input_bo;
     std::unique_ptr<xrt::bo> output_bo;
     std::unique_ptr<xrt::bo> scratch_bo;
 
@@ -5662,8 +5670,11 @@ static std::string make_tblock_fused_cache_key(
         int64_t num_kv_heads, int64_t head_dim, int64_t ffn_hidden_dim,
         int rope_method_type) {
     char buf[256];
+    // v2 = 4-BO split_dynamic layout (x+angles carved into dynamic_input_bo);
+    // cache-key bump forces regeneration of pre-split bundles. Bundles
+    // predating this change won't parse against the new dispatch path.
     snprintf(buf, sizeof(buf),
-             "tblock_fused_S%ld_E%ld_H%ld_KV%ld_D%ld_F%ld_bf16_rope%d",
+             "tblock_fused_v2_S%ld_E%ld_H%ld_KV%ld_D%ld_F%ld_bf16_rope%d",
              (long)seq_bucket, (long)embed_dim,
              (long)num_heads, (long)num_kv_heads, (long)head_dim,
              (long)ffn_hidden_dim, rope_method_type);
@@ -5846,9 +5857,10 @@ static bool parse_tblock_fused_layout(
             return foreach_object(cc, [&](cursor & cc2, const std::string & bk) {
                 int64_t v = 0;
                 if (!parse_int64(cc2, v)) return false;
-                if      (bk == "input_bytes")   out.input_bytes   = (size_t)v;
-                else if (bk == "output_bytes")  out.output_bytes  = (size_t)v;
-                else if (bk == "scratch_bytes") out.scratch_bytes = (size_t)v;
+                if      (bk == "input_bytes")         out.input_bytes         = (size_t)v;
+                else if (bk == "dynamic_input_bytes") out.dynamic_input_bytes = (size_t)v;
+                else if (bk == "output_bytes")        out.output_bytes        = (size_t)v;
+                else if (bk == "scratch_bytes")       out.scratch_bytes       = (size_t)v;
                 return true;
             });
         }
@@ -5920,21 +5932,29 @@ static xdna_tblock_fused_entry * get_or_load_tblock_fused_kernel(
             ? std::string("main:sequence") : entry.layout.kernel_name;
         entry.kernel = xrt::ext::kernel(entry.hw_ctx, kname);
 
-        // Allocate the 3 persistent BOs via xrt::ext::bo bound to the
+        // Allocate the persistent BOs via xrt::ext::bo bound to the
         // hw_context — matches FusedMLIROperator's XRTTensor pattern
         // (host_only; cheap sync / unified memory on NPU2). Sizes come
-        // straight from the layout JSON.
+        // straight from the layout JSON. When dynamic_input_bytes > 0
+        // the kernel is 4-BO (static weights vs dynamic x+angles split);
+        // otherwise it's the legacy 3-BO layout with everything in
+        // input_bo.
         entry.input_bo = std::make_unique<xrt::bo>(
             xrt::ext::bo(entry.hw_ctx, entry.layout.input_bytes));
+        if (entry.layout.dynamic_input_bytes > 0) {
+            entry.dynamic_input_bo = std::make_unique<xrt::bo>(
+                xrt::ext::bo(entry.hw_ctx, entry.layout.dynamic_input_bytes));
+        }
         entry.output_bo = std::make_unique<xrt::bo>(
             xrt::ext::bo(entry.hw_ctx, entry.layout.output_bytes));
         entry.scratch_bo = std::make_unique<xrt::bo>(
             xrt::ext::bo(entry.hw_ctx, entry.layout.scratch_bytes));
 
         auto [ins, _] = ctx->tblock_fused_cache.emplace(cache_key, std::move(entry));
-        GGML_LOG_INFO("ggml-xdna: loaded fused tblock ELF %s (in=%zu out=%zu scratch=%zu, %zu named bufs)\n",
+        GGML_LOG_INFO("ggml-xdna: loaded fused tblock ELF %s (in=%zu dyn_in=%zu out=%zu scratch=%zu, %zu named bufs)\n",
                       cache_key.c_str(),
                       ins->second.layout.input_bytes,
+                      ins->second.layout.dynamic_input_bytes,
                       ins->second.layout.output_bytes,
                       ins->second.layout.scratch_bytes,
                       ins->second.layout.buffers.size());
@@ -6985,10 +7005,11 @@ static void tblock_fused_bulk_prewarm(ggml_backend_xdna_context * ctx,
     }
     for (auto & f : futs) f.wait();
 
-    // One sync per unique entry — the dispatch path still re-syncs after
-    // writing x+angles each call (whole-BO sync is unavoidable on host-only
-    // BOs), but this initial sync makes the first dispatch's weight bytes
-    // already resident and shifts nothing to the critical path.
+    // One sync per unique entry pushes all static weights on-device once.
+    // With the split-dynamic layout, dispatch re-syncs ONLY the small
+    // dynamic_input_bo (x + angles, ~3 MB) per call instead of the full
+    // 122 MB static input_bo. Legacy 3-BO bundles (dynamic_input_bo=null)
+    // still pay the whole-BO re-sync cost per dispatch.
     for (auto * entry : entries_seen) {
         try {
             entry->input_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
@@ -7111,17 +7132,28 @@ static bool ggml_backend_xdna_transformer_block_prefill_fused(
             }
         }
 
+        // Where x and angles live depends on the kernel layout:
+        //   - Legacy 3-BO kernel: both live in input_bo (buf_type="input"),
+        //     and we must re-sync the full 122 MB input_bo each call.
+        //   - Split 4-BO kernel (bundles built 2026-04-20+): x/angles live
+        //     in a separate dynamic_input_bo (buf_type="dynamic_input"),
+        //     and only that small (~3 MB) BO needs to be synced per call.
+        const bool split_dyn = (entry->dynamic_input_bo != nullptr);
+        xrt::bo * xa_bo = split_dyn ? entry->dynamic_input_bo.get()
+                                    : entry->input_bo.get();
+        const char * xa_type = split_dyn ? "dynamic_input" : "input";
+
         // RoPE angles — precomputed per-call (cheap, ~us-scale).
         const auto _ap_t_rope_begin = _ap_prof ? _ap_now() : _ap_clock::time_point{};
         {
             auto it = entry->layout.buffers.find(XDNA_TBF_ANGLES);
-            if (it == entry->layout.buffers.end() || it->second.buf_type != "input") {
-                GGML_LOG_ERROR("ggml-xdna: fused tblock 'angles' missing from layout\n");
+            if (it == entry->layout.buffers.end() || it->second.buf_type != xa_type) {
+                GGML_LOG_ERROR("ggml-xdna: fused tblock 'angles' missing from layout or wrong buf_type\n");
                 return false;
             }
             const size_t need = (size_t)S_pad * (size_t)d * sizeof(uint16_t);
             if (it->second.length < need) return false;
-            uint16_t * dst = (uint16_t *)((char *)entry->input_bo->map<void*>()
+            uint16_t * dst = (uint16_t *)((char *)xa_bo->map<void*>()
                                           + it->second.offset);
             // Zero the full padded region; RoPE helper writes only the first S rows.
             memset(dst, 0, it->second.length);
@@ -7134,16 +7166,17 @@ static bool ggml_backend_xdna_transformer_block_prefill_fused(
                                   _ap_us(_ap_t_rope_begin, _ap_now()));
         }
 
-        // Activation x — write into input_bo at its offset.
+        // Activation x — write into the dynamic BO (or input_bo in legacy
+        // mode) at its offset.
         const auto _ap_t_in_begin = _ap_prof ? _ap_now() : _ap_clock::time_point{};
         {
             auto it = entry->layout.buffers.find(XDNA_TBF_X);
-            if (it == entry->layout.buffers.end() || it->second.buf_type != "input") {
-                GGML_LOG_ERROR("ggml-xdna: fused tblock 'x' missing from layout\n");
+            if (it == entry->layout.buffers.end() || it->second.buf_type != xa_type) {
+                GGML_LOG_ERROR("ggml-xdna: fused tblock 'x' missing from layout or wrong buf_type\n");
                 return false;
             }
             if (it->second.length < bytes_x_pad) return false;
-            uint16_t * dst = (uint16_t *)((char *)entry->input_bo->map<void*>()
+            uint16_t * dst = (uint16_t *)((char *)xa_bo->map<void*>()
                                           + it->second.offset);
             if (S_pad > S) memset(dst, 0, bytes_x_pad);
             if (m.inpL->type == GGML_TYPE_F32) {
@@ -7154,11 +7187,9 @@ static bool ggml_backend_xdna_transformer_block_prefill_fused(
             } else {
                 memcpy(dst, m.inpL->data, bytes_x_actual);
             }
-            // Single sync for the whole input_bo — all weights + x + angles
-            // live in it. Weights on repeat layers are already bytes-identical
-            // so the sync is still correct; the only new bytes each call are
-            // x + angles, but XRT has no partial-range sync on host_only BOs.
-            entry->input_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            // Sync only the (possibly-small) x/angles BO. The large static
+            // input_bo was synced once during bulk prewarm and never again.
+            xa_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
         }
         if (_ap_prof) {
             xdna_attn_prof_record(XDNA_AP_BO_SYNC_TO_DEV,
@@ -7167,11 +7198,14 @@ static bool ggml_backend_xdna_transformer_block_prefill_fused(
 
         // Single xrt::run on the fused kernel — one NPU submission for the
         // whole transformer block. This is the entire point of Layer 4A.
+        // Kernel signature: (input, [dynamic_input,] output, scratch).
         const auto _ap_t_rlbuild_begin = _ap_prof ? _ap_now() : _ap_clock::time_point{};
         xrt::run run(entry->kernel);
-        run.set_arg(0, *entry->input_bo);
-        run.set_arg(1, *entry->output_bo);
-        run.set_arg(2, *entry->scratch_bo);
+        int argi = 0;
+        run.set_arg(argi++, *entry->input_bo);
+        if (split_dyn) run.set_arg(argi++, *entry->dynamic_input_bo);
+        run.set_arg(argi++, *entry->output_bo);
+        run.set_arg(argi++, *entry->scratch_bo);
         if (_ap_prof) {
             xdna_attn_prof_record(XDNA_AP_RL_BUILD,
                                   _ap_us(_ap_t_rlbuild_begin, _ap_now()));
