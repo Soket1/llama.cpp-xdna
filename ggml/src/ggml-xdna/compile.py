@@ -1685,6 +1685,7 @@ def transformer_block_prefill_fused_cache_key(
     head_dim: int, ffn_hidden_dim: int,
     dtype: str = "bf16",
     rope_method_type: int = 0,
+    num_layers: int = 1,
 ) -> str:
     seq_len_padded = select_transformer_block_prefill_fused_seq_bucket(seq_len)
     key_data = {
@@ -1698,6 +1699,10 @@ def transformer_block_prefill_fused_cache_key(
         "dtype": dtype,
         "rope_method_type": rope_method_type,
     }
+    # Only fold num_layers into the key when >1 so N=1 cache entries
+    # remain bit-identical to pre-Layer-4B bundles (no thrash).
+    if num_layers > 1:
+        key_data["num_layers"] = num_layers
     key_json = json.dumps(key_data, sort_keys=True)
     return hashlib.sha256(key_json.encode()).hexdigest()[:16]
 
@@ -1778,6 +1783,7 @@ def _stage_tblock_fused_artifacts(op, output_dir: str) -> None:
             "head_dim": op.head_dim,
             "ffn_hidden_dim": op.ffn_hidden_dim,
             "rope_method_type": op.rope_method_type,
+            "num_layers": getattr(op, "num_layers", 1),
         },
     }
     with open(names["layout"], "w") as f:
@@ -1805,12 +1811,15 @@ def compile_transformer_block_prefill_fused(
     head_dim: int, ffn_hidden_dim: int,
     dtype: str, output_dir: str,
     rope_method_type: int = 0,
+    num_layers: int = 1,
 ) -> str:
     if dtype != "bf16":
         raise ValueError(
             f"TransformerBlockPrefillFused currently supports only bf16, "
             f"got {dtype}"
         )
+    if num_layers < 1:
+        raise ValueError(f"num_layers must be >= 1, got {num_layers}")
     ok, reason = validate_transformer_block_prefill_fused_shapes(
         seq_len, embed_dim, num_heads, num_kv_heads, head_dim, ffn_hidden_dim
     )
@@ -1839,6 +1848,7 @@ def compile_transformer_block_prefill_fused(
         head_dim=head_dim,
         ffn_hidden_dim=ffn_hidden_dim,
         rope_method_type=rope_method_type,
+        num_layers=num_layers,
     )
     op.compile()
 
@@ -1851,10 +1861,11 @@ def compile_transformer_block_prefill_fused_cached(
     head_dim: int, ffn_hidden_dim: int,
     dtype: str = "bf16",
     rope_method_type: int = 0,
+    num_layers: int = 1,
 ) -> Path:
     key = transformer_block_prefill_fused_cache_key(
         seq_len, embed_dim, num_heads, num_kv_heads, head_dim, ffn_hidden_dim,
-        dtype, rope_method_type=rope_method_type,
+        dtype, rope_method_type=rope_method_type, num_layers=num_layers,
     )
     output_dir = str(get_cache_dir() / key)
     if tblock_fused_bundle_present(output_dir):
@@ -1862,6 +1873,7 @@ def compile_transformer_block_prefill_fused_cached(
     compile_transformer_block_prefill_fused(
         seq_len, embed_dim, num_heads, num_kv_heads, head_dim, ffn_hidden_dim,
         dtype, output_dir, rope_method_type=rope_method_type,
+        num_layers=num_layers,
     )
     return Path(output_dir)
 
@@ -2086,6 +2098,11 @@ def main():
                                 choices=[0, 1],
                                 help="RoPE rotation: 0=TWO_HALVES (HF/ggml NEOX), "
                                      "1=INTERLEAVED (ggml NORMAL adjacent-pair)")
+    tblockf_parser.add_argument("--num-layers", type=int, default=1,
+                                help="Number of consecutive transformer blocks "
+                                     "packed into one ELF (Layer 4B multi-layer "
+                                     "packing). Default 1 preserves the Phase "
+                                     "3.7 bundle format.")
     tblockf_parser.add_argument("--cache-dir", type=str, default=None,
                                 help="Override GGML_XDNA_CACHE_DIR for this run")
     tblockf_parser.add_argument("--out", type=str,
@@ -2266,6 +2283,7 @@ def main():
                 args.ffn_hidden,
                 args.dtype, args.out,
                 rope_method_type=args.rope_method_type,
+                num_layers=args.num_layers,
             )
         else:
             path = compile_transformer_block_prefill_fused_cached(
@@ -2274,6 +2292,7 @@ def main():
                 args.ffn_hidden,
                 args.dtype,
                 rope_method_type=args.rope_method_type,
+                num_layers=args.num_layers,
             )
         print(path)
 

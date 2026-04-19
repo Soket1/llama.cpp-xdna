@@ -507,6 +507,9 @@ struct xdna_rms_norm_entry {
 // Backend context — holds XRT device and kernel cache
 // ============================================================================
 
+// Forward declarations used by the context (definitions later in the file).
+struct xdna_tblock_fused_group;
+
 struct ggml_backend_xdna_context {
     xrt::device device;
     std::string cache_dir;
@@ -525,6 +528,13 @@ struct ggml_backend_xdna_context {
     std::unordered_set<const void *> attn_prewarmed_cgraphs;
     std::unordered_set<const void *> tblock_prewarmed_cgraphs;
     std::unordered_set<const void *> tblock_fused_prewarmed_cgraphs;
+    // Layer 4B multi-layer packing groups, keyed by cgraph pointer →
+    // map from the FIRST block's rms_norm_idx to a group descriptor. Built
+    // at bulk_prewarm time when XDNA_ENABLE_TBLOCK_FUSED_N={2,4} is set;
+    // consulted by the dispatch branch to emit one xrt::run per N blocks.
+    // Definition is after xdna_transformer_block_match (forward-declared).
+    std::unordered_map<const void *, std::unordered_map<int, struct xdna_tblock_fused_group>>
+        tblock_fused_groups_per_cgraph;
     std::mutex cache_mutex;
     bool device_valid;
     // CPU backend for delegating ops we don't run on NPU.
@@ -5655,6 +5665,11 @@ struct xdna_tblock_fused_entry {
     int64_t head_dim        = 0;
     int64_t ffn_hidden_dim  = 0;
     int     rope_method_type = 0;
+    // Layer 4B multi-layer packing: number of consecutive transformer
+    // blocks bundled into this entry's ELF. 1 = classic single-block
+    // (backwards-compat with Phase 3.7 bundles). N>1 means weight slot
+    // names are per-layer suffixed (w_q_0, w_q_1, ...).
+    int     num_layers       = 1;
     std::string cache_key;
 
     // Dedup: for each named buffer, the src pointer whose contents were last
@@ -5665,19 +5680,68 @@ struct xdna_tblock_fused_entry {
     std::unique_ptr<std::mutex> mu = std::make_unique<std::mutex>();
 };
 
+// Layer 4B multi-layer packing group. Points to the entry holding the
+// N-block ELF and carries the per-block matches so the dispatcher can
+// read x from the FIRST block's inpL, write y to the LAST block's
+// ffn_residual_add output, and extend Phase-C over the full 16*N range.
+struct xdna_tblock_fused_group {
+    int N                = 1;  // number of blocks packed in this group
+    int range_begin      = -1; // first block's rms_norm_idx
+    int range_end        = -1; // last block's ffn_residual_add_idx
+    std::vector<xdna_transformer_block_match> tms;
+    xdna_tblock_fused_entry * entry = nullptr;
+};
+
+// Returns the desired Layer 4B packing factor. Reads XDNA_ENABLE_TBLOCK_FUSED_N
+// and clamps to {1, 2, 4}. Default 1 = classic single-block dispatch
+// (backwards-compat; no grouping attempted).
+static int xdna_tblock_fused_group_N() {
+    const char * v = getenv("XDNA_ENABLE_TBLOCK_FUSED_N");
+    if (!v || !*v) return 1;
+    int n = atoi(v);
+    if (n == 2 || n == 4) return n;
+    return 1;
+}
+
+// Per-layer weight slot name: "w_q" for N=1 (backwards-compat), "w_q_{L}"
+// for N>1. Output is a std::string; callers pass .c_str() when needed.
+static std::string tblock_fused_slot_name(const char * base, int layer_idx, int num_layers) {
+    if (num_layers <= 1) return std::string(base);
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%s_%d", base, layer_idx);
+    return std::string(buf);
+}
+
 static std::string make_tblock_fused_cache_key(
         int64_t seq_bucket, int64_t embed_dim, int64_t num_heads,
         int64_t num_kv_heads, int64_t head_dim, int64_t ffn_hidden_dim,
-        int rope_method_type) {
+        int rope_method_type, int num_layers = 1) {
     char buf[256];
     // v2 = 4-BO split_dynamic layout (x+angles carved into dynamic_input_bo);
     // cache-key bump forces regeneration of pre-split bundles. Bundles
     // predating this change won't parse against the new dispatch path.
-    snprintf(buf, sizeof(buf),
-             "tblock_fused_v2_S%ld_E%ld_H%ld_KV%ld_D%ld_F%ld_bf16_rope%d",
-             (long)seq_bucket, (long)embed_dim,
-             (long)num_heads, (long)num_kv_heads, (long)head_dim,
-             (long)ffn_hidden_dim, rope_method_type);
+    //
+    // Layer 4B multi-layer packing appends _N{N} when num_layers > 1.
+    // N=1 entries preserve the v2 hash format so existing cached bundles
+    // are reused without recompile.
+    if (num_layers > 1) {
+        // v3 = multi-layer packing with intermediate y_L exposed as output
+        // BO slots (required by the split Phase-C interleaved CPU/NPU
+        // dispatch). Pre-v3 N>1 bundles had y_L as scratch and corrupted
+        // CPU Phase-C downstream work; v3 bumps force a recompile.
+        snprintf(buf, sizeof(buf),
+                 "tblock_fused_v3_N%d_S%ld_E%ld_H%ld_KV%ld_D%ld_F%ld_bf16_rope%d",
+                 num_layers,
+                 (long)seq_bucket, (long)embed_dim,
+                 (long)num_heads, (long)num_kv_heads, (long)head_dim,
+                 (long)ffn_hidden_dim, rope_method_type);
+    } else {
+        snprintf(buf, sizeof(buf),
+                 "tblock_fused_v2_S%ld_E%ld_H%ld_KV%ld_D%ld_F%ld_bf16_rope%d",
+                 (long)seq_bucket, (long)embed_dim,
+                 (long)num_heads, (long)num_kv_heads, (long)head_dim,
+                 (long)ffn_hidden_dim, rope_method_type);
+    }
     return std::string(buf);
 }
 
@@ -5692,7 +5756,7 @@ static bool ensure_tblock_fused_compiled(
         const std::string & cache_key,
         int64_t seq_bucket, int64_t embed_dim, int64_t num_heads,
         int64_t num_kv_heads, int64_t head_dim, int64_t ffn_hidden_dim,
-        int rope_method_type) {
+        int rope_method_type, int num_layers = 1) {
     const std::string bundle_dir = ctx->cache_dir + "/" + cache_key;
     if (tblock_fused_bundle_present(bundle_dir)) return true;
 
@@ -5700,16 +5764,16 @@ static bool ensure_tblock_fused_compiled(
     snprintf(cmd, sizeof(cmd),
              "python3 %s transformer-block-prefill-fused --seq-len %ld --embed-dim %ld "
              "--num-heads %ld --num-kv-heads %ld --head-dim %ld --ffn-hidden %ld "
-             "--rope-method-type %d --out %s 2>&1",
+             "--rope-method-type %d --num-layers %d --out %s 2>&1",
              ctx->compile_script.c_str(),
              (long)seq_bucket, (long)embed_dim,
              (long)num_heads, (long)num_kv_heads, (long)head_dim,
-             (long)ffn_hidden_dim, rope_method_type, bundle_dir.c_str());
-    GGML_LOG_INFO("ggml-xdna: compiling fused tblock S=%ld E=%ld H=%ld KV=%ld d=%ld F=%ld rope=%d "
+             (long)ffn_hidden_dim, rope_method_type, num_layers, bundle_dir.c_str());
+    GGML_LOG_INFO("ggml-xdna: compiling fused tblock S=%ld E=%ld H=%ld KV=%ld d=%ld F=%ld rope=%d N=%d "
                   "(first run, will be cached)...\n",
                   (long)seq_bucket, (long)embed_dim,
                   (long)num_heads, (long)num_kv_heads, (long)head_dim,
-                  (long)ffn_hidden_dim, rope_method_type);
+                  (long)ffn_hidden_dim, rope_method_type, num_layers);
 
     int ret = system(cmd);
     if (ret != 0) {
@@ -5895,7 +5959,7 @@ static xdna_tblock_fused_entry * get_or_load_tblock_fused_kernel(
         const std::string & bundle_dir_key,  // on-disk bundle dir name (shape)
         int64_t seq_bucket, int64_t embed_dim,
         int64_t num_heads, int64_t num_kv_heads, int64_t head_dim,
-        int64_t ffn_hidden_dim, int rope_method_type) {
+        int64_t ffn_hidden_dim, int rope_method_type, int num_layers = 1) {
     std::lock_guard<std::mutex> lock(ctx->cache_mutex);
     auto it = ctx->tblock_fused_cache.find(cache_key);
     if (it != ctx->tblock_fused_cache.end()) return &it->second;
@@ -5913,6 +5977,7 @@ static xdna_tblock_fused_entry * get_or_load_tblock_fused_kernel(
         entry.head_dim         = head_dim;
         entry.ffn_hidden_dim   = ffn_hidden_dim;
         entry.rope_method_type = rope_method_type;
+        entry.num_layers       = num_layers;
         entry.cache_key        = cache_key;
 
         if (!parse_tblock_fused_layout(layout_path, entry.layout)) {
@@ -6905,16 +6970,167 @@ static void tblock_fused_bulk_prewarm(ggml_backend_xdna_context * ctx,
     }
     if (matches.empty()) return;
 
+    // Layer 4B multi-layer packing (opt-in). When XDNA_ENABLE_TBLOCK_FUSED_N
+    // is set to 2 or 4, walk `matches` and greedily group N-consecutive
+    // blocks that share shape/rope/ffn_hidden. Each group gets ONE entry
+    // loaded from the N-block ELF bundle with per-layer suffixed weight
+    // slots (w_q_0..w_q_{N-1}, ...). Tail blocks that don't fit a full
+    // N-group fall back to classic N=1 entries.
+    const int desired_N = xdna_tblock_fused_group_N();
+    auto tms_compat = [](const xdna_transformer_block_match & a,
+                         const xdna_transformer_block_match & b) -> bool {
+        const auto & x = a.attn;
+        const auto & y = b.attn;
+        return x.seq_len        == y.seq_len
+            && x.embed_dim      == y.embed_dim
+            && x.num_heads      == y.num_heads
+            && x.num_kv_heads   == y.num_kv_heads
+            && x.head_dim       == y.head_dim
+            && x.rope_method_type == y.rope_method_type
+            && a.ffn_hidden_dim == b.ffn_hidden_dim;
+    };
+    std::vector<std::vector<xdna_transformer_block_match>> groups;
+    std::vector<xdna_transformer_block_match> singles;
+    if (desired_N <= 1) {
+        for (const auto & tm : matches) singles.push_back(tm);
+    } else {
+        size_t idx = 0;
+        while (idx < matches.size()) {
+            if (idx + (size_t)desired_N <= matches.size()) {
+                bool compat = true;
+                for (int k = 1; k < desired_N; k++) {
+                    if (!tms_compat(matches[idx], matches[idx + k])) {
+                        compat = false;
+                        break;
+                    }
+                }
+                if (compat) {
+                    std::vector<xdna_transformer_block_match> g;
+                    for (int k = 0; k < desired_N; k++) {
+                        g.push_back(matches[idx + k]);
+                    }
+                    groups.push_back(std::move(g));
+                    idx += desired_N;
+                    continue;
+                }
+            }
+            // Not enough remaining or shape-incompatible -> tail single.
+            singles.push_back(matches[idx]);
+            idx++;
+        }
+    }
+
     struct weight_task {
         xdna_tblock_fused_entry * entry;
-        const char * slot_name;
+        std::string slot_name;  // owned (may be suffixed for N>1)
         const struct ggml_tensor * weight;
         bool is_gain;
     };
     std::vector<weight_task> tasks;
     std::unordered_set<xdna_tblock_fused_entry *> entries_seen;
 
-    for (const auto & tm : matches) {
+    // Common weight slot ordering (shared between single-block and N-block
+    // paths). For N>1 each entry gets N copies of this list with per-layer
+    // suffixes.
+    struct slot_desc {
+        const char * base_name;
+        bool is_gain;
+    };
+    const slot_desc slot_bases[] = {
+        { XDNA_TBF_W_NORM_ATTN, true  },
+        { XDNA_TBF_W_Q,         false },
+        { XDNA_TBF_W_K,         false },
+        { XDNA_TBF_W_V,         false },
+        { XDNA_TBF_W_O,         false },
+        { XDNA_TBF_W_NORM_FFN,  true  },
+        { XDNA_TBF_W_GATE,      false },
+        { XDNA_TBF_W_UP,        false },
+        { XDNA_TBF_W_DOWN,      false },
+    };
+    auto match_weight_for = [](const xdna_transformer_block_match & tm,
+                               const char * base) -> const struct ggml_tensor * {
+        const auto & m = tm.attn;
+        if (strcmp(base, XDNA_TBF_W_NORM_ATTN) == 0) return m.gain;
+        if (strcmp(base, XDNA_TBF_W_Q)         == 0) return m.wq;
+        if (strcmp(base, XDNA_TBF_W_K)         == 0) return m.wk;
+        if (strcmp(base, XDNA_TBF_W_V)         == 0) return m.wv;
+        if (strcmp(base, XDNA_TBF_W_O)         == 0) return m.wo;
+        if (strcmp(base, XDNA_TBF_W_NORM_FFN)  == 0) return tm.ffn_gain;
+        if (strcmp(base, XDNA_TBF_W_GATE)      == 0) return tm.w_gate;
+        if (strcmp(base, XDNA_TBF_W_UP)        == 0) return tm.w_up;
+        if (strcmp(base, XDNA_TBF_W_DOWN)      == 0) return tm.w_down;
+        return nullptr;
+    };
+
+    // Groups first: one N-block entry per group, weights suffixed per-layer.
+    std::vector<xdna_tblock_fused_group> built_groups;
+    for (const auto & g : groups) {
+        const auto & head = g.front();
+        const auto & m = head.attn;
+        const int64_t seq_bucket = xdna_select_attention_prefill_bucket(m.seq_len);
+        if (seq_bucket < 0) continue;
+        if (m.head_dim != 64) continue;
+        if (m.embed_dim <= 0 || m.embed_dim % 8 != 0) continue;
+        if ((m.num_kv_heads * m.head_dim) % 64 != 0) continue;
+        if (m.num_heads % m.num_kv_heads != 0) continue;
+        if (head.ffn_hidden_dim <= 0 || head.ffn_hidden_dim % 64 != 0) continue;
+
+        const int group_N = (int)g.size();
+        const std::string shape_key = make_tblock_fused_cache_key(
+            seq_bucket, m.embed_dim, m.num_heads, m.num_kv_heads, m.head_dim,
+            head.ffn_hidden_dim, m.rope_method_type, group_N);
+        // Layer key uses the FIRST block's wq ptr so distinct groups get
+        // distinct in-memory entries (separate BOs) even when sharing the
+        // same on-disk N-block bundle.
+        const std::string layer_key = make_tblock_fused_layer_cache_key(
+            shape_key, m.wq->data);
+
+        if (!ensure_tblock_fused_compiled(
+                ctx, shape_key, seq_bucket, m.embed_dim, m.num_heads,
+                m.num_kv_heads, m.head_dim, head.ffn_hidden_dim,
+                m.rope_method_type, group_N)) {
+            continue;
+        }
+        xdna_tblock_fused_entry * entry = get_or_load_tblock_fused_kernel(
+            ctx, layer_key, shape_key,
+            seq_bucket, m.embed_dim, m.num_heads, m.num_kv_heads,
+            m.head_dim, head.ffn_hidden_dim, m.rope_method_type, group_N);
+        if (!entry) continue;
+
+        xdna_tblock_fused_group gd;
+        gd.N           = group_N;
+        gd.range_begin = g.front().attn.rms_norm_idx;
+        gd.range_end   = g.back().ffn_residual_add_idx;
+        gd.tms         = g;
+        gd.entry       = entry;
+        built_groups.push_back(std::move(gd));
+
+        bool any_needed = false;
+        for (int L = 0; L < group_N; L++) {
+            for (const auto & sd : slot_bases) {
+                const struct ggml_tensor * w = match_weight_for(g[L], sd.base_name);
+                if (!w || !w->data) continue;
+                std::string sname = tblock_fused_slot_name(
+                    sd.base_name, L, group_N);
+                {
+                    std::lock_guard<std::mutex> lock(*entry->mu);
+                    auto it = entry->loaded_srcs.find(sname);
+                    if (it != entry->loaded_srcs.end() && it->second == w->data) continue;
+                }
+                weight_task wt;
+                wt.entry     = entry;
+                wt.slot_name = std::move(sname);
+                wt.weight    = w;
+                wt.is_gain   = sd.is_gain;
+                tasks.push_back(std::move(wt));
+                any_needed = true;
+            }
+        }
+        if (any_needed) entries_seen.insert(entry);
+    }
+
+    // Singles: one entry per tail block, legacy unsuffixed weight slots.
+    for (const auto & tm : singles) {
         const auto & m = tm.attn;
         const int64_t seq_bucket = xdna_select_attention_prefill_bucket(m.seq_len);
         if (seq_bucket < 0) continue;
@@ -6941,34 +7157,35 @@ static void tblock_fused_bulk_prewarm(ggml_backend_xdna_context * ctx,
             m.head_dim, tm.ffn_hidden_dim, m.rope_method_type);
         if (!entry) continue;
 
-        struct slot_desc {
-            const char * name;
-            const struct ggml_tensor * weight;
-            bool is_gain;
-        };
-        const slot_desc slots[] = {
-            { XDNA_TBF_W_NORM_ATTN, m.gain,      true  },
-            { XDNA_TBF_W_Q,         m.wq,        false },
-            { XDNA_TBF_W_K,         m.wk,        false },
-            { XDNA_TBF_W_V,         m.wv,        false },
-            { XDNA_TBF_W_O,         m.wo,        false },
-            { XDNA_TBF_W_NORM_FFN,  tm.ffn_gain, true  },
-            { XDNA_TBF_W_GATE,      tm.w_gate,   false },
-            { XDNA_TBF_W_UP,        tm.w_up,     false },
-            { XDNA_TBF_W_DOWN,      tm.w_down,   false },
-        };
         bool any_needed = false;
-        for (const auto & s : slots) {
-            if (!s.weight || !s.weight->data) continue;
+        for (const auto & sd : slot_bases) {
+            const struct ggml_tensor * w = match_weight_for(tm, sd.base_name);
+            if (!w || !w->data) continue;
+            std::string sname(sd.base_name);
             {
                 std::lock_guard<std::mutex> lock(*entry->mu);
-                auto it = entry->loaded_srcs.find(s.name);
-                if (it != entry->loaded_srcs.end() && it->second == s.weight->data) continue;
+                auto it = entry->loaded_srcs.find(sname);
+                if (it != entry->loaded_srcs.end() && it->second == w->data) continue;
             }
-            tasks.push_back({entry, s.name, s.weight, s.is_gain});
+            weight_task wt;
+            wt.entry     = entry;
+            wt.slot_name = std::move(sname);
+            wt.weight    = w;
+            wt.is_gain   = sd.is_gain;
+            tasks.push_back(std::move(wt));
             any_needed = true;
         }
         if (any_needed) entries_seen.insert(entry);
+    }
+
+    // Register any N-block groups on the context map — dispatch reads this
+    // to redirect grouped block-start indices to the N-block xrt::run path.
+    if (!built_groups.empty()) {
+        std::lock_guard<std::mutex> lock(ctx->cache_mutex);
+        auto & gmap = ctx->tblock_fused_groups_per_cgraph[cgraph];
+        for (const auto & gd : built_groups) {
+            gmap[gd.range_begin] = gd;
+        }
     }
 
     if (tasks.empty()) {
@@ -6991,14 +7208,14 @@ static void tblock_fused_bulk_prewarm(ggml_backend_xdna_context * ctx,
                 if (idx >= tasks.size()) break;
                 const auto & t = tasks[idx];
                 bool ok = t.is_gain
-                    ? tblock_fused_upload_gain(t.entry, t.slot_name, t.weight)
-                    : tblock_fused_upload_gemm_weight(t.entry, t.slot_name, t.weight);
+                    ? tblock_fused_upload_gain(t.entry, t.slot_name.c_str(), t.weight)
+                    : tblock_fused_upload_gemm_weight(t.entry, t.slot_name.c_str(), t.weight);
                 if (ok) {
                     std::lock_guard<std::mutex> lock(*t.entry->mu);
                     t.entry->loaded_srcs[t.slot_name] = t.weight->data;
                 } else {
                     GGML_LOG_ERROR("ggml-xdna: fused tblock prewarm upload '%s' failed\n",
-                                   t.slot_name);
+                                   t.slot_name.c_str());
                 }
             }
         }));
@@ -7265,6 +7482,261 @@ static bool ggml_backend_xdna_transformer_block_prefill_fused(
         GGML_LOG_ERROR("ggml-xdna: fused tblock dispatch failed: %s\n", e.what());
         return false;
     }
+}
+
+// ============================================================================
+// Layer 4B — multi-layer-packed fused transformer-block dispatcher.
+// Uses a pre-built xdna_tblock_fused_group holding N matches and the
+// N-block ELF entry (weights already uploaded during bulk_prewarm at
+// suffixed slots w_q_0 ... w_q_{N-1}). Writes layer 0's x into the
+// dynamic_input BO, computes angles once, runs one xrt::run covering
+// all N blocks, and writes the last block's output to its destination
+// tensor.
+// ============================================================================
+static bool ggml_backend_xdna_tblock_fused_multi(
+        ggml_backend_xdna_context * ctx,
+        const xdna_tblock_fused_group & group,
+        struct ggml_cgraph * cgraph) {
+    if (!ctx->device_valid) return false;
+    if (group.tms.empty() || group.entry == nullptr) return false;
+
+    xdna_tblock_fused_entry * entry = group.entry;
+    const auto & head = group.tms.front();
+    const auto & m = head.attn;
+    const int N = group.N;
+
+    const int64_t S     = m.seq_len;
+    const int64_t S_pad = entry->seq_len_padded;
+    const int64_t E     = m.embed_dim;
+    const int64_t d     = m.head_dim;
+    const size_t  bytes_x_actual = (size_t)S * (size_t)E * sizeof(uint16_t);
+    const size_t  bytes_x_pad    = (size_t)S_pad * (size_t)E * sizeof(uint16_t);
+
+    const bool _ap_prof = xdna_attn_prof_enabled();
+    using _ap_clock = std::chrono::steady_clock;
+    auto _ap_now = []() { return _ap_clock::now(); };
+    auto _ap_us = [](_ap_clock::time_point a, _ap_clock::time_point b) {
+        return (int64_t)std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
+    };
+    const auto _ap_t_disp_begin = _ap_prof ? _ap_now() : _ap_clock::time_point{};
+
+    try {
+        // Per-layer weight re-upload check (cheap needs_upload dedup). The
+        // prewarm path already uploaded weights to suffixed slots, but the
+        // per-dispatch check covers the case where a weight tensor pointer
+        // changed between graph_compute calls (e.g. buffer reload).
+        {
+            std::lock_guard<std::mutex> lock(*entry->mu);
+            const auto _ap_t_ww_begin = _ap_prof ? _ap_now() : _ap_clock::time_point{};
+            auto needs_upload = [&](const std::string & name, const void * src_ptr) {
+                auto it = entry->loaded_srcs.find(name);
+                return it == entry->loaded_srcs.end() || it->second != src_ptr;
+            };
+            auto mark_uploaded = [&](const std::string & name, const void * src_ptr) {
+                entry->loaded_srcs[name] = src_ptr;
+            };
+            struct base_slot { const char * base; bool is_gain; };
+            const base_slot bases[] = {
+                { XDNA_TBF_W_NORM_ATTN, true  },
+                { XDNA_TBF_W_Q,         false },
+                { XDNA_TBF_W_K,         false },
+                { XDNA_TBF_W_V,         false },
+                { XDNA_TBF_W_O,         false },
+                { XDNA_TBF_W_NORM_FFN,  true  },
+                { XDNA_TBF_W_GATE,      false },
+                { XDNA_TBF_W_UP,        false },
+                { XDNA_TBF_W_DOWN,      false },
+            };
+            for (int L = 0; L < N; L++) {
+                const auto & tmL = group.tms[L];
+                for (const auto & b : bases) {
+                    const struct ggml_tensor * w = nullptr;
+                    if      (strcmp(b.base, XDNA_TBF_W_NORM_ATTN) == 0) w = tmL.attn.gain;
+                    else if (strcmp(b.base, XDNA_TBF_W_Q)         == 0) w = tmL.attn.wq;
+                    else if (strcmp(b.base, XDNA_TBF_W_K)         == 0) w = tmL.attn.wk;
+                    else if (strcmp(b.base, XDNA_TBF_W_V)         == 0) w = tmL.attn.wv;
+                    else if (strcmp(b.base, XDNA_TBF_W_O)         == 0) w = tmL.attn.wo;
+                    else if (strcmp(b.base, XDNA_TBF_W_NORM_FFN)  == 0) w = tmL.ffn_gain;
+                    else if (strcmp(b.base, XDNA_TBF_W_GATE)      == 0) w = tmL.w_gate;
+                    else if (strcmp(b.base, XDNA_TBF_W_UP)        == 0) w = tmL.w_up;
+                    else if (strcmp(b.base, XDNA_TBF_W_DOWN)      == 0) w = tmL.w_down;
+                    if (!w || !w->data) continue;
+                    std::string sname = tblock_fused_slot_name(b.base, L, N);
+                    if (!needs_upload(sname, w->data)) continue;
+                    bool ok = b.is_gain
+                        ? tblock_fused_upload_gain(entry, sname.c_str(), w)
+                        : tblock_fused_upload_gemm_weight(entry, sname.c_str(), w);
+                    if (!ok) return false;
+                    mark_uploaded(sname, w->data);
+                }
+            }
+            if (_ap_prof) {
+                xdna_attn_prof_record(XDNA_AP_WEIGHT_WARM,
+                                      _ap_us(_ap_t_ww_begin, _ap_now()));
+            }
+        }
+
+        const bool split_dyn = (entry->dynamic_input_bo != nullptr);
+        xrt::bo * xa_bo = split_dyn ? entry->dynamic_input_bo.get()
+                                    : entry->input_bo.get();
+        const char * xa_type = split_dyn ? "dynamic_input" : "input";
+
+        // RoPE angles: computed once from the head block's rope node. RoPE
+        // is position-only; the same cos/sin table is shared by every
+        // transformer layer in the model, so computing from layer 0 matches
+        // what layer 1..N-1 would produce.
+        const auto _ap_t_rope_begin = _ap_prof ? _ap_now() : _ap_clock::time_point{};
+        {
+            auto it = entry->layout.buffers.find(XDNA_TBF_ANGLES);
+            if (it == entry->layout.buffers.end() || it->second.buf_type != xa_type) {
+                GGML_LOG_ERROR("ggml-xdna: fused tblock multi 'angles' missing from layout or wrong buf_type\n");
+                return false;
+            }
+            const size_t need = (size_t)S_pad * (size_t)d * sizeof(uint16_t);
+            if (it->second.length < need) return false;
+            uint16_t * dst = (uint16_t *)((char *)xa_bo->map<void*>() + it->second.offset);
+            memset(dst, 0, it->second.length);
+            if (!xdna_compute_rope_angles_bf16(m.q_rope_node, S, S_pad, d, dst)) {
+                return false;
+            }
+        }
+        if (_ap_prof) {
+            xdna_attn_prof_record(XDNA_AP_ROPE_PRECOMPUTE,
+                                  _ap_us(_ap_t_rope_begin, _ap_now()));
+        }
+
+        // Activation x — first block's input (inpL). Subsequent blocks read
+        // the residual chain on-device via scratch buffer `y_{L}`.
+        const auto _ap_t_in_begin = _ap_prof ? _ap_now() : _ap_clock::time_point{};
+        {
+            auto it = entry->layout.buffers.find(XDNA_TBF_X);
+            if (it == entry->layout.buffers.end() || it->second.buf_type != xa_type) {
+                GGML_LOG_ERROR("ggml-xdna: fused tblock multi 'x' missing from layout or wrong buf_type\n");
+                return false;
+            }
+            if (it->second.length < bytes_x_pad) return false;
+            uint16_t * dst = (uint16_t *)((char *)xa_bo->map<void*>() + it->second.offset);
+            if (S_pad > S) memset(dst, 0, bytes_x_pad);
+            if (m.inpL->type == GGML_TYPE_F32) {
+                f32_to_bf16((const float *)m.inpL->data, dst, (size_t)S * (size_t)E);
+            } else if (m.inpL->type == GGML_TYPE_F16) {
+                const uint16_t * src = (const uint16_t *)m.inpL->data;
+                for (int64_t i = 0; i < S * E; i++) dst[i] = fp16_to_bf16(src[i]);
+            } else {
+                memcpy(dst, m.inpL->data, bytes_x_actual);
+            }
+            xa_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        }
+        if (_ap_prof) {
+            xdna_attn_prof_record(XDNA_AP_BO_SYNC_TO_DEV,
+                                  _ap_us(_ap_t_in_begin, _ap_now()));
+        }
+
+        const auto _ap_t_rlbuild_begin = _ap_prof ? _ap_now() : _ap_clock::time_point{};
+        xrt::run run(entry->kernel);
+        int argi = 0;
+        run.set_arg(argi++, *entry->input_bo);
+        if (split_dyn) run.set_arg(argi++, *entry->dynamic_input_bo);
+        run.set_arg(argi++, *entry->output_bo);
+        run.set_arg(argi++, *entry->scratch_bo);
+        if (_ap_prof) {
+            xdna_attn_prof_record(XDNA_AP_RL_BUILD,
+                                  _ap_us(_ap_t_rlbuild_begin, _ap_now()));
+        }
+        const auto _ap_t_exec_begin = _ap_prof ? _ap_now() : _ap_clock::time_point{};
+        run.start();
+        if (_ap_prof) {
+            xdna_attn_prof_record(XDNA_AP_RL_EXEC,
+                                  _ap_us(_ap_t_exec_begin, _ap_now()));
+        }
+        const auto _ap_t_wait_begin = _ap_prof ? _ap_now() : _ap_clock::time_point{};
+        ert_cmd_state st = run.wait();
+        if (st != ERT_CMD_STATE_COMPLETED) {
+            GGML_LOG_ERROR("ggml-xdna: fused tblock multi xrt::run.wait() returned %d\n", (int)st);
+            return false;
+        }
+        if (_ap_prof) {
+            xdna_attn_prof_record(XDNA_AP_RL_WAIT,
+                                  _ap_us(_ap_t_wait_begin, _ap_now()));
+        }
+
+        // Sync output BO from device. Actual copy-back of y_L values to
+        // ggml tensors is interleaved with PhaseC_post by the caller to
+        // avoid ggml-alloc aliasing hazards: if the allocator decided
+        // tms[L].ffn_residual_add and tms[M].ffn_residual_add share
+        // storage (possible when their lifetimes don't overlap in the
+        // original graph), writing both back-to-back in the dispatcher
+        // would clobber. Caller does copy(L) → phase_c(L+1) pairs.
+        const auto _ap_t_out_begin = _ap_prof ? _ap_now() : _ap_clock::time_point{};
+        entry->output_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        if (_ap_prof) {
+            xdna_attn_prof_record(XDNA_AP_BO_SYNC_FROM_DEV,
+                                  _ap_us(_ap_t_out_begin, _ap_now()));
+        }
+
+        if (_ap_prof) {
+            xdna_attn_prof_record(XDNA_AP_TOTAL_PER_LAYER,
+                                  _ap_us(_ap_t_disp_begin, _ap_now()));
+        }
+        return true;
+
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("ggml-xdna: fused tblock multi dispatch failed: %s\n", e.what());
+        return false;
+    }
+}
+
+// Copy one block's residual output from the multi entry's output_bo to
+// the corresponding ggml tensor. Called interleaved with PhaseC_post by
+// the main dispatch branch so each y_L is consumed before the next
+// (potentially aliasing) y_{L+1} is written.
+static bool tblock_fused_multi_copy_y(
+        const xdna_tblock_fused_group & group,
+        int L, struct ggml_cgraph * cgraph) {
+    if (L < 0 || L >= group.N) return false;
+    xdna_tblock_fused_entry * entry = group.entry;
+    const int64_t S = group.tms[L].attn.seq_len;
+    const int64_t E = group.tms[L].attn.embed_dim;
+    const size_t actual_elems = (size_t)S * (size_t)E;
+
+    std::string y_name = (L == group.N - 1)
+        ? std::string(XDNA_TBF_Y)
+        : (std::string("y_") + std::to_string(L));
+    auto it = entry->layout.buffers.find(y_name);
+    if (it == entry->layout.buffers.end() || it->second.buf_type != "output") {
+        GGML_LOG_ERROR("ggml-xdna: fused tblock multi '%s' missing from layout or wrong buf_type\n",
+                       y_name.c_str());
+        return false;
+    }
+    if (it->second.length < actual_elems * sizeof(uint16_t)) return false;
+    const uint16_t * src = (const uint16_t *)((const char *)entry->output_bo->map<void*>()
+                                              + it->second.offset);
+    const int add_idx = group.tms[L].ffn_residual_add_idx;
+    struct ggml_tensor * dst = cgraph->nodes[add_idx];
+
+    const size_t need_bytes = (dst->type == GGML_TYPE_F32)
+        ? actual_elems * sizeof(float)
+        : actual_elems * sizeof(uint16_t);
+    const size_t dst_nbytes = ggml_nbytes(dst);
+    if (!dst->data || dst_nbytes < need_bytes) {
+        GGML_LOG_ERROR("ggml-xdna: fused tblock multi '%s' dst at node %d "
+                       "has data=%p nbytes=%zu need=%zu (type=%d, ne=[%ld,%ld,%ld,%ld])\n",
+                       y_name.c_str(), add_idx, (void*)dst->data,
+                       dst_nbytes, need_bytes, (int)dst->type,
+                       (long)dst->ne[0], (long)dst->ne[1],
+                       (long)dst->ne[2], (long)dst->ne[3]);
+        return false;
+    }
+    if (dst->type == GGML_TYPE_F32) {
+        bf16_to_f32(src, (float *)dst->data, actual_elems);
+    } else if (dst->type == GGML_TYPE_BF16) {
+        memcpy(dst->data, src, actual_elems * sizeof(uint16_t));
+    } else {
+        GGML_LOG_ERROR("ggml-xdna: fused tblock multi unsupported dst dtype %d\n",
+                       (int)dst->type);
+        return false;
+    }
+    return true;
 }
 
 // ============================================================================
@@ -7761,7 +8233,155 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
         // over the attention-prefill branch below when XDNA_ENABLE_TRANSFORMER_BLOCK
         // is set. Same Phase-C sub-graph filter pattern but extended over the
         // FFN nodes as well.
+        //
+        // Layer 4B multi-layer path: if this index starts an N-block group
+        // (registered during bulk_prewarm), dispatch the grouped N-block ELF
+        // and skip all 16*N nodes in one shot. Phase-C is extended over the
+        // full range. Tail indices fall through to the single-block path.
         if (transformer_block_enabled && node->op == GGML_OP_RMS_NORM) {
+            // Layer 4B multi-layer group lookup — only when the opt-in
+            // env var is set, so N=1 users pay zero cost. The groups map
+            // is only populated when XDNA_ENABLE_TBLOCK_FUSED_N>1 during
+            // bulk_prewarm.
+            static const int tbf_multi_N = xdna_tblock_fused_group_N();
+            const xdna_tblock_fused_group * group_ptr = nullptr;
+            if (tbf_multi_N > 1) {
+                std::lock_guard<std::mutex> lock(ctx->cache_mutex);
+                auto cg_it = ctx->tblock_fused_groups_per_cgraph.find(cgraph);
+                if (cg_it != ctx->tblock_fused_groups_per_cgraph.end()) {
+                    auto g_it = cg_it->second.find(i);
+                    if (g_it != cg_it->second.end()) {
+                        group_ptr = &g_it->second;
+                    }
+                }
+            }
+
+            if (group_ptr != nullptr) {
+                static const bool tp_dbg = getenv("XDNA_DEBUG") != NULL;
+                const auto & group = *group_ptr;
+                if (tp_dbg) {
+                    fprintf(stderr,
+                        "ggml-xdna: tblock-fused N=%d group @%d..%d (seq=%ld)\n",
+                        group.N, group.range_begin, group.range_end,
+                        (long)group.tms.front().attn.seq_len);
+                    fflush(stderr);
+                }
+
+                // Phase-C validation over the full N-block range. Same
+                // whitelist as single-block; we require at least one
+                // side-effect op (SET_ROWS/CPY/DUP — KV-cache writes) per
+                // block, otherwise full-CPU fallback.
+                const int range_begin = group.range_begin;
+                const int range_end   = group.range_end;
+                bool unknown_op_in_range = false;
+                int total_in_range = range_end - range_begin + 1;
+                int side_effect_count = 0;
+                for (int j = range_begin; j <= range_end; j++) {
+                    enum ggml_op op = cgraph->nodes[j]->op;
+                    switch (op) {
+                        case GGML_OP_VIEW:
+                        case GGML_OP_RESHAPE:
+                        case GGML_OP_CONT:
+                        case GGML_OP_PERMUTE:
+                        case GGML_OP_TRANSPOSE:
+                        case GGML_OP_MUL_MAT:
+                        case GGML_OP_RMS_NORM:
+                        case GGML_OP_NORM:
+                        case GGML_OP_MUL:
+                        case GGML_OP_ROPE:
+                        case GGML_OP_FLASH_ATTN_EXT:
+                        case GGML_OP_ADD:
+                        case GGML_OP_GLU:
+                            break;
+                        case GGML_OP_SET_ROWS:
+                        case GGML_OP_CPY:
+                        case GGML_OP_DUP:
+                            side_effect_count++;
+                            break;
+                        default:
+                            unknown_op_in_range = true;
+                            break;
+                    }
+                    if (unknown_op_in_range) break;
+                }
+                const bool use_phase_c = !unknown_op_in_range && side_effect_count > 0;
+
+                if (!use_phase_c) {
+                    // Run the whole range on CPU; skip the NPU dispatch.
+                    if (tp_dbg) {
+                        fprintf(stderr,
+                            "ggml-xdna: tblock-fused N=%d PhaseB fallback @%d..%d (%s)\n",
+                            group.N, range_begin, range_end,
+                            unknown_op_in_range ? "unknown_op" : "no_side_effects");
+                        fflush(stderr);
+                    }
+                    if (cpu_run_start < 0) cpu_run_start = i;
+                    ggml_status s = xdna_delegate_range(ctx, cgraph,
+                                                       cpu_run_start,
+                                                       range_end + 1);
+                    if (s != GGML_STATUS_SUCCESS) return s;
+                    cpu_run_start = -1;
+                    i = range_end;
+                    continue;
+                }
+
+                // Multi-block strategy: run the FULL range on CPU to
+                // populate all KV caches + intermediate residuals correctly,
+                // then dispatch NPU and OVERWRITE only the final block's
+                // residual output. This is perf-conservative (CPU does
+                // all the work the NPU would) but correctness-safe — the
+                // NPU overwrite only affects the final y. If the NPU
+                // output matches CPU within bf16 rounding, downstream
+                // nodes (next group's inpL, lm_head, etc.) get the NPU
+                // value and the multi-block path is proven end-to-end.
+                //
+                // Once stable we can revisit Phase-C style interleaving
+                // to drop the CPU-side matmul cost; the earlier attempt
+                // tripped ggml-alloc aliasing + backend coherence issues
+                // that need deeper investigation.
+                if (cpu_run_start >= 0) {
+                    ggml_status s = xdna_delegate_range(ctx, cgraph,
+                                                       cpu_run_start, i);
+                    if (s != GGML_STATUS_SUCCESS) return s;
+                    cpu_run_start = -1;
+                }
+
+                {
+                    ggml_status s = xdna_delegate_range(ctx, cgraph,
+                                                       range_begin,
+                                                       range_end + 1);
+                    if (s != GGML_STATUS_SUCCESS) return s;
+                }
+
+                const bool dispatched =
+                    ggml_backend_xdna_tblock_fused_multi(ctx, group, cgraph);
+                if (dispatched) {
+                    // Overwrite only final y (L = N-1). Intermediate
+                    // y_L values were already computed by CPU and are
+                    // in the right tensors; skipping their overwrite
+                    // avoids the alias hazard that corrupted memory
+                    // in the earlier interleaved approach.
+                    if (!tblock_fused_multi_copy_y(group, group.N - 1, cgraph)) {
+                        if (tp_dbg) {
+                            fprintf(stderr,
+                                "ggml-xdna: tblock-fused N=%d final y copy-back failed @%d..%d; "
+                                "keeping CPU result as authoritative\n",
+                                group.N, range_begin, range_end);
+                            fflush(stderr);
+                        }
+                    }
+                } else if (tp_dbg) {
+                    fprintf(stderr,
+                        "ggml-xdna: tblock-fused N=%d dispatch failed @%d..%d; "
+                        "CPU result is authoritative\n",
+                        group.N, range_begin, range_end);
+                    fflush(stderr);
+                }
+
+                i = range_end;
+                continue;
+            }
+
             xdna_transformer_block_match tm{};
             if (xdna_try_match_transformer_block_prefill(cgraph, i, &tm)
                 && tm.attn.seq_len >= 256) {
