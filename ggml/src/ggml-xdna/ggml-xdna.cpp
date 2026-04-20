@@ -5676,6 +5676,10 @@ struct xdna_tblock_fused_entry {
     // stored as packed INT8 + bf16 scales in uint8 BO slots. Detected
     // from layout.json via buf_info::dtype == "uint8".
     bool    w8a16            = false;
+    // W8A16 FFN (Phase B): when true, FFN weights (w_gate/w_up/w_down)
+    // are ALSO packed INT8 + bf16 scales. Implies w8a16. When false and
+    // w8a16 is true, we're in A.7 mode: INT8 attn + bf16 FFN.
+    bool    w8a16_ffn        = false;
     std::string cache_key;
 
     // Dedup: for each named buffer, the src pointer whose contents were last
@@ -5719,19 +5723,31 @@ static std::string tblock_fused_slot_name(const char * base, int layer_idx, int 
 }
 
 // Returns true when the process is configured to use W8A16 fused tblock
-// bundles (INT8 attention projections + bf16 activations). Gated behind
+// bundles with INT8 attention projections only (A.7). Gated behind
 // XDNA_ENABLE_TBLOCK_FUSED_W8A16=1; requires XDNA_ENABLE_TBLOCK_FUSED=1
-// (the base tblock-fused path).
+// (the base tblock-fused path). Does NOT imply INT8 FFN — that is a
+// separate gate below.
 static bool xdna_tblock_fused_w8a16_enabled() {
     static const bool v = (getenv("XDNA_ENABLE_TBLOCK_FUSED_W8A16") != NULL) &&
                           (getenv("XDNA_ENABLE_TBLOCK_FUSED")        != NULL);
     return v;
 }
 
+// Returns true when the process is additionally configured to use Phase B
+// bundles (INT8 attention + INT8 FFN). Requires BOTH the base w8a16 gate
+// and XDNA_ENABLE_TBLOCK_FUSED_W8A16_FFN=1.
+static bool xdna_tblock_fused_w8a16_ffn_enabled() {
+    static const bool v = xdna_tblock_fused_w8a16_enabled() &&
+                          (getenv("XDNA_ENABLE_TBLOCK_FUSED_W8A16_FFN") != NULL);
+    return v;
+}
+
 static std::string make_tblock_fused_cache_key(
         int64_t seq_bucket, int64_t embed_dim, int64_t num_heads,
         int64_t num_kv_heads, int64_t head_dim, int64_t ffn_hidden_dim,
-        int rope_method_type, int num_layers = 1, bool w8a16 = false) {
+        int rope_method_type, int num_layers = 1, bool w8a16 = false,
+        bool w8a16_ffn = false) {
+    GGML_ASSERT(!w8a16_ffn || w8a16);
     char buf[256];
     // v2 = 4-BO split_dynamic layout (x+angles carved into dynamic_input_bo);
     // cache-key bump forces regeneration of pre-split bundles. Bundles
@@ -5741,10 +5757,13 @@ static std::string make_tblock_fused_cache_key(
     // N=1 entries preserve the v2 hash format so existing cached bundles
     // are reused without recompile.
     //
-    // W8A16 attention variant appends a _w8a16 tag; that keeps the bf16
-    // attention-projection cache entries untouched (they remain reusable
-    // when the user flips the W8A16 gate off).
-    const char * w8_tag = w8a16 ? "_w8a16" : "";
+    // W8A16 appends a tag so bf16 cache entries stay untouched. Three modes:
+    //   - bf16                : no tag
+    //   - A.7 (attn INT8)     : _w8a16    (FFN still bf16)
+    //   - B   (attn+FFN INT8) : _w8a16ffn (FFN GEMMs also fused-dequant)
+    // The _w8a16ffn tag has 3 additional uint8 buffers in layout.json vs
+    // _w8a16, so the split forces a clean cache miss between A.7 and B.
+    const char * w8_tag = w8a16_ffn ? "_w8a16ffn" : (w8a16 ? "_w8a16" : "");
     if (num_layers > 1) {
         // v3 = multi-layer packing with intermediate y_L exposed as output
         // BO slots (required by the split Phase-C interleaved CPU/NPU
@@ -5767,8 +5786,12 @@ static std::string make_tblock_fused_cache_key(
     return std::string(buf);
 }
 
-static bool tblock_fused_bundle_present(const std::string & bundle_dir, bool w8a16 = false) {
-    const std::string suf = w8a16 ? std::string("_w8a16") : std::string("");
+static bool tblock_fused_bundle_present(const std::string & bundle_dir,
+                                        bool w8a16 = false,
+                                        bool w8a16_ffn = false) {
+    GGML_ASSERT(!w8a16_ffn || w8a16);
+    const std::string suf = w8a16_ffn ? std::string("_w8a16ffn")
+                          : (w8a16 ? std::string("_w8a16") : std::string(""));
     std::ifstream elf_f(bundle_dir + "/tblock_fused" + suf + ".elf", std::ios::binary);
     std::ifstream lay_f(bundle_dir + "/tblock_fused" + suf + ".layout.json");
     return elf_f.good() && lay_f.good();
@@ -5779,12 +5802,15 @@ static bool ensure_tblock_fused_compiled(
         const std::string & cache_key,
         int64_t seq_bucket, int64_t embed_dim, int64_t num_heads,
         int64_t num_kv_heads, int64_t head_dim, int64_t ffn_hidden_dim,
-        int rope_method_type, int num_layers = 1, bool w8a16 = false) {
+        int rope_method_type, int num_layers = 1, bool w8a16 = false,
+        bool w8a16_ffn = false) {
+    GGML_ASSERT(!w8a16_ffn || w8a16);
     const std::string bundle_dir = ctx->cache_dir + "/" + cache_key;
-    if (tblock_fused_bundle_present(bundle_dir, w8a16)) return true;
+    if (tblock_fused_bundle_present(bundle_dir, w8a16, w8a16_ffn)) return true;
 
     char cmd[1280];
-    const char * w8_flag = w8a16 ? " --w8a16" : "";
+    const char * w8_flag = w8a16_ffn ? " --w8a16 --w8a16-ffn"
+                         : (w8a16 ? " --w8a16" : "");
     snprintf(cmd, sizeof(cmd),
              "python3 %s transformer-block-prefill-fused --seq-len %ld --embed-dim %ld "
              "--num-heads %ld --num-kv-heads %ld --head-dim %ld --ffn-hidden %ld "
@@ -5794,19 +5820,21 @@ static bool ensure_tblock_fused_compiled(
              (long)num_heads, (long)num_kv_heads, (long)head_dim,
              (long)ffn_hidden_dim, rope_method_type, num_layers, w8_flag,
              bundle_dir.c_str());
+    const char * mode_tag = w8a16_ffn ? " W8A16+FFN"
+                          : (w8a16 ? " W8A16" : "");
     GGML_LOG_INFO("ggml-xdna: compiling fused tblock S=%ld E=%ld H=%ld KV=%ld d=%ld F=%ld rope=%d N=%d%s "
                   "(first run, will be cached)...\n",
                   (long)seq_bucket, (long)embed_dim,
                   (long)num_heads, (long)num_kv_heads, (long)head_dim,
                   (long)ffn_hidden_dim, rope_method_type, num_layers,
-                  w8a16 ? " W8A16" : "");
+                  mode_tag);
 
     int ret = system(cmd);
     if (ret != 0) {
         GGML_LOG_ERROR("ggml-xdna: fused tblock compile failed (exit %d)\n", ret);
         return false;
     }
-    if (!tblock_fused_bundle_present(bundle_dir, w8a16)) {
+    if (!tblock_fused_bundle_present(bundle_dir, w8a16, w8a16_ffn)) {
         GGML_LOG_ERROR("ggml-xdna: fused tblock compile ran but bundle missing in %s\n",
                        bundle_dir.c_str());
         return false;
@@ -5990,13 +6018,15 @@ static xdna_tblock_fused_entry * get_or_load_tblock_fused_kernel(
         int64_t seq_bucket, int64_t embed_dim,
         int64_t num_heads, int64_t num_kv_heads, int64_t head_dim,
         int64_t ffn_hidden_dim, int rope_method_type, int num_layers = 1,
-        bool w8a16 = false) {
+        bool w8a16 = false, bool w8a16_ffn = false) {
+    GGML_ASSERT(!w8a16_ffn || w8a16);
     std::lock_guard<std::mutex> lock(ctx->cache_mutex);
     auto it = ctx->tblock_fused_cache.find(cache_key);
     if (it != ctx->tblock_fused_cache.end()) return &it->second;
 
     const std::string bundle_dir = ctx->cache_dir + "/" + bundle_dir_key;
-    const std::string suf = w8a16 ? std::string("_w8a16") : std::string("");
+    const std::string suf = w8a16_ffn ? std::string("_w8a16ffn")
+                          : (w8a16 ? std::string("_w8a16") : std::string(""));
     const std::string elf_path    = bundle_dir + "/tblock_fused" + suf + ".elf";
     const std::string layout_path = bundle_dir + "/tblock_fused" + suf + ".layout.json";
 
@@ -6011,6 +6041,7 @@ static xdna_tblock_fused_entry * get_or_load_tblock_fused_kernel(
         entry.rope_method_type = rope_method_type;
         entry.num_layers       = num_layers;
         entry.w8a16            = w8a16;
+        entry.w8a16_ffn        = w8a16_ffn;
         entry.cache_key        = cache_key;
 
         if (!parse_tblock_fused_layout(layout_path, entry.layout)) {
@@ -7383,10 +7414,12 @@ static void tblock_fused_bulk_prewarm(ggml_backend_xdna_context * ctx,
         if (head.ffn_hidden_dim <= 0 || head.ffn_hidden_dim % 64 != 0) continue;
 
         const int group_N = (int)g.size();
-        const bool w8a16_gated = xdna_tblock_fused_w8a16_enabled();
+        const bool w8a16_gated     = xdna_tblock_fused_w8a16_enabled();
+        const bool w8a16_ffn_gated = xdna_tblock_fused_w8a16_ffn_enabled();
         const std::string shape_key = make_tblock_fused_cache_key(
             seq_bucket, m.embed_dim, m.num_heads, m.num_kv_heads, m.head_dim,
-            head.ffn_hidden_dim, m.rope_method_type, group_N, w8a16_gated);
+            head.ffn_hidden_dim, m.rope_method_type, group_N, w8a16_gated,
+            w8a16_ffn_gated);
         // Layer key uses the FIRST block's wq ptr so distinct groups get
         // distinct in-memory entries (separate BOs) even when sharing the
         // same on-disk N-block bundle.
@@ -7396,14 +7429,14 @@ static void tblock_fused_bulk_prewarm(ggml_backend_xdna_context * ctx,
         if (!ensure_tblock_fused_compiled(
                 ctx, shape_key, seq_bucket, m.embed_dim, m.num_heads,
                 m.num_kv_heads, m.head_dim, head.ffn_hidden_dim,
-                m.rope_method_type, group_N, w8a16_gated)) {
+                m.rope_method_type, group_N, w8a16_gated, w8a16_ffn_gated)) {
             continue;
         }
         xdna_tblock_fused_entry * entry = get_or_load_tblock_fused_kernel(
             ctx, layer_key, shape_key,
             seq_bucket, m.embed_dim, m.num_heads, m.num_kv_heads,
             m.head_dim, head.ffn_hidden_dim, m.rope_method_type, group_N,
-            w8a16_gated);
+            w8a16_gated, w8a16_ffn_gated);
         if (!entry) continue;
 
         xdna_tblock_fused_group gd;
@@ -7449,24 +7482,26 @@ static void tblock_fused_bulk_prewarm(ggml_backend_xdna_context * ctx,
         if (m.num_heads % m.num_kv_heads != 0) continue;
         if (tm.ffn_hidden_dim <= 0 || tm.ffn_hidden_dim % 64 != 0) continue;
 
-        const bool w8a16_gated = xdna_tblock_fused_w8a16_enabled();
+        const bool w8a16_gated     = xdna_tblock_fused_w8a16_enabled();
+        const bool w8a16_ffn_gated = xdna_tblock_fused_w8a16_ffn_enabled();
         const std::string shape_key = make_tblock_fused_cache_key(
             seq_bucket, m.embed_dim, m.num_heads, m.num_kv_heads, m.head_dim,
-            tm.ffn_hidden_dim, m.rope_method_type, /*num_layers=*/1, w8a16_gated);
+            tm.ffn_hidden_dim, m.rope_method_type, /*num_layers=*/1,
+            w8a16_gated, w8a16_ffn_gated);
         const std::string layer_key = make_tblock_fused_layer_cache_key(
             shape_key, m.wq->data);
 
         if (!ensure_tblock_fused_compiled(
                 ctx, shape_key, seq_bucket, m.embed_dim, m.num_heads,
                 m.num_kv_heads, m.head_dim, tm.ffn_hidden_dim, m.rope_method_type,
-                /*num_layers=*/1, w8a16_gated)) {
+                /*num_layers=*/1, w8a16_gated, w8a16_ffn_gated)) {
             continue;
         }
         xdna_tblock_fused_entry * entry = get_or_load_tblock_fused_kernel(
             ctx, layer_key, shape_key,
             seq_bucket, m.embed_dim, m.num_heads, m.num_kv_heads,
             m.head_dim, tm.ffn_hidden_dim, m.rope_method_type,
-            /*num_layers=*/1, w8a16_gated);
+            /*num_layers=*/1, w8a16_gated, w8a16_ffn_gated);
         if (!entry) continue;
 
         bool any_needed = false;
@@ -7581,17 +7616,19 @@ static bool ggml_backend_xdna_transformer_block_prefill_fused(
     const int64_t seq_bucket = xdna_select_attention_prefill_bucket(m.seq_len);
     if (seq_bucket < 0) return false;
 
-    const bool w8a16_gated = xdna_tblock_fused_w8a16_enabled();
+    const bool w8a16_gated     = xdna_tblock_fused_w8a16_enabled();
+    const bool w8a16_ffn_gated = xdna_tblock_fused_w8a16_ffn_enabled();
     const std::string shape_key = make_tblock_fused_cache_key(
         seq_bucket, m.embed_dim, m.num_heads, m.num_kv_heads, m.head_dim,
-        tm.ffn_hidden_dim, m.rope_method_type, /*num_layers=*/1, w8a16_gated);
+        tm.ffn_hidden_dim, m.rope_method_type, /*num_layers=*/1,
+        w8a16_gated, w8a16_ffn_gated);
     const std::string layer_key = make_tblock_fused_layer_cache_key(
         shape_key, m.wq->data);
 
     if (!ensure_tblock_fused_compiled(
             ctx, shape_key, seq_bucket, m.embed_dim, m.num_heads,
             m.num_kv_heads, m.head_dim, tm.ffn_hidden_dim, m.rope_method_type,
-            /*num_layers=*/1, w8a16_gated)) {
+            /*num_layers=*/1, w8a16_gated, w8a16_ffn_gated)) {
         return false;
     }
 
@@ -7599,7 +7636,7 @@ static bool ggml_backend_xdna_transformer_block_prefill_fused(
         ctx, layer_key, shape_key,
         seq_bucket, m.embed_dim, m.num_heads, m.num_kv_heads,
         m.head_dim, tm.ffn_hidden_dim, m.rope_method_type,
-        /*num_layers=*/1, w8a16_gated);
+        /*num_layers=*/1, w8a16_gated, w8a16_ffn_gated);
     if (!entry) return false;
 
     const int64_t S     = m.seq_len;

@@ -1688,7 +1688,10 @@ def transformer_block_prefill_fused_cache_key(
     rope_method_type: int = 0,
     num_layers: int = 1,
     w8a16: bool = False,
+    w8a16_ffn: bool = False,
 ) -> str:
+    if w8a16_ffn and not w8a16:
+        raise ValueError("w8a16_ffn=True requires w8a16=True")
     seq_len_padded = select_transformer_block_prefill_fused_seq_bucket(seq_len)
     key_data = {
         "op": "transformer_block_prefill_fused",
@@ -1706,19 +1709,37 @@ def transformer_block_prefill_fused_cache_key(
     if num_layers > 1:
         key_data["num_layers"] = num_layers
     # Only fold w8a16 when True so the bf16 cache entries remain
-    # bit-identical to pre-W8A16 bundles (no thrash).
-    if w8a16:
-        key_data["w8a16"] = True
+    # bit-identical to pre-W8A16 bundles (no thrash). Three modes:
+    #   - w8a16=False                      : no key entry (pure bf16)
+    #   - w8a16=True, w8a16_ffn=False (A.7): key_data["w8a16"] = "attn"
+    #     (INT8 attn projections only; FFN GEMMs are bf16). This tag was
+    #     introduced alongside the w8a16_ffn split — it forces a fresh
+    #     cache miss vs any pre-split w8a16 bundles (which were Phase B).
+    #   - w8a16_ffn=True              (B)  : key_data["w8a16"] = "ffn"
+    #     (INT8 attn + INT8 FFN; preserves the existing Phase-B cache key).
+    if w8a16_ffn:
+        key_data["w8a16"] = "ffn"
+    elif w8a16:
+        key_data["w8a16"] = "attn"
     key_json = json.dumps(key_data, sort_keys=True)
     return hashlib.sha256(key_json.encode()).hexdigest()[:16]
 
 
-def _tblock_fused_bundle_filenames(output_dir: str, w8a16: bool = False) -> dict:
+def _tblock_fused_bundle_filenames(
+    output_dir: str, w8a16: bool = False, w8a16_ffn: bool = False
+) -> dict:
     """Canonical filenames produced by the fused staging helper.
 
     Kept in one place so both the producer and the C++-side consumer (via
     the bundle_present check) reference the same strings.
     """
+    if w8a16_ffn and not w8a16:
+        raise ValueError("w8a16_ffn=True requires w8a16=True")
+    if w8a16_ffn:
+        return {
+            "elf": os.path.join(output_dir, "tblock_fused_w8a16ffn.elf"),
+            "layout": os.path.join(output_dir, "tblock_fused_w8a16ffn.layout.json"),
+        }
     if w8a16:
         return {
             "elf": os.path.join(output_dir, "tblock_fused_w8a16.elf"),
@@ -1730,7 +1751,9 @@ def _tblock_fused_bundle_filenames(output_dir: str, w8a16: bool = False) -> dict
     }
 
 
-def _stage_tblock_fused_artifacts(op, output_dir: str, w8a16: bool = False) -> None:
+def _stage_tblock_fused_artifacts(
+    op, output_dir: str, w8a16: bool = False, w8a16_ffn: bool = False
+) -> None:
     """Copy the FusedMLIROperator ELF and write its buffer layout as JSON.
 
     FusedMLIROperator produces a single ``{name}.elf`` artifact in
@@ -1743,8 +1766,12 @@ def _stage_tblock_fused_artifacts(op, output_dir: str, w8a16: bool = False) -> N
     named tensor. Serialize both to predictable filenames under
     ``output_dir``.
     """
+    if w8a16_ffn and not w8a16:
+        raise ValueError("w8a16_ffn=True requires w8a16=True")
     os.makedirs(output_dir, exist_ok=True)
-    names = _tblock_fused_bundle_filenames(output_dir, w8a16=w8a16)
+    names = _tblock_fused_bundle_filenames(
+        output_dir, w8a16=w8a16, w8a16_ffn=w8a16_ffn
+    )
 
     # ELF
     elf_artifact = op.artifacts[0]
@@ -1810,8 +1837,14 @@ def _stage_tblock_fused_artifacts(op, output_dir: str, w8a16: bool = False) -> N
         json.dump(layout, f, indent=2, sort_keys=True)
 
 
-def tblock_fused_bundle_present(output_dir: str, w8a16: bool = False) -> bool:
-    names = _tblock_fused_bundle_filenames(output_dir, w8a16=w8a16)
+def tblock_fused_bundle_present(
+    output_dir: str, w8a16: bool = False, w8a16_ffn: bool = False
+) -> bool:
+    if w8a16_ffn and not w8a16:
+        raise ValueError("w8a16_ffn=True requires w8a16=True")
+    names = _tblock_fused_bundle_filenames(
+        output_dir, w8a16=w8a16, w8a16_ffn=w8a16_ffn
+    )
     return all(os.path.exists(p) for p in names.values())
 
 
@@ -1833,7 +1866,10 @@ def compile_transformer_block_prefill_fused(
     rope_method_type: int = 0,
     num_layers: int = 1,
     w8a16: bool = False,
+    w8a16_ffn: bool = False,
 ) -> str:
+    if w8a16_ffn and not w8a16:
+        raise ValueError("w8a16_ffn=True requires w8a16=True")
     if dtype != "bf16":
         raise ValueError(
             f"TransformerBlockPrefillFused currently supports only bf16, "
@@ -1861,13 +1897,11 @@ def compile_transformer_block_prefill_fused(
         AttentionBlockPrefillFused,
     )
 
-    # Note: the current IRON AttentionBlockPrefillFused class always uses
-    # FusedDequantGEMMi8 for the four attention projections (W8A16), so
-    # the --w8a16 flag does NOT toggle the IRON operator shape. It solely
-    # controls the bundle filenames + cache key so the C++ backend can
-    # keep W8A16 bundles segregated from any legacy bf16 bundles that
-    # may still be lying around in the cache dir. The IRON op signature
-    # is unchanged.
+    # The IRON AttentionBlockPrefillFused class always uses
+    # FusedDequantGEMMi8 for the four attention projections (W8A16 attn).
+    # The w8a16_ffn kwarg additionally toggles the three FFN GEMMs
+    # (gate/up/down) to FusedDequantGEMMi8. --w8a16 alone selects the A.7
+    # "attn only" bundle; --w8a16 --w8a16-ffn selects the Phase B bundle.
     op = AttentionBlockPrefillFused(
         seq_len=seq_len_padded,
         embed_dim=embed_dim,
@@ -1877,10 +1911,11 @@ def compile_transformer_block_prefill_fused(
         ffn_hidden_dim=ffn_hidden_dim,
         rope_method_type=rope_method_type,
         num_layers=num_layers,
+        w8a16_ffn=w8a16_ffn,
     )
     op.compile()
 
-    _stage_tblock_fused_artifacts(op, output_dir, w8a16=w8a16)
+    _stage_tblock_fused_artifacts(op, output_dir, w8a16=w8a16, w8a16_ffn=w8a16_ffn)
     return output_dir
 
 
@@ -1891,19 +1926,22 @@ def compile_transformer_block_prefill_fused_cached(
     rope_method_type: int = 0,
     num_layers: int = 1,
     w8a16: bool = False,
+    w8a16_ffn: bool = False,
 ) -> Path:
+    if w8a16_ffn and not w8a16:
+        raise ValueError("w8a16_ffn=True requires w8a16=True")
     key = transformer_block_prefill_fused_cache_key(
         seq_len, embed_dim, num_heads, num_kv_heads, head_dim, ffn_hidden_dim,
         dtype, rope_method_type=rope_method_type, num_layers=num_layers,
-        w8a16=w8a16,
+        w8a16=w8a16, w8a16_ffn=w8a16_ffn,
     )
     output_dir = str(get_cache_dir() / key)
-    if tblock_fused_bundle_present(output_dir, w8a16=w8a16):
+    if tblock_fused_bundle_present(output_dir, w8a16=w8a16, w8a16_ffn=w8a16_ffn):
         return Path(output_dir)
     compile_transformer_block_prefill_fused(
         seq_len, embed_dim, num_heads, num_kv_heads, head_dim, ffn_hidden_dim,
         dtype, output_dir, rope_method_type=rope_method_type,
-        num_layers=num_layers, w8a16=w8a16,
+        num_layers=num_layers, w8a16=w8a16, w8a16_ffn=w8a16_ffn,
     )
     return Path(output_dir)
 
@@ -2134,13 +2172,16 @@ def main():
                                      "packing). Default 1 preserves the Phase "
                                      "3.7 bundle format.")
     tblockf_parser.add_argument("--w8a16", action="store_true",
-                                help="W8A16 mode: the bundle is named "
+                                help="W8A16 mode: INT8 attention projections "
+                                     "(Wq/Wk/Wv/Wo), bf16 FFN. Bundle is named "
                                      "tblock_fused_w8a16.{elf,layout.json} "
                                      "and its cache key is disambiguated from "
-                                     "the bf16 variant. The IRON operator "
-                                     "itself always produces an INT8-attn "
-                                     "composite right now; this flag is the "
-                                     "on-disk/naming switch.")
+                                     "the bf16 variant.")
+    tblockf_parser.add_argument("--w8a16-ffn", action="store_true",
+                                help="Phase B: additionally quantize the FFN "
+                                     "GEMMs (gate/up/down) to INT8. Requires "
+                                     "--w8a16. Bundle is named "
+                                     "tblock_fused_w8a16ffn.{elf,layout.json}.")
     tblockf_parser.add_argument("--cache-dir", type=str, default=None,
                                 help="Override GGML_XDNA_CACHE_DIR for this run")
     tblockf_parser.add_argument("--out", type=str,
@@ -2314,6 +2355,8 @@ def main():
     elif args.op == "transformer-block-prefill-fused":
         if args.cache_dir:
             os.environ["GGML_XDNA_CACHE_DIR"] = args.cache_dir
+        if args.w8a16_ffn and not args.w8a16:
+            parser.error("--w8a16-ffn requires --w8a16")
         if args.out:
             path = compile_transformer_block_prefill_fused(
                 args.seq_len, args.embed_dim,
@@ -2323,6 +2366,7 @@ def main():
                 rope_method_type=args.rope_method_type,
                 num_layers=args.num_layers,
                 w8a16=args.w8a16,
+                w8a16_ffn=args.w8a16_ffn,
             )
         else:
             path = compile_transformer_block_prefill_fused_cached(
@@ -2333,6 +2377,7 @@ def main():
                 rope_method_type=args.rope_method_type,
                 num_layers=args.num_layers,
                 w8a16=args.w8a16,
+                w8a16_ffn=args.w8a16_ffn,
             )
         print(path)
 
