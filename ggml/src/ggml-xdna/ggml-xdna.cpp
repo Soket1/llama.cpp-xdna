@@ -7028,24 +7028,33 @@ static void xdna_tblock_fused_w8a16_pack_from_f32(
             for (int64_t k_tile_idx = 0; k_tile_idx < num_k_tiles; k_tile_idx++) {
                 const int64_t k_start = k_tile_idx * tile_k;
 
-                // 1) INT8 weights block.
+                // 1) INT8 weights block, micro-tile (i_blk, j_blk, s, t)
+                // layout to match the new fdgemm_i8 kernel (Phase A.7).
+                // For (r,s,t)=(4,8,8): colA=tile_k/8, colB=tile_n/8.  Per
+                // micro-tile: 64 contiguous int8 bytes in (s, t) row-major.
                 int8_t * tile_int8 = (int8_t *)(col_out + byte_offset);
+                const int s_dim = 8;
+                const int t_dim = 8;
+                const int64_t colB_local = tile_n / t_dim;
                 for (int ki = 0; ki < tile_k; ki++) {
                     const int64_t k = k_start + ki;
                     const int64_t g = k / G;
+                    const int64_t i_blk = ki / s_dim;
+                    const int64_t s_in  = ki % s_dim;
                     for (int ni = 0; ni < tile_n; ni++) {
                         const int64_t nn = n_start + ni;
+                        const int64_t j_blk = ni / t_dim;
+                        const int64_t t_in  = ni % t_dim;
                         float v = B_kn[k * N + nn];
-                        // Use the fp32 scale for quantization; matches the
-                        // reference's `torch.round(B / scales_f32)`.
                         float scale = scales_f32[(size_t)g * (size_t)n_per_col +
                                                  (size_t)(nn - n_col_start)];
-                        // rint() honors FE_TONEAREST (round-half-to-even by
-                        // default) which matches torch.round().
                         int32_t qi = (int32_t)rintf(v / scale);
                         if (qi < -128) qi = -128;
                         else if (qi > 127) qi = 127;
-                        tile_int8[ki * tile_n + ni] = (int8_t)qi;
+                        const int64_t mt_off =
+                            (i_blk * colB_local + j_blk) * (s_dim * t_dim) +
+                            s_in * t_dim + t_in;
+                        tile_int8[mt_off] = (int8_t)qi;
                     }
                 }
                 byte_offset += (int64_t)tile_k * (int64_t)tile_n;
