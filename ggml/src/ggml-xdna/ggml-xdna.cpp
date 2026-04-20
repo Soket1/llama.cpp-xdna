@@ -7132,9 +7132,11 @@ static void xdna_tblock_fused_w8a16_pack_from_f32(
 }
 
 // Write a W8A16 attention projection weight into entry->input_bo. Accepts
-// F16, F32, BF16 ggml tensors; internally builds a (K, N) fp32 staging
-// buffer (so the packer sees a single unified input), runs the packer
-// into the BO at the layout offset.
+// F16, F32, BF16, Q8_0 ggml tensors. All dtypes go through a (K, N) fp32
+// staging buffer + the generic packer. A direct Q8_0 → tile-layout
+// repack was attempted but had a correctness bug in the sub-tile byte
+// layout — reverted. Future optimization: rewrite with byte-level unit
+// test against the fp32-packer output.
 //
 // ggml stores B as (N, K) row-major (B_ggml[n, k] at offset n*K + k).
 // The packer expects (K, N) row-major: B_kn[k, n] = B_ggml[n, k].
@@ -7198,12 +7200,14 @@ static bool tblock_fused_upload_w8a16_weight(
         }
     } else if (weight->type == GGML_TYPE_Q8_0) {
         // Q8_0 block-32: per (row, k-block) = [fp16 scale, 32 int8].
-        // Dequant-then-repack: our packer will re-derive scales from the
-        // dequanted fp32 and re-emit int8. Both use symmetric block-32
-        // quant with max(|vals|)/127, so this round-trip is numerically
-        // identical to the original Q8_0 int8 bytes (up to fp32 rounding).
-        // Real benefit: loads Q8_0 GGUFs directly (half the on-disk size
-        // of F16) instead of requiring an F16 dequantized copy.
+        // Dequant to fp32 then repack. Our packer re-derives scales from
+        // the dequanted fp32 values; because Q8_0 uses the same symmetric
+        // `max(|vals|)/127` scheme, this round-trip is numerically
+        // identical to Q8_0's original int8 bytes (up to fp32 rounding).
+        // A direct Q8_0 → tile-layout path was attempted but had a
+        // correctness bug in the sub-tile byte layout — reverted until
+        // someone rewrites with a byte-level unit test against the
+        // fp32-packer output.
         constexpr int QK8_0 = 32;
         const size_t blk_bytes = sizeof(ggml_fp16_t) + (size_t)QK8_0;
         if (K % QK8_0 != 0) {
