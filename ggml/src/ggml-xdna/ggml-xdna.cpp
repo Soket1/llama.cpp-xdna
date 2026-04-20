@@ -3713,10 +3713,18 @@ static bool xdna_try_match_swiglu(const struct ggml_cgraph * cgraph, int i,
     // accepted when the master SwiGLU gate and the INT8 opt-in flag are both
     // set; otherwise we keep the existing bf16/f32 behaviour untouched.
     static const bool int8_enabled = getenv("XDNA_ENABLE_SWIGLU_INT8") != NULL;
+    // Tblock W8A16 has its own Q8_0 upload path (dequant → fp32 → packer).
+    // When tblock+W8A16 is active we accept Q8_0 weights here so the
+    // tblock matcher's swiglu sub-match succeeds; is_int8 is still set so
+    // the tblock consumer can distinguish "Q8_0 weights need the uint8
+    // upload branch" from "bf16/f16 weights take the bf16 upload branch".
+    static const bool tblock_w8a16_gate =
+        (getenv("XDNA_ENABLE_TBLOCK_FUSED") != NULL) &&
+        (getenv("XDNA_ENABLE_TBLOCK_FUSED_W8A16") != NULL);
     const bool all_q8_0 = (gate_w->type == GGML_TYPE_Q8_0)
                        && (up_w->type   == GGML_TYPE_Q8_0)
                        && (down_w->type == GGML_TYPE_Q8_0);
-    const bool allow_int8 = int8_enabled && all_q8_0;
+    const bool allow_int8 = (int8_enabled || tblock_w8a16_gate) && all_q8_0;
 
     const struct ggml_tensor * ws[3] = { gate_w, up_w, down_w };
     const char * ws_names[3] = { "gate_w", "up_w", "down_w" };
@@ -3792,7 +3800,12 @@ static bool xdna_try_match_swiglu(const struct ggml_cgraph * cgraph, int i,
         if (!prefill_enabled) SWIGLU_REJECT("prefill disabled (set XDNA_ENABLE_SWIGLU_PREFILL=1 or XDNA_ENABLE_TRANSFORMER_BLOCK=1 or XDNA_ENABLE_TBLOCK_FUSED=1 to opt in)");
         const int64_t padded_M = ((M + 63) / 64) * 64;
         if (allow_int8) {
-            static const bool prefill_int8_ok = getenv("XDNA_ENABLE_SWIGLU_PREFILL_INT8") != NULL;
+            // Tblock+W8A16 is itself a prefill-int8 opt-in; don't gate it
+            // behind XDNA_ENABLE_SWIGLU_PREFILL_INT8 (which is for the
+            // standalone int8 swiglu dispatch path).
+            static const bool prefill_int8_ok =
+                (getenv("XDNA_ENABLE_SWIGLU_PREFILL_INT8") != NULL) ||
+                tblock_w8a16_gate;
             if (!prefill_int8_ok)
                 SWIGLU_REJECT("prefill-int8 disabled (set XDNA_ENABLE_SWIGLU_PREFILL_INT8=1)");
             int tm = xdna_pick_swiglu_prefill_tile_m(padded_M);
@@ -5400,6 +5413,12 @@ static bool xdna_try_match_transformer_block_prefill(
         return false;
     }
 
+    // W8A16 tblock accepts Q8_0 FFN weights via the uint8 upload branch
+    // in tblock_fused_upload_w8a16_weight. When W8A16 is off we stick to
+    // bf16/f16/f32 weights, which is what trial.is_int8=false signals.
+    static const bool tblock_w8a16_gate_tbl =
+        (getenv("XDNA_ENABLE_TBLOCK_FUSED") != NULL) &&
+        (getenv("XDNA_ENABLE_TBLOCK_FUSED_W8A16") != NULL);
     int swiglu_anchor = -1;
     xdna_swiglu_match sm{};
     for (int j = ffn_norm_mul_idx + 1; j + 3 < std::min(ffn_norm_mul_idx + 32, n); j++) {
@@ -5408,7 +5427,7 @@ static bool xdna_try_match_transformer_block_prefill(
         struct ggml_tensor * inp = (struct ggml_tensor *)trial.input;
         struct ggml_tensor * inp_stripped = xdna_strip_view(inp);
         if (inp_stripped != ffn_norm_out && inp != ffn_norm_out) continue;
-        if (trial.is_int8) continue;
+        if (trial.is_int8 && !tblock_w8a16_gate_tbl) continue;
         swiglu_anchor = j;
         sm = trial;
         break;
@@ -5765,19 +5784,23 @@ static std::string make_tblock_fused_cache_key(
     // _w8a16, so the split forces a clean cache miss between A.7 and B.
     const char * w8_tag = w8a16_ffn ? "_w8a16ffn" : (w8a16 ? "_w8a16" : "");
     if (num_layers > 1) {
-        // v3 = multi-layer packing with intermediate y_L exposed as output
-        // BO slots (required by the split Phase-C interleaved CPU/NPU
-        // dispatch). Pre-v3 N>1 bundles had y_L as scratch and corrupted
-        // CPU Phase-C downstream work; v3 bumps force a recompile.
+        // v5 = multi-layer packing + fdgemm_i8 4-row default (2026-04-20).
+        // v3 added y_L as output BO slots for Phase-C interleave.
+        // v5 bumps force a clean recompile so users pick up the 4-row
+        // fdgemm_i8 kernel without manually clearing the tblock cache.
         snprintf(buf, sizeof(buf),
-                 "tblock_fused_v3%s_N%d_S%ld_E%ld_H%ld_KV%ld_D%ld_F%ld_bf16_rope%d",
+                 "tblock_fused_v5%s_N%d_S%ld_E%ld_H%ld_KV%ld_D%ld_F%ld_bf16_rope%d",
                  w8_tag, num_layers,
                  (long)seq_bucket, (long)embed_dim,
                  (long)num_heads, (long)num_kv_heads, (long)head_dim,
                  (long)ffn_hidden_dim, rope_method_type);
     } else {
+        // v4 = single-layer + fdgemm_i8 4-row default (2026-04-20).
+        // v2 split x/angles into dynamic_input BO; v4 bumps so users
+        // pick up the 4-row fdgemm_i8 kernel (Phase B +26% prefill) on
+        // next run without manually clearing the tblock cache.
         snprintf(buf, sizeof(buf),
-                 "tblock_fused_v2%s_S%ld_E%ld_H%ld_KV%ld_D%ld_F%ld_bf16_rope%d",
+                 "tblock_fused_v4%s_S%ld_E%ld_H%ld_KV%ld_D%ld_F%ld_bf16_rope%d",
                  w8_tag,
                  (long)seq_bucket, (long)embed_dim,
                  (long)num_heads, (long)num_kv_heads, (long)head_dim,
@@ -7173,6 +7196,38 @@ static bool tblock_fused_upload_w8a16_weight(
                 B_kn[(size_t)k * (size_t)N + (size_t)nn] = v;
             }
         }
+    } else if (weight->type == GGML_TYPE_Q8_0) {
+        // Q8_0 block-32: per (row, k-block) = [fp16 scale, 32 int8].
+        // Dequant-then-repack: our packer will re-derive scales from the
+        // dequanted fp32 and re-emit int8. Both use symmetric block-32
+        // quant with max(|vals|)/127, so this round-trip is numerically
+        // identical to the original Q8_0 int8 bytes (up to fp32 rounding).
+        // Real benefit: loads Q8_0 GGUFs directly (half the on-disk size
+        // of F16) instead of requiring an F16 dequantized copy.
+        constexpr int QK8_0 = 32;
+        const size_t blk_bytes = sizeof(ggml_fp16_t) + (size_t)QK8_0;
+        if (K % QK8_0 != 0) {
+            GGML_LOG_ERROR("ggml-xdna: fused tblock W8A16 Q8_0 weight '%s' K=%ld "
+                           "not multiple of QK8_0=32\n", name, (long)K);
+            return false;
+        }
+        const int64_t num_blks_per_row = K / QK8_0;
+        const size_t row_stride = (size_t)num_blks_per_row * blk_bytes;
+        const uint8_t * src = (const uint8_t *)weight->data;
+        for (int64_t nn = 0; nn < N; nn++) {
+            const uint8_t * row = src + (size_t)nn * row_stride;
+            for (int64_t g = 0; g < num_blks_per_row; g++) {
+                const uint8_t * blk = row + (size_t)g * blk_bytes;
+                ggml_fp16_t dh;
+                memcpy(&dh, blk, sizeof(dh));
+                const float d = ggml_fp16_to_fp32(dh);
+                const int8_t * qs = (const int8_t *)(blk + sizeof(ggml_fp16_t));
+                for (int j = 0; j < QK8_0; j++) {
+                    const int64_t k = g * QK8_0 + j;
+                    B_kn[(size_t)k * (size_t)N + (size_t)nn] = d * (float)qs[j];
+                }
+            }
+        }
     } else {
         GGML_LOG_ERROR("ggml-xdna: fused tblock W8A16 weight '%s' unsupported dtype %d\n",
                        name, (int)weight->type);
@@ -7243,6 +7298,33 @@ static bool tblock_fused_upload_gemm_weight(
         for (int64_t k = 0; k < K; k++) {
             for (int64_t nn = 0; nn < N; nn++) {
                 dst[k * N + nn] = src[nn * K + k];
+            }
+        }
+    } else if (weight->type == GGML_TYPE_Q8_0) {
+        // Q8_0 → bf16 dequant + transpose (ggml (N, K) → packer (K, N)).
+        constexpr int QK8_0 = 32;
+        const size_t blk_bytes = sizeof(ggml_fp16_t) + (size_t)QK8_0;
+        if (K % QK8_0 != 0) {
+            GGML_LOG_ERROR("ggml-xdna: fused tblock bf16 weight '%s' K=%ld not "
+                           "multiple of QK8_0=32\n", name, (long)K);
+            return false;
+        }
+        const int64_t num_blks_per_row = K / QK8_0;
+        const size_t row_stride = (size_t)num_blks_per_row * blk_bytes;
+        const uint8_t * src = (const uint8_t *)weight->data;
+        for (int64_t nn = 0; nn < N; nn++) {
+            const uint8_t * row = src + (size_t)nn * row_stride;
+            for (int64_t g = 0; g < num_blks_per_row; g++) {
+                const uint8_t * blk = row + (size_t)g * blk_bytes;
+                ggml_fp16_t dh;
+                memcpy(&dh, blk, sizeof(dh));
+                const float d = ggml_fp16_to_fp32(dh);
+                const int8_t * qs = (const int8_t *)(blk + sizeof(ggml_fp16_t));
+                for (int j = 0; j < QK8_0; j++) {
+                    const int64_t k = g * QK8_0 + j;
+                    const float v = d * (float)qs[j];
+                    dst[k * N + nn] = xdna_f32_to_bf16_bits(v);
+                }
             }
         }
     } else {
@@ -9576,14 +9658,21 @@ static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const s
             if (src0->ne[2] != 1 || src0->ne[3] != 1) return false;
             if (src1->ne[2] != 1 || src1->ne[3] != 1) return false;
             if (src1->type != GGML_TYPE_F32) return false;
-            // Q8_0 weights are accepted only when the fused INT8 SwiGLU gate is
-            // active; the dispatch layer never runs a bare Q8_0 MUL_MAT on the
-            // NPU (no standalone gemv_int8 wiring yet) — it relies on the CPU
-            // fallback inside graph_compute. Claiming it here keeps the
-            // scheduler from splitting the FFN pattern across backends.
+            // Q8_0 weights are accepted when any Q8_0-capable composite gate
+            // is active:
+            //   - XDNA_ENABLE_SWIGLU_INT8  → standalone int8 SwiGLU dispatch
+            //   - tblock+W8A16             → fused tblock consumes Q8_0 via
+            //     tblock_fused_upload_w8a16_weight's Q8_0 branch.
+            // The dispatch layer never runs a bare Q8_0 MUL_MAT on the NPU
+            // (no standalone gemv_int8 wiring yet) — bare Q8_0 mm falls back
+            // to CPU inside graph_compute. Claiming here keeps the scheduler
+            // from splitting the attention / FFN pattern across backends.
             static const bool int8_ok = getenv("XDNA_ENABLE_SWIGLU_INT8") != NULL;
+            static const bool tblock_w8a16_ok =
+                (getenv("XDNA_ENABLE_TBLOCK_FUSED") != NULL) &&
+                (getenv("XDNA_ENABLE_TBLOCK_FUSED_W8A16") != NULL);
             if (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_BF16 || src0->type == GGML_TYPE_F16) return true;
-            if (int8_ok && src0->type == GGML_TYPE_Q8_0) return true;
+            if ((int8_ok || tblock_w8a16_ok) && src0->type == GGML_TYPE_Q8_0) return true;
             return false;
         }
 
