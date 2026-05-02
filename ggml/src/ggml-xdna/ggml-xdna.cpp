@@ -3631,6 +3631,285 @@ static void xdna_plan_qkv(const struct ggml_cgraph * cgraph, xdna_qkv_plan * out
     }
 }
 
+// ============================================================================
+// Decode GEMV batcher — collects standalone MUL_MAT M=1 dispatches and
+// flushes them as a single xrt::runlist per (K,N) shape group.
+//
+// In decode mode, each transformer layer has an O projection GEMV that is
+// dispatched individually. With 32 layers, that's 32 separate xrt::run
+// submissions (~1-5ms each). The batcher collects these and dispatches
+// them as one runlist per shape group, reducing host-side overhead.
+//
+// Gate: XDNA_ENABLE_DECODE_BATCH=1 (requires XDNA_ENABLE_GEMV=1 for
+// standalone GEMV dispatch).
+// ============================================================================
+
+struct xdna_decode_batcher {
+    struct batch_item {
+        xdna_kernel_entry * entry;  // kernel for this (K,N) shape
+        struct ggml_tensor * dst;   // MUL_MAT output tensor (has src[0]=weight, src[1]=input)
+        int node_idx;               // cgraph index (for debug logging)
+    };
+
+    std::vector<batch_item> items;
+    bool enabled;
+
+    xdna_decode_batcher() : enabled(getenv("XDNA_ENABLE_DECODE_BATCH") != NULL) {}
+
+    bool empty() const { return items.empty(); }
+    bool is_enabled() const { return enabled; }
+
+    void add(xdna_kernel_entry * entry, struct ggml_tensor * dst, int idx) {
+        if (!enabled) return;
+        items.push_back({entry, dst, idx});
+    }
+
+    // Dispatch all collected GEMVs as xrt::runlists, one per (K,N) shape group.
+    // Falls back to individual dispatch on failure.
+    void flush(ggml_backend_xdna_context * ctx) {
+        if (items.empty()) return;
+
+        static const bool prof = getenv("XDNA_DEBUG") != NULL;
+        using clk = std::chrono::steady_clock;
+
+        // Group items by (K,N) shape — same shape shares kernel/hw_ctx.
+        struct shape_key {
+            int64_t K, N;
+            bool operator==(const shape_key & o) const { return K == o.K && N == o.N; }
+        };
+        struct shape_hash {
+            size_t operator()(const shape_key & k) const {
+                size_t h1 = std::hash<int64_t>{}(k.K);
+                size_t h2 = std::hash<int64_t>{}(k.N);
+                return h1 ^ (h2 * 0x9e3779b97f4a7c15ULL + 0x9e3779b9 + (h1 << 6) + (h1 >> 2));
+            }
+        };
+        std::unordered_map<shape_key, std::vector<batch_item *>, shape_hash> groups;
+        for (auto & item : items) {
+            int64_t K = item.dst->src[0]->ne[0];
+            int64_t N = item.dst->src[0]->ne[1];
+            groups[{K, N}].push_back(&item);
+        }
+
+        auto t_flush_s = clk::now();
+        int n_dispatched = 0;
+
+        for (auto & [key, group_entries] : groups) {
+            const int batch_n = (int)group_entries.size();
+            xdna_kernel_entry * entry = group_entries[0]->entry;
+
+            // Single item: dispatch via existing direct path (less overhead).
+            if (batch_n == 1) {
+                try {
+                    ggml_backend_xdna_mul_mat_gemv(ctx, group_entries[0]->dst);
+                    n_dispatched++;
+                } catch (const std::exception & e) {
+                    GGML_LOG_ERROR("ggml-xdna: decode_batch single dispatch failed: %s\n", e.what());
+                }
+                continue;
+            }
+
+            // Multiple same-shape GEMVs: build one xrt::runlist.
+            try {
+                // Per-item BOs — must outlive rl.execute()/rl.wait().
+                std::vector<xrt::bo> in_bos;
+                std::vector<xrt::bo> out_bos;
+                std::vector<xrt::bo *> w_ptrs;
+                in_bos.reserve(batch_n);
+                out_bos.reserve(batch_n);
+                w_ptrs.reserve(batch_n);
+
+                auto t_dma_s = clk::now();
+
+                for (int j = 0; j < batch_n; j++) {
+                    auto * item = group_entries[j];
+                    const ggml_tensor * src0 = item->dst->src[0];  // weight
+                    const ggml_tensor * src1 = item->dst->src[1];  // input
+                    const int64_t K = src0->ne[0];
+                    const int64_t N = src0->ne[1];
+                    const size_t mat_elems = (size_t)(N * K);
+
+                    // Weight BO from cache (immutable after first load).
+                    xrt::bo * w_bo = nullptr;
+                    {
+                        std::lock_guard<std::mutex> lock(*entry->b_bo_mutex);
+                        auto it = entry->b_bo_cache.find(src0->data);
+                        if (it == entry->b_bo_cache.end()) {
+                            size_t mat_bytes = mat_elems * sizeof(uint16_t);
+                            xrt::bo new_w(ctx->device, mat_bytes,
+                                          xrt::bo::flags::host_only,
+                                          entry->kernel.group_id(3));
+                            if (src0->type == GGML_TYPE_F32) {
+                                f32_to_bf16((const float *)src0->data,
+                                            (uint16_t *)new_w.map<void*>(), mat_elems);
+                            } else {
+                                memcpy(new_w.map<void*>(), src0->data, mat_bytes);
+                            }
+                            new_w.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                            auto [ins, _] = entry->b_bo_cache.emplace(src0->data, std::move(new_w));
+                            w_bo = &ins->second;
+                            if (prof) {
+                                fprintf(stderr,
+                                    "ggml-xdna: decode_batch warm weight K=%ld N=%ld %s (%zu cached)\n",
+                                    (long)K, (long)N,
+                                    src0->name[0] ? src0->name : "?",
+                                    entry->b_bo_cache.size());
+                                fflush(stderr);
+                            }
+                        } else {
+                            w_bo = &it->second;
+                        }
+                    }
+                    w_ptrs.push_back(w_bo);
+
+                    // Per-item input BO.
+                    size_t vec_bytes = (size_t)K * sizeof(uint16_t);
+                    in_bos.emplace_back(ctx->device, vec_bytes,
+                                        xrt::bo::flags::host_only,
+                                        entry->kernel.group_id(4));
+                    if (src1->type == GGML_TYPE_F32) {
+                        f32_to_bf16((const float *)src1->data,
+                                    (uint16_t *)in_bos.back().map<void*>(),
+                                    (size_t)K);
+                    } else {
+                        memcpy(in_bos.back().map<void*>(), src1->data, vec_bytes);
+                    }
+                    in_bos.back().sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+                    // Per-item output BO.
+                    size_t out_bytes = (size_t)N * sizeof(uint16_t);
+                    out_bos.emplace_back(ctx->device, out_bytes,
+                                         xrt::bo::flags::host_only,
+                                         entry->kernel.group_id(5));
+                }
+                auto t_dma_e = clk::now();
+
+                // Build runlist.
+                auto t_build_s = clk::now();
+                xrt::runlist rl(entry->hw_ctx);
+                for (int j = 0; j < batch_n; j++) {
+                    xrt::run r(entry->kernel);
+                    r.set_arg(0, 3u);  // GEMV opcode
+                    r.set_arg(1, entry->insts_bo);
+                    r.set_arg(2, (uint32_t)entry->insts.size());
+                    r.set_arg(3, *w_ptrs[j]);
+                    r.set_arg(4, in_bos[j]);
+                    r.set_arg(5, out_bos[j]);
+                    rl.add(std::move(r));
+                }
+                auto t_build_e = clk::now();
+
+                // Execute runlist (all GEMVs in one firmware submission).
+                auto t_exec_s = clk::now();
+                rl.execute();
+                auto t_exec_e = clk::now();
+                rl.wait();
+                auto t_wait_e = clk::now();
+
+                // Sync outputs back and convert bf16 → f32.
+                auto t_out_s = clk::now();
+                for (int j = 0; j < batch_n; j++) {
+                    const int64_t N = group_entries[j]->dst->src[0]->ne[1];
+                    out_bos[j].sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+                    bf16_to_f32((const uint16_t *)out_bos[j].map<void*>(),
+                                (float *)group_entries[j]->dst->data,
+                                (size_t)N);
+                }
+                auto t_out_e = clk::now();
+
+                n_dispatched += batch_n;
+
+                if (prof) {
+                    auto us = [](clk::time_point a, clk::time_point b) {
+                        return (long)std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
+                    };
+                    fprintf(stderr,
+                        "ggml-xdna: decode_batch K=%ld N=%ld count=%d "
+                        "dma=%ld build=%ld exec=%ld wait=%ld out=%ld total=%ld us\n",
+                        (long)key.K, (long)key.N, batch_n,
+                        us(t_dma_s, t_dma_e),
+                        us(t_build_s, t_build_e),
+                        us(t_exec_s, t_exec_e),
+                        us(t_exec_e, t_wait_e),
+                        us(t_out_s, t_out_e),
+                        us(t_dma_s, t_out_e));
+                    fflush(stderr);
+                }
+            } catch (const std::exception & e) {
+                GGML_LOG_ERROR("ggml-xdna: decode_batch runlist failed "
+                               "(K=%ld N=%ld count=%d): %s, falling back to individual dispatch\n",
+                               (long)key.K, (long)key.N, batch_n, e.what());
+                // Fallback: dispatch each item individually.
+                for (int j = 0; j < batch_n; j++) {
+                    try {
+                        ggml_backend_xdna_mul_mat_gemv(ctx, group_entries[j]->dst);
+                        n_dispatched++;
+                    } catch (const std::exception & e2) {
+                        GGML_LOG_ERROR("ggml-xdna: decode_batch fallback also failed: %s\n", e2.what());
+                    }
+                }
+            }
+        }
+
+        if (prof && n_dispatched > 0) {
+            auto t_flush_e = clk::now();
+            auto flush_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                t_flush_e - t_flush_s).count();
+            fprintf(stderr,
+                "ggml-xdna: decode_batch flush: %d GEMVs in %zu runlists, "
+                "%ld us total, %d dispatches saved\n",
+                n_dispatched, groups.size(), (long)flush_us,
+                n_dispatched - (int)groups.size());
+            fflush(stderr);
+        }
+
+        clear();
+    }
+
+    void clear() { items.clear(); }
+};
+
+// Pre-scan the graph for standalone decode GEMVs (MUL_MAT with M==1) that
+// are shape-dispatchable and not already consumed by QKV or SwiGLU matchers.
+// Returns node indices eligible for decode_batch collection.
+static std::unordered_set<int> xdna_plan_decode_batch(
+    const struct ggml_cgraph * cgraph,
+    const xdna_qkv_plan & qkv_plan)
+{
+    static const bool dbg = getenv("XDNA_DEBUG") != NULL;
+    std::unordered_set<int> batchable;
+
+    // Indices already consumed by QKV.
+    std::unordered_set<int> consumed = qkv_plan.skip_indices;
+    for (auto & [idx, _] : qkv_plan.triple_at) {
+        consumed.insert(idx);
+    }
+
+    int n_decode_gemv = 0;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const struct ggml_tensor * node = cgraph->nodes[i];
+        if (node->op != GGML_OP_MUL_MAT) continue;
+        const int64_t M = node->src[1]->ne[1];
+        if (M != 1) continue;
+        n_decode_gemv++;
+        const int64_t K = node->src[0]->ne[0];
+        const int64_t N = node->src[0]->ne[1];
+        if (!xdna_shape_dispatchable_gemv(K, N)) continue;
+        if (consumed.count(i)) continue;
+        batchable.insert(i);
+    }
+
+    if (dbg) {
+        fprintf(stderr,
+            "ggml-xdna: decode_batch plan: %d decode GEMVs, %zu batchable "
+            "(QKV consumed %zu indices)\n",
+            n_decode_gemv, batchable.size(), consumed.size());
+        fflush(stderr);
+    }
+
+    return batchable;
+}
+
 // Matched SwiGLU pattern. Populated by xdna_try_match_swiglu.
 struct xdna_swiglu_match {
     struct ggml_tensor * gate_mm;    // node[i]   — MUL_MAT(gate_w, input)
@@ -8602,6 +8881,14 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
         }
     }
 
+    // Pre-scan for decode GEMV batching. Identifies standalone MUL_MAT M=1
+    // nodes eligible for runlist batching (gated by XDNA_ENABLE_DECODE_BATCH).
+    xdna_decode_batcher decode_batcher;
+    std::unordered_set<int> decode_batch_indices;
+    if (decode_batcher.is_enabled()) {
+        decode_batch_indices = xdna_plan_decode_batch(cgraph, qkv_plan);
+    }
+
     // Bulk pre-warm all attention-prefill weights for this cgraph before the
     // per-node loop walks it serially. Without this, each of the N attention
     // layers' first dispatch pays ~44ms of host-side transpose+DMA on the
@@ -8632,6 +8919,17 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
     int cpu_run_start = -1;
     for (int i = 0; i < n; i++) {
         struct ggml_tensor * node = cgraph->nodes[i];
+
+        // Determine if this node is a batchable decode GEMV. If NOT, flush
+        // any pending batched GEMVs first — the current node may depend on
+        // their results (sequential graph dependency).
+        const bool is_batchable_gemv = decode_batcher.is_enabled()
+            && decode_batch_indices.count(i)
+            && node->op == GGML_OP_MUL_MAT
+            && node->src[1]->ne[1] == 1;
+        if (!is_batchable_gemv && !decode_batcher.empty()) {
+            decode_batcher.flush(ctx);
+        }
 
         // QKV triple: dispatch Q+K+V as one xrt::runlist at Q's position.
         // K/V indices come later in the linear walk and are in skip_indices.
@@ -9334,6 +9632,37 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
         }
 
         if (xdna_node_npu_dispatchable(node)) {
+            // Batchable decode GEMV: collect in the batcher instead of
+            // dispatching individually. The batcher will flush these as
+            // a single xrt::runlist when a non-batchable node is reached.
+            if (is_batchable_gemv) {
+                if (cpu_run_start >= 0) {
+                    ggml_status s = xdna_delegate_range(ctx, cgraph, cpu_run_start, i);
+                    if (s != GGML_STATUS_SUCCESS) return s;
+                    cpu_run_start = -1;
+                }
+                // Ensure kernel is compiled and entry is loaded.
+                const int64_t K = node->src[0]->ne[0];
+                const int64_t N = node->src[0]->ne[1];
+                int num_cols = 4;
+                std::string cache_key = make_cache_key(XDNA_OP_GEMV, 1, K, N, "bf16", num_cols);
+                if (ensure_compiled(ctx, cache_key, XDNA_OP_GEMV, 1, K, N, "bf16", num_cols)) {
+                    xdna_kernel_entry * entry = get_or_load_kernel(ctx, cache_key, XDNA_OP_GEMV, 1, K, N);
+                    if (entry) {
+                        decode_batcher.add(entry, node, i);
+                        continue;
+                    }
+                }
+                // Fallback: if compile/load failed, dispatch individually.
+                if (debug) {
+                    fprintf(stderr, "ggml-xdna: decode_batch fallback individual @%d\n", i);
+                    fflush(stderr);
+                }
+            }
+            // Flush any pending batched GEMVs before individual dispatch.
+            if (!decode_batcher.empty()) {
+                decode_batcher.flush(ctx);
+            }
             // Flush any pending CPU run up to this point.
             if (cpu_run_start >= 0) {
                 ggml_status s = xdna_delegate_range(ctx, cgraph, cpu_run_start, i);
@@ -9348,6 +9677,11 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
         // View-only nodes are pure metadata — they still need to be in the
         // CPU run (CPU treats them as no-ops), so we just extend the range.
         if (cpu_run_start < 0) cpu_run_start = i;
+    }
+
+    // Flush any remaining batched decode GEMVs before the trailing CPU run.
+    if (!decode_batcher.empty()) {
+        decode_batcher.flush(ctx);
     }
 
     // Flush trailing CPU run.
