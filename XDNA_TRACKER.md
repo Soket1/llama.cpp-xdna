@@ -10,13 +10,13 @@
 ## P1: Decode Latency (9 → 30+ t/s)
 
 ### 1.1 xrt::runlist Batching
-- [ ] Аудит текущего dispatch path — найти все точки где `xrt::run` вызывается поодиночке
-- [ ] Реализовать `xdna_runlist_builder` — собирает несколько kernel dispatches в один `xrt::runlist`
-- [ ] Batch для decode layer: Q + K + V + O + gate + up + down (7 ops → 1 submit)
-- [ ] Batch для SwiGLU decode: gate GEMV + SiLU + eltwise + down GEMV (4 ops → 1 submit)
-- [ ] Batch для QKV: уже сделано ✅ (проверить корректность)
+- [x] Аудит текущего dispatch path — найти все точки где `xrt::run` вызывается поодиночке
+- [x] Реализовать `xdna_decode_batcher` — собирает несколько kernel dispatches в один `xrt::runlist`
+- [ ] Batch для decode layer: Q + K + V + O + gate + up + down (7 ops → 1 submit) — требует cross-layer restructuring
+- [x] Batch для SwiGLU decode: gate GEMV + SiLU + eltwise + down GEMV (4 ops → 1 submit)
+- [x] Batch для QKV: уже сделано ✅ (проверить корректность)
 - [ ] Benchmark: измерить overhead до/после на StrixHalo
-- [ ] Файлы: `ggml-xdna.cpp` → `ggml_backend_xdna_mul_mat_*`, `graph_compute()`
+- [x] Файлы: `ggml-xdna.cpp` → `ggml_backend_xdna_mul_mat_*`, `graph_compute()`
 
 ### 1.2 Persistent Command Buffers
 - [ ] Выделить `xrt::run` объекты при загрузке модели (один раз на shape)
