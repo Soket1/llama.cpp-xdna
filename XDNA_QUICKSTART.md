@@ -2,6 +2,8 @@
 
 Руководство по запуску llama.cpp с бэкендом ggml-xdna на AMD Ryzen AI процессорах с NPU (XDNA/XDNA2).
 
+> **Платформы:** [Linux](#linux) | [Windows](#windows)
+
 ## Поддерживаемое оборудование
 
 | Поколение | NPU | AIE Columns | Чипы |
@@ -11,75 +13,176 @@
 
 > **Примечание:** Текущий код валидирован преимущественно на **XDNA2 (8 columns)**. XDNA1 (4 columns) имеет ограниченную поддержку.
 
-## Предварительные требования
+### Квантизация по поколениям
 
-### 1. AMD XRT (Xilinx Runtime)
+| Поколение | W8A16 | W4ABF16 | W8A8 |
+|-----------|-------|---------|------|
+| XDNA 1 (Phoenix, Hawk Point) | ❌ | ✅ | ❌ |
+| XDNA 2 (Strix, Strix Halo) | ✅ | ✅ | ✅ |
 
-XRT — это рантайм для доступа к NPU. Должен быть установлен и настроен.
+---
+
+## Linux
+
+### Предварительные требования
+
+#### 1. Ядро Linux
+
+NPU требует модуль ядра `amdxdna`. Минимальная версия: **Linux 6.14** (встроен в mainline).
 
 ```bash
-# Установка XRT (если ещё не установлен)
+# Проверить версию ядра
+uname -r  # должно быть >= 6.14
+
+# Проверить что модуль загрушен
+lsmod | grep amdxdna
+
+# Если не загружен:
+sudo modprobe amdxdna
+
+# Проверить что NPU виден:
+xrt-smi examine
+```
+
+> **Fedora 41+, Ubuntu 25.04+** — ядро 6.14+ уже в репозиториях.
+> Для более старых дистрибутивов — сборка ядра из source с патчем amdxdna.
+
+#### 2. AMD XRT (Xilinx Runtime)
+
+XRT — рантайм для доступа к NPU.
+
+```bash
+# Установка XRT
 # Инструкции: https://github.com/amd/xdna-driver
 
-# Проверка установки
+# Проверка
 ls /opt/xilinx/xrt/include/xrt/xrt_device.h
 ls /opt/xilinx/xrt/lib/libxrt_core.so
 
-# Настройка окружения (добавить в ~/.bashrc)
+# Настройка (добавить в ~/.bashrc)
 source /opt/xilinx/xrt/setup.sh
 ```
 
-### 2. IRON (AMD NPU Operator Library)
+#### 3. IRON (AMD NPU Operator Library)
 
 IRON нужен **только на этапе компиляции кернелов** (xclbin). Не нужен для запуска с предскомпилированным кешем.
 
 ```bash
-# Клонирование IRON
 git clone https://github.com/amd/IRON.git
 cd IRON
 pip install -e .
 ```
 
-### 3. Python зависимости (для compile.py)
+#### 4. Python зависимости
 
 ```bash
 pip install numpy
 # IRON устанавливает остальные зависимости (aie, mlir, etc.)
 ```
 
-## Сборка
-
-### Клонирование форка
+### Сборка (Linux)
 
 ```bash
 git clone --branch ggml-xdna https://github.com/albiol2004/llama.cpp.git
 cd llama.cpp
-```
 
-### Сборка с CMake
-
-```bash
-# Убедитесь что XRT настроен
 source /opt/xilinx/xrt/setup.sh
 
-# Сборка
 cmake -B build -DGGML_XDNA=ON
 cmake --build build --config Release -j$(nproc)
 ```
 
-> **Примечание:** CMake автоматически ищет XRT в `/opt/xilinx/xrt/`. Если XRT установлен в другое место, укажите:
-> ```bash
-> cmake -B build -DGGML_XDNA=ON -DXRT_INCLUDE_DIR=/path/to/xrt/include -DXRT_CORE_LIB=/path/to/libxrt_core.so
-> ```
-
-### Проверка сборки
-
+Если XRT установлен не в `/opt/xilinx/xrt/`:
 ```bash
-# Должен показать ggml-xdna в списке бэкендов
-./build/bin/llama-cli --list-devices
+cmake -B build -DGGML_XDNA=ON \
+  -DXRT_INCLUDE_DIR=/path/to/xrt/include \
+  -DXRT_CORE_LIB=/path/to/libxrt_core.so
 ```
 
-## Запуск
+---
+
+## Windows
+
+### Предварительные требования
+
+#### 1. NPU Driver
+
+NPU драйвер для Windows поставляется через **Windows Update**. На Ryzen AI ноутбуках обычно уже установлен.
+
+```powershell
+# Проверить в Device Manager:
+# → System devices → AMD NPU / XDNA Device
+
+# Или через PowerShell:
+Get-PnpDevice | Where-Object { $_.FriendlyName -match "NPU|XDNA" }
+```
+
+Если драйвер не установлен — обновите Windows или скачайте с [AMD Support](https://www.amd.com/en/support).
+
+#### 2. AMD XRT для Windows
+
+```powershell
+# Скачать XRT installer с:
+# https://github.com/amd/xdna-driver/releases
+
+# Или через Ryzen AI SDK:
+# https://ryzenai.docs.amd.com/
+
+# Проверить:
+& "C:\Program Files\AMD\XRT\bin\xrt-smi.exe" examine
+```
+
+#### 3. Visual Studio Build Tools
+
+Нужен MSVC компилятор:
+
+```powershell
+# Установить Visual Studio 2022 Build Tools
+# или Visual Studio 2022 Community с компонентами:
+#   - Desktop development with C++
+#   - C++ CMake tools for Windows
+```
+
+#### 4. Python (для compile.py)
+
+```powershell
+# Python 3.10+ с pip
+python --version
+pip install numpy
+# IRON: pip install -e path\to\IRON
+```
+
+### Сборка (Windows)
+
+```powershell
+git clone --branch ggml-xdna https://github.com/albiol2004/llama.cpp.git
+cd llama.cpp
+
+# В Developer PowerShell for VS 2022:
+cmake -B build -DGGML_XDNA=ON
+cmake --build build --config Release
+
+# Или с явными путями к XRT:
+cmake -B build -DGGML_XDNA=ON `
+  -DXRT_INCLUDE_DIR="C:\Program Files\AMD\XRT\include" `
+  -DXRT_CORE_LIB="C:\Program Files\AMD\XRT\lib\xrt_core.lib"
+```
+
+### Запуск (Windows)
+
+```powershell
+.\build\bin\Release\llama-cli.exe -m model.gguf -p "Hello" -n 50
+
+# С HF моделью
+.\build\bin\Release\llama-cli.exe -hf ggml-org/gemma-3-1b-it-GGUF -p "Hello" -n 50
+
+# Сервер
+.\build\bin\Release\llama-server.exe -hf ggml-org/gemma-3-1b-it-GGUF
+```
+
+---
+
+## Запуск (общий)
 
 ### Базовый запуск
 
@@ -138,31 +241,35 @@ XDNA_ENABLE_TRANSFORMER_BLOCK=1 \
 ./build/bin/llama-cli -m model.gguf -p "Hello" -n 50
 ```
 
+На Windows:
+```powershell
+$env:XDNA_ENABLE_SWIGLU=1
+$env:XDNA_ENABLE_QKV=1
+$env:XDNA_ENABLE_SWIGLU_PREFILL=1
+$env:XDNA_ENABLE_ATTENTION_PREFILL=1
+$env:XDNA_ENABLE_TRANSFORMER_BLOCK=1
+.\build\bin\Release\llama-cli.exe -m model.gguf -p "Hello" -n 50
+```
+
 ## Диагностика
 
 ### Отладочный вывод
 
 ```bash
-# Общий debug — статистика dispatch, match counts, overhead
+# Linux
 export XDNA_DEBUG=1
 ./build/bin/llama-cli -m model.gguf -p "Hello" -n 10
 
-# Вывод покажет:
-# ggml-xdna: graph_compute n_nodes=1234 mul_mat=456 npu_dispatchable=389
-# ggml-xdna: swiglu_window=32 swiglu_match=32
-# ggml-xdna: QKV plan: 32 triples (64 skip nodes)
+# Windows PowerShell
+$env:XDNA_DEBUG=1
+.\build\bin\Release\llama-cli.exe -m model.gguf -p "Hello" -n 10
 ```
 
-### Пример вывода с XDNA_DEBUG
-
+Вывод покажет:
 ```
-ggml-xdna: graph_compute n_nodes=1856 mul_mat=448 npu_dispatchable=448
-           glu=128 swiglu=128 swiglu_window=32 swiglu_match=32
-           attn_window=0 attn_match=0 tblock_window=0 tblock_match=0
+ggml-xdna: graph_compute n_nodes=1234 mul_mat=456 npu_dispatchable=389
+ggml-xdna: swiglu_window=32 swiglu_match=32
 ggml-xdna: QKV plan: 32 triples (64 skip nodes)
-ggml-xdna: warm gemv matrix K=2048 N=2048 weight=w_q (1 cached)
-ggml-xdna: qkv_prof K=2048 Nq=2048 Nk=512 Nv=512 in=15us rl_build=8us
-           rl_exec=120us rl_wait=85us out=12us total=240us
 ```
 
 ### Профилирование
@@ -177,13 +284,16 @@ python ggml/src/ggml-xdna/tools/xrt_trace_to_chrome.py --input xrt_trace.log --o
 
 ```bash
 # Кеш xclbin хранится в:
-ls ~/.cache/ggml-xdna/xclbin/
+# Linux:   ~/.cache/ggml-xdna/xclbin/
+# Windows: %LOCALAPPDATA%\ggml-xdna\xclbin\
 
-# Переопределить директорию кеша:
-export GGML_XDNA_CACHE_DIR=/path/to/cache
+# Переопределить:
+export GGML_XDNA_CACHE_DIR=/path/to/cache          # Linux
+$env:GGML_XDNA_CACHE_DIR="C:\path\to\cache"        # Windows
 
-# Очистить кеш (перекомпилирует все кернелы):
-rm -rf ~/.cache/ggml-xdna/xclbin/
+# Очистить (перекомпилирует все кернелы):
+rm -rf ~/.cache/ggml-xdna/xclbin/                   # Linux
+Remove-Item -Recurse "$env:LOCALAPPDATA\ggml-xdna"  # Windows
 ```
 
 ## Рекомендуемые модели
@@ -224,23 +334,27 @@ rm -rf ~/.cache/ggml-xdna/xclbin/
 ### "XRT not found"
 
 ```bash
-# Решение: установить XRT и source setup.sh
+# Linux
 source /opt/xilinx/xrt/setup.sh
-# Или указать пути явно:
+# Или:
 export XILINX_XRT=/opt/xilinx/xrt
+
+# Windows — проверить что XRT установлен:
+& "C:\Program Files\AMD\XRT\bin\xrt-smi.exe" examine
 ```
 
 ### "No device found" / "XRT device invalid"
 
 ```bash
-# Проверить что NPU виден:
+# Linux:
 xrt-smi examine
-# Должен показать NPU device
-
-# Если не виден — проверить драйвер:
 lsmod | grep amdxdna
-# Если не загружен:
 sudo modprobe amdxdna
+
+# Windows:
+# Device Manager → System devices → AMD NPU / XDNA Device
+# Если нет — обновите Windows Update или установите драйвер с AMD Support
+& "C:\Program Files\AMD\XRT\bin\xrt-smi.exe" examine
 ```
 
 ### "compile.py failed" / "IRON not found"
@@ -250,12 +364,26 @@ sudo modprobe amdxdna
 pip install -e /path/to/IRON
 
 # Или использовать предкомпилированный кеш (если есть)
-export GGML_XDNA_CACHE_DIR=/path/to/precompiled/cache
+export GGML_XDNA_CACHE_DIR=/path/to/precompiled/cache          # Linux
+$env:GGML_XDNA_CACHE_DIR="C:\precompiled\cache"                # Windows
 ```
 
 ### Медленный первый запуск
 
 Первый запуск компилирует xclbin кернелы для конкретных shape модели. Это занимает 1-5 минут. Последние запуски используют кеш (~секунды).
+
+### Windows: "VCRUNTIME140.dll not found"
+
+Установите [Visual C++ Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe).
+
+### Windows: "xrt-smi не найден"
+
+```powershell
+# Добавить XRT в PATH:
+$env:PATH += ";C:\Program Files\AMD\XRT\bin"
+# Или полный путь:
+& "C:\Program Files\AMD\XRT\bin\xrt-smi.exe" examine
+```
 
 ---
 
