@@ -1114,6 +1114,14 @@ static void ggml_backend_xdna_mul_mat_gemm(ggml_backend_xdna_context * ctx, stru
         return;
     }
 
+    // [INT8 GEMM] Persistent weight scale cache: src0->data → per-tensor scale.
+    // Needed because the scale is computed once during weight BO creation but
+    // must be applied on every dispatch for i32→f32 dequantization.
+    // Keyed identically to b_bo_cache (by weight data pointer).
+    // Safe as static (not thread_local): ggml graph_compute dispatches
+    // MUL_MAT nodes sequentially on a single thread.
+    static std::unordered_map<const void *, float> s_wt_scale_cache;
+
     try {
         size_t a_elems = M * K;
         size_t b_elems = N * K;
@@ -1160,7 +1168,6 @@ static void ggml_backend_xdna_mul_mat_gemm(ggml_backend_xdna_context * ctx, stru
         // [INT8 GEMM] Q8_0 weights → repack to per-tensor int8 in [K,N] layout.
         // Bf16 path: transpose + bf16 convert as before.
         xrt::bo * b_bo_ptr = nullptr;
-        float wt_scale = 1.0f;
         {
             std::lock_guard<std::mutex> lock(*entry->b_bo_mutex);
             auto it = entry->b_bo_cache.find(src0->data);
@@ -1171,11 +1178,11 @@ static void ggml_backend_xdna_mul_mat_gemm(ggml_backend_xdna_context * ctx, stru
                     // [INT8 GEMM] Repack Q8_0 → per-tensor int8 [K, N] row-major.
                     // xdna_repack_q8_0_to_gemm_int8 transposes ggml's (N, K) to (K, N)
                     // and returns the per-tensor scale factor.
-                    wt_scale = xdna_repack_q8_0_to_gemm_int8(
+                    float wt_scale = xdna_repack_q8_0_to_gemm_int8(
                         (const uint8_t *)src0->data, N, K,
                         (int8_t *)new_b.map<void*>());
-                    // Store weight scale in a side channel — we'll use it for
-                    // output dequantization. For now, log it.
+                    // Persist weight scale for future dequantization.
+                    s_wt_scale_cache[src0->data] = wt_scale;
                     fprintf(stderr, "ggml-xdna: INT8 GEMM weight scale=%.6f K=%lld N=%lld\n",
                             wt_scale, (long long)K, (long long)N);
                 } else if (src0->type == GGML_TYPE_F32) {
@@ -1221,6 +1228,9 @@ static void ggml_backend_xdna_mul_mat_gemm(ggml_backend_xdna_context * ctx, stru
             // INT8 GEMM produces: C[i,j] = sum_k(A_int8[i,k] * B_int8[k,j])
             // The true float value is: C_f32[i,j] = C_i32[i,j] * act_scale * wt_scale
             // Convert to f32 for ggml's downstream consumers.
+            float wt_scale = 1.0f;
+            auto sc_it = s_wt_scale_cache.find(src0->data);
+            if (sc_it != s_wt_scale_cache.end()) wt_scale = sc_it->second;
             const int32_t * c_i32 = (const int32_t *)entry->c_bo->map<void*>();
             float * dst_f32 = (float *)dst->data;
             float combined_scale = act_scale * wt_scale;
