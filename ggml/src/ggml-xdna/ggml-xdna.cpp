@@ -1042,10 +1042,18 @@ static xdna_kernel_entry * get_or_load_kernel(ggml_backend_xdna_context * ctx,
         return &it->second;
     }
 
-    // Load from disk
+    // Load from disk — try bundle layout first (combined.xclbin in subdir),
+    // fall back to flat layout (cache_key.xclbin + cache_key.insts in cache_dir).
     const std::string bundle_dir = ctx->cache_dir + "\\" + cache_key;
     std::string xclbin_path = bundle_dir + "\\combined.xclbin";
     std::string insts_path  = bundle_dir + "\\" + cache_key + ".insts";
+
+    // If bundle dir doesn't have combined.xclbin, try flat layout
+    // (ensure_compiled produces flat files for GEMV/GEMM).
+    if (!std::ifstream(xclbin_path).good()) {
+        xclbin_path = ctx->cache_dir + "\\" + cache_key + ".xclbin";
+        insts_path  = ctx->cache_dir + "\\" + cache_key + ".insts";
+    }
 
     static const bool dbg = getenv("XDNA_DEBUG") != NULL;
     if (dbg) {
