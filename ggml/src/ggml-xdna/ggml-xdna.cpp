@@ -1042,22 +1042,23 @@ static xdna_kernel_entry * get_or_load_kernel(ggml_backend_xdna_context * ctx,
         return &it->second;
     }
 
-    // Load from disk — try bundle layout first (combined.xclbin in subdir),
-    // fall back to flat layout (cache_key.xclbin + cache_key.insts in cache_dir).
-    const std::string bundle_dir = ctx->cache_dir + "\\" + cache_key;
-    std::string xclbin_path = bundle_dir + "\\combined.xclbin";
-    std::string insts_path  = bundle_dir + "\\" + cache_key + ".insts";
+    // Load from disk — try flat layout first (cache_key.xclbin + cache_key.insts
+    // in cache_dir), fall back to bundle layout (combined.xclbin in subdir).
+    // Flat layout is preferred because compile.py generates flat files for GEMV/GEMM.
+    std::string xclbin_path = ctx->cache_dir + "\\" + cache_key + ".xclbin";
+    std::string insts_path  = ctx->cache_dir + "\\" + cache_key + ".insts";
 
-    // If bundle dir doesn't have combined.xclbin, try flat layout
-    // (ensure_compiled produces flat files for GEMV/GEMM).
+    // If flat layout doesn't exist, try bundle layout
+    // (combined.xclbin in a subdirectory, used by fused kernels like SwiGLU/QKV).
     if (!std::ifstream(xclbin_path).good()) {
-        xclbin_path = ctx->cache_dir + "\\" + cache_key + ".xclbin";
-        insts_path  = ctx->cache_dir + "\\" + cache_key + ".insts";
+        const std::string bundle_dir = ctx->cache_dir + "\\" + cache_key;
+        xclbin_path = bundle_dir + "\\combined.xclbin";
+        insts_path  = bundle_dir + "\\" + cache_key + ".insts";
     }
 
     static const bool dbg = getenv("XDNA_DEBUG") != NULL;
     if (dbg) {
-        fprintf(stderr, "ggml-xdna: checking kernel bundle at %s\n", bundle_dir.c_str());
+        fprintf(stderr, "ggml-xdna: kernel '%s'\n", cache_key.c_str());
         fprintf(stderr, "ggml-xdna:   xclbin: %s (exists: %d)\n", xclbin_path.c_str(), std::ifstream(xclbin_path).good());
         fprintf(stderr, "ggml-xdna:   insts:  %s (exists: %d)\n", insts_path.c_str(), std::ifstream(insts_path).good());
     }
