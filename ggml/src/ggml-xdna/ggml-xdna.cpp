@@ -9809,7 +9809,7 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                 // Ensure kernel is compiled and entry is loaded.
                 const int64_t K = node->src[0]->ne[0];
                 const int64_t N = node->src[0]->ne[1];
-                int num_cols = 4;
+                int num_cols = ctx->num_cols;
                 std::string cache_key = make_cache_key(XDNA_OP_GEMV, 1, K, N, "bf16", num_cols);
                 if (ensure_compiled(ctx, cache_key, XDNA_OP_GEMV, 1, K, N, "bf16", num_cols)) {
                     xdna_kernel_entry * entry = get_or_load_kernel(ctx, cache_key, XDNA_OP_GEMV, 1, K, N);
