@@ -3333,7 +3333,10 @@ static xdna_qkv_entry * get_or_load_qkv_kernel(
         ctx->device.register_xclbin(entry.xclbin);
         auto uuid = entry.xclbin.get_uuid();
         entry.hw_ctx = xrt::hw_context(ctx->device, uuid);
-        entry.fused_kernel = xrt::kernel(entry.hw_ctx, "fused_qkv");
+        // IRON-generated kernels use the default "MLIR_AIE" kernel name
+        // (the function symbol in the ELF is always MLIR_AIE, regardless of
+        // --xclbin-kernel-name display label).
+        entry.fused_kernel = xrt::kernel(entry.hw_ctx, "MLIR_AIE");
 
         // Load insts
         entry.insts_data = read_binary_file(bundle_dir + "/qkv_main.insts");
