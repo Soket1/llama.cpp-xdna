@@ -3486,65 +3486,62 @@ static void ggml_backend_xdna_mul_mat_qkv(
 
         using clk = std::chrono::steady_clock;
         static const bool prof = getenv("XDNA_DEBUG") != NULL;
-        auto t_in_s = clk::now();
 
-        // Load fresh input activation (bf16-from-f32 convert).
-        if (src1_input->type == GGML_TYPE_F32) {
-            f32_to_bf16((const float *)src1_input->data,
-                        (uint16_t *)entry->input_bo->map<void*>(), input_elems);
-        } else {
-            memcpy(entry->input_bo->map<void*>(), src1_input->data, input_bytes);
+        const int64_t M = src1_input->ne[1];
+        const size_t row_bytes = embedding_dim * sizeof(uint16_t);
+
+        // Output stride per row in f32 (dst tensors are [dim, M] row-major).
+        const size_t q_row_f32 = (size_t)q_dim;
+        const size_t k_row_f32 = (size_t)k_dim;
+        const size_t v_row_f32 = (size_t)v_dim;
+
+        auto t_total_s = clk::now();
+
+        for (int64_t m = 0; m < M; m++) {
+            // Load input row m (bf16-from-f32 convert).
+            const float * in_f32_row = (const float *)src1_input->data + m * embedding_dim;
+            if (src1_input->type == GGML_TYPE_F32) {
+                f32_to_bf16(in_f32_row,
+                            (uint16_t *)entry->input_bo->map<void*>(), input_elems);
+            } else {
+                memcpy(entry->input_bo->map<void*>(),
+                       (const char *)src1_input->data + m * row_bytes, row_bytes);
+            }
+            entry->input_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+            // Run single GEMV.
+            xrt::runlist rl(entry->hw_ctx);
+            {
+                xrt::run r(entry->fused_kernel);
+                r.set_arg(0, 3u);
+                r.set_arg(1, entry->insts_bo);
+                r.set_arg(2, (uint32_t)entry->insts_data.size());
+                r.set_arg(3, *w_concat_bo);
+                r.set_arg(4, *entry->input_bo);
+                r.set_arg(5, *entry->output_bo);
+                rl.add(r);
+            }
+            rl.execute();
+            rl.wait();
+
+            // Sync output and split into Q, K, V row m.
+            entry->output_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+            const uint16_t * out_bf16 = (const uint16_t *)entry->output_bo->map<void*>();
+            bf16_to_f32(out_bf16,                    (float *)q_dst->data + m * q_row_f32, (size_t)q_dim);
+            bf16_to_f32(out_bf16 + q_dim,            (float *)k_dst->data + m * k_row_f32, (size_t)k_dim);
+            bf16_to_f32(out_bf16 + q_dim + k_dim,    (float *)v_dst->data + m * v_row_f32, (size_t)v_dim);
         }
-        entry->input_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
-        auto t_in_e = clk::now();
 
-        // Build runlist: 1 fused GEMV.
-        auto t_rl_build_s = clk::now();
-        xrt::runlist rl(entry->hw_ctx);
-
-        {
-            xrt::run r(entry->fused_kernel);
-            r.set_arg(0, 3u);
-            r.set_arg(1, entry->insts_bo);
-            r.set_arg(2, (uint32_t)entry->insts_data.size());
-            r.set_arg(3, *w_concat_bo);
-            r.set_arg(4, *entry->input_bo);
-            r.set_arg(5, *entry->output_bo);
-            rl.add(r);
-        }
-        auto t_rl_build_e = clk::now();
-
-        auto t_rl_exec_s = clk::now();
-        rl.execute();
-        auto t_rl_exec_e = clk::now();
-
-        auto t_rl_wait_s = clk::now();
-        rl.wait();
-        auto t_rl_wait_e = clk::now();
-
-        // Sync output back and split into Q, K, V segments.
-        auto t_out_s = clk::now();
-        entry->output_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-        const uint16_t * out_bf16 = (const uint16_t *)entry->output_bo->map<void*>();
-        bf16_to_f32(out_bf16,                    (float *)q_dst->data, (size_t)q_dim);
-        bf16_to_f32(out_bf16 + q_dim,            (float *)k_dst->data, (size_t)k_dim);
-        bf16_to_f32(out_bf16 + q_dim + k_dim,    (float *)v_dst->data, (size_t)v_dim);
-        auto t_out_e = clk::now();
+        auto t_total_e = clk::now();
 
         if (prof) {
-            auto us = [](clk::time_point a, clk::time_point b) {
-                return (long long)std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
-            };
+            auto us_total = (long long)std::chrono::duration_cast<std::chrono::microseconds>(
+                t_total_e - t_total_s).count();
             GGML_LOG_INFO(
-                "ggml-xdna: qkv_prof K=%lld Nq=%lld Nk=%lld Nv=%lld in=%lld "
-                "rl_build=%lld rl_exec=%lld rl_wait=%lld out=%lld total=%lld us\n",
+                "ggml-xdna: qkv_prof K=%lld Nq=%lld Nk=%lld Nv=%lld M=%lld "
+                "total=%lld us (%lld us/row)\n",
                 (long long)embedding_dim, (long long)q_dim, (long long)k_dim, (long long)v_dim,
-                us(t_in_s,       t_in_e),
-                us(t_rl_build_s, t_rl_build_e),
-                us(t_rl_exec_s,  t_rl_exec_e),
-                us(t_rl_wait_s,  t_rl_wait_e),
-                us(t_out_s,      t_out_e),
-                us(t_in_s,       t_out_e));
+                (long long)M, us_total, M > 0 ? us_total / M : 0);
         }
 
     } catch (const std::exception & e) {
@@ -3641,7 +3638,7 @@ static bool xdna_validate_qkv_triple(const struct ggml_tensor * w_q,
     if (w_k->ne[0] != embedding_dim) return false;
     if (w_v->ne[0] != embedding_dim) return false;
 
-    if (input->ne[1] != 1) return false;  // M=1 only for now
+    if (input->ne[1] < 1 || input->ne[1] > 4) return false;  // M=1..4 (loop GEMV per row)
 
     int num_cols = 4;
     const char * cols_env = getenv("GGML_XDNA_NUM_COLS");
