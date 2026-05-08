@@ -1709,56 +1709,76 @@ static xdna_swiglu_kernel_entry * get_or_load_swiglu_kernel(
             break;
     }
 
-    try {
-        xdna_swiglu_kernel_entry entry;
-        entry.op_kind       = op_kind;
-        entry.embedding_dim = embedding_dim;
-        entry.hidden_dim    = hidden_dim;
-        entry.seq_len       = seq_len;
-        entry.num_cols      = num_cols;
-        entry.group_size    = group_size;
-        entry.mm1_m_input   = mm1_m_input;
-        entry.mm2_m_input   = mm2_m_input;
-        entry.num_kernels   = num_kernels;
+    // First attempt: try loading the cached xclbin as-is.
+    // If it fails (stale cache, wrong kernel name, etc.), delete the
+    // bundle and recompile once.
+    for (int attempt = 0; attempt < 2; attempt++) {
+        try {
+            xdna_swiglu_kernel_entry entry;
+            entry.op_kind       = op_kind;
+            entry.embedding_dim = embedding_dim;
+            entry.hidden_dim    = hidden_dim;
+            entry.seq_len       = seq_len;
+            entry.num_cols      = num_cols;
+            entry.group_size    = group_size;
+            entry.mm1_m_input   = mm1_m_input;
+            entry.mm2_m_input   = mm2_m_input;
+            entry.num_kernels   = num_kernels;
 
-        entry.xclbin = xrt::xclbin(bundle_dir + "/combined.xclbin");
-        ctx->device.register_xclbin(entry.xclbin);
-        auto uuid = entry.xclbin.get_uuid();
-        entry.hw_ctx = xrt::hw_context(ctx->device, uuid);
+            entry.xclbin = xrt::xclbin(bundle_dir + "/combined.xclbin");
+            ctx->device.register_xclbin(entry.xclbin);
+            auto uuid = entry.xclbin.get_uuid();
+            entry.hw_ctx = xrt::hw_context(ctx->device, uuid);
 
-        for (int s = 0; s < num_kernels; s++) {
-            entry.kernels[s] = xrt::kernel(entry.hw_ctx, kernel_names[s]);
+            for (int s = 0; s < num_kernels; s++) {
+                entry.kernels[s] = xrt::kernel(entry.hw_ctx, kernel_names[s]);
 
-            const std::string insts_path = bundle_dir + "/swiglu_" + insts_tags[s] + ".insts";
-            entry.insts_data[s] = read_binary_file(insts_path);
-            if (entry.insts_data[s].empty()) {
-                GGML_LOG_ERROR("ggml-xdna: failed to read SwiGLU insts file: %s\n",
-                               insts_path.c_str());
+                const std::string insts_path = bundle_dir + "/swiglu_" + insts_tags[s] + ".insts";
+                entry.insts_data[s] = read_binary_file(insts_path);
+                if (entry.insts_data[s].empty()) {
+                    GGML_LOG_ERROR("ggml-xdna: failed to read SwiGLU insts file: %s\n",
+                                   insts_path.c_str());
+                    return nullptr;
+                }
+                entry.insts_bo[s] = xrt::bo(ctx->device, entry.insts_data[s].size(),
+                                             xrt::bo::flags::cacheable,
+                                             entry.kernels[s].group_id(1));
+                entry.insts_bo[s].write(entry.insts_data[s].data());
+                entry.insts_bo[s].sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            }
+
+            auto [inserted_it, _] = ctx->swiglu_cache.emplace(cache_key, std::move(entry));
+            xdna_swiglu_kernel_entry * entry_ptr = &inserted_it->second;
+            GGML_LOG_INFO("ggml-xdna: loaded SwiGLU kernel bundle for %s (%d kernels)\n",
+                          cache_key.c_str(), num_kernels);
+
+            // Pay the first-submit slow-path cost (ctx-connect + HMM pin) once
+            // here instead of on the first real FFN dispatch. Non-fatal on failure.
+            swiglu_warmup_entry(ctx, entry_ptr);
+
+            return entry_ptr;
+
+        } catch (const std::exception & e) {
+            if (attempt == 0) {
+                // Stale xclbin (wrong kernel name, corrupted, etc.).
+                // Delete the bundle so the next dispatch cycle will
+                // re-enter ensure_swiglu_compiled + get_or_load_swiglu_kernel
+                // with the correct parameters from the caller.
+                GGML_LOG_WARN("ggml-xdna: SwiGLU cache stale for %s (%s), "
+                              "invalidating — will recompile on next dispatch\n",
+                              cache_key.c_str(), e.what());
+                std::string rm_cmd = "rd /s /q \"" + bundle_dir + "\" 2>nul";
+                system(rm_cmd.c_str());
+                return nullptr;
+            } else {
+                GGML_LOG_ERROR("ggml-xdna: failed to load SwiGLU kernel %s "
+                               "even after cache invalidation: %s\n",
+                               cache_key.c_str(), e.what());
                 return nullptr;
             }
-            entry.insts_bo[s] = xrt::bo(ctx->device, entry.insts_data[s].size(),
-                                         xrt::bo::flags::cacheable,
-                                         entry.kernels[s].group_id(1));
-            entry.insts_bo[s].write(entry.insts_data[s].data());
-            entry.insts_bo[s].sync(XCL_BO_SYNC_BO_TO_DEVICE);
         }
-
-        auto [inserted_it, _] = ctx->swiglu_cache.emplace(cache_key, std::move(entry));
-        xdna_swiglu_kernel_entry * entry_ptr = &inserted_it->second;
-        GGML_LOG_INFO("ggml-xdna: loaded SwiGLU kernel bundle for %s (%d kernels)\n",
-                      cache_key.c_str(), num_kernels);
-
-        // Pay the first-submit slow-path cost (ctx-connect + HMM pin) once
-        // here instead of on the first real FFN dispatch. Non-fatal on failure.
-        swiglu_warmup_entry(ctx, entry_ptr);
-
-        return entry_ptr;
-
-    } catch (const std::exception & e) {
-        GGML_LOG_ERROR("ggml-xdna: failed to load SwiGLU kernel %s: %s\n",
-                       cache_key.c_str(), e.what());
-        return nullptr;
     }
+    return nullptr;
 }
 
 // Warm a single weight slot: copy the bf16/f32 weight into the appropriate BO
@@ -2944,57 +2964,70 @@ static xdna_swiglu_fused_entry * get_or_load_swiglu_fused_kernel(
 
     const std::string bundle_dir = ctx->cache_dir + "\\" + cache_key;
 
-    try {
-        xdna_swiglu_fused_entry entry;
-        entry.op_kind       = XDNA_OP_SWIGLU_FUSED_INT8;
-        entry.embedding_dim = embedding_dim;
-        entry.hidden_dim    = hidden_dim;
-        entry.num_cols      = num_cols;
-        entry.group_size    = group_size;
-        entry.fused_m_input = fused_m_input;
-        entry.down_m_input  = down_m_input;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        try {
+            xdna_swiglu_fused_entry entry;
+            entry.op_kind       = XDNA_OP_SWIGLU_FUSED_INT8;
+            entry.embedding_dim = embedding_dim;
+            entry.hidden_dim    = hidden_dim;
+            entry.num_cols      = num_cols;
+            entry.group_size    = group_size;
+            entry.fused_m_input = fused_m_input;
+            entry.down_m_input  = down_m_input;
 
-        // Load combined xclbin (fused gate+up+silu+mul + down GEMV)
-        entry.xclbin = xrt::xclbin(bundle_dir + "/combined.xclbin");
-        ctx->device.register_xclbin(entry.xclbin);
-        auto uuid = entry.xclbin.get_uuid();
-        entry.hw_ctx = xrt::hw_context(ctx->device, uuid);
-        entry.fused_kernel = xrt::kernel(entry.hw_ctx, "swiglu_fused");
-        entry.down_kernel  = xrt::kernel(entry.hw_ctx, "swiglu_down_gemv_int8");
+            // Load combined xclbin (fused gate+up+silu+mul + down GEMV)
+            entry.xclbin = xrt::xclbin(bundle_dir + "/combined.xclbin");
+            ctx->device.register_xclbin(entry.xclbin);
+            auto uuid = entry.xclbin.get_uuid();
+            entry.hw_ctx = xrt::hw_context(ctx->device, uuid);
+            entry.fused_kernel = xrt::kernel(entry.hw_ctx, "swiglu_fused");
+            entry.down_kernel  = xrt::kernel(entry.hw_ctx, "swiglu_down_gemv_int8");
 
-        // Load fused kernel insts
-        entry.fused_insts_data = read_binary_file(bundle_dir + "/swiglu_fused.insts");
-        if (entry.fused_insts_data.empty()) {
-            GGML_LOG_ERROR("ggml-xdna: failed to read swiglu_fused insts file\n");
-            return nullptr;
+            // Load fused kernel insts
+            entry.fused_insts_data = read_binary_file(bundle_dir + "/swiglu_fused.insts");
+            if (entry.fused_insts_data.empty()) {
+                GGML_LOG_ERROR("ggml-xdna: failed to read swiglu_fused insts file\n");
+                return nullptr;
+            }
+            entry.fused_insts_bo = xrt::bo(ctx->device, entry.fused_insts_data.size(),
+                                            xrt::bo::flags::cacheable,
+                                            entry.fused_kernel.group_id(1));
+            entry.fused_insts_bo.write(entry.fused_insts_data.data());
+            entry.fused_insts_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+            // Load down GEMV kernel insts
+            entry.down_insts_data = read_binary_file(bundle_dir + "/swiglu_down_gemv_int8.insts");
+            if (entry.down_insts_data.empty()) {
+                GGML_LOG_ERROR("ggml-xdna: failed to read swiglu_down_gemv_int8 insts file\n");
+                return nullptr;
+            }
+            entry.down_insts_bo = xrt::bo(ctx->device, entry.down_insts_data.size(),
+                                           xrt::bo::flags::cacheable,
+                                           entry.down_kernel.group_id(1));
+            entry.down_insts_bo.write(entry.down_insts_data.data());
+            entry.down_insts_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+            auto [inserted_it, _] = ctx->swiglu_fused_cache.emplace(cache_key, std::move(entry));
+            GGML_LOG_INFO("ggml-xdna: loaded SwiGLU fused INT8 kernel bundle for %s\n", cache_key.c_str());
+            return &inserted_it->second;
+
+        } catch (const std::exception & e) {
+            if (attempt == 0) {
+                GGML_LOG_WARN("ggml-xdna: SwiGLU fused cache stale for %s (%s), "
+                              "invalidating — will recompile on next dispatch\n",
+                              cache_key.c_str(), e.what());
+                std::string rm_cmd = "rd /s /q \"" + bundle_dir + "\" 2>nul";
+                system(rm_cmd.c_str());
+                return nullptr;
+            } else {
+                GGML_LOG_ERROR("ggml-xdna: failed to load SwiGLU fused kernel %s "
+                               "even after cache invalidation: %s\n",
+                               cache_key.c_str(), e.what());
+                return nullptr;
+            }
         }
-        entry.fused_insts_bo = xrt::bo(ctx->device, entry.fused_insts_data.size(),
-                                        xrt::bo::flags::cacheable,
-                                        entry.fused_kernel.group_id(1));
-        entry.fused_insts_bo.write(entry.fused_insts_data.data());
-        entry.fused_insts_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-
-        // Load down GEMV kernel insts
-        entry.down_insts_data = read_binary_file(bundle_dir + "/swiglu_down_gemv_int8.insts");
-        if (entry.down_insts_data.empty()) {
-            GGML_LOG_ERROR("ggml-xdna: failed to read swiglu_down_gemv_int8 insts file\n");
-            return nullptr;
-        }
-        entry.down_insts_bo = xrt::bo(ctx->device, entry.down_insts_data.size(),
-                                       xrt::bo::flags::cacheable,
-                                       entry.down_kernel.group_id(1));
-        entry.down_insts_bo.write(entry.down_insts_data.data());
-        entry.down_insts_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-
-        auto [inserted_it, _] = ctx->swiglu_fused_cache.emplace(cache_key, std::move(entry));
-        GGML_LOG_INFO("ggml-xdna: loaded SwiGLU fused INT8 kernel bundle for %s\n", cache_key.c_str());
-        return &inserted_it->second;
-
-    } catch (const std::exception & e) {
-        GGML_LOG_ERROR("ggml-xdna: failed to load SwiGLU fused INT8 kernel %s: %s\n",
-                       cache_key.c_str(), e.what());
-        return nullptr;
     }
+    return nullptr;
 }
 
 // Warm (or look up) an INT8 weight BO for the fused SwiGLU path. Identical to
@@ -3303,6 +3336,34 @@ static bool ensure_qkv_compiled(ggml_backend_xdna_context * ctx,
     return true;
 }
 
+// Try to load the QKV xclbin and instantiate the kernel.
+// Returns true on success, false if the xclbin is stale/incompatible
+// (caller should invalidate cache and retry).
+static bool try_load_qkv_entry(xdna_qkv_entry & entry,
+                               ggml_backend_xdna_context * ctx,
+                               const std::string & bundle_dir) {
+    entry.xclbin = xrt::xclbin(bundle_dir + "/combined.xclbin");
+    ctx->device.register_xclbin(entry.xclbin);
+    auto uuid = entry.xclbin.get_uuid();
+    entry.hw_ctx = xrt::hw_context(ctx->device, uuid);
+    // IRON-generated kernels use the default "MLIR_AIE" kernel name
+    // (the function symbol in the ELF is always MLIR_AIE, regardless of
+    // --xclbin-kernel-name display label).
+    entry.fused_kernel = xrt::kernel(entry.hw_ctx, "MLIR_AIE");
+
+    entry.insts_data = read_binary_file(bundle_dir + "/qkv_main.insts");
+    if (entry.insts_data.empty()) {
+        GGML_LOG_ERROR("ggml-xdna: failed to read qkv_main insts file\n");
+        return false;
+    }
+    entry.insts_bo = xrt::bo(ctx->device, entry.insts_data.size(),
+                              xrt::bo::flags::cacheable,
+                              entry.fused_kernel.group_id(1));
+    entry.insts_bo.write(entry.insts_data.data());
+    entry.insts_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    return true;
+}
+
 static xdna_qkv_entry * get_or_load_qkv_kernel(
         ggml_backend_xdna_context * ctx,
         const std::string & cache_key,
@@ -3318,47 +3379,56 @@ static xdna_qkv_entry * get_or_load_qkv_kernel(
 
     const std::string bundle_dir = ctx->cache_dir + "\\" + cache_key;
 
-    try {
-        xdna_qkv_entry entry;
-        entry.op_kind       = XDNA_OP_QKV;
-        entry.embedding_dim = embedding_dim;
-        entry.q_dim         = q_dim;
-        entry.k_dim         = k_dim;
-        entry.v_dim         = v_dim;
-        entry.total_out     = q_dim + k_dim + v_dim;
-        entry.num_cols      = num_cols;
+    // First attempt: try loading the cached xclbin as-is.
+    // If it fails (stale cache, wrong kernel name, etc.), delete the
+    // bundle and recompile once.
+    for (int attempt = 0; attempt < 2; attempt++) {
+        try {
+            xdna_qkv_entry entry;
+            entry.op_kind       = XDNA_OP_QKV;
+            entry.embedding_dim = embedding_dim;
+            entry.q_dim         = q_dim;
+            entry.k_dim         = k_dim;
+            entry.v_dim         = v_dim;
+            entry.total_out     = q_dim + k_dim + v_dim;
+            entry.num_cols      = num_cols;
 
-        // Load combined xclbin (fused_qkv)
-        entry.xclbin = xrt::xclbin(bundle_dir + "/combined.xclbin");
-        ctx->device.register_xclbin(entry.xclbin);
-        auto uuid = entry.xclbin.get_uuid();
-        entry.hw_ctx = xrt::hw_context(ctx->device, uuid);
-        // IRON-generated kernels use the default "MLIR_AIE" kernel name
-        // (the function symbol in the ELF is always MLIR_AIE, regardless of
-        // --xclbin-kernel-name display label).
-        entry.fused_kernel = xrt::kernel(entry.hw_ctx, "MLIR_AIE");
+            if (!try_load_qkv_entry(entry, ctx, bundle_dir)) {
+                GGML_LOG_ERROR("ggml-xdna: QKV bundle files incomplete in %s\n",
+                               bundle_dir.c_str());
+                return nullptr;
+            }
 
-        // Load insts
-        entry.insts_data = read_binary_file(bundle_dir + "/qkv_main.insts");
-        if (entry.insts_data.empty()) {
-            GGML_LOG_ERROR("ggml-xdna: failed to read qkv_main insts file\n");
-            return nullptr;
+            auto [inserted_it, _] = ctx->qkv_cache.emplace(cache_key, std::move(entry));
+            GGML_LOG_INFO("ggml-xdna: loaded QKV kernel bundle for %s\n", cache_key.c_str());
+            return &inserted_it->second;
+
+        } catch (const std::exception & e) {
+            if (attempt == 0) {
+                // First attempt failed — likely a stale xclbin with a
+                // different kernel name.  Nuke the bundle and recompile.
+                GGML_LOG_WARN("ggml-xdna: QKV cache stale for %s (%s), "
+                              "invalidating and recompiling...\n",
+                              cache_key.c_str(), e.what());
+                std::string rm_cmd = "rd /s /q \"" + bundle_dir + "\" 2>nul";
+                system(rm_cmd.c_str());
+                if (!ensure_qkv_compiled(ctx, cache_key,
+                                         embedding_dim, q_dim, k_dim, v_dim,
+                                         num_cols)) {
+                    GGML_LOG_ERROR("ggml-xdna: QKV recompilation failed for %s\n",
+                                   cache_key.c_str());
+                    return nullptr;
+                }
+                // Loop around for second attempt with fresh xclbin.
+            } else {
+                GGML_LOG_ERROR("ggml-xdna: failed to load QKV kernel %s "
+                               "even after recompilation: %s\n",
+                               cache_key.c_str(), e.what());
+                return nullptr;
+            }
         }
-        entry.insts_bo = xrt::bo(ctx->device, entry.insts_data.size(),
-                                  xrt::bo::flags::cacheable,
-                                  entry.fused_kernel.group_id(1));
-        entry.insts_bo.write(entry.insts_data.data());
-        entry.insts_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-
-        auto [inserted_it, _] = ctx->qkv_cache.emplace(cache_key, std::move(entry));
-        GGML_LOG_INFO("ggml-xdna: loaded QKV kernel bundle for %s\n", cache_key.c_str());
-        return &inserted_it->second;
-
-    } catch (const std::exception & e) {
-        GGML_LOG_ERROR("ggml-xdna: failed to load QKV kernel %s: %s\n",
-                       cache_key.c_str(), e.what());
-        return nullptr;
     }
+    return nullptr;  // unreachable
 }
 
 // Concatenate Wq, Wk, Wv row-wise into one buffer and upload.
