@@ -42,6 +42,16 @@ static const char * xdna_python_cmd() {
     return env ? env : "python";
 }
 
+// Platform-specific null redirect suffix for system() calls.
+// Suppresses compile.py stdout/stderr to avoid polluting llama-cli output.
+static const char * xdna_null_redirect() {
+#ifdef _WIN32
+    return " > NUL 2>&1";
+#else
+    return " > /dev/null 2>&1";
+#endif
+}
+
 // Session-wide buffer-traffic counters (behind XDNA_DEBUG). These measure
 // how much data the scheduler moves through our buffer interface — a proxy
 // for inter-backend copy overhead. Logged on backend_free.
@@ -993,12 +1003,12 @@ static bool ensure_compiled(ggml_backend_xdna_context * ctx,
     if (op_kind == XDNA_OP_GEMV) {
         snprintf(cmd, sizeof(cmd),
                  "%s \"%s\" gemv --N %lld --K %lld --dtype-in %s --dtype-out %s "
-                 "--num-aie-columns %d --out \"%s\" 2>&1",
+                 "--num-aie-columns %d --out \"%s\"%s",
                  xdna_python_cmd(), ctx->compile_script.c_str(),
                  (long long)N, (long long)K,
                  dtype_in, dtype_in,
                  num_cols,
-                 xclbin_path.c_str());
+                 xclbin_path.c_str(), xdna_null_redirect());
         GGML_LOG_INFO("ggml-xdna: compiling GEMV K=%lld N=%lld (first run, will be cached)...\n",
                       (long long)K, (long long)N);
     } else {
@@ -1006,12 +1016,12 @@ static bool ensure_compiled(ggml_backend_xdna_context * ctx,
         const char * out_dtype = dtype_out ? dtype_out : dtype_in;
         snprintf(cmd, sizeof(cmd),
                  "%s %s gemm --M %lld --K %lld --N %lld --dtype-in %s --dtype-out %s "
-                 "--num-aie-columns %d --out %s 2>&1",
+                 "--num-aie-columns %d --out %s%s",
                  xdna_python_cmd(), ctx->compile_script.c_str(),
                  (long long)M, (long long)K, (long long)N,
                  dtype_in, out_dtype,
                  num_cols,
-                 xclbin_path.c_str());
+                 xclbin_path.c_str(), xdna_null_redirect());
         GGML_LOG_INFO("ggml-xdna: compiling GEMM %lldx%lldx%lld (first run, will be cached)...\n",
                       (long long)M, (long long)K, (long long)N);
     }
@@ -1519,19 +1529,19 @@ static bool ensure_swiglu_compiled(ggml_backend_xdna_context * ctx,
     if (op_kind == XDNA_OP_SWIGLU_DECODE) {
         snprintf(cmd, sizeof(cmd),
                  "%s \"%s\" swiglu-decode --embedding-dim %lld --hidden-dim %lld "
-                 "--num-aie-columns %d --out \"%s\" 2>&1",
+                 "--num-aie-columns %d --out \"%s\"%s",
                  xdna_python_cmd(), ctx->compile_script.c_str(),
                  (long long)embedding_dim, (long long)hidden_dim,
-                 num_cols, bundle_dir.c_str());
+                 num_cols, bundle_dir.c_str(), xdna_null_redirect());
         GGML_LOG_INFO("ggml-xdna: compiling SwiGLU decode K=%lld N=%lld (first run, will be cached)...\n",
                       (long long)embedding_dim, (long long)hidden_dim);
     } else {
         snprintf(cmd, sizeof(cmd),
                  "%s \"%s\" swiglu-prefill --seq-len %lld --embedding-dim %lld --hidden-dim %lld "
-                 "--num-aie-columns %d --tile-m %d --tile-n %d --out \"%s\" 2>&1",
+                 "--num-aie-columns %d --tile-m %d --tile-n %d --out \"%s\"%s",
                  xdna_python_cmd(), ctx->compile_script.c_str(),
                  (long long)seq_len, (long long)embedding_dim, (long long)hidden_dim,
-                 num_cols, tile_m, tile_n, bundle_dir.c_str());
+                 num_cols, tile_m, tile_n, bundle_dir.c_str(), xdna_null_redirect());
         GGML_LOG_INFO("ggml-xdna: compiling SwiGLU prefill M=%lld K=%lld N=%lld tile_m=%d tile_n=%d (first run, will be cached)...\n",
                       (long long)seq_len, (long long)embedding_dim, (long long)hidden_dim, tile_m, tile_n);
     }
@@ -2943,10 +2953,10 @@ static bool ensure_swiglu_fused_compiled(ggml_backend_xdna_context * ctx,
     char cmd[1024];
     snprintf(cmd, sizeof(cmd),
              "%s %s swiglu-fused-int8 --embedding-dim %lld --hidden-dim %lld "
-             "--num-aie-columns %d --group-size %d --out %s 2>&1",
+             "--num-aie-columns %d --group-size %d --out %s%s",
              xdna_python_cmd(), ctx->compile_script.c_str(),
              (long long)embedding_dim, (long long)hidden_dim,
-             num_cols, group_size, bundle_dir.c_str());
+             num_cols, group_size, bundle_dir.c_str(), xdna_null_redirect());
     GGML_LOG_INFO("ggml-xdna: compiling SwiGLU fused INT8 K=%lld N=%lld g=%d (first run, will be cached)...\n",
                   (long long)embedding_dim, (long long)hidden_dim, group_size);
 
@@ -3331,10 +3341,10 @@ static bool ensure_qkv_compiled(ggml_backend_xdna_context * ctx,
     char cmd[1024];
     snprintf(cmd, sizeof(cmd),
              "%s %s qkv --embedding-dim %lld --q-dim %lld --k-dim %lld --v-dim %lld "
-             "--num-aie-columns %d --out %s 2>&1",
+             "--num-aie-columns %d --out %s%s",
              xdna_python_cmd(), ctx->compile_script.c_str(),
              (long long)embedding_dim, (long long)q_dim, (long long)k_dim, (long long)v_dim,
-             num_cols, bundle_dir.c_str());
+             num_cols, bundle_dir.c_str(), xdna_null_redirect());
     GGML_LOG_INFO("ggml-xdna: compiling QKV K=%lld Nq=%lld Nk=%lld Nv=%lld cols=%d (first run, will be cached)...\n",
                   (long long)embedding_dim, (long long)q_dim, (long long)k_dim, (long long)v_dim, num_cols);
 
@@ -4859,12 +4869,12 @@ static bool ensure_attention_prefill_compiled(ggml_backend_xdna_context * ctx,
              "%s %s attention-prefill --seq-len %lld --embed-dim %lld "
              "--num-heads %lld --num-kv-heads %lld --head-dim %lld "
              "--rope-method-type %d "
-             "--out %s 2>&1",
+             "--out %s%s",
              xdna_python_cmd(), ctx->compile_script.c_str(),
              (long long)seq_bucket, (long long)embed_dim,
              (long long)num_heads, (long long)num_kv_heads, (long long)head_dim,
              rope_method_type,
-             bundle_dir.c_str());
+             bundle_dir.c_str(), xdna_null_redirect());
     GGML_LOG_INFO("ggml-xdna: compiling attention-prefill S=%lld E=%lld H=%lld KV=%lld d=%lld "
                   "(first run, will be cached)...\n",
                   (long long)seq_bucket, (long long)embed_dim,
@@ -6058,11 +6068,11 @@ static bool ensure_transformer_block_prefill_compiled(
     snprintf(cmd, sizeof(cmd),
              "%s %s transformer-block-prefill --seq-len %lld --embed-dim %lld "
              "--num-heads %lld --num-kv-heads %lld --head-dim %lld --ffn-hidden %lld "
-             "--rope-method-type %d --out %s 2>&1",
+             "--rope-method-type %d --out %s%s",
              xdna_python_cmd(), ctx->compile_script.c_str(),
              (long long)seq_bucket, (long long)embed_dim,
              (long long)num_heads, (long long)num_kv_heads, (long long)head_dim,
-             (long long)ffn_hidden_dim, rope_method_type, bundle_dir.c_str());
+             (long long)ffn_hidden_dim, rope_method_type, bundle_dir.c_str(), xdna_null_redirect());
     GGML_LOG_INFO("ggml-xdna: compiling transformer-block-prefill S=%lld E=%lld H=%lld KV=%lld d=%lld F=%lld "
                   "(first run, will be cached)...\n",
                   (long long)seq_bucket, (long long)embed_dim,
@@ -6359,12 +6369,12 @@ static bool ensure_tblock_fused_compiled(
     snprintf(cmd, sizeof(cmd),
              "%s %s transformer-block-prefill-fused --seq-len %lld --embed-dim %lld "
              "--num-heads %lld --num-kv-heads %lld --head-dim %lld --ffn-hidden %lld "
-             "--rope-method-type %d --num-layers %d%s --out %s 2>&1",
+             "--rope-method-type %d --num-layers %d%s --out %s%s",
              xdna_python_cmd(), ctx->compile_script.c_str(),
              (long long)seq_bucket, (long long)embed_dim,
              (long long)num_heads, (long long)num_kv_heads, (long long)head_dim,
              (long long)ffn_hidden_dim, rope_method_type, num_layers, w8_flag,
-             bundle_dir.c_str());
+             bundle_dir.c_str(), xdna_null_redirect());
     const char * mode_tag = w8a16_ffn ? " W8A16+FFN"
                           : (w8a16 ? " W8A16" : "");
     GGML_LOG_INFO("ggml-xdna: compiling fused tblock S=%lld E=%lld H=%lld KV=%lld d=%lld F=%lld rope=%d N=%d%s "
@@ -8793,12 +8803,12 @@ static bool ensure_rms_norm_compiled(ggml_backend_xdna_context * ctx,
     snprintf(cmd, sizeof(cmd),
              "%s \"%s\" rms_norm --size %lld --dtype bf16 "
              "--num-aie-columns %d --num-channels %d --tile-size %d%s "
-             "--out \"%s\" 2>&1",
+             "--out \"%s\"%s",
              xdna_python_cmd(),
              ctx->compile_script.c_str(),
              (long long)size, num_cols, num_channels, tile_size,
              weighted ? " --weighted" : "",
-             bundle_dir.c_str());
+             bundle_dir.c_str(), xdna_null_redirect());
     GGML_LOG_INFO("ggml-xdna: compiling RMSNorm size=%lld cols=%d ch=%d tile=%d "
                   "(first run, will be cached)...\n",
                   (long long)size, num_cols, num_channels, tile_size);
