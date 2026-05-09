@@ -445,11 +445,19 @@ def select_gemv_tiles(N: int, K: int, num_aie_columns: int,
         raise ValueError(f"Cannot find tile_size_output for N={N}, cols={num_aie_columns}")
 
     # tile_in: L1 double-buffered matrix tile is 2 * tile_in * K * sizeof(bf16) bytes.
-    # AIE2p core-tile usable budget is ~32KB — cap tile_in accordingly so we
-    # don't blow past L1. Prefer larger tile_in for throughput when it fits.
-    l1_budget_bytes = 32 * 1024
+    # AIE2p (Strix Point / NPU2) has 64KB L1 data memory per tile.
+    # Must also reserve space for B (input vector, depth=1) and C (output, depth=2).
+    l1_budget_bytes = 64 * 1024  # AIE2p: 64KB per tile
     bf16 = 2
-    max_tsi_by_l1 = max(1, l1_budget_bytes // (2 * K * bf16))  # 2 = double-buffer
+    # B (K elements, depth=1) + C (tile_out elements, depth=2) must fit.
+    bc_bytes = (K * bf16) + (2 * tile_out * bf16)
+    if bc_bytes >= l1_budget_bytes:
+        raise ValueError(
+            f"L1 overflow: B+C alone need {bc_bytes} bytes but budget is "
+            f"{l1_budget_bytes}. K={K}, tile_out={tile_out}, cols={num_aie_columns}"
+        )
+    l1_available_for_a = l1_budget_bytes - bc_bytes
+    max_tsi_by_l1 = l1_available_for_a // (2 * K * bf16)  # 2 = double-buffer
     tsi_candidates = [8, 4, 2, 1]
     tile_in = None
     for tsi in tsi_candidates:
@@ -458,7 +466,11 @@ def select_gemv_tiles(N: int, K: int, num_aie_columns: int,
             tile_in = tsi
             break
     if tile_in is None:
-        raise ValueError(f"Cannot find tile_size_input for N={N}, K={K}, cols={num_aie_columns}")
+        raise ValueError(
+            f"Cannot find tile_size_input for N={N}, K={K}, cols={num_aie_columns}. "
+            f"L1 available for A: {l1_available_for_a} bytes, "
+            f"B+C: {bc_bytes} bytes, budget: {l1_budget_bytes} bytes."
+        )
 
     return tile_in, tile_out
 
@@ -484,6 +496,19 @@ def validate_swiglu_decode_shapes(embedding_dim: int, hidden_dim: int,
         raise ValueError(
             f"embedding_dim={embedding_dim} must be divisible by "
             f"num_aie_columns={num_aie_columns}"
+        )
+    # Static kernel buffers (left_buf/right_buf) are compiled with -DM_OUTPUT_MAX.
+    # m_output = hidden_dim / fused_cols (fused kernel uses 4 cols on NPU2).
+    # Safety check: hidden_dim must fit in a reasonable buffer. The operator
+    # passes -DM_OUTPUT_MAX at compile time, but we validate here to fail early.
+    fused_cols = 4  # hardcoded in AIESwiGLUDecode for fused kernel
+    m_output = hidden_dim // fused_cols
+    max_supported = 4096  # default M_OUTPUT_MAX in kernel source
+    if m_output > max_supported:
+        raise ValueError(
+            f"hidden_dim // {fused_cols} = {m_output} exceeds static kernel "
+            f"buffer capacity ({max_supported}). Increase M_OUTPUT_MAX or "
+            f"reduce hidden_dim."
         )
     # The two GEMV stages must themselves be dispatchable. Reuse the GEMV tile
     # selector — it raises ValueError on K%64 / per-col / L1 budget violations.
@@ -785,7 +810,11 @@ def compile_swiglu_decode(embedding_dim: int, hidden_dim: int, dtype: str,
 
     from iron.operators.swiglu_decode.op import AIESwiGLUDecode
 
-    op = AIESwiGLUDecode(embedding_dim=embedding_dim, hidden_dim=hidden_dim)
+    op = AIESwiGLUDecode(
+        embedding_dim=embedding_dim,
+        hidden_dim=hidden_dim,
+        num_aie_columns=num_aie_columns,
+    )
     op.compile()
 
     _stage_swiglu_decode_new(op, output_dir)
@@ -1233,6 +1262,7 @@ def compile_qkv(embedding_dim: int, q_dim: int, k_dim: int, v_dim: int,
         q_dim=q_dim,
         k_dim=k_dim,
         v_dim=v_dim,
+        num_aie_columns=num_aie_columns,
     )
     op.compile()
 
