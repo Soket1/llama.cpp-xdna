@@ -2000,6 +2000,8 @@ def compile_transformer_block_prefill_fused_cached(
 
 def main():
     parser = argparse.ArgumentParser(description="ggml-xdna IRON compilation bridge")
+    parser.add_argument("--quiet", action="store_true",
+                        help="Suppress stdout output (for use from ggml-xdna backend)")
     subparsers = parser.add_subparsers(dest="op", required=True)
 
     # GEMM subcommand
@@ -2252,7 +2254,8 @@ def main():
                 args.num_aie_columns,
                 args.b_col_maj,
             )
-        print(path)
+        if not args.quiet:
+            print(path)
     elif args.op == "gemv":
         if args.out:
             path = compile_gemv(
@@ -2266,7 +2269,8 @@ def main():
                 args.dtype_in, args.dtype_out,
                 args.num_aie_columns,
             )
-        print(path)
+        if not args.quiet:
+            print(path)
     elif args.op == "swiglu-decode":
         if args.out:
             path = compile_swiglu_decode(
@@ -2278,7 +2282,8 @@ def main():
                 args.embedding_dim, args.hidden_dim,
                 args.dtype, args.num_aie_columns,
             )
-        print(path)
+        if not args.quiet:
+            print(path)
     elif args.op == "swiglu-decode-int8":
         if args.out:
             path = compile_swiglu_decode_int8(
@@ -2292,7 +2297,8 @@ def main():
                 args.num_aie_columns,
                 group_size=args.group_size,
             )
-        print(path)
+        if not args.quiet:
+            print(path)
     elif args.op == "swiglu-fused-int8":
         if args.out:
             path = compile_swiglu_fused_int8(
@@ -2306,7 +2312,8 @@ def main():
                 args.num_aie_columns,
                 group_size=args.group_size,
             )
-        print(path)
+        if not args.quiet:
+            print(path)
     elif args.op == "qkv":
         if args.out:
             path = compile_qkv(
@@ -2318,7 +2325,8 @@ def main():
                 args.embedding_dim, args.q_dim, args.k_dim, args.v_dim,
                 args.num_aie_columns,
             )
-        print(path)
+        if not args.quiet:
+            print(path)
     elif args.op == "swiglu-prefill":
         if args.out:
             path = compile_swiglu_prefill(
@@ -2332,7 +2340,8 @@ def main():
                 args.dtype, args.num_aie_columns,
                 tile_m=args.tile_m, tile_n=args.tile_n,
             )
-        print(path)
+        if not args.quiet:
+            print(path)
     elif args.op == "swiglu-prefill-int8":
         if args.out:
             path = compile_swiglu_prefill_int8(
@@ -2346,7 +2355,8 @@ def main():
                 args.num_aie_columns,
                 tile_m=args.tile_m, tile_n=args.tile_n,
             )
-        print(path)
+        if not args.quiet:
+            print(path)
     elif args.op == "rms_norm":
         if args.cache_dir:
             os.environ["GGML_XDNA_CACHE_DIR"] = args.cache_dir
@@ -2361,7 +2371,8 @@ def main():
                 args.size, args.dtype, args.num_aie_columns,
                 args.num_channels, args.tile_size, args.weighted,
             )
-        print(path)
+        if not args.quiet:
+            print(path)
     elif args.op == "attention-prefill":
         if args.cache_dir:
             os.environ["GGML_XDNA_CACHE_DIR"] = args.cache_dir
@@ -2379,7 +2390,8 @@ def main():
                 args.dtype,
                 rope_method_type=args.rope_method_type,
             )
-        print(path)
+        if not args.quiet:
+            print(path)
     elif args.op == "transformer-block-prefill":
         if args.cache_dir:
             os.environ["GGML_XDNA_CACHE_DIR"] = args.cache_dir
@@ -2399,7 +2411,8 @@ def main():
                 args.dtype,
                 rope_method_type=args.rope_method_type,
             )
-        print(path)
+        if not args.quiet:
+            print(path)
     elif args.op == "transformer-block-prefill-fused":
         if args.cache_dir:
             os.environ["GGML_XDNA_CACHE_DIR"] = args.cache_dir
@@ -2427,7 +2440,8 @@ def main():
                 w8a16=args.w8a16,
                 w8a16_ffn=args.w8a16_ffn,
             )
-        print(path)
+        if not args.quiet:
+            print(path)
 
 
 if __name__ == "__main__":
