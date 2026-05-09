@@ -2077,6 +2077,7 @@ static void ggml_backend_xdna_mul_mat_swiglu(ggml_backend_xdna_context * ctx,
                         // embedding_dim bf16 values.
                         {
                             const int fused_cols = 4;
+                            GGML_ASSERT(hidden_dim % fused_cols == 0 && "hidden_dim must be divisible by 4 for fused SwiGLU interleave");
                             const int64_t rows_per_col = hidden_dim / fused_cols;
                             for (int col = 0; col < fused_cols; col++) {
                                 const int64_t start = col * rows_per_col;
