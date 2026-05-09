@@ -1,3 +1,4 @@
+#define GGML_BACKEND_SHARED
 #include "ggml-impl.h"
 #include "ggml-xdna.h"
 #include "ggml-backend-impl.h"
@@ -2054,8 +2055,8 @@ static void ggml_backend_xdna_mul_mat_swiglu(ggml_backend_xdna_context * ctx,
                     if (it != entry->w_fused_bo_cache.end()) {
                         w_fused_bo_ptr = &it->second;
                     } else {
-                        // Interleaved layout: [gate_row_0, up_row_0, gate_row_1, up_row_1, ...]
-                        // Each row has embedding_dim elements (bf16). Total rows = 2 * hidden_dim.
+                        // Per-column block layout: [gate_col0, up_col0, gate_col1, up_col1, ...]
+                        // Each block is rows_per_col contiguous rows of embedding_dim bf16 values.
                         const size_t fused_elems = 2 * (size_t)hidden_dim * (size_t)embedding_dim;
                         const size_t fused_bytes = fused_elems * sizeof(uint16_t);
 
@@ -2066,17 +2067,27 @@ static void ggml_backend_xdna_mul_mat_swiglu(ggml_backend_xdna_context * ctx,
                         const uint16_t * w_up   = (const uint16_t *)w2_bo_ptr->map<const void*>();
                         uint16_t * dst = (uint16_t *)fused_bo.map<void*>();
 
-                        // Gate and up weights are [hidden_dim, embedding_dim] bf16 (GEMV layout).
-                        // Interleave row-by-row: for each hidden_dim row i,
-                        //   fused[2*i]   = gate[i]  (embedding_dim bf16 values)
-                        //   fused[2*i+1] = up[i]
-                        for (int64_t i = 0; i < hidden_dim; i++) {
-                            memcpy(dst + (2 * i)     * embedding_dim,
-                                   w_gate + i * embedding_dim,
-                                   embedding_dim * sizeof(uint16_t));
-                            memcpy(dst + (2 * i + 1) * embedding_dim,
-                                   w_up   + i * embedding_dim,
-                                   embedding_dim * sizeof(uint16_t));
+                        // Per-column block interleave — must match the Python
+                        // interleave_weights() layout that the IRON-compiled
+                        // xclbin's DMA pattern expects.
+                        // Fused kernel always uses 4 columns (dual-GEMV DMA
+                        // constraint), regardless of the device column count.
+                        // Layout: [gate_col0, up_col0, gate_col1, up_col1, ...]
+                        // Each "block" is rows_per_col contiguous rows of
+                        // embedding_dim bf16 values.
+                        {
+                            const int fused_cols = 4;
+                            const int64_t rows_per_col = hidden_dim / fused_cols;
+                            for (int col = 0; col < fused_cols; col++) {
+                                const int64_t start = col * rows_per_col;
+                                const int64_t out_start = col * 2 * rows_per_col;
+                                memcpy(dst + out_start * embedding_dim,
+                                       w_gate + start * embedding_dim,
+                                       rows_per_col * embedding_dim * sizeof(uint16_t));
+                                memcpy(dst + (out_start + rows_per_col) * embedding_dim,
+                                       w_up + start * embedding_dim,
+                                       rows_per_col * embedding_dim * sizeof(uint16_t));
+                            }
                         }
 
                         fused_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
@@ -9059,6 +9070,18 @@ static bool xdna_node_npu_dispatchable(const struct ggml_tensor * node) {
     return xdna_shape_dispatchable(M, K, N);
 }
 
+// Local equivalent of ggml_graph_view (not exported by ggml-base)
+static struct ggml_cgraph xdna_graph_view(struct ggml_cgraph * cgraph0, int i0, int i1) {
+    struct ggml_cgraph cgraph;
+    memset(&cgraph, 0, sizeof(cgraph));
+    cgraph.n_nodes = i1 - i0;
+    cgraph.nodes = cgraph0->nodes + i0;
+    cgraph.use_counts = cgraph0->use_counts;
+    cgraph.visited_hash_set = cgraph0->visited_hash_set;
+    cgraph.order = cgraph0->order;
+    return cgraph;
+}
+
 // Delegate a contiguous run of nodes [i0, i1) to the CPU backend as a single
 // batched call — cheaper than per-node calls and lets the CPU backend keep
 // its own state (threads, arenas) across related nodes.
@@ -9070,7 +9093,7 @@ static ggml_status xdna_delegate_range(ggml_backend_xdna_context * ctx,
         GGML_LOG_ERROR("ggml-xdna: CPU backend not initialized, cannot delegate\n");
         return GGML_STATUS_FAILED;
     }
-    struct ggml_cgraph sub = ggml_graph_view(cgraph, i0, i1);
+    struct ggml_cgraph sub = xdna_graph_view(cgraph, i0, i1);
     return ggml_backend_graph_compute(ctx->cpu_backend, &sub);
 }
 
