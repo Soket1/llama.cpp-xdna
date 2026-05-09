@@ -540,9 +540,12 @@ struct ggml_backend_xdna_context {
     std::string cache_dir;
     std::string compile_script;
     std::unordered_map<std::string, xdna_kernel_entry> kernel_cache;
+    std::unordered_set<std::string> kernel_compile_failed;
     std::unordered_map<std::string, xdna_swiglu_kernel_entry> swiglu_cache;
     std::unordered_map<std::string, xdna_swiglu_fused_entry> swiglu_fused_cache;
+    std::unordered_set<std::string> swiglu_compile_failed;
     std::unordered_map<std::string, xdna_qkv_entry> qkv_cache;
+    std::unordered_set<std::string> qkv_compile_failed;
     std::unordered_map<std::string, xdna_rms_norm_entry> rms_norm_cache;
     std::unordered_map<std::string, xdna_attention_prefill_entry> attention_prefill_cache;
     std::unordered_map<std::string, xdna_transformer_block_prefill_entry> transformer_block_prefill_cache;
@@ -968,6 +971,11 @@ static bool ensure_compiled(ggml_backend_xdna_context * ctx,
                             int64_t M, int64_t K, int64_t N,
                             const char * dtype_in, int num_cols,
                             const char * dtype_out = nullptr) {
+    // Skip recompilation if we already failed for this key
+    if (ctx->kernel_compile_failed.count(cache_key)) {
+        return false;
+    }
+
     std::string xclbin_path = ctx->cache_dir + GGML_XDNA_PATH_SEP + cache_key + ".xclbin";
     std::string insts_path  = ctx->cache_dir + GGML_XDNA_PATH_SEP + cache_key + ".insts";
 
@@ -1011,6 +1019,7 @@ static bool ensure_compiled(ggml_backend_xdna_context * ctx,
     int ret = system(cmd);
     if (ret != 0) {
         GGML_LOG_ERROR("ggml-xdna: compilation failed (exit code %d)\n", ret);
+        ctx->kernel_compile_failed.insert(cache_key);
         return false;
     }
 
@@ -1019,6 +1028,7 @@ static bool ensure_compiled(ggml_backend_xdna_context * ctx,
     std::ifstream inf(insts_path);
     if (!xf.good() || !inf.good()) {
         GGML_LOG_ERROR("ggml-xdna: compilation succeeded but output files missing\n");
+        ctx->kernel_compile_failed.insert(cache_key);
         return false;
     }
 
@@ -1482,6 +1492,11 @@ static bool ensure_swiglu_compiled(ggml_backend_xdna_context * ctx,
                                    int64_t seq_len, int num_cols,
                                    int tile_m, int group_size = 0,
                                    int tile_n = 64) {
+    // Skip recompilation if we already failed for this key
+    if (ctx->swiglu_compile_failed.count(cache_key)) {
+        return false;
+    }
+
     const std::string bundle_dir = ctx->cache_dir + "\\" + cache_key;
     const char * const * insts_tags;
     int num_kernels;
@@ -1524,12 +1539,14 @@ static bool ensure_swiglu_compiled(ggml_backend_xdna_context * ctx,
     int ret = system(cmd);
     if (ret != 0) {
         GGML_LOG_ERROR("ggml-xdna: SwiGLU compilation failed (exit code %d)\n", ret);
+        ctx->swiglu_compile_failed.insert(cache_key);
         return false;
     }
 
     if (!swiglu_bundle_present(bundle_dir, insts_tags, num_kernels)) {
         GGML_LOG_ERROR("ggml-xdna: SwiGLU compilation succeeded but bundle files missing in %s\n",
                        bundle_dir.c_str());
+        ctx->swiglu_compile_failed.insert(cache_key);
         return false;
     }
 
@@ -2913,6 +2930,11 @@ static bool ensure_swiglu_fused_compiled(ggml_backend_xdna_context * ctx,
                                          const std::string & cache_key,
                                          int64_t embedding_dim, int64_t hidden_dim,
                                          int num_cols, int group_size) {
+    // Skip recompilation if we already failed for this key
+    if (ctx->swiglu_compile_failed.count(cache_key)) {
+        return false;
+    }
+
     const std::string bundle_dir = ctx->cache_dir + "\\" + cache_key;
     if (swiglu_fused_bundle_present(bundle_dir)) {
         return true;
@@ -2931,12 +2953,14 @@ static bool ensure_swiglu_fused_compiled(ggml_backend_xdna_context * ctx,
     int ret = system(cmd);
     if (ret != 0) {
         GGML_LOG_ERROR("ggml-xdna: SwiGLU fused INT8 compilation failed (exit code %d)\n", ret);
+        ctx->swiglu_compile_failed.insert(cache_key);
         return false;
     }
 
     if (!swiglu_fused_bundle_present(bundle_dir)) {
         GGML_LOG_ERROR("ggml-xdna: SwiGLU fused INT8 compilation succeeded but bundle files missing in %s\n",
                        bundle_dir.c_str());
+        ctx->swiglu_compile_failed.insert(cache_key);
         return false;
     }
 
@@ -3294,6 +3318,11 @@ static bool ensure_qkv_compiled(ggml_backend_xdna_context * ctx,
                                 int64_t embedding_dim,
                                 int64_t q_dim, int64_t k_dim, int64_t v_dim,
                                 int num_cols) {
+    // Skip recompilation if we already failed for this key
+    if (ctx->qkv_compile_failed.count(cache_key)) {
+        return false;
+    }
+
     const std::string bundle_dir = ctx->cache_dir + "\\" + cache_key;
     if (qkv_bundle_present(bundle_dir)) {
         return true;
@@ -3312,12 +3341,14 @@ static bool ensure_qkv_compiled(ggml_backend_xdna_context * ctx,
     int ret = system(cmd);
     if (ret != 0) {
         GGML_LOG_ERROR("ggml-xdna: QKV compilation failed (exit code %d)\n", ret);
+        ctx->qkv_compile_failed.insert(cache_key);
         return false;
     }
 
     if (!qkv_bundle_present(bundle_dir)) {
         GGML_LOG_ERROR("ggml-xdna: QKV compilation succeeded but bundle files missing in %s\n",
                        bundle_dir.c_str());
+        ctx->qkv_compile_failed.insert(cache_key);
         return false;
     }
 
