@@ -543,6 +543,41 @@ struct xdna_rms_norm_entry {
 // Backend context — holds XRT device and kernel cache
 // ============================================================================
 
+// ============================================================================
+// FlowKV Decode Attention entry — single xclbin with 2-tile streaming pipeline
+// (score + value) per KV head group. Implements online softmax attention with
+// fused RoPE on Q. Mirrors iron/operators/flowkv_decode/op.py AIEFlowKVDecode.
+// ============================================================================
+
+struct xdna_flowkv_entry {
+    xrt::xclbin     xclbin;
+    xrt::hw_context hw_ctx;
+    xrt::kernel     kernel;   // "flowkv_decode"
+
+    std::vector<char> insts_data;
+    xrt::bo           insts_bo;
+
+    // Shape params (baked into xclbin).
+    int64_t num_heads;
+    int64_t num_kv_heads;
+    int64_t head_dim;
+    int64_t seq_len;
+    int64_t chunk_size;
+    int     num_cols;
+
+    std::string cache_key;
+
+    // Persistent BOs (lazy, allocated on first dispatch).
+    //   bo_kv:   interleaved KV cache (num_kv_heads * seq_len * 2 * head_dim bf16)
+    //   bo_q:    packed Q + RoPE angles (num_kv_heads * (group_size*head_dim + head_dim) bf16)
+    //   bo_out:  attention output (num_heads * head_dim bf16)
+    std::unique_ptr<xrt::bo> bo_kv;
+    std::unique_ptr<xrt::bo> bo_q;
+    std::unique_ptr<xrt::bo> bo_out;
+
+    std::unique_ptr<std::mutex> mu = std::make_unique<std::mutex>();
+};
+
 // Forward declarations used by the context (definitions later in the file).
 struct xdna_tblock_fused_group;
 
@@ -561,6 +596,8 @@ struct ggml_backend_xdna_context {
     std::unordered_map<std::string, xdna_attention_prefill_entry> attention_prefill_cache;
     std::unordered_map<std::string, xdna_transformer_block_prefill_entry> transformer_block_prefill_cache;
     std::unordered_map<std::string, struct xdna_tblock_fused_entry> tblock_fused_cache;
+    std::unordered_map<std::string, struct xdna_flowkv_entry> flowkv_cache;
+    std::unordered_set<std::string> flowkv_compile_failed;
     int num_cols;
     // Set of cgraph pointers for which attn_prefill_bulk_prewarm() has already
     // run. Purely an optimization guard — the dispatch path's per-weight cache
@@ -2267,7 +2304,7 @@ static void ggml_backend_xdna_mul_mat_swiglu(ggml_backend_xdna_context * ctx,
             auto us = [](clk::time_point a, clk::time_point b) {
                 return (long long)std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
             };
-            fprintf(stderr, 
+            fprintf(stderr,
                 "ggml-xdna: swiglu_prof %s M=%lld K=%lld N=%lld in=%lld "
                 "rl_build=%lld rl_exec=%lld rl_wait=%lld "
                 "out=%lld wb_l=%lld wb_r=%lld wb_i=%lld total=%lld us\n",
@@ -2595,7 +2632,7 @@ static void ggml_backend_xdna_mul_mat_swiglu_int8(
             auto us = [](clk::time_point a, clk::time_point b) {
                 return (long long)std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
             };
-            fprintf(stderr, 
+            fprintf(stderr,
                 "ggml-xdna: swiglu_prof decode_int8 M=%lld K=%lld N=%lld in=%lld "
                 "rl_build=%lld rl_exec=%lld rl_wait=%lld "
                 "out=%lld wb_l=%lld wb_r=%lld wb_i=%lld total=%lld us\n",
@@ -2908,7 +2945,7 @@ static void ggml_backend_xdna_mul_mat_swiglu_prefill_int8(
             auto us = [](clk::time_point a, clk::time_point b) {
                 return (long long)std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
             };
-            fprintf(stderr, 
+            fprintf(stderr,
                 "ggml-xdna: swiglu_prof prefill_int8 M=%lld K=%lld N=%lld "
                 "in=%lld rl_build=%lld rl_exec=%lld rl_wait=%lld out=%lld wb=%lld total=%lld us\n",
                 (long long)M, (long long)embedding_dim, (long long)hidden_dim,
@@ -3295,7 +3332,7 @@ static void ggml_backend_xdna_mul_mat_swiglu_fused_int8(
             auto us = [](clk::time_point a, clk::time_point b) {
                 return (long long)std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
             };
-            fprintf(stderr, 
+            fprintf(stderr,
                 "ggml-xdna: swiglu_prof fused_int8 K=%lld N=%lld in=%lld "
                 "rl_build=%lld rl_exec=%lld rl_wait=%lld out=%lld wb=%lld total=%lld us\n",
                 (long long)embedding_dim, (long long)hidden_dim,
@@ -3656,7 +3693,7 @@ static void ggml_backend_xdna_mul_mat_qkv(
         if (prof) {
             auto us_total = (long long)std::chrono::duration_cast<std::chrono::microseconds>(
                 t_total_e - t_total_s).count();
-            fprintf(stderr, 
+            fprintf(stderr,
                 "ggml-xdna: qkv_prof K=%lld Nq=%lld Nk=%lld Nv=%lld M=%lld "
                 "total=%lld us (%lld us/row)\n",
                 (long long)embedding_dim, (long long)q_dim, (long long)k_dim, (long long)v_dim,
@@ -3888,6 +3925,337 @@ static void xdna_plan_qkv(const struct ggml_cgraph * cgraph, xdna_qkv_plan * out
                 cgraph->n_nodes, n_mulmat, by_src1.size(),
                 n_groups_2, n_groups_3, n_groups_other, n_triples_validated);
         fflush(stderr);
+    }
+}
+
+// ============================================================================
+// FlowKV Decode Attention — streaming decode attention with online softmax
+// and fused RoPE. Single xclbin with 2-tile pipeline per KV head group.
+// ============================================================================
+
+static std::string make_flowkv_cache_key(int64_t num_heads, int64_t num_kv_heads,
+                                         int64_t head_dim, int64_t seq_len,
+                                         int64_t chunk_size, int num_cols) {
+    char buf[256];
+    snprintf(buf, sizeof(buf), "flowkv_H%lld_KV%lld_d%lld_S%lld_C%lld_%dcol",
+             (long long)num_heads, (long long)num_kv_heads,
+             (long long)head_dim, (long long)seq_len,
+             (long long)chunk_size, num_cols);
+    return std::string(buf);
+}
+
+static bool flowkv_bundle_present(const std::string & bundle_dir) {
+    std::ifstream f1(bundle_dir + "/combined.xclbin");
+    if (!f1.good()) return false;
+    std::ifstream f2(bundle_dir + "/flowkv_decode_main.insts");
+    if (!f2.good()) return false;
+    return true;
+}
+
+static bool ensure_flowkv_compiled(ggml_backend_xdna_context * ctx,
+                                   const std::string & cache_key,
+                                   int64_t num_heads, int64_t num_kv_heads,
+                                   int64_t head_dim, int64_t seq_len,
+                                   int64_t chunk_size, int num_cols) {
+    if (ctx->flowkv_compile_failed.count(cache_key)) return false;
+
+    std::string bundle_dir = ctx->cache_dir + "/" + cache_key;
+    if (flowkv_bundle_present(bundle_dir)) return true;
+
+    // Invoke compile.py flowkv-decode
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd),
+             "%s %s --quiet flowkv-decode"
+             " --num-heads %lld --num-kv-heads %lld --head-dim %lld"
+             " --seq-len %lld --chunk-size %lld --num-cols %d"
+             " --out %s",
+             xdna_python_cmd(), ctx->compile_script.c_str(),
+             (long long)num_heads, (long long)num_kv_heads,
+             (long long)head_dim, (long long)seq_len,
+             (long long)chunk_size, num_cols,
+             bundle_dir.c_str());
+
+    fprintf(stderr, "ggml-xdna: compiling FlowKV decode H=%lld KV=%lld d=%lld S=%lld C=%lld cols=%d "
+            "(first run, will be cached)...\n",
+            (long long)num_heads, (long long)num_kv_heads,
+            (long long)head_dim, (long long)seq_len,
+            (long long)chunk_size, num_cols);
+    fflush(stderr);
+
+    int ret = system(cmd);
+    if (ret != 0) {
+        GGML_LOG_ERROR("ggml-xdna: FlowKV decode compilation failed (exit code %d)\n", ret);
+        ctx->flowkv_compile_failed.insert(cache_key);
+        return false;
+    }
+    if (!flowkv_bundle_present(bundle_dir)) {
+        GGML_LOG_ERROR("ggml-xdna: FlowKV decode compilation succeeded but bundle files missing in %s\n",
+                       bundle_dir.c_str());
+        ctx->flowkv_compile_failed.insert(cache_key);
+        return false;
+    }
+    fprintf(stderr, "ggml-xdna: FlowKV decode compilation complete, cached at %s\n",
+            bundle_dir.c_str());
+    fflush(stderr);
+    return true;
+}
+
+static bool try_load_flowkv_entry(xdna_flowkv_entry & entry,
+                                  ggml_backend_xdna_context * ctx,
+                                  const std::string & bundle_dir) {
+    std::string xclbin_path = bundle_dir + "/combined.xclbin";
+    std::string insts_path  = bundle_dir + "/flowkv_decode_main.insts";
+
+    if (!std::ifstream(xclbin_path).good() || !std::ifstream(insts_path).good()) return false;
+
+    try {
+        entry.xclbin = xrt::xclbin(xclbin_path);
+        entry.hw_ctx = xrt::hw_context(ctx->device, entry.xclbin);
+        entry.kernel = xrt::kernel(entry.hw_ctx, "flowkv_decode");
+        entry.insts_data = read_binary_file(insts_path);
+        entry.insts_bo = xrt::bo(ctx->device, entry.insts_data.size(),
+                                 xrt::bo::flags::cacheable, entry.kernel.group_id(3));
+        memcpy(entry.insts_bo.map<void*>(), entry.insts_data.data(), entry.insts_data.size());
+        entry.insts_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("ggml-xdna: failed to load FlowKV decode xclbin: %s\n", e.what());
+        return false;
+    }
+    return true;
+}
+
+static xdna_flowkv_entry * get_or_load_flowkv_kernel(
+        ggml_backend_xdna_context * ctx,
+        int64_t num_heads, int64_t num_kv_heads,
+        int64_t head_dim, int64_t seq_len,
+        int64_t chunk_size, int num_cols) {
+    std::string cache_key = make_flowkv_cache_key(
+        num_heads, num_kv_heads, head_dim, seq_len, chunk_size, num_cols);
+
+    {
+        std::lock_guard<std::mutex> lock(ctx->cache_mutex);
+        auto it = ctx->flowkv_cache.find(cache_key);
+        if (it != ctx->flowkv_cache.end()) return &it->second;
+    }
+
+    std::string bundle_dir = ctx->cache_dir + "/" + cache_key;
+
+    // Retry loop: compile if missing, then load.
+    for (int attempt = 0; attempt < 2; attempt++) {
+        if (!flowkv_bundle_present(bundle_dir)) {
+            if (!ensure_flowkv_compiled(ctx, cache_key,
+                                        num_heads, num_kv_heads, head_dim,
+                                        seq_len, chunk_size, num_cols)) {
+                return nullptr;
+            }
+        }
+
+        xdna_flowkv_entry entry;
+        entry.num_heads    = num_heads;
+        entry.num_kv_heads = num_kv_heads;
+        entry.head_dim     = head_dim;
+        entry.seq_len      = seq_len;
+        entry.chunk_size   = chunk_size;
+        entry.num_cols     = num_cols;
+        entry.cache_key    = cache_key;
+
+        if (try_load_flowkv_entry(entry, ctx, bundle_dir)) {
+            std::lock_guard<std::mutex> lock(ctx->cache_mutex);
+            auto [ins, _] = ctx->flowkv_cache.emplace(cache_key, std::move(entry));
+            fprintf(stderr, "ggml-xdna: loaded FlowKV decode kernel bundle for %s\n",
+                    cache_key.c_str());
+            fflush(stderr);
+            return &ins->second;
+        }
+
+        // Stale cache — delete and recompile.
+        if (attempt == 0) {
+            fprintf(stderr, "ggml-xdna: FlowKV cache stale for %s, recompiling...\n",
+                    cache_key.c_str());
+            fflush(stderr);
+            // Best-effort cleanup of stale bundle directory.
+            std::string rm_cmd = "rm -rf \"" + bundle_dir + "\"";
+            (void)system(rm_cmd.c_str());
+            ctx->flowkv_compile_failed.erase(cache_key);
+        }
+    }
+    GGML_LOG_ERROR("ggml-xdna: failed to load FlowKV decode kernel after recompile\n");
+    return nullptr;
+}
+
+// Dispatch FlowKV decode attention for a single decode step.
+// q_tensor:  [head_dim, num_heads] — Q vectors (unrotated)
+// k_tensor:  [head_dim, seq_len * num_kv_heads] — K cache (already rotated)
+// v_tensor:  [head_dim, seq_len * num_kv_heads] — V cache
+// out_tensor: [head_dim, num_heads] — attention output
+//
+// RoPE is applied in-register on the NPU score tile before attention.
+// K in the cache is assumed to be already rotated.
+static bool ggml_backend_xdna_flowkv_decode(
+        ggml_backend_xdna_context * ctx,
+        const struct ggml_tensor * q_tensor,
+        const struct ggml_tensor * k_tensor,
+        const struct ggml_tensor * v_tensor,
+        struct ggml_tensor * out_tensor,
+        int64_t num_heads, int64_t num_kv_heads,
+        int64_t head_dim, int64_t seq_len) {
+    static const bool dbg = getenv("XDNA_DEBUG") != NULL;
+
+    if (!ctx || !ctx->device_valid) {
+        GGML_LOG_ERROR("ggml-xdna: FlowKV called but XRT device invalid\n");
+        return false;
+    }
+
+    // Derive chunk_size and num_cols from hardware.
+    static const int num_cols = ctx->num_cols;
+    static const int chunk_size = 32;  // Default chunk size
+
+    // Validate constraints.
+    if (head_dim != 64) {
+        if (dbg) fprintf(stderr, "ggml-xdna: FlowKV only supports head_dim=64, got %lld\n",
+                         (long long)head_dim);
+        return false;
+    }
+    if (seq_len % chunk_size != 0) {
+        if (dbg) fprintf(stderr, "ggml-xdna: FlowKV seq_len=%lld not divisible by chunk_size=%d\n",
+                         (long long)seq_len, chunk_size);
+        return false;
+    }
+    if (num_kv_heads % num_cols != 0) {
+        if (dbg) fprintf(stderr, "ggml-xdna: FlowKV num_kv_heads=%lld not divisible by num_cols=%d\n",
+                         (long long)num_kv_heads, num_cols);
+        return false;
+    }
+
+    xdna_flowkv_entry * entry = get_or_load_flowkv_kernel(
+        ctx, num_heads, num_kv_heads, head_dim, seq_len, chunk_size, num_cols);
+    if (!entry) return false;
+
+    try {
+        // Allocate BOs on first use.
+        if (!entry->bo_kv) {
+            size_t kv_size = num_kv_heads * seq_len * 2 * head_dim * sizeof(uint16_t);
+            entry->bo_kv = std::make_unique<xrt::bo>(
+                xrt::bo(ctx->device, kv_size, xrt::bo::flags::host_only,
+                        entry->kernel.group_id(0)));
+        }
+        if (!entry->bo_q) {
+            int group_size = num_heads / num_kv_heads;
+            size_t q_size = num_kv_heads * (group_size * head_dim + head_dim) * sizeof(uint16_t);
+            entry->bo_q = std::make_unique<xrt::bo>(
+                xrt::bo(ctx->device, q_size, xrt::bo::flags::host_only,
+                        entry->kernel.group_id(1)));
+        }
+        if (!entry->bo_out) {
+            size_t out_size = num_heads * head_dim * sizeof(uint16_t);
+            entry->bo_out = std::make_unique<xrt::bo>(
+                xrt::bo(ctx->device, out_size, xrt::bo::flags::host_only,
+                        entry->kernel.group_id(2)));
+        }
+
+        // --- Prepare KV cache buffer (interleaved K and V) ---
+        // DDR layout: (num_kv_heads, seq_len, 2, head_dim) flattened
+        // For each position: K row then V row.
+        {
+            auto kv_ptr = entry->bo_kv->map<char *>();
+            const char * k_data = (const char *)k_tensor->data;
+            const char * v_data = (const char *)v_tensor->data;
+            size_t head_stride = seq_len * head_dim * sizeof(ggml_fp16_t);
+            size_t row_bytes = head_dim * sizeof(ggml_fp16_t);
+
+            for (int64_t kv_h = 0; kv_h < num_kv_heads; kv_h++) {
+                for (int64_t pos = 0; pos < seq_len; pos++) {
+                    // K row
+                    size_t dst_k = (kv_h * seq_len * 2 + pos * 2) * row_bytes;
+                    size_t src_k = kv_h * head_stride + pos * row_bytes;
+                    memcpy(kv_ptr + dst_k, k_data + src_k, row_bytes);
+                    // V row
+                    size_t dst_v = (kv_h * seq_len * 2 + pos * 2 + 1) * row_bytes;
+                    size_t src_v = kv_h * head_stride + pos * row_bytes;
+                    memcpy(kv_ptr + dst_v, v_data + src_v, row_bytes);
+                }
+            }
+            entry->bo_kv->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        }
+
+        // --- Prepare Q buffer (packed Q + RoPE angles) ---
+        // DDR layout: [Q_group0 (gs*hd) | angles (hd) | Q_group1 (gs*hd) | angles (hd) | ...]
+        // For now, we need RoPE angles. In the expanded attention pattern,
+        // RoPE has already been applied to Q by the graph. So we pass
+        // the already-rotated Q directly and set angles to identity (cos=1, sin=0).
+        // This means the kernel's RoPE step is a no-op on already-rotated Q.
+        {
+            auto q_ptr = entry->bo_q->map<char *>();
+            const char * q_data = (const char *)q_tensor->data;
+            int group_size = num_heads / num_kv_heads;
+            size_t q_head_bytes = head_dim * sizeof(ggml_fp16_t);
+            size_t group_stride = group_size * head_dim + head_dim;
+            size_t group_bytes = group_stride * sizeof(ggml_fp16_t);
+
+            // Identity angles: cos=1.0 (0x3C00 in bf16), sin=0.0 (0x0000 in bf16)
+            // bf16 1.0 = 0x3F80 >> 16 = 0x3C00
+            // bf16 0.0 = 0x0000
+            char angle_cos_bf16[2] = {0x00, 0x3C};  // bf16 1.0 (little-endian)
+            char angle_sin_bf16[2] = {0x00, 0x00};  // bf16 0.0
+
+            for (int64_t kv_h = 0; kv_h < num_kv_heads; kv_h++) {
+                size_t base = kv_h * group_bytes;
+                // Copy Q heads for this KV group
+                for (int g = 0; g < group_size; g++) {
+                    int64_t h = kv_h * group_size + g;
+                    size_t dst = base + g * q_head_bytes;
+                    size_t src = h * q_head_bytes;
+                    memcpy(q_ptr + dst, q_data + src, q_head_bytes);
+                }
+                // Write identity angles (cos=1, sin=0 interleaved)
+                size_t angles_off = base + group_size * q_head_bytes;
+                for (int d = 0; d < head_dim; d += 2) {
+                    memcpy(q_ptr + angles_off + d * 2, angle_cos_bf16, 2);
+                    memcpy(q_ptr + angles_off + d * 2 + 2, angle_sin_bf16, 2);
+                }
+            }
+            entry->bo_q->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        }
+
+        // --- Dispatch ---
+        auto run = xrt::run(entry->kernel);
+        run.set_arg(0, *entry->bo_kv);
+        run.set_arg(1, *entry->bo_q);
+        run.set_arg(2, *entry->bo_out);
+        run.set_arg(3, entry->insts_bo);
+
+        {
+            std::lock_guard<std::mutex> lock(*entry->mu);
+            auto t0 = std::chrono::steady_clock::now();
+            run.start();
+            auto state = run.wait(30000);  // 30s timeout
+            auto t1 = std::chrono::steady_clock::now();
+
+            if (state != ERT_CMD_STATE_COMPLETED) {
+                GGML_LOG_ERROR("ggml-xdna: FlowKV dispatch failed, state=%d\n", (int)state);
+                return false;
+            }
+
+            if (dbg) {
+                float ms = std::chrono::duration<float, std::milli>(t1 - t0).count();
+                fprintf(stderr, "ggml-xdna: FlowKV decode H=%lld KV=%lld S=%lld → %.2f ms\n",
+                        (long long)num_heads, (long long)num_kv_heads,
+                        (long long)seq_len, ms);
+                fflush(stderr);
+            }
+        }
+
+        // --- Read back output ---
+        entry->bo_out->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        {
+            auto out_ptr = entry->bo_out->map<char *>();
+            memcpy(out_tensor->data, out_ptr, num_heads * head_dim * sizeof(ggml_fp16_t));
+        }
+
+        return true;
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("ggml-xdna: FlowKV dispatch exception: %s\n", e.what());
+        return false;
     }
 }
 
@@ -8748,7 +9116,7 @@ static bool xdna_select_rms_norm_params(int64_t size, int max_cols,
                                         int * out_cols, int * out_channels,
                                         int * out_tile_size) {
     const int tile_size = 32;  // matches the bridge default and IRON test grid
-    
+
     // Support forcing ch=1 via environment variable (useful for matching specific kernels)
     const bool force_ch1 = getenv("GGML_XDNA_FORCE_CH1") != NULL;
     std::vector<int> ch_candidates = force_ch1 ? std::vector<int>{1} : std::vector<int>{2, 1};
@@ -8771,7 +9139,7 @@ static bool xdna_select_rms_norm_params(int64_t size, int max_cols,
 static bool rms_norm_bundle_present(const std::string & bundle_dir) {
     std::string xclbin_path = bundle_dir + "\\combined.xclbin";
     std::string insts_path = bundle_dir + "\\rms_norm_main.insts";
-    
+
     std::ifstream xf(xclbin_path);
     if (!xf.good()) {
         // fprintf(stderr, "ggml-xdna: rms_norm_bundle_present: missing %s\n", xclbin_path.c_str());
@@ -8798,7 +9166,7 @@ static bool ensure_rms_norm_compiled(ggml_backend_xdna_context * ctx,
     if (!xdna_env_enabled("XDNA_ENABLE_RMS_NORM")) return false;
 
     const std::string bundle_dir = ctx->cache_dir + "\\" + cache_key;
-    
+
     static const bool dbg = getenv("XDNA_DEBUG") != NULL;
     if (dbg) {
         fprintf(stderr, "ggml-xdna: searching for rms_norm in %s\n", bundle_dir.c_str());
@@ -8955,7 +9323,7 @@ static bool ggml_backend_xdna_rms_norm(ggml_backend_xdna_context * ctx,
 
     const std::string cache_key = make_rms_norm_cache_key(
         size, "bf16", num_cols, num_channels, tile_size, /*weighted=*/false);
-    
+
     if (dbg) {
         fprintf(stderr, "ggml-xdna: using rms_norm cache_key: %s\n", cache_key.c_str());
     }
@@ -9098,6 +9466,129 @@ static ggml_status xdna_delegate_range(ggml_backend_xdna_context * ctx,
     return ggml_backend_graph_compute(ctx->cpu_backend, &sub);
 }
 
+// ============================================================================
+// Expanded decode-attention matcher for FlowKV.
+//
+// Matches the pattern: MUL_MAT(Q@K^T) [SCALE] [ADD mask] SOFT_MAX MUL_MAT(scores@V)
+// where all MUL_MATs have M=1 (decode). Returns the indices of the first
+// MUL_MAT, SOFT_MAX, and last MUL_MAT if matched.
+// ============================================================================
+struct xdna_flowkv_match {
+    int qk_idx;      // index of first MUL_MAT (Q @ K^T)
+    int softmax_idx;  // index of SOFT_MAX
+    int pv_idx;       // index of second MUL_MAT (scores @ V)
+    int64_t num_heads;
+    int64_t num_kv_heads;
+    int64_t head_dim;
+    int64_t seq_len;
+};
+
+static bool xdna_try_match_flowkv_decode(const struct ggml_cgraph * cgraph,
+                                         int start_idx, xdna_flowkv_match * out) {
+    // We look for the pattern starting at a MUL_MAT with M=1.
+    int n = cgraph->n_nodes;
+    if (start_idx + 2 >= n) return false;  // need at least 3 nodes
+
+    struct ggml_tensor * first_mm = cgraph->nodes[start_idx];
+    if (first_mm->op != GGML_OP_MUL_MAT) return false;
+
+    // First MUL_MAT must be decode (M=1).
+    if (first_mm->src[1]->ne[1] != 1) return false;
+
+    // Shapes: src[0] = K^T [head_dim, seq_len], src[1] = Q [head_dim, 1]
+    // Result: [seq_len, 1]
+    int64_t head_dim = first_mm->src[0]->ne[0];
+    int64_t seq_len  = first_mm->src[0]->ne[1];
+    int64_t num_heads = first_mm->ne[1];  // may be ne[1] of result
+
+    // Validate decode shape.
+    if (head_dim != 64) return false;
+    if (seq_len < 1) return false;
+
+    // Walk forward looking for SOFT_MAX, tolerating SCALE and ADD.
+    int softmax_idx = -1;
+    for (int j = start_idx + 1; j < n && j < start_idx + 6; j++) {
+        enum ggml_op op = cgraph->nodes[j]->op;
+        if (op == GGML_OP_SOFT_MAX) {
+            softmax_idx = j;
+            break;
+        }
+        if (op == GGML_OP_SCALE || op == GGML_OP_ADD) {
+            continue;  // tolerated intermediate
+        }
+        // Any other op breaks the pattern.
+        return false;
+    }
+    if (softmax_idx < 0) return false;
+
+    // After SOFT_MAX, look for the second MUL_MAT (scores @ V).
+    int pv_idx = -1;
+    for (int j = softmax_idx + 1; j < n && j < softmax_idx + 6; j++) {
+        enum ggml_op op = cgraph->nodes[j]->op;
+        if (op == GGML_OP_MUL_MAT) {
+            // Must be decode (M=1).
+            if (cgraph->nodes[j]->src[1]->ne[1] != 1) return false;
+            pv_idx = j;
+            break;
+        }
+        if (op == GGML_OP_VIEW || op == GGML_OP_RESHAPE ||
+            op == GGML_OP_CONT || op == GGML_OP_PERMUTE) {
+            continue;  // tolerated
+        }
+        return false;
+    }
+    if (pv_idx < 0) return false;
+
+    // Derive num_heads and num_kv_heads from the graph structure.
+    // The Q@K^T MUL_MAT: src[1] = Q [head_dim, num_heads] (but M=1 so ne[1]=1)
+    // Actually for decode, Q is [head_dim, 1] per head, but the graph may
+    // batch all heads. Let's derive from tensor dims.
+    // first_mm->src[1] = activation, first_mm->src[0] = weight
+    // For Q@K^T: weight = K cache [head_dim, seq_len * num_kv_heads]
+    // We need num_kv_heads from the K weight layout.
+    int64_t k_total_cols = first_mm->src[0]->ne[1];  // seq_len * num_kv_heads
+    int64_t num_kv_heads = k_total_cols / seq_len;
+    if (num_kv_heads < 1 || seq_len * num_kv_heads != k_total_cols) return false;
+
+    // For the PV MUL_MAT: src[0] = V^T [head_dim, seq_len * num_kv_heads]
+    // Result = [head_dim, num_heads] but M=1 means it's per-head.
+    // Actually in expanded attention, the second MUL_MAT is:
+    //   V [head_dim, seq_len * num_kv_heads] × softmax_output [seq_len, 1]
+    //   → [head_dim, 1] per head, or [head_dim, num_heads] batched.
+    // The result shape tells us num_heads.
+    int64_t out_dim = cgraph->nodes[pv_idx]->ne[0];  // head_dim
+    if (out_dim != head_dim) return false;
+
+    // num_heads = result ne[1] (for batched) or we infer from Q tensor.
+    // For decode with expanded attention, each head is typically separate.
+    // Let's try to infer from the first MUL_MAT's result ne[1].
+    num_heads = first_mm->ne[1];
+    if (num_heads < 1) num_heads = 1;
+
+    // Check GQA constraint.
+    if (num_heads % num_kv_heads != 0) return false;
+
+    out->qk_idx     = start_idx;
+    out->softmax_idx = softmax_idx;
+    out->pv_idx      = pv_idx;
+    out->num_heads   = num_heads;
+    out->num_kv_heads = num_kv_heads;
+    out->head_dim    = head_dim;
+    out->seq_len     = seq_len;
+
+    static const bool dbg = getenv("XDNA_DEBUG") != NULL;
+    if (dbg) {
+        fprintf(stderr,
+                "ggml-xdna: FlowKV match @%d..%d (QK=%d softmax=%d PV=%d) "
+                "H=%lld KV=%lld d=%lld S=%lld\n",
+                start_idx, pv_idx, start_idx, softmax_idx, pv_idx,
+                (long long)num_heads, (long long)num_kv_heads,
+                (long long)head_dim, (long long)seq_len);
+        fflush(stderr);
+    }
+    return true;
+}
+
 static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     ggml_backend_xdna_context * ctx = (ggml_backend_xdna_context *)backend->context;
     int n = cgraph->n_nodes;
@@ -9174,6 +9665,7 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
     static const bool transformer_block_enabled =
         (getenv("XDNA_ENABLE_TRANSFORMER_BLOCK") != NULL) ||
         (getenv("XDNA_ENABLE_TBLOCK_FUSED") != NULL);
+    static const bool flowkv_decode_enabled = getenv("XDNA_ENABLE_FLOWKV_DECODE") != NULL;
 
     // Pre-scan for QKV triples. Llama.cpp's Qwen3.5 decode interleaves
     // RMSNorm/view ops between Q and K/V MUL_MATs, so a 3-consecutive-node
@@ -9271,6 +9763,56 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                     cpu_run_start = -1;
                 }
                 continue;
+            }
+        }
+
+        // FlowKV decode attention: match expanded attention pattern
+        // (MUL_MAT Q@K^T → [SCALE] → [ADD mask] → SOFT_MAX → MUL_MAT scores@V)
+        // for decode (M=1). Dispatches the entire attention to NPU in one shot.
+        if (flowkv_decode_enabled && node->op == GGML_OP_MUL_MAT
+            && node->src[1]->ne[1] == 1) {
+            xdna_flowkv_match fkm{};
+            if (xdna_try_match_flowkv_decode(cgraph, i, &fkm)) {
+                // Flush any pending CPU run up to this node.
+                if (cpu_run_start >= 0) {
+                    ggml_status s = xdna_delegate_range(ctx, cgraph, cpu_run_start, i);
+                    if (s != GGML_STATUS_SUCCESS) return s;
+                    cpu_run_start = -1;
+                }
+
+                // Get the Q, K, V tensors from the matched nodes.
+                struct ggml_tensor * qk_mm = cgraph->nodes[fkm.qk_idx];
+                struct ggml_tensor * pv_mm = cgraph->nodes[fkm.pv_idx];
+                // Q@K^T: src[0]=K^T, src[1]=Q
+                struct ggml_tensor * q_tensor = qk_mm->src[1];
+                struct ggml_tensor * k_tensor = qk_mm->src[0];
+                // scores@V: src[0]=V^T, src[1]=softmax(scores)
+                struct ggml_tensor * v_tensor = pv_mm->src[0];
+                struct ggml_tensor * out_tensor = pv_mm;
+
+                bool dispatched = ggml_backend_xdna_flowkv_decode(
+                    ctx, q_tensor, k_tensor, v_tensor, out_tensor,
+                    fkm.num_heads, fkm.num_kv_heads, fkm.head_dim, fkm.seq_len);
+
+                if (dispatched) {
+                    // Skip all nodes from qk_idx to pv_idx (inclusive).
+                    // They've been handled by FlowKV on NPU.
+                    if (cpu_run_start >= 0) {
+                        // Should not happen (we flushed above), but be safe.
+                        xdna_delegate_range(ctx, cgraph, cpu_run_start, fkm.qk_idx);
+                        cpu_run_start = -1;
+                    }
+                    i = fkm.pv_idx;  // loop will i++ past it
+                    continue;
+                }
+                // If dispatch failed, fall through to CPU path.
+                static bool flowkv_warned = false;
+                if (!flowkv_warned && debug) {
+                    fprintf(stderr, "ggml-xdna: FlowKV dispatch failed @%d, "
+                            "falling back to CPU\n", i);
+                    fflush(stderr);
+                    flowkv_warned = true;
+                }
             }
         }
 
@@ -10400,17 +10942,38 @@ static bool ggml_backend_xdna_device_offload_op(ggml_backend_dev_t dev, const st
     static const bool transformer_block_enabled   =
         (getenv("XDNA_ENABLE_TRANSFORMER_BLOCK") != NULL) ||
         (getenv("XDNA_ENABLE_TBLOCK_FUSED") != NULL);
-    if (qkv_enabled || attention_prefill_enabled || transformer_block_enabled) {
+    static const bool flowkv_decode_enabled       = getenv("XDNA_ENABLE_FLOWKV_DECODE") != NULL;
+    if (qkv_enabled || attention_prefill_enabled || transformer_block_enabled || flowkv_decode_enabled) {
         // Gate aggressive non-MUL_MAT claims on prefill shape. During decode
         // (seq=1), claiming intermediates like ADD/MUL/RMS_NORM/ROPE just
         // fragments scheduling with delegate_range round-trips and has no
         // fused-pattern benefit (the matcher gates on seq>=256). Heuristic:
         // look at this op's ne[1]; fall back to src[0]->ne[1]. Prefill ops
         // carry the seq dim here; decode ops carry 1.
+        //
+        // FlowKV decode is an exception: it needs the scheduler to keep
+        // expanded-attention intermediates (SCALE, ADD mask, SOFT_MAX)
+        // in the same segment during decode (seq dim in ne[0] of src[0]).
         auto is_prefill_op = [](const struct ggml_tensor * op) -> bool {
             int64_t seq = op->ne[1];
             if (seq <= 1 && op->src[0] != nullptr) seq = op->src[0]->ne[1];
             return seq >= 32;
+        };
+        // For FlowKV: check if this op is part of an expanded attention
+        // decode pattern. The key dimension is in src[0]->ne[0] (head_dim=64)
+        // or src[0]->ne[1] (seq_len). If seq_len > 1 and M=1, it's decode attn.
+        auto is_flowkv_decode_op = [](const struct ggml_tensor * op) -> bool {
+            if (op->src[0] == nullptr) return false;
+            int64_t dim1 = op->src[0]->ne[1];
+            // SOFT_MAX result: ne[0]=seq_len, ne[1]=1 for decode
+            if (op->op == GGML_OP_SOFT_MAX) {
+                return op->ne[0] > 1 && op->ne[1] == 1;
+            }
+            // SCALE/ADD on attention scores: src carries seq_len dim
+            if (op->op == GGML_OP_SCALE || op->op == GGML_OP_ADD) {
+                return dim1 > 1 || (op->src[1] != nullptr && op->src[1]->ne[1] > 1);
+            }
+            return false;
         };
         switch (op->op) {
             case GGML_OP_MUL_MAT: {
@@ -10418,6 +10981,12 @@ static bool ggml_backend_xdna_device_offload_op(ggml_backend_dev_t dev, const st
                 const int64_t N = op->src[0]->ne[1];
                 const int64_t M = op->src[1]->ne[1];
                 if (M == 1) {
+                    // For FlowKV: claim M=1 MUL_MATs where K=head_dim=64
+                    // and N=seq_len (Q@K^T) or N=seq_len (scores@V).
+                    // These are the attention score and output computations.
+                    if (flowkv_decode_enabled && K == 64 && N > 1) {
+                        return true;
+                    }
                     // Aggressive M=1 claim only makes sense for QKV (decode
                     // matmul fusion). Attention-prefill and transformer-block
                     // are prefill-only; claiming M=1 MUL_MATs for them
@@ -10435,19 +11004,22 @@ static bool ggml_backend_xdna_device_offload_op(ggml_backend_dev_t dev, const st
             // graph_compute's CPU fallback delegates them via
             // xdna_delegate_range (cheap during prefill). During decode,
             // return false to let them stay on CPU natively.
+            // For FlowKV: also claim SCALE, ADD, SOFT_MAX in decode attention.
+            case GGML_OP_SCALE:
             case GGML_OP_ADD:
+            case GGML_OP_SOFT_MAX:
+                if (flowkv_decode_enabled && is_flowkv_decode_op(op)) return true;
+                return is_prefill_op(op);
             case GGML_OP_MUL:
             case GGML_OP_SUB:
             case GGML_OP_DIV:
             case GGML_OP_RMS_NORM:
             case GGML_OP_NORM:
             case GGML_OP_GROUP_NORM:
-            case GGML_OP_SCALE:
             case GGML_OP_CPY:
             case GGML_OP_CONT:
             case GGML_OP_DUP:
             case GGML_OP_ROPE:
-            case GGML_OP_SOFT_MAX:
             case GGML_OP_FLASH_ATTN_EXT:
             case GGML_OP_UNARY:
             case GGML_OP_GLU:

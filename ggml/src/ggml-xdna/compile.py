@@ -26,7 +26,7 @@ if os.name == 'nt':
     driver_dir = r'C:\Windows\System32\DriverStore\FileRepository\kipudrv.inf_amd64_1a1aa059597c4810'
     if os.path.exists(driver_dir):
         os.add_dll_directory(driver_dir)
-    
+
     # Add XRT SDK python folder to DLL path too
     xrt_sdk_dlls = r'C:\Users\Kuhnya\Downloads\xrt_windows_sdk\xrt_sdk\xrt\bin\condautils'
     if os.path.exists(xrt_sdk_dlls):
@@ -197,6 +197,30 @@ def rms_norm_cache_key(size: int, dtype: str, num_aie_columns: int,
     }
     key_json = json.dumps(key_data, sort_keys=True)
     return hashlib.sha256(key_json.encode()).hexdigest()[:16]
+
+
+def flowkv_decode_cache_key(num_heads: int, num_kv_heads: int, head_dim: int,
+                            seq_len: int, chunk_size: int,
+                            num_cols: int) -> str:
+    """Cache key for a FlowKV decode attention configuration.
+
+    Single xclbin with 2-tile pipeline (score + value) per KV head group.
+    Disjoint from other ops by the "op" field.
+    """
+    key_data = {
+        "op": "flowkv_decode",
+        "num_heads": num_heads,
+        "num_kv_heads": num_kv_heads,
+        "head_dim": head_dim,
+        "seq_len": seq_len,
+        "chunk_size": chunk_size,
+        "num_cols": num_cols,
+    }
+    key_json = json.dumps(key_data, sort_keys=True)
+    return hashlib.sha256(key_json.encode()).hexdigest()[:16]
+
+
+FLOWKV_DECODE_KERNELS = ("flowkv_decode",)
 
 
 def qkv_cache_key(embedding_dim: int, q_dim: int, k_dim: int, v_dim: int,
@@ -1287,6 +1311,81 @@ def compile_qkv_cached(embedding_dim: int, q_dim: int, k_dim: int, v_dim: int,
     return Path(output_dir)
 
 
+# ---------------------------------------------------------------------------
+# FlowKV Decode Attention (single xclbin, 2-tile streaming pipeline)
+# ---------------------------------------------------------------------------
+
+def _stage_flowkv_decode_artifacts(op, output_dir: str) -> None:
+    """Stage a compiled FlowKV decode op's xclbin + insts under output_dir.
+
+    Produces:
+        <output_dir>/combined.xclbin
+        <output_dir>/flowkv_decode_main.insts
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    build_dir = op.context.build_dir
+    compiled_xclbin = build_dir / op.xclbin_artifact.filename
+    compiled_insts = build_dir / op.insts_artifact.filename
+    shutil.copy2(str(compiled_xclbin), os.path.join(output_dir, "combined.xclbin"))
+    shutil.copy2(str(compiled_insts), os.path.join(output_dir, "flowkv_decode_main.insts"))
+
+
+def compile_flowkv_decode(num_heads: int, num_kv_heads: int, head_dim: int,
+                          seq_len: int, chunk_size: int = 32,
+                          num_cols: int = 4, output_dir: str = "") -> str:
+    """Compile a FlowKV decode attention operator.
+
+    Produces one xclbin with a 2-tile streaming pipeline (score + value)
+    per KV head group, with fused RoPE on Q. Uses online softmax for
+    exact FlashAttention semantics in a single streaming pass.
+
+    Output layout:
+        <output_dir>/combined.xclbin
+        <output_dir>/flowkv_decode_main.insts
+    """
+    from iron.operators.flowkv_decode.op import AIEFlowKVDecode
+
+    op = AIEFlowKVDecode(
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        seq_len=seq_len,
+        chunk_size=chunk_size,
+        num_cols=num_cols,
+    )
+    op.compile()
+
+    _stage_flowkv_decode_artifacts(op, output_dir)
+    return output_dir
+
+
+def compile_flowkv_decode_cached(num_heads: int, num_kv_heads: int,
+                                 head_dim: int, seq_len: int,
+                                 chunk_size: int = 32,
+                                 num_cols: int = 4) -> Path:
+    """Compile a FlowKV decode attention operator with caching.
+
+    Returns path to the cache directory containing combined.xclbin and
+    flowkv_decode_main.insts.
+    """
+    key = flowkv_decode_cache_key(
+        num_heads, num_kv_heads, head_dim, seq_len, chunk_size, num_cols
+    )
+
+    cached = get_cached_chained_dir(
+        key, FLOWKV_DECODE_KERNELS, prefix="flowkv_decode"
+    )
+    if cached is not None:
+        return cached
+
+    output_dir = str(get_cache_dir() / key)
+    compile_flowkv_decode(
+        num_heads, num_kv_heads, head_dim, seq_len, chunk_size, num_cols,
+        output_dir,
+    )
+    return Path(output_dir)
+
+
 def compile_swiglu_prefill_cached(seq_len: int, embedding_dim: int, hidden_dim: int,
                                   dtype: str = "bf16",
                                   num_aie_columns: int = 4,
@@ -2149,6 +2248,27 @@ def main():
     rms_parser.add_argument("--out", type=str,
                             help="Output directory (default: cache)")
 
+    # FlowKV Decode Attention subcommand (streaming decode attention with online softmax)
+    fkvd_parser = subparsers.add_parser(
+        "flowkv-decode",
+        help="Compile FlowKV decode attention (streaming online softmax, fused RoPE, "
+             "2-tile pipeline per KV head group)",
+    )
+    fkvd_parser.add_argument("--num-heads", type=int, required=True,
+                             help="Number of query heads (e.g. 32 for Llama 3.2 1B)")
+    fkvd_parser.add_argument("--num-kv-heads", type=int, required=True,
+                             help="Number of KV heads (e.g. 8 for Llama 3.2 1B)")
+    fkvd_parser.add_argument("--head-dim", type=int, default=64,
+                             help="Per-head dimension (only 64 supported)")
+    fkvd_parser.add_argument("--seq-len", type=int, required=True,
+                             help="KV cache sequence length")
+    fkvd_parser.add_argument("--chunk-size", type=int, default=32,
+                             help="K/V chunk size for streaming (default: 32)")
+    fkvd_parser.add_argument("--num-cols", type=int, default=4,
+                             help="Number of AIE columns (default: 4)")
+    fkvd_parser.add_argument("--out", type=str,
+                             help="Output directory (default: cache)")
+
     # SwiGLU prefill INT8 subcommand
     swpi_parser = subparsers.add_parser(
         "swiglu-prefill-int8",
@@ -2400,6 +2520,20 @@ def main():
             path = compile_rms_norm_cached(
                 args.size, args.dtype, args.num_aie_columns,
                 args.num_channels, args.tile_size, args.weighted,
+            )
+        if not args.quiet:
+            print(path)
+    elif args.op == "flowkv-decode":
+        if args.out:
+            path = compile_flowkv_decode(
+                args.num_heads, args.num_kv_heads, args.head_dim,
+                args.seq_len, args.chunk_size, args.num_cols,
+                args.out,
+            )
+        else:
+            path = compile_flowkv_decode_cached(
+                args.num_heads, args.num_kv_heads, args.head_dim,
+                args.seq_len, args.chunk_size, args.num_cols,
             )
         if not args.quiet:
             print(path)
