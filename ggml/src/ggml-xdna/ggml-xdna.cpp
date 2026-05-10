@@ -4349,8 +4349,6 @@ static bool ggml_backend_xdna_flowkv_per_head(
     }
 }
 
-static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
-
 // ============================================================================
 // Decode GEMV batcher — collects standalone MUL_MAT M=1 dispatches and
 // flushes them as a single xrt::runlist per (K,N) shape group.
