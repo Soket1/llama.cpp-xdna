@@ -220,6 +220,8 @@ def flowkv_decode_cache_key(num_heads: int, num_kv_heads: int, head_dim: int,
     return hashlib.sha256(key_json.encode()).hexdigest()[:16]
 
 
+# Single-kernel xclbin: insts file is staged as "flowkv_decode_main.insts"
+# by _stage_flowkv_decode_artifacts(), so the lookup key must be ("main",).
 FLOWKV_DECODE_KERNELS = ("main",)
 
 
