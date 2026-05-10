@@ -220,7 +220,7 @@ def flowkv_decode_cache_key(num_heads: int, num_kv_heads: int, head_dim: int,
     return hashlib.sha256(key_json.encode()).hexdigest()[:16]
 
 
-FLOWKV_DECODE_KERNELS = ("flowkv_decode",)
+FLOWKV_DECODE_KERNELS = ("main",)
 
 
 def qkv_cache_key(embedding_dim: int, q_dim: int, k_dim: int, v_dim: int,
