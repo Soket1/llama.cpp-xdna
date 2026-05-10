@@ -4084,8 +4084,6 @@ static xdna_flowkv_entry * get_or_load_flowkv_kernel(
     GGML_LOG_ERROR("ggml-xdna: failed to load FlowKV decode kernel after recompile\n");
     return nullptr;
 }
-    return nullptr;
-}
 
 // ============================================================================
 // Expanded decode-attention matcher for FlowKV (per-head dispatch).
