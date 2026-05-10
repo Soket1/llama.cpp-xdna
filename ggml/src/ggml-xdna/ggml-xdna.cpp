@@ -537,9 +537,6 @@ struct xdna_rms_norm_entry {
     //   out_bo: size * sizeof(uint16_t) bf16 output
     std::unique_ptr<xrt::bo> in_bo;
     std::unique_ptr<xrt::bo> out_bo;
-
-    // Weight (gain) BO cache for weighted RMSNorm. Keyed by weight data ptr.
-    std::unordered_map<const void *, xrt::bo> weight_bo_cache;
 };
 
 // ============================================================================
@@ -8914,19 +8911,10 @@ static bool ggml_backend_xdna_rms_norm(ggml_backend_xdna_context * ctx,
     if (!ggml_is_contiguous(src)) return false;
     if (!ggml_is_contiguous(node)) return false;
 
-    // Weight (gain) tensor — ggml RMSNorm stores it in src[1].
-    const struct ggml_tensor * weight = node->src[1];
-
-    // Only f32 or bf16 supported on the activation side.
+    // Only f32 or bf16 supported on the activation side. Weight src[1] (which
+    // ggml uses for RMSNormWeighted) isn't wired in yet.
     if (src->type != GGML_TYPE_F32 && src->type != GGML_TYPE_BF16) return false;
     if (node->type != GGML_TYPE_F32 && node->type != GGML_TYPE_BF16) return false;
-
-    // If weight is present, it must be bf16 or f32 and contiguous.
-    if (weight != nullptr) {
-        if (!ggml_is_contiguous(weight)) return false;
-        if (weight->type != GGML_TYPE_F32 && weight->type != GGML_TYPE_BF16) return false;
-        if (weight->ne[0] != src->ne[0]) return false;
-    }
 
     // Epsilon is baked into the AIE kernel at 1e-5. For typical activations
     // with mean(x^2) ~ O(1), the difference between 1e-6 and 1e-4 changes
@@ -8949,8 +8937,6 @@ static bool ggml_backend_xdna_rms_norm(ggml_backend_xdna_context * ctx,
     const int64_t nrows = src->ne[1] * src->ne[2] * src->ne[3];
     if (size <= 0 || nrows <= 0) return false;
 
-    const bool weighted = (weight != nullptr);
-
     int num_cols = 0, num_channels = 0, tile_size = 0;
     // NPU1 = 4 cols, NPU2 = 8 cols. Use the same "8 first, fall back to 4"
     // strategy other paths follow. The selector rejects configs that don't
@@ -8968,14 +8954,14 @@ static bool ggml_backend_xdna_rms_norm(ggml_backend_xdna_context * ctx,
     }
 
     const std::string cache_key = make_rms_norm_cache_key(
-        size, "bf16", num_cols, num_channels, tile_size, weighted);
-
+        size, "bf16", num_cols, num_channels, tile_size, /*weighted=*/false);
+    
     if (dbg) {
         fprintf(stderr, "ggml-xdna: using rms_norm cache_key: %s\n", cache_key.c_str());
     }
 
     if (!ensure_rms_norm_compiled(ctx, cache_key, size, num_cols, num_channels,
-                                  tile_size, weighted)) {
+                                  tile_size, /*weighted=*/false)) {
         return false;
     }
 
@@ -8997,41 +8983,9 @@ static bool ggml_backend_xdna_rms_norm(ggml_backend_xdna_context * ctx,
                 entry->kernel.group_id(3));
         }
         if (!entry->out_bo) {
-            if (weighted) {
-                // Weighted design: arg layout is (opcode, insts, isize, in, weight, out)
-                // so out is group_id(5).
-                entry->out_bo = std::make_unique<xrt::bo>(
-                    ctx->device, row_bytes, xrt::bo::flags::host_only,
-                    entry->kernel.group_id(5));
-            } else {
-                entry->out_bo = std::make_unique<xrt::bo>(
-                    ctx->device, row_bytes, xrt::bo::flags::host_only,
-                    entry->kernel.group_id(4));
-            }
-        }
-
-        // Weight (gain) BO — cached by weight data pointer so we only upload once
-        // per new weight tensor (each layer has a different gain vector).
-        xrt::bo * weight_bo_ptr = nullptr;
-        if (weighted) {
-            const void * weight_ptr = weight->data;
-            auto & wcache = entry->weight_bo_cache;
-            auto wit = wcache.find(weight_ptr);
-            if (wit == wcache.end()) {
-                xrt::bo wbo(ctx->device, row_bytes, xrt::bo::flags::host_only,
-                            entry->kernel.group_id(4));
-                uint16_t * wmap = wbo.map<uint16_t *>();
-                if (weight->type == GGML_TYPE_F32) {
-                    f32_to_bf16((const float *)weight->data, wmap, row_elems);
-                } else {
-                    std::memcpy(wmap, weight->data, row_bytes);
-                }
-                wbo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-                auto [ins, _] = wcache.emplace(weight_ptr, std::move(wbo));
-                weight_bo_ptr = &ins->second;
-            } else {
-                weight_bo_ptr = &wit->second;
-            }
+            entry->out_bo = std::make_unique<xrt::bo>(
+                ctx->device, row_bytes, xrt::bo::flags::host_only,
+                entry->kernel.group_id(4));
         }
 
         uint16_t * in_map  = entry->in_bo->map<uint16_t *>();
@@ -9048,18 +9002,9 @@ static bool ggml_backend_xdna_rms_norm(ggml_backend_xdna_context * ctx,
             }
             entry->in_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
-            xrt::run run;
-            if (weighted) {
-                // Weighted: (opcode, insts, isize, in, weight, out)
-                run = entry->kernel(3, entry->insts_bo,
-                                    (uint32_t)entry->insts.size(),
-                                    *entry->in_bo, *weight_bo_ptr, *entry->out_bo);
-            } else {
-                // Non-weighted: (opcode, insts, isize, in, out)
-                run = entry->kernel(3, entry->insts_bo,
-                                    (uint32_t)entry->insts.size(),
-                                    *entry->in_bo, *entry->out_bo);
-            }
+            auto run = entry->kernel(3, entry->insts_bo,
+                                     (uint32_t)entry->insts.size(),
+                                     *entry->in_bo, *entry->out_bo);
             run.wait();
 
             entry->out_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
@@ -9077,9 +9022,8 @@ static bool ggml_backend_xdna_rms_norm(ggml_backend_xdna_context * ctx,
 
     if (dbg) {
         fprintf(stderr, "ggml-xdna: rms_norm dispatch ok size=%lld nrows=%lld "
-                        "cols=%d channels=%d tile=%d weighted=%d\n",
-                (long long)size, (long long)nrows, num_cols, num_channels, tile_size,
-                (int)weighted);
+                        "cols=%d channels=%d tile=%d\n",
+                (long long)size, (long long)nrows, num_cols, num_channels, tile_size);
     }
     return true;
 }
