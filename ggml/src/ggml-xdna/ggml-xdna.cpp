@@ -4277,8 +4277,8 @@ static bool ggml_backend_xdna_flowkv_per_head(
             auto q_ptr = entry->bo_q->map<char *>();
             size_t q_head_bytes = head_dim * sizeof(uint16_t);
 
-            // Identity angles: cos=1.0 (bf16 0x3C00), sin=0.0 (bf16 0x0000)
-            char angle_cos_bf16[2] = {0x00, 0x3C};
+            // Identity angles: cos=1.0 (bf16 0x3F80), sin=0.0 (bf16 0x0000)
+            char angle_cos_bf16[2] = {0x80, 0x3F};
             char angle_sin_bf16[2] = {0x00, 0x00};
 
             // Copy Q for each head in the group.
