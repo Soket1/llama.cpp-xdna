@@ -1010,7 +1010,7 @@ static bool ensure_compiled(ggml_backend_xdna_context * ctx,
                  dtype_in, dtype_in,
                  num_cols,
                  xclbin_path.c_str(), xdna_null_redirect());
-        GGML_LOG_INFO("ggml-xdna: compiling GEMV K=%lld N=%lld (first run, will be cached)...\n",
+        fprintf(stderr, "ggml-xdna: compiling GEMV K=%lld N=%lld (first run, will be cached)...\n",
                       (long long)K, (long long)N);
     } else {
         // [INT8 GEMM] Use separate dtype_out when provided (e.g. "i32" for i8 input).
@@ -1023,7 +1023,7 @@ static bool ensure_compiled(ggml_backend_xdna_context * ctx,
                  dtype_in, out_dtype,
                  num_cols,
                  xclbin_path.c_str(), xdna_null_redirect());
-        GGML_LOG_INFO("ggml-xdna: compiling GEMM %lldx%lldx%lld (first run, will be cached)...\n",
+        fprintf(stderr, "ggml-xdna: compiling GEMM %lldx%lldx%lld (first run, will be cached)...\n",
                       (long long)M, (long long)K, (long long)N);
     }
 
@@ -1043,7 +1043,7 @@ static bool ensure_compiled(ggml_backend_xdna_context * ctx,
         return false;
     }
 
-    GGML_LOG_INFO("ggml-xdna: compilation complete, cached at %s\n", xclbin_path.c_str());
+    fprintf(stderr, "ggml-xdna: compilation complete, cached at %s\n", xclbin_path.c_str());
     return true;
 }
 
@@ -1115,7 +1115,7 @@ static xdna_kernel_entry * get_or_load_kernel(ggml_backend_xdna_context * ctx,
         entry.insts_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
         auto [inserted_it, _] = ctx->kernel_cache.emplace(cache_key, std::move(entry));
-        GGML_LOG_INFO("ggml-xdna: loaded kernel for %s\n", cache_key.c_str());
+        fprintf(stderr, "ggml-xdna: loaded kernel for %s\n", cache_key.c_str());
         return &inserted_it->second;
 
     } catch (const std::exception & e) {
@@ -1534,7 +1534,7 @@ static bool ensure_swiglu_compiled(ggml_backend_xdna_context * ctx,
                  xdna_python_cmd(), ctx->compile_script.c_str(),
                  (long long)embedding_dim, (long long)hidden_dim,
                  num_cols, bundle_dir.c_str(), xdna_null_redirect());
-        GGML_LOG_INFO("ggml-xdna: compiling SwiGLU decode K=%lld N=%lld (first run, will be cached)...\n",
+        fprintf(stderr, "ggml-xdna: compiling SwiGLU decode K=%lld N=%lld (first run, will be cached)...\n",
                       (long long)embedding_dim, (long long)hidden_dim);
     } else {
         snprintf(cmd, sizeof(cmd),
@@ -1543,7 +1543,7 @@ static bool ensure_swiglu_compiled(ggml_backend_xdna_context * ctx,
                  xdna_python_cmd(), ctx->compile_script.c_str(),
                  (long long)seq_len, (long long)embedding_dim, (long long)hidden_dim,
                  num_cols, tile_m, tile_n, bundle_dir.c_str(), xdna_null_redirect());
-        GGML_LOG_INFO("ggml-xdna: compiling SwiGLU prefill M=%lld K=%lld N=%lld tile_m=%d tile_n=%d (first run, will be cached)...\n",
+        fprintf(stderr, "ggml-xdna: compiling SwiGLU prefill M=%lld K=%lld N=%lld tile_m=%d tile_n=%d (first run, will be cached)...\n",
                       (long long)seq_len, (long long)embedding_dim, (long long)hidden_dim, tile_m, tile_n);
     }
 
@@ -1561,7 +1561,7 @@ static bool ensure_swiglu_compiled(ggml_backend_xdna_context * ctx,
         return false;
     }
 
-    GGML_LOG_INFO("ggml-xdna: SwiGLU compilation complete, cached at %s\n", bundle_dir.c_str());
+    fprintf(stderr, "ggml-xdna: SwiGLU compilation complete, cached at %s\n", bundle_dir.c_str());
     return true;
 }
 
@@ -1695,12 +1695,12 @@ static void swiglu_warmup_entry(ggml_backend_xdna_context * ctx,
         if (dbg) {
             auto t_end = clk::now();
             auto us = std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_start).count();
-            GGML_LOG_INFO("ggml-xdna: swiglu warmup %s M=%lld emb=%lld hid=%lld took %lld us\n",
+            fprintf(stderr, "ggml-xdna: swiglu warmup %s M=%lld emb=%lld hid=%lld took %lld us\n",
                           prefill ? "prefill" : "decode",
                           (long long)M, (long long)embedding_dim, (long long)hidden_dim, (long long)us);
         }
     } catch (const std::exception & e) {
-        GGML_LOG_INFO("ggml-xdna: warning: SwiGLU warmup failed (%s) — first dispatch will pay the cost\n",
+        fprintf(stderr, "ggml-xdna: warning: SwiGLU warmup failed (%s) — first dispatch will pay the cost\n",
                       e.what());
     }
 }
@@ -1777,7 +1777,7 @@ static xdna_swiglu_kernel_entry * get_or_load_swiglu_kernel(
 
         auto [inserted_it, _] = ctx->swiglu_cache.emplace(cache_key, std::move(entry));
         xdna_swiglu_kernel_entry * entry_ptr = &inserted_it->second;
-        GGML_LOG_INFO("ggml-xdna: loaded SwiGLU kernel bundle for %s (%d kernels)\n",
+        fprintf(stderr, "ggml-xdna: loaded SwiGLU kernel bundle for %s (%d kernels)\n",
                       cache_key.c_str(), num_kernels);
 
         // Pay the first-submit slow-path cost (ctx-connect + HMM pin) once
@@ -1791,7 +1791,7 @@ static xdna_swiglu_kernel_entry * get_or_load_swiglu_kernel(
         // Delete the bundle so the next dispatch cycle will
         // re-enter ensure_swiglu_compiled + get_or_load_swiglu_kernel
         // with the correct parameters from the caller.
-        GGML_LOG_WARN("ggml-xdna: SwiGLU cache stale for %s (%s), "
+        fprintf(stderr, "ggml-xdna: SwiGLU cache stale for %s (%s), "
                       "invalidating — will recompile on next dispatch\n",
                       cache_key.c_str(), e.what());
 #ifdef _WIN32
@@ -2267,7 +2267,7 @@ static void ggml_backend_xdna_mul_mat_swiglu(ggml_backend_xdna_context * ctx,
             auto us = [](clk::time_point a, clk::time_point b) {
                 return (long long)std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
             };
-            GGML_LOG_INFO(
+            fprintf(stderr, 
                 "ggml-xdna: swiglu_prof %s M=%lld K=%lld N=%lld in=%lld "
                 "rl_build=%lld rl_exec=%lld rl_wait=%lld "
                 "out=%lld wb_l=%lld wb_r=%lld wb_i=%lld total=%lld us\n",
@@ -2595,7 +2595,7 @@ static void ggml_backend_xdna_mul_mat_swiglu_int8(
             auto us = [](clk::time_point a, clk::time_point b) {
                 return (long long)std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
             };
-            GGML_LOG_INFO(
+            fprintf(stderr, 
                 "ggml-xdna: swiglu_prof decode_int8 M=%lld K=%lld N=%lld in=%lld "
                 "rl_build=%lld rl_exec=%lld rl_wait=%lld "
                 "out=%lld wb_l=%lld wb_r=%lld wb_i=%lld total=%lld us\n",
@@ -2908,7 +2908,7 @@ static void ggml_backend_xdna_mul_mat_swiglu_prefill_int8(
             auto us = [](clk::time_point a, clk::time_point b) {
                 return (long long)std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
             };
-            GGML_LOG_INFO(
+            fprintf(stderr, 
                 "ggml-xdna: swiglu_prof prefill_int8 M=%lld K=%lld N=%lld "
                 "in=%lld rl_build=%lld rl_exec=%lld rl_wait=%lld out=%lld wb=%lld total=%lld us\n",
                 (long long)M, (long long)embedding_dim, (long long)hidden_dim,
@@ -2969,7 +2969,7 @@ static bool ensure_swiglu_fused_compiled(ggml_backend_xdna_context * ctx,
              xdna_python_cmd(), ctx->compile_script.c_str(),
              (long long)embedding_dim, (long long)hidden_dim,
              num_cols, group_size, bundle_dir.c_str(), xdna_null_redirect());
-    GGML_LOG_INFO("ggml-xdna: compiling SwiGLU fused INT8 K=%lld N=%lld g=%d (first run, will be cached)...\n",
+    fprintf(stderr, "ggml-xdna: compiling SwiGLU fused INT8 K=%lld N=%lld g=%d (first run, will be cached)...\n",
                   (long long)embedding_dim, (long long)hidden_dim, group_size);
 
     int ret = system(cmd);
@@ -2986,7 +2986,7 @@ static bool ensure_swiglu_fused_compiled(ggml_backend_xdna_context * ctx,
         return false;
     }
 
-    GGML_LOG_INFO("ggml-xdna: SwiGLU fused INT8 compilation complete, cached at %s\n", bundle_dir.c_str());
+    fprintf(stderr, "ggml-xdna: SwiGLU fused INT8 compilation complete, cached at %s\n", bundle_dir.c_str());
     return true;
 }
 
@@ -3048,11 +3048,11 @@ static xdna_swiglu_fused_entry * get_or_load_swiglu_fused_kernel(
         entry.down_insts_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
         auto [inserted_it, _] = ctx->swiglu_fused_cache.emplace(cache_key, std::move(entry));
-        GGML_LOG_INFO("ggml-xdna: loaded SwiGLU fused INT8 kernel bundle for %s\n", cache_key.c_str());
+        fprintf(stderr, "ggml-xdna: loaded SwiGLU fused INT8 kernel bundle for %s\n", cache_key.c_str());
         return &inserted_it->second;
 
     } catch (const std::exception & e) {
-        GGML_LOG_WARN("ggml-xdna: SwiGLU fused cache stale for %s (%s), "
+        fprintf(stderr, "ggml-xdna: SwiGLU fused cache stale for %s (%s), "
                       "invalidating — will recompile on next dispatch\n",
                       cache_key.c_str(), e.what());
 #ifdef _WIN32
@@ -3295,7 +3295,7 @@ static void ggml_backend_xdna_mul_mat_swiglu_fused_int8(
             auto us = [](clk::time_point a, clk::time_point b) {
                 return (long long)std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
             };
-            GGML_LOG_INFO(
+            fprintf(stderr, 
                 "ggml-xdna: swiglu_prof fused_int8 K=%lld N=%lld in=%lld "
                 "rl_build=%lld rl_exec=%lld rl_wait=%lld out=%lld wb=%lld total=%lld us\n",
                 (long long)embedding_dim, (long long)hidden_dim,
@@ -3357,7 +3357,7 @@ static bool ensure_qkv_compiled(ggml_backend_xdna_context * ctx,
              xdna_python_cmd(), ctx->compile_script.c_str(),
              (long long)embedding_dim, (long long)q_dim, (long long)k_dim, (long long)v_dim,
              num_cols, bundle_dir.c_str(), xdna_null_redirect());
-    GGML_LOG_INFO("ggml-xdna: compiling QKV K=%lld Nq=%lld Nk=%lld Nv=%lld cols=%d (first run, will be cached)...\n",
+    fprintf(stderr, "ggml-xdna: compiling QKV K=%lld Nq=%lld Nk=%lld Nv=%lld cols=%d (first run, will be cached)...\n",
                   (long long)embedding_dim, (long long)q_dim, (long long)k_dim, (long long)v_dim, num_cols);
 
     int ret = system(cmd);
@@ -3374,7 +3374,7 @@ static bool ensure_qkv_compiled(ggml_backend_xdna_context * ctx,
         return false;
     }
 
-    GGML_LOG_INFO("ggml-xdna: QKV compilation complete, cached at %s\n", bundle_dir.c_str());
+    fprintf(stderr, "ggml-xdna: QKV compilation complete, cached at %s\n", bundle_dir.c_str());
     return true;
 }
 
@@ -3442,14 +3442,14 @@ static xdna_qkv_entry * get_or_load_qkv_kernel(
             }
 
             auto [inserted_it, _] = ctx->qkv_cache.emplace(cache_key, std::move(entry));
-            GGML_LOG_INFO("ggml-xdna: loaded QKV kernel bundle for %s\n", cache_key.c_str());
+            fprintf(stderr, "ggml-xdna: loaded QKV kernel bundle for %s\n", cache_key.c_str());
             return &inserted_it->second;
 
         } catch (const std::exception & e) {
             if (attempt == 0) {
                 // First attempt failed — likely a stale xclbin with a
                 // different kernel name.  Nuke the bundle and recompile.
-                GGML_LOG_WARN("ggml-xdna: QKV cache stale for %s (%s), "
+                fprintf(stderr, "ggml-xdna: QKV cache stale for %s (%s), "
                               "invalidating and recompiling...\n",
                               cache_key.c_str(), e.what());
 #ifdef _WIN32
@@ -3656,7 +3656,7 @@ static void ggml_backend_xdna_mul_mat_qkv(
         if (prof) {
             auto us_total = (long long)std::chrono::duration_cast<std::chrono::microseconds>(
                 t_total_e - t_total_s).count();
-            GGML_LOG_INFO(
+            fprintf(stderr, 
                 "ggml-xdna: qkv_prof K=%lld Nq=%lld Nk=%lld Nv=%lld M=%lld "
                 "total=%lld us (%lld us/row)\n",
                 (long long)embedding_dim, (long long)q_dim, (long long)k_dim, (long long)v_dim,
@@ -4887,7 +4887,7 @@ static bool ensure_attention_prefill_compiled(ggml_backend_xdna_context * ctx,
              (long long)num_heads, (long long)num_kv_heads, (long long)head_dim,
              rope_method_type,
              bundle_dir.c_str(), xdna_null_redirect());
-    GGML_LOG_INFO("ggml-xdna: compiling attention-prefill S=%lld E=%lld H=%lld KV=%lld d=%lld "
+    fprintf(stderr, "ggml-xdna: compiling attention-prefill S=%lld E=%lld H=%lld KV=%lld d=%lld "
                   "(first run, will be cached)...\n",
                   (long long)seq_bucket, (long long)embed_dim,
                   (long long)num_heads, (long long)num_kv_heads, (long long)head_dim);
@@ -4902,7 +4902,7 @@ static bool ensure_attention_prefill_compiled(ggml_backend_xdna_context * ctx,
                        bundle_dir.c_str());
         return false;
     }
-    GGML_LOG_INFO("ggml-xdna: attention-prefill compile complete, cached at %s\n",
+    fprintf(stderr, "ggml-xdna: attention-prefill compile complete, cached at %s\n",
                   bundle_dir.c_str());
     return true;
 }
@@ -4950,7 +4950,7 @@ static xdna_attention_prefill_entry * get_or_load_attention_prefill_kernel(
         }
 
         auto [ins, _] = ctx->attention_prefill_cache.emplace(cache_key, std::move(entry));
-        GGML_LOG_INFO("ggml-xdna: loaded attention-prefill bundle %s\n", cache_key.c_str());
+        fprintf(stderr, "ggml-xdna: loaded attention-prefill bundle %s\n", cache_key.c_str());
         return &ins->second;
 
     } catch (const std::exception & e) {
@@ -6085,7 +6085,7 @@ static bool ensure_transformer_block_prefill_compiled(
              (long long)seq_bucket, (long long)embed_dim,
              (long long)num_heads, (long long)num_kv_heads, (long long)head_dim,
              (long long)ffn_hidden_dim, rope_method_type, bundle_dir.c_str(), xdna_null_redirect());
-    GGML_LOG_INFO("ggml-xdna: compiling transformer-block-prefill S=%lld E=%lld H=%lld KV=%lld d=%lld F=%lld "
+    fprintf(stderr, "ggml-xdna: compiling transformer-block-prefill S=%lld E=%lld H=%lld KV=%lld d=%lld F=%lld "
                   "(first run, will be cached)...\n",
                   (long long)seq_bucket, (long long)embed_dim,
                   (long long)num_heads, (long long)num_kv_heads, (long long)head_dim,
@@ -6101,7 +6101,7 @@ static bool ensure_transformer_block_prefill_compiled(
                        bundle_dir.c_str());
         return false;
     }
-    GGML_LOG_INFO("ggml-xdna: transformer-block-prefill compile complete, cached at %s\n",
+    fprintf(stderr, "ggml-xdna: transformer-block-prefill compile complete, cached at %s\n",
                   bundle_dir.c_str());
     return true;
 }
@@ -6149,7 +6149,7 @@ static xdna_transformer_block_prefill_entry * get_or_load_transformer_block_pref
         }
 
         auto [ins, _] = ctx->transformer_block_prefill_cache.emplace(cache_key, std::move(entry));
-        GGML_LOG_INFO("ggml-xdna: loaded transformer-block-prefill bundle %s\n", cache_key.c_str());
+        fprintf(stderr, "ggml-xdna: loaded transformer-block-prefill bundle %s\n", cache_key.c_str());
         return &ins->second;
 
     } catch (const std::exception & e) {
@@ -6389,7 +6389,7 @@ static bool ensure_tblock_fused_compiled(
              bundle_dir.c_str(), xdna_null_redirect());
     const char * mode_tag = w8a16_ffn ? " W8A16+FFN"
                           : (w8a16 ? " W8A16" : "");
-    GGML_LOG_INFO("ggml-xdna: compiling fused tblock S=%lld E=%lld H=%lld KV=%lld d=%lld F=%lld rope=%d N=%d%s "
+    fprintf(stderr, "ggml-xdna: compiling fused tblock S=%lld E=%lld H=%lld KV=%lld d=%lld F=%lld rope=%d N=%d%s "
                   "(first run, will be cached)...\n",
                   (long long)seq_bucket, (long long)embed_dim,
                   (long long)num_heads, (long long)num_kv_heads, (long long)head_dim,
@@ -6406,7 +6406,7 @@ static bool ensure_tblock_fused_compiled(
                        bundle_dir.c_str());
         return false;
     }
-    GGML_LOG_INFO("ggml-xdna: fused tblock compile complete, cached at %s\n",
+    fprintf(stderr, "ggml-xdna: fused tblock compile complete, cached at %s\n",
                   bundle_dir.c_str());
     return true;
 }
@@ -6647,7 +6647,7 @@ static xdna_tblock_fused_entry * get_or_load_tblock_fused_kernel(
             xrt::ext::bo(entry.hw_ctx, entry.layout.scratch_bytes));
 
         auto [ins, _] = ctx->tblock_fused_cache.emplace(cache_key, std::move(entry));
-        GGML_LOG_INFO("ggml-xdna: loaded fused tblock ELF %s (in=%zu dyn_in=%zu out=%zu scratch=%zu, %zu named bufs)\n",
+        fprintf(stderr, "ggml-xdna: loaded fused tblock ELF %s (in=%zu dyn_in=%zu out=%zu scratch=%zu, %zu named bufs)\n",
                       cache_key.c_str(),
                       ins->second.layout.input_bytes,
                       ins->second.layout.dynamic_input_bytes,
@@ -8821,7 +8821,7 @@ static bool ensure_rms_norm_compiled(ggml_backend_xdna_context * ctx,
              (long long)size, num_cols, num_channels, tile_size,
              weighted ? " --weighted" : "",
              bundle_dir.c_str(), xdna_null_redirect());
-    GGML_LOG_INFO("ggml-xdna: compiling RMSNorm size=%lld cols=%d ch=%d tile=%d "
+    fprintf(stderr, "ggml-xdna: compiling RMSNorm size=%lld cols=%d ch=%d tile=%d "
                   "(first run, will be cached)...\n",
                   (long long)size, num_cols, num_channels, tile_size);
 
@@ -8837,7 +8837,7 @@ static bool ensure_rms_norm_compiled(ggml_backend_xdna_context * ctx,
         return false;
     }
 
-    GGML_LOG_INFO("ggml-xdna: RMSNorm compilation complete, cached at %s\n",
+    fprintf(stderr, "ggml-xdna: RMSNorm compilation complete, cached at %s\n",
                   bundle_dir.c_str());
     return true;
 }
@@ -8885,7 +8885,7 @@ static xdna_rms_norm_entry * get_or_load_rms_norm_kernel(
         entry.insts_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
         auto [inserted_it, _] = ctx->rms_norm_cache.emplace(cache_key, std::move(entry));
-        GGML_LOG_INFO("ggml-xdna: loaded RMSNorm kernel for %s\n", cache_key.c_str());
+        fprintf(stderr, "ggml-xdna: loaded RMSNorm kernel for %s\n", cache_key.c_str());
         return &inserted_it->second;
 
     } catch (const std::exception & e) {
@@ -9892,7 +9892,7 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                     // INT8 SwiGLU not available in IRON-windows build —
                     // compile.py raises NotImplementedError for INT8 kernels.
                     // Fall through to the bf16 path instead of crashing.
-                    GGML_LOG_WARN("ggml-xdna: INT8 SwiGLU not available in IRON-windows build, using bf16 fallback\n");
+                    fprintf(stderr, "ggml-xdna: INT8 SwiGLU not available in IRON-windows build, using bf16 fallback\n");
                 }
                 {
                     ggml_backend_xdna_mul_mat_swiglu(
