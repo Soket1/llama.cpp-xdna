@@ -1377,6 +1377,57 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         ggml_backend_sched_print_assignments(sched, graph);
     }
 
+    // XDNA_SCHED_DEBUG: force scheduler assignment dump to stderr
+    {
+        static const bool sched_dbg = getenv("XDNA_SCHED_DEBUG") != NULL;
+        if (sched_dbg) {
+            int cur_split = 0;
+            fprintf(stderr, "=== XNA_SCHED_DEBUG: %d nodes, %d splits ===\n", graph->n_nodes, sched->n_splits);
+            for (int i = 0; i < graph->n_nodes; i++) {
+                if (cur_split < sched->n_splits && i == sched->splits[cur_split].i_start) {
+                    ggml_backend_t split_backend = sched->backends[sched->splits[cur_split].backend_id];
+                    fprintf(stderr, "\n## SPLIT #%d: %s (nodes %d..%d)\n", cur_split,
+                        ggml_backend_name(split_backend),
+                        sched->splits[cur_split].i_start,
+                        sched->splits[cur_split].i_end);
+                    cur_split++;
+                }
+                struct ggml_tensor * node = graph->nodes[i];
+                int node_bid = sched->node_backend_ids[hash_id(node)];
+                const char * backend_name = node_bid >= 0 ? ggml_backend_name(sched->backends[node_bid]) : "???";
+                // Print cause if available
+                const char * cause = "";
+                #ifdef NDEBUG
+                #else
+                // causes array is local to split_graph, we can't access it here
+                #endif
+                fprintf(stderr, "  [%3d] %-12s %-25s  backend=%s%s", i,
+                    ggml_op_name(node->op),
+                    node->name ? node->name : "(null)",
+                    backend_name,
+                    ggml_is_view_op(node->op) ? " [VIEW]" : "");
+                // Print sources
+                for (int j = 0; j < GGML_MAX_SRC; j++) {
+                    struct ggml_tensor * src = node->src[j];
+                    if (src == NULL) continue;
+                    int src_bid = sched->node_backend_ids[hash_id(src)];
+                    // If src is a view, also check view_src
+                    int vs_bid = -1;
+                    if (src->view_src) {
+                        vs_bid = sched->node_backend_ids[hash_id(src->view_src)];
+                    }
+                    const char * src_backend = src_bid >= 0 ? ggml_backend_name(sched->backends[src_bid]) : "???";
+                    const char * vs_backend = vs_bid >= 0 ? ggml_backend_name(sched->backends[vs_bid]) : "N/A";
+                    fprintf(stderr, "  src%d=%s(%s)[vs=%s]", j,
+                        src->name ? src->name : "?", src_backend, vs_backend);
+                }
+                fprintf(stderr, "\n");
+            }
+            fprintf(stderr, "=== END XNA_SCHED_DEBUG ===\n\n");
+            fflush(stderr);
+        }
+    }
+
     // swap node_backend_ids and leaf _backend_ids with prevs
     {
         int * tmp = sched->node_backend_ids;

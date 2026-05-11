@@ -4116,7 +4116,26 @@ static std::vector<xdna_flowkv_group> xdna_plan_flowkv(
         const struct ggml_cgraph * cgraph) {
     std::vector<xdna_flowkv_group> groups;
     static const bool dbg = getenv("XDNA_DEBUG") != NULL;
+    static const bool sched_dbg = getenv("XNA_SCHED_DEBUG") != NULL;
     int n = cgraph->n_nodes;
+
+    // XNA_SCHED_DEBUG: dump all nodes in this segment for FlowKV analysis
+    if (sched_dbg) {
+        fprintf(stderr, "  FlowKV plan scan: %d nodes in segment\n", n);
+        for (int i = 0; i < n; i++) {
+            struct ggml_tensor * node = cgraph->nodes[i];
+            fprintf(stderr, "    [%3d] %-12s %-25s", i, ggml_op_name(node->op),
+                node->name ? node->name : "(null)");
+            if (node->op == GGML_OP_MUL_MAT) {
+                fprintf(stderr, "  K=%lld N=%lld M=%lld",
+                    (long long)node->src[0]->ne[0],
+                    (long long)node->src[0]->ne[1],
+                    (long long)node->src[1]->ne[1]);
+            }
+            fprintf(stderr, "\n");
+        }
+        fflush(stderr);
+    }
 
     // Map from K source pointer → group index in 'groups'.
     std::unordered_map<const void *, int> k_to_group;
@@ -4126,18 +4145,30 @@ static std::vector<xdna_flowkv_group> xdna_plan_flowkv(
     for (int i = 0; i < n; i++) {
         struct ggml_tensor * node = cgraph->nodes[i];
         if (node->op != GGML_OP_MUL_MAT) continue;
-        if (node->src[1]->ne[1] != 1) continue;  // not decode
+        if (node->src[1]->ne[1] != 1) {
+            if (sched_dbg) fprintf(stderr, "    FlowKV reject [%d] MUL_MAT: M=%lld != 1 (not decode)\n", i, (long long)node->src[1]->ne[1]);
+            continue;
+        }
 
         int64_t K = node->src[0]->ne[0];
         int64_t N = node->src[0]->ne[1];
-        if (K != 64) continue;  // head_dim must be 64
+        if (K != 64) {
+            if (sched_dbg) fprintf(stderr, "    FlowKV reject [%d] MUL_MAT: K=%lld != 64\n", i, (long long)K);
+            continue;
+        }
 
         // Check if this looks like Q@K^T: result ne[0] = seq_len (should be > 1)
-        if (node->ne[0] <= 1) continue;
+        if (node->ne[0] <= 1) {
+            if (sched_dbg) fprintf(stderr, "    FlowKV reject [%d] MUL_MAT: ne[0]=%lld <= 1\n", i, (long long)node->ne[0]);
+            continue;
+        }
 
         int64_t seq_len = node->ne[0];
         // N should be seq_len (single KV head).
-        if (N != seq_len) continue;
+        if (N != seq_len) {
+            if (sched_dbg) fprintf(stderr, "    FlowKV reject [%d] MUL_MAT: N=%lld != seq_len=%lld\n", i, (long long)N, (long long)seq_len);
+            continue;
+        }
 
         // Walk forward to find SOFT_MAX and then scores@V MUL_MAT.
         int softmax_idx = -1;
@@ -4147,7 +4178,10 @@ static std::vector<xdna_flowkv_group> xdna_plan_flowkv(
             if (op == GGML_OP_SCALE || op == GGML_OP_ADD) continue;
             break;
         }
-        if (softmax_idx < 0) continue;
+        if (softmax_idx < 0) {
+            if (sched_dbg) fprintf(stderr, "    FlowKV reject [%d] MUL_MAT: no SOFT_MAX found within 6 nodes forward\n", i);
+            continue;
+        }
 
         int pv_idx = -1;
         for (int j = softmax_idx + 1; j < n && j < softmax_idx + 6; j++) {
@@ -4161,7 +4195,10 @@ static std::vector<xdna_flowkv_group> xdna_plan_flowkv(
                 op == GGML_OP_CONT || op == GGML_OP_PERMUTE) continue;
             break;
         }
-        if (pv_idx < 0) continue;
+        if (pv_idx < 0) {
+            if (sched_dbg) fprintf(stderr, "    FlowKV reject [%d] MUL_MAT: no scores@V MUL_MAT after SOFT_MAX at [%d]\n", i, softmax_idx);
+            continue;
+        }
 
         // Validate PV shape: src[0] should have same head_dim.
         if (cgraph->nodes[pv_idx]->src[0]->ne[0] != K) continue;
