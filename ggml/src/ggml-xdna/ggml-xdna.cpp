@@ -4236,11 +4236,24 @@ static std::vector<xdna_flowkv_group> xdna_plan_flowkv(
     return groups;
 }
 
+// Helper: copy a single head slice from a batched 4D tensor.
+static void flowkv_copy_head_slice(
+        char * dst, const char * src_base,
+        const struct ggml_tensor * t, int64_t head_idx,
+        int64_t head_dim, size_t head_bytes) {
+    if (t->ne[2] <= 1) {
+        memcpy(dst, src_base, head_bytes);
+    } else {
+        memcpy(dst, src_base + head_idx * t->nb[2], head_bytes);
+    }
+}
+
 // Per-KV-head FlowKV dispatch. Processes one KV head group (group_size Q heads
 // sharing the same K/V cache) with num_kv_heads=1, num_cols=1.
 //
-// For Llama 3.2 1B: 8 dispatches per layer (one per KV head), each processing
-// 4 Q heads (group_size=4).
+// Supports both:
+//   - Expanded path: 32 separate Q@K^T MUL_MATs (per-head tensors)
+//   - Batched path:   1 batched Q@K^T MUL_MAT (ne[2]=32, ne[3]=1)
 static bool ggml_backend_xdna_flowkv_per_head(
         ggml_backend_xdna_context * ctx,
         const xdna_flowkv_group & group,
@@ -4249,141 +4262,172 @@ static bool ggml_backend_xdna_flowkv_per_head(
 
     if (!ctx || !ctx->device_valid) return false;
 
-    int64_t group_size = (int64_t)group.heads.size();
     int64_t head_dim = group.head_dim;
     int64_t seq_len = group.seq_len;
-    int64_t num_heads = group_size;      // Q heads in this group
-    int64_t num_kv_heads = 1;            // one KV head per dispatch
     int chunk_size = 32;
     int num_cols = 1;
 
     if (head_dim != 64) return false;
     if (seq_len % chunk_size != 0) return false;
 
-    xdna_flowkv_entry * entry = get_or_load_flowkv_kernel(
-        ctx, num_heads, num_kv_heads, head_dim, seq_len, chunk_size, num_cols);
-    if (!entry) return false;
-
-    try {
-        // Allocate BOs on first use.
-        if (!entry->bo_kv) {
-            size_t kv_size = 1 * seq_len * 2 * head_dim * sizeof(uint16_t);
-            entry->bo_kv = std::make_unique<xrt::bo>(
-                xrt::bo(ctx->device, kv_size, xrt::bo::flags::host_only,
-                        entry->kernel.group_id(0)));
-        }
-        if (!entry->bo_q) {
-            size_t q_size = 1 * (group_size * head_dim + head_dim) * sizeof(uint16_t);
-            entry->bo_q = std::make_unique<xrt::bo>(
-                xrt::bo(ctx->device, q_size, xrt::bo::flags::host_only,
-                        entry->kernel.group_id(1)));
-        }
-        if (!entry->bo_out) {
-            size_t out_size = group_size * head_dim * sizeof(uint16_t);
-            entry->bo_out = std::make_unique<xrt::bo>(
-                xrt::bo(ctx->device, out_size, xrt::bo::flags::host_only,
-                        entry->kernel.group_id(2)));
-        }
-
-        // --- Prepare KV cache buffer (interleaved K and V for one KV head) ---
-        // DDR layout: (1, seq_len, 2, head_dim) flattened
-        // For each position: K row then V row.
-        {
-            auto kv_ptr = entry->bo_kv->map<char *>();
-            // Use the first head's K/V sources (all heads in group share same K/V).
-            struct ggml_tensor * k_tensor = cgraph->nodes[group.heads[0].qk_idx]->src[0];
-            struct ggml_tensor * v_tensor = cgraph->nodes[group.heads[0].pv_idx]->src[0];
-            const char * k_data = (const char *)k_tensor->data;
-            const char * v_data = (const char *)v_tensor->data;
-            size_t row_bytes = head_dim * sizeof(uint16_t);
-
-            for (int64_t pos = 0; pos < seq_len; pos++) {
-                size_t dst_k = pos * 2 * row_bytes;
-                size_t src_k = pos * row_bytes;
-                memcpy(kv_ptr + dst_k, k_data + src_k, row_bytes);
-
-                size_t dst_v = (pos * 2 + 1) * row_bytes;
-                size_t src_v = pos * row_bytes;
-                memcpy(kv_ptr + dst_v, v_data + src_v, row_bytes);
-            }
-            entry->bo_kv->sync(XCL_BO_SYNC_BO_TO_DEVICE);
-        }
-
-        // --- Prepare Q buffer (packed Q + identity RoPE angles) ---
-        // DDR layout: [Q_group (gs*hd) | angles (hd)]
-        // Q is already rotated by the graph, so pass identity angles.
-        {
-            auto q_ptr = entry->bo_q->map<char *>();
-            size_t q_head_bytes = head_dim * sizeof(uint16_t);
-
-            // Identity angles: cos=1.0 (bf16 0x3F80), sin=0.0 (bf16 0x0000)
-            char angle_cos_bf16[2] = {(char)0x80, (char)0x3F};
-            char angle_sin_bf16[2] = {(char)0x00, (char)0x00};
-
-            // Copy Q for each head in the group.
-            for (int64_t g = 0; g < group_size; g++) {
-                struct ggml_tensor * q_tensor =
-                    cgraph->nodes[group.heads[g].qk_idx]->src[1];
-                const char * q_data = (const char *)q_tensor->data;
-                memcpy(q_ptr + g * q_head_bytes, q_data, q_head_bytes);
-            }
-
-            // Write identity angles after Q data.
-            size_t angles_off = group_size * q_head_bytes;
-            for (int d = 0; d < head_dim; d += 2) {
-                memcpy(q_ptr + angles_off + d * 2, angle_cos_bf16, 2);
-                memcpy(q_ptr + angles_off + d * 2 + 2, angle_sin_bf16, 2);
-            }
-            entry->bo_q->sync(XCL_BO_SYNC_BO_TO_DEVICE);
-        }
-
-        // --- Dispatch ---
-        auto run = xrt::run(entry->kernel);
-        run.set_arg(0, *entry->bo_kv);
-        run.set_arg(1, *entry->bo_q);
-        run.set_arg(2, *entry->bo_out);
-        run.set_arg(3, entry->insts_bo);
-
-        {
-            std::lock_guard<std::mutex> lock(*entry->mu);
-            auto t0 = std::chrono::steady_clock::now();
-            run.start();
-            auto state = run.wait(30000);
-            auto t1 = std::chrono::steady_clock::now();
-
-            if (state != ERT_CMD_STATE_COMPLETED) {
-                GGML_LOG_ERROR("ggml-xdna: FlowKV per-head dispatch failed, state=%d\n",
-                               (int)state);
-                return false;
-            }
-
-            if (dbg) {
-                float ms = std::chrono::duration<float, std::milli>(t1 - t0).count();
-                fprintf(stderr, "ggml-xdna: FlowKV KV=%lld gs=%lld S=%lld → %.2f ms\n",
-                        (long long)group.kv_head_idx, (long long)group_size,
-                        (long long)seq_len, ms);
-                fflush(stderr);
-            }
-        }
-
-        // --- Read back output and scatter to per-head result tensors ---
-        entry->bo_out->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-        {
-            auto out_ptr = entry->bo_out->map<char *>();
-            size_t out_head_bytes = head_dim * sizeof(uint16_t);
-            for (int64_t g = 0; g < group_size; g++) {
-                struct ggml_tensor * out_tensor =
-                    cgraph->nodes[group.heads[g].pv_idx];
-                memcpy(out_tensor->data, out_ptr + g * out_head_bytes,
-                       out_head_bytes);
-            }
-        }
-
-        return true;
-    } catch (const std::exception & e) {
-        GGML_LOG_ERROR("ggml-xdna: FlowKV per-head exception: %s\n", e.what());
-        return false;
+    // Detect batched mode: all heads reference the same qk_idx.
+    bool batched = true;
+    int ref_qk = group.heads[0].qk_idx;
+    for (size_t h = 1; h < group.heads.size(); h++) {
+        if (group.heads[h].qk_idx != ref_qk) { batched = false; break; }
     }
+
+    int64_t n_kv_heads = 1;
+    int64_t n_q_heads_total = (int64_t)group.heads.size();
+    if (batched && group.heads.size() > 1) {
+        struct ggml_tensor * k_tensor = cgraph->nodes[ref_qk]->src[0];
+        n_kv_heads = k_tensor->ne[2];
+        if (n_kv_heads < 1) n_kv_heads = 1;
+    }
+    int64_t q_heads_per_kv = n_q_heads_total / n_kv_heads;
+
+    bool all_ok = true;
+    for (int64_t kv_h = 0; kv_h < n_kv_heads; kv_h++) {
+        int64_t group_size = batched ? q_heads_per_kv : 1;
+        int64_t num_heads = group_size;
+
+        xdna_flowkv_entry * entry = get_or_load_flowkv_kernel(
+            ctx, num_heads, /*num_kv_heads=*/1, head_dim, seq_len, chunk_size, num_cols);
+        if (!entry) { all_ok = false; continue; }
+
+        try {
+            if (!entry->bo_kv) {
+                size_t kv_size = 1 * seq_len * 2 * head_dim * sizeof(uint16_t);
+                entry->bo_kv = std::make_unique<xrt::bo>(
+                    xrt::bo(ctx->device, kv_size, xrt::bo::flags::host_only,
+                            entry->kernel.group_id(0)));
+            }
+            if (!entry->bo_q) {
+                size_t q_size = 1 * (group_size * head_dim + head_dim) * sizeof(uint16_t);
+                entry->bo_q = std::make_unique<xrt::bo>(
+                    xrt::bo(ctx->device, q_size, xrt::bo::flags::host_only,
+                            entry->kernel.group_id(1)));
+            }
+            if (!entry->bo_out) {
+                size_t out_size = group_size * head_dim * sizeof(uint16_t);
+                entry->bo_out = std::make_unique<xrt::bo>(
+                    xrt::bo(ctx->device, out_size, xrt::bo::flags::host_only,
+                            entry->kernel.group_id(2)));
+            }
+
+            // --- Prepare KV cache buffer ---
+            {
+                auto kv_ptr = entry->bo_kv->map<char *>();
+                struct ggml_tensor * k_tensor = cgraph->nodes[ref_qk]->src[0];
+                struct ggml_tensor * v_tensor =
+                    cgraph->nodes[group.heads[0].pv_idx]->src[0];
+                const char * k_data = (const char *)k_tensor->data;
+                const char * v_data = (const char *)v_tensor->data;
+                size_t row_bytes = head_dim * sizeof(uint16_t);
+
+                size_t k_pos_stride = k_tensor->nb[1];
+                size_t k_head_stride = k_tensor->ne[2] > 1 ? k_tensor->nb[2] : 0;
+                size_t v_pos_stride = v_tensor->nb[1];
+                size_t v_head_stride = v_tensor->ne[2] > 1 ? v_tensor->nb[2] : 0;
+
+                for (int64_t pos = 0; pos < seq_len; pos++) {
+                    size_t dst_k = pos * 2 * row_bytes;
+                    size_t src_k = pos * k_pos_stride + kv_h * k_head_stride;
+                    memcpy(kv_ptr + dst_k, k_data + src_k, row_bytes);
+
+                    size_t dst_v = (pos * 2 + 1) * row_bytes;
+                    size_t src_v = pos * v_pos_stride + kv_h * v_head_stride;
+                    memcpy(kv_ptr + dst_v, v_data + src_v, row_bytes);
+                }
+                entry->bo_kv->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            }
+
+            // --- Prepare Q buffer ---
+            {
+                auto q_ptr = entry->bo_q->map<char *>();
+                size_t q_head_bytes = head_dim * sizeof(uint16_t);
+
+                char angle_cos_bf16[2] = {(char)0x80, (char)0x3F};
+                char angle_sin_bf16[2] = {(char)0x00, (char)0x00};
+
+                struct ggml_tensor * q_tensor =
+                    cgraph->nodes[ref_qk]->src[1];
+                const char * q_data = (const char *)q_tensor->data;
+
+                for (int64_t g = 0; g < group_size; g++) {
+                    int64_t q_head = batched ? (kv_h * q_heads_per_kv + g) : g;
+                    flowkv_copy_head_slice(
+                        q_ptr + g * q_head_bytes, q_data,
+                        q_tensor, q_head, head_dim, q_head_bytes);
+                }
+
+                size_t angles_off = group_size * q_head_bytes;
+                for (int d = 0; d < head_dim; d += 2) {
+                    memcpy(q_ptr + angles_off + d * 2, angle_cos_bf16, 2);
+                    memcpy(q_ptr + angles_off + d * 2 + 2, angle_sin_bf16, 2);
+                }
+                entry->bo_q->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            }
+
+            // --- Dispatch ---
+            auto run = xrt::run(entry->kernel);
+            run.set_arg(0, *entry->bo_kv);
+            run.set_arg(1, *entry->bo_q);
+            run.set_arg(2, *entry->bo_out);
+            run.set_arg(3, entry->insts_bo);
+
+            {
+                std::lock_guard<std::mutex> lock(*entry->mu);
+                auto t0 = std::chrono::steady_clock::now();
+                run.start();
+                auto state = run.wait(30000);
+                auto t1 = std::chrono::steady_clock::now();
+
+                if (state != ERT_CMD_STATE_COMPLETED) {
+                    GGML_LOG_ERROR("ggml-xdna: FlowKV per-head dispatch failed, state=%d\n",
+                                   (int)state);
+                    all_ok = false;
+                    continue;
+                }
+
+                if (dbg) {
+                    float ms = std::chrono::duration<float, std::milli>(t1 - t0).count();
+                    fprintf(stderr, "ggml-xdna: FlowKV KV=%lld gs=%lld S=%lld → %.2f ms\n",
+                            (long long)kv_h, (long long)group_size,
+                            (long long)seq_len, ms);
+                    fflush(stderr);
+                }
+            }
+
+            // --- Read back output and scatter ---
+            entry->bo_out->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+            {
+                auto out_ptr = entry->bo_out->map<char *>();
+                size_t out_head_bytes = head_dim * sizeof(uint16_t);
+                struct ggml_tensor * out_tensor =
+                    cgraph->nodes[group.heads[0].pv_idx];
+                const char * out_base = (const char *)out_tensor->data;
+
+                for (int64_t g = 0; g < group_size; g++) {
+                    int64_t q_head = batched ? (kv_h * q_heads_per_kv + g) : g;
+                    if (out_tensor->ne[2] > 1) {
+                        memcpy((char *)out_base + q_head * out_tensor->nb[2],
+                               out_ptr + g * out_head_bytes, out_head_bytes);
+                    } else {
+                        struct ggml_tensor * h_out =
+                            cgraph->nodes[group.heads[g].pv_idx];
+                        memcpy(h_out->data, out_ptr + g * out_head_bytes,
+                               out_head_bytes);
+                    }
+                }
+            }
+        } catch (const std::exception & e) {
+            GGML_LOG_ERROR("ggml-xdna: FlowKV per-head exception: %s\n", e.what());
+            all_ok = false;
+        }
+    } // for kv_h
+
+    return all_ok;
 }
 
 // ============================================================================
@@ -10868,6 +10912,17 @@ static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const s
         case GGML_OP_MUL_MAT: {
             const struct ggml_tensor * src0 = op->src[0];
             const struct ggml_tensor * src1 = op->src[1];
+            // FlowKV decode attention: Q@K^T and scores@V are batched over
+            // heads (ne[2] = n_heads or n_kv_heads) and non-contiguous after
+            // ggml_permute(0,2,1,3). We must claim them here so the scheduler
+            // assigns them to XDNA; graph_compute's FlowKV matcher handles
+            // the actual dispatch decision.
+            static const bool flowkv_decode_enabled_for_supports = getenv("XDNA_ENABLE_FLOWKV_DECODE") != NULL;
+            if (flowkv_decode_enabled_for_supports && src1->ne[1] == 1 && src0->ne[0] == 64 && src0->ne[1] > 1) {
+                if (src1->type != GGML_TYPE_F32) return false;
+                if (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_BF16 || src0->type == GGML_TYPE_F16) return true;
+                return false;
+            }
             if (!ggml_is_contiguous(src0)) return false;
             if (!ggml_is_contiguous(src1)) return false;
             if (src0->ne[2] != 1 || src0->ne[3] != 1) return false;
@@ -11003,8 +11058,7 @@ static bool ggml_backend_xdna_device_offload_op(ggml_backend_dev_t dev, const st
                 const int64_t M = op->src[1]->ne[1];
                 if (M == 1) {
                     // For FlowKV: claim M=1 MUL_MATs where K=head_dim=64
-                    // and N=seq_len (Q@K^T) or N=seq_len (scores@V).
-                    // These are the attention score and output computations.
+                    // and N=seq_len (Q@K^T).
                     if (flowkv_decode_enabled && K == 64 && N > 1) {
                         return true;
                     }
@@ -11016,6 +11070,10 @@ static bool ggml_backend_xdna_device_offload_op(ggml_backend_dev_t dev, const st
                     if (K < 64 || K % 64 != 0) return false;
                     if (N < 8  || N > 32768)   return false;
                     if (N % 8 != 0)            return false;
+                    return true;
+                }
+                // FlowKV scores@V: K=head_dim=64, N=n_kv_heads, M=seq_len.
+                if (flowkv_decode_enabled && K == 64 && N > 1 && M > 1) {
                     return true;
                 }
                 return xdna_shape_dispatchable(M, K, N);
@@ -11050,6 +11108,10 @@ static bool ggml_backend_xdna_device_offload_op(ggml_backend_dev_t dev, const st
             case GGML_OP_VIEW:
             case GGML_OP_PERMUTE:
             case GGML_OP_TRANSPOSE:
+                // FlowKV decode: keep VIEW/CONT/RESHAPE/PERMUTE on XDNA
+                // so the scheduler doesn't split the attention pattern
+                // (Q@K^T → SOFT_MAX → scores@V) across segments.
+                if (flowkv_decode_enabled) return true;
                 return is_prefill_op(op);
             default:
                 return false;
