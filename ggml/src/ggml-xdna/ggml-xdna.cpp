@@ -4685,6 +4685,7 @@ static std::unordered_set<int> xdna_plan_decode_batch(
     }
 
     int n_decode_gemv = 0;
+    int n_attn_reject = 0;
     for (int i = 0; i < cgraph->n_nodes; i++) {
         const struct ggml_tensor * node = cgraph->nodes[i];
         if (node->op != GGML_OP_MUL_MAT) continue;
@@ -4695,14 +4696,51 @@ static std::unordered_set<int> xdna_plan_decode_batch(
         const int64_t N = node->src[0]->ne[1];
         if (!xdna_shape_dispatchable_gemv(K, N)) continue;
         if (consumed.count(i)) continue;
+
+        // Attention guard: skip MUL_MAT nodes that are near SOFT_MAX.
+        // Case 1 (forward): Q@K^T before SOFT_MAX
+        // Case 2 (backward): scores@V after SOFT_MAX
+        // Both have permuted/interleaved data that the NPU GEMV kernel
+        // cannot handle correctly.
+        bool is_attn = false;
+        // Forward scan: Q@K^T → [SCALE] [ADD] → SOFT_MAX
+        for (int j = i + 1; j < cgraph->n_nodes && j < i + 8; j++) {
+            enum ggml_op op = cgraph->nodes[j]->op;
+            if (op == GGML_OP_SOFT_MAX) { is_attn = true; break; }
+            if (op == GGML_OP_SCALE || op == GGML_OP_ADD ||
+                op == GGML_OP_VIEW || op == GGML_OP_RESHAPE ||
+                op == GGML_OP_PERMUTE || op == GGML_OP_CONT) continue;
+            break;
+        }
+        // Backward scan: SOFT_MAX → [VIEW/RESHAPE/PERMUTE] → scores@V
+        if (!is_attn) {
+            for (int j = i - 1; j >= 0 && j > i - 8; j--) {
+                enum ggml_op op = cgraph->nodes[j]->op;
+                if (op == GGML_OP_SOFT_MAX) { is_attn = true; break; }
+                if (op == GGML_OP_VIEW || op == GGML_OP_RESHAPE ||
+                    op == GGML_OP_PERMUTE || op == GGML_OP_CONT) continue;
+                break;
+            }
+        }
+        if (is_attn) {
+            n_attn_reject++;
+            if (dbg) {
+                fprintf(stderr,
+                    "ggml-xdna: decode_batch skip [%d] attn MUL_MAT K=%lld N=%lld\n",
+                    i, (long long)K, (long long)N);
+                fflush(stderr);
+            }
+            continue;
+        }
+
         batchable.insert(i);
     }
 
     if (dbg) {
         fprintf(stderr,
             "ggml-xdna: decode_batch plan: %d decode GEMVs, %zu batchable "
-            "(QKV consumed %zu indices)\n",
-            n_decode_gemv, batchable.size(), consumed.size());
+            "(QKV consumed %zu indices, attn reject %d)\n",
+            n_decode_gemv, batchable.size(), consumed.size(), n_attn_reject);
         fflush(stderr);
     }
 
@@ -9738,10 +9776,49 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
 
     // Pre-scan for decode GEMV batching. Identifies standalone MUL_MAT M=1
     // nodes eligible for runlist batching (gated by XDNA_ENABLE_DECODE_BATCH).
+    // Also excludes attention Q@K^T MUL_MATs (followed by SOFT_MAX).
     xdna_decode_batcher decode_batcher;
     std::unordered_set<int> decode_batch_indices;
     if (decode_batcher.is_enabled()) {
         decode_batch_indices = xdna_plan_decode_batch(cgraph, qkv_plan);
+    }
+
+    // Pre-scan: identify MUL_MAT nodes that are part of attention patterns.
+    // Two cases:
+    //   1. Q@K^T: MUL_MAT followed by [SCALE] [ADD] SOFT_MAX
+    //   2. scores@V: MUL_MAT preceded by SOFT_MAX (within a short window)
+    // Both have permuted/interleaved data that the NPU GEMV kernel cannot
+    // handle correctly. They must stay on CPU. This set covers the individual
+    // dispatch path (decode_batch has its own equivalent check).
+    std::unordered_set<int> attn_mulmat_indices;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const struct ggml_tensor * node = cgraph->nodes[i];
+        if (node->op != GGML_OP_MUL_MAT) continue;
+        if (node->src[1]->ne[1] != 1) continue;
+        // Case 1: forward scan — Q@K^T before SOFT_MAX
+        for (int j = i + 1; j < cgraph->n_nodes && j < i + 8; j++) {
+            enum ggml_op op = cgraph->nodes[j]->op;
+            if (op == GGML_OP_SOFT_MAX) {
+                attn_mulmat_indices.insert(i);
+                break;
+            }
+            if (op == GGML_OP_SCALE || op == GGML_OP_ADD ||
+                op == GGML_OP_VIEW || op == GGML_OP_RESHAPE ||
+                op == GGML_OP_PERMUTE || op == GGML_OP_CONT) continue;
+            break;
+        }
+        if (attn_mulmat_indices.count(i)) continue;
+        // Case 2: backward scan — scores@V after SOFT_MAX
+        for (int j = i - 1; j >= 0 && j > i - 8; j--) {
+            enum ggml_op op = cgraph->nodes[j]->op;
+            if (op == GGML_OP_SOFT_MAX) {
+                attn_mulmat_indices.insert(i);
+                break;
+            }
+            if (op == GGML_OP_VIEW || op == GGML_OP_RESHAPE ||
+                op == GGML_OP_PERMUTE || op == GGML_OP_CONT) continue;
+            break;
+        }
     }
 
     // Bulk pre-warm all attention-prefill weights for this cgraph before the
@@ -10527,6 +10604,16 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                 continue;
             }
             // Dispatch rejected the node — fall it into the CPU accumulator.
+            if (cpu_run_start < 0) cpu_run_start = i;
+            continue;
+        }
+
+        // Attention guard: never dispatch Q@K^T MUL_MATs to NPU as GEMVs.
+        // These are attention score computations (followed by SOFT_MAX) with
+        // permuted Q and interleaved K cache — the NPU GEMV kernel produces
+        // garbage on them. The decode_batch plan already excludes them; this
+        // check covers the individual dispatch path.
+        if (attn_mulmat_indices.count(i)) {
             if (cpu_run_start < 0) cpu_run_start = i;
             continue;
         }
