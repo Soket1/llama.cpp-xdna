@@ -73,6 +73,11 @@
 !/models/ggml-vocab-*.gguf*
 !/models/templates
 
+# NPU Caches
+/npu_kernels*
+/IRON-windows/
+/iron_repo/
+
 # Zig
 /zig-out/
 /zig-cache/
