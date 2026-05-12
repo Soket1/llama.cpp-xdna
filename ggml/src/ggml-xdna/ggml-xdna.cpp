@@ -10901,10 +10901,13 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
             if (poc_dbg) {
                 fprintf(stderr, "ggml-xdna: [FlowKV-POC] CONT(kqv_out) @%d: "
                         "head_dim=%lld seq_len=%lld kv_heads=%lld q_heads=%lld "
-                        "kqv_out data=%p\n",
+                        "kqv_out data=%p type=%d | Q type=%d K type=%d V type=%d\n",
                         i, (long long)head_dim, (long long)seq_len,
                         (long long)num_kv_heads, (long long)num_q_heads,
-                        kqv_out->data);
+                        kqv_out->data, (int)kqv_out->type,
+                        (int)flowkv_poc_q_perm->type,
+                        (int)flowkv_poc_k_perm->type,
+                        (int)flowkv_poc_v_perm->type);
                 fflush(stderr);
             }
 
@@ -10947,49 +10950,96 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                     size_t v_nb2 = flowkv_poc_v_perm->nb[2];
                     size_t q_nb2 = flowkv_poc_q_perm->nb[2];
 
+                    // Detect tensor types for f32→bf16 conversion.
+                    // QKV dispatch outputs f32 (bf16_to_f32), KV cache may be f32 or bf16.
+                    // FlowKV kernel expects bf16 input, produces bf16 output.
+                    const bool k_is_f32 = (flowkv_poc_k_perm->type == GGML_TYPE_F32);
+                    const bool v_is_f32 = (flowkv_poc_v_perm->type == GGML_TYPE_F32);
+                    const bool q_is_f32 = (flowkv_poc_q_perm->type == GGML_TYPE_F32);
+                    const bool out_is_f32 = (kqv_out->type == GGML_TYPE_F32);
+
                     // Identity RoPE angles (cos=0x3F80, sin=0x0000).
                     char angle_cos_bf16[2] = {(char)0x80, (char)0x3F};  // 0x3F80 = 1.0 bf16
                     char angle_sin_bf16[2] = {(char)0x00, (char)0x00};  // 0x0000 = 0.0 bf16
 
                     // Process each KV head.
                     for (int64_t kv_h = 0; kv_h < num_kv_heads; kv_h++) {
-                        // --- Prepare KV buffer (interleaved K/V) ---
+                        // --- Prepare KV buffer (interleaved K/V, bf16) ---
                         {
                             auto kv_ptr = fk_entry->bo_kv->map<char *>();
                             for (int64_t pos = 0; pos < seq_len; pos++) {
-                                // K: contiguous head_dim values at [pos, kv_h]
+                                // K: copy head_dim elements → bf16 in KV buffer.
                                 size_t dst_k = pos * 2 * row_bytes;
-                                size_t src_k = pos * k_nb1 + kv_h * k_nb2;
-                                memcpy(kv_ptr + dst_k, k_data + src_k, row_bytes);
-
-                                // V: head_dim values may be strided.
-                                size_t dst_v = (pos * 2 + 1) * row_bytes;
-                                if (v_nb0 == (size_t)head_dim * 2) {
-                                    // V layout: [head_dim, seq_len, kv_heads] → contiguous
-                                    size_t src_v = pos * v_nb1 + kv_h * v_nb2;
-                                    memcpy(kv_ptr + dst_v, v_data + src_v, row_bytes);
+                                if (k_is_f32) {
+                                    // f32 K: convert each element to bf16.
+                                    const float * src = (const float *)(k_data + pos * k_nb1 + kv_h * k_nb2);
+                                    uint16_t * dst = (uint16_t *)(kv_ptr + dst_k);
+                                    f32_to_bf16(src, dst, (size_t)head_dim);
                                 } else {
-                                    // V layout: [seq_len, head_dim, kv_heads] → strided
-                                    for (int64_t d = 0; d < head_dim; d++) {
-                                        size_t src_v = pos * v_nb0 + d * v_nb1 + kv_h * v_nb2;
-                                        memcpy(kv_ptr + dst_v + d * 2, v_data + src_v, 2);
+                                    size_t src_k = pos * k_nb1 + kv_h * k_nb2;
+                                    memcpy(kv_ptr + dst_k, k_data + src_k, row_bytes);
+                                }
+
+                                // V: copy head_dim elements → bf16 in KV buffer.
+                                size_t dst_v = (pos * 2 + 1) * row_bytes;
+                                if (v_is_f32) {
+                                    // f32 V: gather with stride conversion.
+                                    uint16_t * dst = (uint16_t *)(kv_ptr + dst_v);
+                                    if (v_nb0 == (size_t)head_dim * 4) {
+                                        // V layout: [head_dim, seq_len, kv_heads] → contiguous f32
+                                        const float * src = (const float *)(v_data + pos * v_nb1 + kv_h * v_nb2);
+                                        f32_to_bf16(src, dst, (size_t)head_dim);
+                                    } else {
+                                        // V layout: [seq_len, head_dim, kv_heads] → strided f32
+                                        for (int64_t d = 0; d < head_dim; d++) {
+                                            const float * src = (const float *)(v_data + pos * v_nb0 + d * v_nb1 + kv_h * v_nb2);
+                                            float val = *src;
+                                            // Manual f32→bf16 round-to-nearest-even.
+                                            uint32_t bits;
+                                            memcpy(&bits, &val, 4);
+                                            uint16_t bf = (uint16_t)(bits >> 16);
+                                            // Round: add 0x7FFF + round-bit, then shift.
+                                            if ((bits & 0x7FFFFFFF) < 0x7F800000) {
+                                                uint32_t rounding = 0x7FFF + ((bf & 1) ^ 1);
+                                                bf = (uint16_t)((bits + rounding) >> 16);
+                                            }
+                                            memcpy(kv_ptr + dst_v + d * 2, &bf, 2);
+                                        }
+                                    }
+                                } else {
+                                    // bf16 V: gather with correct strides.
+                                    if (v_nb0 == (size_t)head_dim * 2) {
+                                        // V layout: [head_dim, seq_len, kv_heads] → contiguous bf16
+                                        size_t src_v = pos * v_nb1 + kv_h * v_nb2;
+                                        memcpy(kv_ptr + dst_v, v_data + src_v, row_bytes);
+                                    } else {
+                                        // V layout: [seq_len, head_dim, kv_heads] → strided bf16
+                                        for (int64_t d = 0; d < head_dim; d++) {
+                                            size_t src_v = pos * v_nb0 + d * v_nb1 + kv_h * v_nb2;
+                                            memcpy(kv_ptr + dst_v + d * 2, v_data + src_v, 2);
+                                        }
                                     }
                                 }
                             }
                             fk_entry->bo_kv->sync(XCL_BO_SYNC_BO_TO_DEVICE);
                         }
 
-                        // --- Prepare Q buffer ---
+                        // --- Prepare Q buffer (bf16) ---
                         {
                             auto q_ptr = fk_entry->bo_q->map<char *>();
+                            size_t q_head_bytes_bf16 = head_dim * sizeof(uint16_t);
                             for (int64_t g = 0; g < q_heads_per_kv; g++) {
                                 int64_t q_head = kv_h * q_heads_per_kv + g;
-                                flowkv_copy_head_slice(
-                                    q_ptr + g * row_bytes, q_data,
-                                    flowkv_poc_q_perm, q_head, head_dim, row_bytes);
+                                const char * src = q_data + q_head * q_nb2;
+                                char * dst = q_ptr + g * q_head_bytes_bf16;
+                                if (q_is_f32) {
+                                    f32_to_bf16((const float *)src, (uint16_t *)dst, (size_t)head_dim);
+                                } else {
+                                    memcpy(dst, src, q_head_bytes_bf16);
+                                }
                             }
                             // Append identity RoPE angles.
-                            size_t angles_off = q_heads_per_kv * row_bytes;
+                            size_t angles_off = q_heads_per_kv * q_head_bytes_bf16;
                             for (int64_t d = 0; d < head_dim; d += 2) {
                                 memcpy(q_ptr + angles_off + d * 2, angle_cos_bf16, 2);
                                 memcpy(q_ptr + angles_off + d * 2 + 2, angle_sin_bf16, 2);
@@ -11025,18 +11075,22 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                             }
                         }
 
-                        // --- Read back and write to kqv_out ---
+                        // --- Read back and write to kqv_out (bf16→f32 if needed) ---
                         fk_entry->bo_out->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
                         {
                             auto out_ptr = fk_entry->bo_out->map<char *>();
-                            // Write per-head results to kqv_out.
-                            // kqv_out layout: [model_dim, M=1] = [num_q_heads * head_dim]
-                            // Each Q head's result goes to offset q_head * head_dim.
                             char * kqv_data = (char *)kqv_out->data;
+                            size_t out_head_bytes = head_dim * sizeof(uint16_t);
                             for (int64_t g = 0; g < q_heads_per_kv; g++) {
                                 int64_t q_head = kv_h * q_heads_per_kv + g;
-                                memcpy(kqv_data + q_head * row_bytes,
-                                       out_ptr + g * row_bytes, row_bytes);
+                                if (out_is_f32) {
+                                    bf16_to_f32((const uint16_t *)(out_ptr + g * out_head_bytes),
+                                                (float *)(kqv_data + q_head * head_dim * sizeof(float)),
+                                                (size_t)head_dim);
+                                } else {
+                                    memcpy(kqv_data + q_head * out_head_bytes,
+                                           out_ptr + g * out_head_bytes, out_head_bytes);
+                                }
                             }
                         }
                     } // for kv_h
