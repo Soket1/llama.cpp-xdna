@@ -11157,6 +11157,18 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
 
                     if (poc_dbg) {
                         fprintf(stderr, "ggml-xdna: [FlowKV-POC] completed, overwrote kqv_out @%d\n", i);
+                        // Diagnostic: check raw bo_out data after sync
+                        {
+                            auto raw = fk_entry->bo_out->map<char *>();
+                            const uint16_t * raw_bf16 = (const uint16_t *)raw;
+                            bool all_zero = true;
+                            for (int d = 0; d < q_heads_per_kv * head_dim; d++) {
+                                if (raw_bf16[d] != 0) { all_zero = false; break; }
+                            }
+                            fprintf(stderr, "  bo_out raw: first 8 bf16:");
+                            for (int d = 0; d < 8; d++) fprintf(stderr, " 0x%04X", raw_bf16[d]);
+                            fprintf(stderr, " all_zero=%d\n", all_zero);
+                        }
                         // Compare NPU vs CPU for first head
                         if (!cpu_save.empty()) {
                             const float * npu_f32 = (const float *)kqv_out->data;
