@@ -10024,6 +10024,27 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                     ctx, q_mm, k_mm, v_mm,
                     q_mm->src[0], k_mm->src[0], v_mm->src[0],
                     q_mm->src[1]);
+                // ── FlowKV diagnostic: log QKV tensors and surrounding nodes ──
+                if (flowkv_decode_enabled) {
+                    fprintf(stderr, "ggml-xdna: [FlowKV-DIAG] QKV @%d: "
+                            "q_mm dst=%s ne=[%lld,%lld] src1=%s ne=[%lld,%lld]\n",
+                            i, q_mm->name,
+                            (long long)q_mm->ne[0], (long long)q_mm->ne[1],
+                            q_mm->src[1]->name,
+                            (long long)q_mm->src[1]->ne[0], (long long)q_mm->src[1]->ne[1]);
+                    // Log nodes i..i+20 (the QKV + cache section)
+                    int log_end = i + 20 < n ? i + 20 : n;
+                    for (int j = i; j < log_end; j++) {
+                        struct ggml_tensor * nd = cgraph->nodes[j];
+                        fprintf(stderr, "  [%d] op=%d name=%s ne=[%lld,%lld,%lld] "
+                                "src0=%s src1=%s\n",
+                                j, (int)nd->op, nd->name,
+                                (long long)nd->ne[0], (long long)nd->ne[1], (long long)nd->ne[2],
+                                nd->src[0] ? nd->src[0]->name : "(null)",
+                                nd->src[1] ? nd->src[1]->name : "(null)");
+                    }
+                    fflush(stderr);
+                }
                 continue;  // natural ++i; intermediate CPU nodes still run via accumulator
             }
             if (qkv_plan.skip_indices.count(i)) {
@@ -10807,6 +10828,29 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
             // Dispatch to NPU.
             ggml_backend_xdna_mul_mat(ctx, node);
             continue;
+        }
+
+        // ── FlowKV direct dispatch diagnostic ─────────────────────────
+        // When we see a CONT node whose src[0] is kqv_out, we're at the
+        // attention→output-projection boundary. Log tensor info for
+        // designing the FlowKV direct dispatch.
+        if (flowkv_decode_enabled && node->op == GGML_OP_CONT &&
+            node->src[0] && strstr(node->src[0]->name, "kqv_out")) {
+            struct ggml_tensor * kqv = node->src[0];
+            fprintf(stderr, "ggml-xdna: [FlowKV-DIAG] CONT(kqv_out) @%d: "
+                    "kqv_out ne=[%lld,%lld,%lld,%lld] type=%d data=%p\n",
+                    i, (long long)kqv->ne[0], (long long)kqv->ne[1],
+                    (long long)kqv->ne[2], (long long)kqv->ne[3],
+                    (int)kqv->type, kqv->data);
+            // Scan this segment for all tensor names
+            for (int j = 0; j < n; j++) {
+                struct ggml_tensor * nd = cgraph->nodes[j];
+                fprintf(stderr, "  [%d] op=%d name=%s src0=%s src1=%s\n",
+                        j, (int)nd->op, nd->name,
+                        nd->src[0] ? nd->src[0]->name : "(null)",
+                        nd->src[1] ? nd->src[1]->name : "(null)");
+            }
+            fflush(stderr);
         }
 
         // View-only nodes are pure metadata — they still need to be in the
