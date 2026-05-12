@@ -11073,6 +11073,24 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                         // IRON xclbin arg layout: opcode(0), insts(1), insts_size(2),
                         // DDR_buf_0(3)=kv, DDR_buf_1(4)=q, DDR_buf_2(5)=out
                         {
+                            // Diagnostic: verify BO data before dispatch
+                            if (poc_dbg && kv_h == 0) {
+                                auto diag_kv = fk_entry->bo_kv->map<char *>();
+                                auto diag_q = fk_entry->bo_q->map<char *>();
+                                const uint16_t * kv_bf16 = (const uint16_t *)diag_kv;
+                                const uint16_t * q_bf16 = (const uint16_t *)diag_q;
+                                fprintf(stderr, "  BO check kv_h=0: KV first 8 bf16:");
+                                for (int d = 0; d < 8; d++) fprintf(stderr, " 0x%04X", kv_bf16[d]);
+                                fprintf(stderr, "\n  BO check kv_h=0: Q first 8 bf16:");
+                                for (int d = 0; d < 8; d++) fprintf(stderr, " 0x%04X", q_bf16[d]);
+                                fprintf(stderr, "\n  BO check: insts size=%u bo_kv size=%zu bo_q size=%zu bo_out size=%zu\n",
+                                        (uint32_t)fk_entry->insts_data.size(),
+                                        (size_t)(1 * seq_len * 2 * row_bytes),
+                                        (size_t)(1 * (q_heads_per_kv * head_dim + head_dim) * sizeof(uint16_t)),
+                                        (size_t)(q_heads_per_kv * row_bytes));
+                                fflush(stderr);
+                            }
+
                             auto run = xrt::run(fk_entry->kernel);
                             run.set_arg(0, 3u);
                             run.set_arg(1, fk_entry->insts_bo);
