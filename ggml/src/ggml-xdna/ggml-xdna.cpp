@@ -4017,7 +4017,7 @@ static bool try_load_flowkv_entry(xdna_flowkv_entry & entry,
         ctx->device.register_xclbin(entry.xclbin);
         auto uuid = entry.xclbin.get_uuid();
         entry.hw_ctx = xrt::hw_context(ctx->device, uuid);
-        entry.kernel = xrt::kernel(entry.hw_ctx, "flowkv_decode");
+        entry.kernel = xrt::kernel(entry.hw_ctx, "MLIR_AIE");
         entry.insts_data = read_binary_file(insts_path);
         entry.insts_bo = xrt::bo(ctx->device, entry.insts_data.size(),
                                  xrt::bo::flags::cacheable, entry.kernel.group_id(3));
