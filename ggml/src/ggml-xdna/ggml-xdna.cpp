@@ -11152,12 +11152,19 @@ static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const s
             // ggml_permute(0,2,1,3). We must claim them here so the scheduler
             // assigns them to XDNA; graph_compute's FlowKV matcher handles
             // the actual dispatch decision.
-            static const bool flowkv_decode_enabled_for_supports = xdna_env_enabled("XDNA_ENABLE_FLOWKV_DECODE");
-            if (flowkv_decode_enabled_for_supports && src1->ne[1] == 1 && src0->ne[0] == 64 && src0->ne[1] > 1) {
-                if (src1->type != GGML_TYPE_F32) return false;
-                if (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_BF16 || src0->type == GGML_TYPE_F16) return true;
-                return false;
-            }
+            //
+            // DISABLED: claiming K=64 MUL_MATs changes graph segmentation,
+            // splitting the attention pattern across XNA/CPU segments. The
+            // CPU backend then can't compute the full attention (Q@K^T →
+            // softmax → scores@V) as a unit, producing garbage output.
+            // Re-enable once FlowKV cross-segment dispatch is proven correct.
+            //
+            // static const bool flowkv_decode_enabled_for_supports = xdna_env_enabled("XDNA_ENABLE_FLOWKV_DECODE");
+            // if (flowkv_decode_enabled_for_supports && src1->ne[1] == 1 && src0->ne[0] == 64 && src0->ne[1] > 1) {
+            //     if (src1->type != GGML_TYPE_F32) return false;
+            //     if (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_BF16 || src0->type == GGML_TYPE_F16) return true;
+            //     return false;
+            // }
             if (!ggml_is_contiguous(src0)) return false;
             if (!ggml_is_contiguous(src1)) return false;
             if (src0->ne[2] != 1 || src0->ne[3] != 1) return false;
