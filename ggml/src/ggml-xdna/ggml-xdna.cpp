@@ -4023,6 +4023,14 @@ static bool try_load_flowkv_entry(xdna_flowkv_entry & entry,
                                  xrt::bo::flags::cacheable, entry.kernel.group_id(1));
         memcpy(entry.insts_bo.map<void*>(), entry.insts_data.data(), entry.insts_data.size());
         entry.insts_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        // Diagnostic: print all group_ids
+        fprintf(stderr, "ggml-xdna: FlowKV kernel loaded, group_ids:");
+        for (int a = 0; a < 10; a++) {
+            try { fprintf(stderr, " [%d]=%zu", a, (size_t)entry.kernel.group_id(a)); }
+            catch (...) { fprintf(stderr, " [%d]=ERR", a); break; }
+        }
+        fprintf(stderr, "\n");
+        fflush(stderr);
     } catch (const std::exception & e) {
         GGML_LOG_ERROR("ggml-xdna: failed to load FlowKV decode xclbin: %s\n", e.what());
         return false;
