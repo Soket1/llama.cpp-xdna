@@ -4020,7 +4020,7 @@ static bool try_load_flowkv_entry(xdna_flowkv_entry & entry,
         entry.kernel = xrt::kernel(entry.hw_ctx, "MLIR_AIE");
         entry.insts_data = read_binary_file(insts_path);
         entry.insts_bo = xrt::bo(ctx->device, entry.insts_data.size(),
-                                 xrt::bo::flags::cacheable, entry.kernel.group_id(3));
+                                 xrt::bo::flags::cacheable, entry.kernel.group_id(1));
         memcpy(entry.insts_bo.map<void*>(), entry.insts_data.data(), entry.insts_data.size());
         entry.insts_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
     } catch (const std::exception & e) {
@@ -4456,19 +4456,19 @@ static bool ggml_backend_xdna_flowkv_per_head(
                 size_t kv_size = 1 * seq_len * 2 * head_dim * sizeof(uint16_t);
                 entry->bo_kv = std::make_unique<xrt::bo>(
                     xrt::bo(ctx->device, kv_size, xrt::bo::flags::host_only,
-                            entry->kernel.group_id(0)));
+                            entry->kernel.group_id(3)));
             }
             if (!entry->bo_q) {
                 size_t q_size = 1 * (group_size * head_dim + head_dim) * sizeof(uint16_t);
                 entry->bo_q = std::make_unique<xrt::bo>(
                     xrt::bo(ctx->device, q_size, xrt::bo::flags::host_only,
-                            entry->kernel.group_id(1)));
+                            entry->kernel.group_id(4)));
             }
             if (!entry->bo_out) {
                 size_t out_size = group_size * head_dim * sizeof(uint16_t);
                 entry->bo_out = std::make_unique<xrt::bo>(
                     xrt::bo(ctx->device, out_size, xrt::bo::flags::host_only,
-                            entry->kernel.group_id(2)));
+                            entry->kernel.group_id(5)));
             }
 
             // --- Prepare KV cache buffer ---
@@ -4522,11 +4522,15 @@ static bool ggml_backend_xdna_flowkv_per_head(
             }
 
             // --- Dispatch ---
+            // IRON xclbin arg layout: opcode(0), insts(1), insts_size(2),
+            // DDR_buf_0(3)=kv, DDR_buf_1(4)=q, DDR_buf_2(5)=out
             auto run = xrt::run(entry->kernel);
-            run.set_arg(0, *entry->bo_kv);
-            run.set_arg(1, *entry->bo_q);
-            run.set_arg(2, *entry->bo_out);
-            run.set_arg(3, entry->insts_bo);
+            run.set_arg(0, 3u);
+            run.set_arg(1, entry->insts_bo);
+            run.set_arg(2, (uint32_t)entry->insts_data.size());
+            run.set_arg(3, *entry->bo_kv);
+            run.set_arg(4, *entry->bo_q);
+            run.set_arg(5, *entry->bo_out);
 
             {
                 std::lock_guard<std::mutex> lock(*entry->mu);
@@ -10928,23 +10932,25 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                     size_t row_bytes = head_dim * sizeof(uint16_t);
 
                     // Allocate BOs if needed.
+                    // IRON xclbin arg layout: opcode(0), insts(1), insts_size(2),
+                    // DDR_buf_0(3)=kv, DDR_buf_1(4)=q, DDR_buf_2(5)=out
                     size_t kv_size = 1 * seq_len * 2 * row_bytes;
                     if (!fk_entry->bo_kv) {
                         fk_entry->bo_kv = std::make_unique<xrt::bo>(
                             xrt::bo(ctx->device, kv_size, xrt::bo::flags::host_only,
-                                    fk_entry->kernel.group_id(0)));
+                                    fk_entry->kernel.group_id(3)));
                     }
                     size_t q_size = 1 * (q_heads_per_kv * head_dim + head_dim) * sizeof(uint16_t);
                     if (!fk_entry->bo_q) {
                         fk_entry->bo_q = std::make_unique<xrt::bo>(
                             xrt::bo(ctx->device, q_size, xrt::bo::flags::host_only,
-                                    fk_entry->kernel.group_id(1)));
+                                    fk_entry->kernel.group_id(4)));
                     }
                     size_t out_size = q_heads_per_kv * row_bytes;
                     if (!fk_entry->bo_out) {
                         fk_entry->bo_out = std::make_unique<xrt::bo>(
                             xrt::bo(ctx->device, out_size, xrt::bo::flags::host_only,
-                                    fk_entry->kernel.group_id(2)));
+                                    fk_entry->kernel.group_id(5)));
                     }
 
                     const char * k_data = (const char *)flowkv_poc_k_perm->data;
@@ -11055,12 +11061,16 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                         }
 
                         // --- Dispatch FlowKV kernel ---
+                        // IRON xclbin arg layout: opcode(0), insts(1), insts_size(2),
+                        // DDR_buf_0(3)=kv, DDR_buf_1(4)=q, DDR_buf_2(5)=out
                         {
                             auto run = xrt::run(fk_entry->kernel);
-                            run.set_arg(0, *fk_entry->bo_kv);
-                            run.set_arg(1, *fk_entry->bo_q);
-                            run.set_arg(2, *fk_entry->bo_out);
-                            run.set_arg(3, fk_entry->insts_bo);
+                            run.set_arg(0, 3u);
+                            run.set_arg(1, fk_entry->insts_bo);
+                            run.set_arg(2, (uint32_t)fk_entry->insts_data.size());
+                            run.set_arg(3, *fk_entry->bo_kv);
+                            run.set_arg(4, *fk_entry->bo_q);
+                            run.set_arg(5, *fk_entry->bo_out);
 
                             std::lock_guard<std::mutex> lock(*fk_entry->mu);
                             auto t0 = std::chrono::steady_clock::now();
