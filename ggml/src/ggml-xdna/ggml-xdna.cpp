@@ -9900,6 +9900,22 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
         (xdna_env_enabled("XDNA_ENABLE_TRANSFORMER_BLOCK")) ||
         (xdna_env_enabled("XDNA_ENABLE_TBLOCK_FUSED"));
     static const bool flowkv_decode_enabled = xdna_env_enabled("XDNA_ENABLE_FLOWKV_DECODE");
+    // ── FlowKV POC: saved permuted Q/K/V tensor pointers ──────────
+    // Persisted across graph_compute calls so CONT(kqv_out) segment
+    // can use Q/K/V from the preceding QKV segment.
+    static const struct ggml_tensor * flowkv_poc_q_perm = nullptr;
+    static const struct ggml_tensor * flowkv_poc_k_perm = nullptr;
+    static const struct ggml_tensor * flowkv_poc_v_perm = nullptr;
+    static int64_t flowkv_poc_head_dim = 0;
+    static int64_t flowkv_poc_seq_len = 0;
+    static int64_t flowkv_poc_num_kv_heads = 0;
+    static int64_t flowkv_poc_num_q_heads = 0;
+    static bool flowkv_poc_valid = false;
+    static const struct ggml_cgraph * flowkv_poc_last_cgraph = nullptr;
+    if (flowkv_poc_last_cgraph != cgraph) {
+        flowkv_poc_valid = false;
+        flowkv_poc_last_cgraph = cgraph;
+    }
 
     // Pre-scan for QKV triples. Llama.cpp's Qwen3.5 decode interleaves
     // RMSNorm/view ops between Q and K/V MUL_MATs, so a 3-consecutive-node
@@ -10044,6 +10060,40 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                 nd->src[1] ? nd->src[1]->name : "(null)");
                     }
                     fflush(stderr);
+                }
+                // ── FlowKV POC: save permuted Q/K/V tensor pointers ──
+                // The segment structure after Q MUL_MAT is fixed:
+                //   +15 = PERMUTE cache_v (V cache permuted)
+                //   +17 = PERMUTE cache_k (K cache permuted)
+                //   +19 = PERMUTE Qcur   (Q rotated permuted)
+                // Save these for the CONT(kqv_out) FlowKV dispatch.
+                if (flowkv_decode_enabled && q_mm->src[1]->ne[1] == 1) {
+                    int v_perm_idx = i + 15;
+                    int k_perm_idx = i + 17;
+                    int q_perm_idx = i + 19;
+                    if (q_perm_idx < n) {
+                        struct ggml_tensor * v_perm = cgraph->nodes[v_perm_idx];
+                        struct ggml_tensor * k_perm = cgraph->nodes[k_perm_idx];
+                        struct ggml_tensor * q_perm = cgraph->nodes[q_perm_idx];
+                        if (q_perm->op == GGML_OP_PERMUTE &&
+                            k_perm->op == GGML_OP_PERMUTE &&
+                            v_perm->op == GGML_OP_PERMUTE) {
+                            flowkv_poc_q_perm = q_perm;
+                            flowkv_poc_k_perm = k_perm;
+                            flowkv_poc_v_perm = v_perm;
+                            flowkv_poc_head_dim = q_perm->ne[0];       // 64
+                            flowkv_poc_seq_len = k_perm->ne[1];        // seq_len
+                            flowkv_poc_num_kv_heads = k_perm->ne[2];   // 8
+                            flowkv_poc_num_q_heads = q_perm->ne[2];    // 32
+                            flowkv_poc_valid = true;
+                            fprintf(stderr, "ggml-xdna: [FlowKV-POC] Saved Q=%p[%lld,%lld,%lld] "
+                                    "K=%p[%lld,%lld,%lld] V=%p[%lld,%lld,%lld]\n",
+                                    q_perm->data, (long long)q_perm->ne[0], (long long)q_perm->ne[1], (long long)q_perm->ne[2],
+                                    k_perm->data, (long long)k_perm->ne[0], (long long)k_perm->ne[1], (long long)k_perm->ne[2],
+                                    v_perm->data, (long long)v_perm->ne[0], (long long)v_perm->ne[1], (long long)v_perm->ne[2]);
+                            fflush(stderr);
+                        }
+                    }
                 }
                 continue;  // natural ++i; intermediate CPU nodes still run via accumulator
             }
@@ -10830,27 +10880,177 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
             continue;
         }
 
-        // ── FlowKV direct dispatch diagnostic ─────────────────────────
-        // When we see a CONT node whose src[0] is kqv_out, we're at the
-        // attention→output-projection boundary. Log tensor info for
-        // designing the FlowKV direct dispatch.
-        if (flowkv_decode_enabled && node->op == GGML_OP_CONT &&
+        // ── FlowKV POC: dispatch at CONT(kqv_out) boundary ─────────
+        // CPU attention has already run and written to kqv_out.
+        // We dispatch FlowKV on NPU and OVERWRITE kqv_out with the
+        // NPU result. If output matches → FlowKV computes correctly.
+        if (flowkv_decode_enabled && flowkv_poc_valid &&
+            node->op == GGML_OP_CONT &&
             node->src[0] && strstr(node->src[0]->name, "kqv_out")) {
-            struct ggml_tensor * kqv = node->src[0];
-            fprintf(stderr, "ggml-xdna: [FlowKV-DIAG] CONT(kqv_out) @%d: "
-                    "kqv_out ne=[%lld,%lld,%lld,%lld] type=%d data=%p\n",
-                    i, (long long)kqv->ne[0], (long long)kqv->ne[1],
-                    (long long)kqv->ne[2], (long long)kqv->ne[3],
-                    (int)kqv->type, kqv->data);
-            // Scan this segment for all tensor names
-            for (int j = 0; j < n; j++) {
-                struct ggml_tensor * nd = cgraph->nodes[j];
-                fprintf(stderr, "  [%d] op=%d name=%s src0=%s src1=%s\n",
-                        j, (int)nd->op, nd->name,
-                        nd->src[0] ? nd->src[0]->name : "(null)",
-                        nd->src[1] ? nd->src[1]->name : "(null)");
+
+            struct ggml_tensor * kqv_out = node->src[0];
+            static const bool poc_dbg = getenv("XDNA_DEBUG") != NULL;
+            int64_t head_dim = flowkv_poc_head_dim;
+            int64_t seq_len = flowkv_poc_seq_len;
+            int64_t num_kv_heads = flowkv_poc_num_kv_heads;
+            int64_t num_q_heads = flowkv_poc_num_q_heads;
+            int64_t q_heads_per_kv = num_q_heads / num_kv_heads;
+            int chunk_size = 32;
+            int num_cols = 1;
+
+            if (poc_dbg) {
+                fprintf(stderr, "ggml-xdna: [FlowKV-POC] CONT(kqv_out) @%d: "
+                        "head_dim=%lld seq_len=%lld kv_heads=%lld q_heads=%lld "
+                        "kqv_out data=%p\n",
+                        i, (long long)head_dim, (long long)seq_len,
+                        (long long)num_kv_heads, (long long)num_q_heads,
+                        kqv_out->data);
+                fflush(stderr);
             }
-            fflush(stderr);
+
+            // Ensure FlowKV kernel is compiled and loaded.
+            xdna_flowkv_entry * fk_entry = get_or_load_flowkv_kernel(
+                ctx, q_heads_per_kv, /*num_kv_heads=*/1, head_dim, seq_len, chunk_size, num_cols);
+
+            if (fk_entry) {
+                try {
+                    size_t row_bytes = head_dim * sizeof(uint16_t);
+
+                    // Allocate BOs if needed.
+                    size_t kv_size = 1 * seq_len * 2 * row_bytes;
+                    if (!fk_entry->bo_kv) {
+                        fk_entry->bo_kv = std::make_unique<xrt::bo>(
+                            xrt::bo(ctx->device, kv_size, xrt::bo::flags::host_only,
+                                    fk_entry->kernel.group_id(0)));
+                    }
+                    size_t q_size = 1 * (q_heads_per_kv * head_dim + head_dim) * sizeof(uint16_t);
+                    if (!fk_entry->bo_q) {
+                        fk_entry->bo_q = std::make_unique<xrt::bo>(
+                            xrt::bo(ctx->device, q_size, xrt::bo::flags::host_only,
+                                    fk_entry->kernel.group_id(1)));
+                    }
+                    size_t out_size = q_heads_per_kv * row_bytes;
+                    if (!fk_entry->bo_out) {
+                        fk_entry->bo_out = std::make_unique<xrt::bo>(
+                            xrt::bo(ctx->device, out_size, xrt::bo::flags::host_only,
+                                    fk_entry->kernel.group_id(2)));
+                    }
+
+                    const char * k_data = (const char *)flowkv_poc_k_perm->data;
+                    const char * v_data = (const char *)flowkv_poc_v_perm->data;
+                    const char * q_data = (const char *)flowkv_poc_q_perm->data;
+                    size_t k_nb0 = flowkv_poc_k_perm->nb[0];
+                    size_t k_nb1 = flowkv_poc_k_perm->nb[1];
+                    size_t k_nb2 = flowkv_poc_k_perm->nb[2];
+                    size_t v_nb0 = flowkv_poc_v_perm->nb[0];
+                    size_t v_nb1 = flowkv_poc_v_perm->nb[1];
+                    size_t v_nb2 = flowkv_poc_v_perm->nb[2];
+                    size_t q_nb2 = flowkv_poc_q_perm->nb[2];
+
+                    // Identity RoPE angles (cos=0x3F80, sin=0x0000).
+                    char angle_cos_bf16[2] = {(char)0x80, (char)0x3F};  // 0x3F80 = 1.0 bf16
+                    char angle_sin_bf16[2] = {(char)0x00, (char)0x00};  // 0x0000 = 0.0 bf16
+
+                    // Process each KV head.
+                    for (int64_t kv_h = 0; kv_h < num_kv_heads; kv_h++) {
+                        // --- Prepare KV buffer (interleaved K/V) ---
+                        {
+                            auto kv_ptr = fk_entry->bo_kv->map<char *>();
+                            for (int64_t pos = 0; pos < seq_len; pos++) {
+                                // K: contiguous head_dim values at [pos, kv_h]
+                                size_t dst_k = pos * 2 * row_bytes;
+                                size_t src_k = pos * k_nb1 + kv_h * k_nb2;
+                                memcpy(kv_ptr + dst_k, k_data + src_k, row_bytes);
+
+                                // V: head_dim values may be strided.
+                                size_t dst_v = (pos * 2 + 1) * row_bytes;
+                                if (v_nb0 == (size_t)head_dim * 2) {
+                                    // V layout: [head_dim, seq_len, kv_heads] → contiguous
+                                    size_t src_v = pos * v_nb1 + kv_h * v_nb2;
+                                    memcpy(kv_ptr + dst_v, v_data + src_v, row_bytes);
+                                } else {
+                                    // V layout: [seq_len, head_dim, kv_heads] → strided
+                                    for (int64_t d = 0; d < head_dim; d++) {
+                                        size_t src_v = pos * v_nb0 + d * v_nb1 + kv_h * v_nb2;
+                                        memcpy(kv_ptr + dst_v + d * 2, v_data + src_v, 2);
+                                    }
+                                }
+                            }
+                            fk_entry->bo_kv->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                        }
+
+                        // --- Prepare Q buffer ---
+                        {
+                            auto q_ptr = fk_entry->bo_q->map<char *>();
+                            for (int64_t g = 0; g < q_heads_per_kv; g++) {
+                                int64_t q_head = kv_h * q_heads_per_kv + g;
+                                flowkv_copy_head_slice(
+                                    q_ptr + g * row_bytes, q_data,
+                                    flowkv_poc_q_perm, q_head, head_dim, row_bytes);
+                            }
+                            // Append identity RoPE angles.
+                            size_t angles_off = q_heads_per_kv * row_bytes;
+                            for (int64_t d = 0; d < head_dim; d += 2) {
+                                memcpy(q_ptr + angles_off + d * 2, angle_cos_bf16, 2);
+                                memcpy(q_ptr + angles_off + d * 2 + 2, angle_sin_bf16, 2);
+                            }
+                            fk_entry->bo_q->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                        }
+
+                        // --- Dispatch FlowKV kernel ---
+                        {
+                            auto run = xrt::run(fk_entry->kernel);
+                            run.set_arg(0, *fk_entry->bo_kv);
+                            run.set_arg(1, *fk_entry->bo_q);
+                            run.set_arg(2, *fk_entry->bo_out);
+                            run.set_arg(3, fk_entry->insts_bo);
+
+                            std::lock_guard<std::mutex> lock(*fk_entry->mu);
+                            auto t0 = std::chrono::steady_clock::now();
+                            run.start();
+                            auto state = run.wait(30000);
+                            auto t1 = std::chrono::steady_clock::now();
+
+                            if (state != ERT_CMD_STATE_COMPLETED) {
+                                GGML_LOG_ERROR("ggml-xdna: [FlowKV-POC] dispatch failed state=%d kv_h=%lld\n",
+                                               (int)state, (long long)kv_h);
+                                continue;
+                            }
+
+                            if (poc_dbg) {
+                                float ms = std::chrono::duration<float, std::milli>(t1 - t0).count();
+                                fprintf(stderr, "ggml-xdna: [FlowKV-POC] kv_h=%lld dispatched %.2f ms\n",
+                                        (long long)kv_h, ms);
+                                fflush(stderr);
+                            }
+                        }
+
+                        // --- Read back and write to kqv_out ---
+                        fk_entry->bo_out->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+                        {
+                            auto out_ptr = fk_entry->bo_out->map<char *>();
+                            // Write per-head results to kqv_out.
+                            // kqv_out layout: [model_dim, M=1] = [num_q_heads * head_dim]
+                            // Each Q head's result goes to offset q_head * head_dim.
+                            char * kqv_data = (char *)kqv_out->data;
+                            for (int64_t g = 0; g < q_heads_per_kv; g++) {
+                                int64_t q_head = kv_h * q_heads_per_kv + g;
+                                memcpy(kqv_data + q_head * row_bytes,
+                                       out_ptr + g * row_bytes, row_bytes);
+                            }
+                        }
+                    } // for kv_h
+
+                    if (poc_dbg) {
+                        fprintf(stderr, "ggml-xdna: [FlowKV-POC] completed, overwrote kqv_out @%d\n", i);
+                        fflush(stderr);
+                    }
+                } catch (const std::exception & e) {
+                    GGML_LOG_ERROR("ggml-xdna: [FlowKV-POC] exception: %s\n", e.what());
+                }
+            } else {
+                GGML_LOG_ERROR("ggml-xdna: [FlowKV-POC] kernel load failed\n");
+            }
         }
 
         // View-only nodes are pure metadata — they still need to be in the
