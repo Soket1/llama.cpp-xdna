@@ -4052,6 +4052,7 @@ static xdna_flowkv_entry * get_or_load_flowkv_kernel(
             if (!ensure_flowkv_compiled(ctx, cache_key,
                                         num_heads, num_kv_heads, head_dim,
                                         seq_len, chunk_size, num_cols)) {
+                ctx->flowkv_compile_failed.insert(cache_key);
                 return nullptr;
             }
         }
@@ -4080,12 +4081,18 @@ static xdna_flowkv_entry * get_or_load_flowkv_kernel(
                     cache_key.c_str());
             fflush(stderr);
             // Best-effort cleanup of stale bundle directory.
+            // Use _rmdir or platform-independent approach (rm -rf is Unix-only).
+#ifdef _WIN32
+            std::string rm_cmd = "rmdir /s /q \"" + bundle_dir + "\"";
+#else
             std::string rm_cmd = "rm -rf \"" + bundle_dir + "\"";
+#endif
             (void)system(rm_cmd.c_str());
             ctx->flowkv_compile_failed.erase(cache_key);
         }
     }
     GGML_LOG_ERROR("ggml-xdna: failed to load FlowKV decode kernel after recompile\n");
+    ctx->flowkv_compile_failed.insert(cache_key);
     return nullptr;
 }
 
