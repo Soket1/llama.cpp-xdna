@@ -35,6 +35,10 @@
 #define GGML_XDNA_PATH_SEP "/"
 #endif
 
+// Forward declaration: env-flag helper used throughout the file.
+// Returns true when the env var is set AND is not "0", "OFF", or "off".
+static bool xdna_env_enabled(const char * name);
+
 // Return the Python interpreter command for invoking compile.py.
 // Honours GGML_XDNA_PYTHON_CMD env var; defaults to "python" (works on
 // Windows and most Linux venvs).  Prefer this over hardcoding "python3".
@@ -4453,7 +4457,7 @@ struct xdna_decode_batcher {
     std::vector<batch_item> items;
     bool enabled;
 
-    xdna_decode_batcher() : enabled(getenv("XDNA_ENABLE_DECODE_BATCH") != NULL) {}
+    xdna_decode_batcher() : enabled(xdna_env_enabled("XDNA_ENABLE_DECODE_BATCH")) {}
 
     bool empty() const { return items.empty(); }
     bool is_enabled() const { return enabled; }
@@ -4828,15 +4832,15 @@ static bool xdna_try_match_swiglu(const struct ggml_cgraph * cgraph, int i,
     // Decide which precision path this pattern is eligible for. Q8_0 is only
     // accepted when the master SwiGLU gate and the INT8 opt-in flag are both
     // set; otherwise we keep the existing bf16/f32 behaviour untouched.
-    static const bool int8_enabled = getenv("XDNA_ENABLE_SWIGLU_INT8") != NULL;
+    static const bool int8_enabled = xdna_env_enabled("XDNA_ENABLE_SWIGLU_INT8");
     // Tblock W8A16 has its own Q8_0 upload path (dequant → fp32 → packer).
     // When tblock+W8A16 is active we accept Q8_0 weights here so the
     // tblock matcher's swiglu sub-match succeeds; is_int8 is still set so
     // the tblock consumer can distinguish "Q8_0 weights need the uint8
     // upload branch" from "bf16/f16 weights take the bf16 upload branch".
     static const bool tblock_w8a16_gate =
-        (getenv("XDNA_ENABLE_TBLOCK_FUSED") != NULL) &&
-        (getenv("XDNA_ENABLE_TBLOCK_FUSED_W8A16") != NULL);
+        (xdna_env_enabled("XDNA_ENABLE_TBLOCK_FUSED")) &&
+        (xdna_env_enabled("XDNA_ENABLE_TBLOCK_FUSED_W8A16"));
     const bool all_q8_0 = (gate_w->type == GGML_TYPE_Q8_0)
                        && (up_w->type   == GGML_TYPE_Q8_0)
                        && (down_w->type == GGML_TYPE_Q8_0);
@@ -4915,9 +4919,9 @@ static bool xdna_try_match_swiglu(const struct ggml_cgraph * cgraph, int i,
         // token for zero net throughput. Keep this aligned with
         // xdna_shape_dispatchable()'s M >= 32 floor for standalone GEMM.
         static const bool prefill_enabled =
-            (getenv("XDNA_ENABLE_SWIGLU_PREFILL") != NULL) ||
-            (getenv("XDNA_ENABLE_TRANSFORMER_BLOCK") != NULL) ||
-            (getenv("XDNA_ENABLE_TBLOCK_FUSED") != NULL);
+            (xdna_env_enabled("XDNA_ENABLE_SWIGLU_PREFILL")) ||
+            (xdna_env_enabled("XDNA_ENABLE_TRANSFORMER_BLOCK")) ||
+            (xdna_env_enabled("XDNA_ENABLE_TBLOCK_FUSED"));
         if (!prefill_enabled) SWIGLU_REJECT("prefill disabled (set XDNA_ENABLE_SWIGLU_PREFILL=1 or XDNA_ENABLE_TRANSFORMER_BLOCK=1 or XDNA_ENABLE_TBLOCK_FUSED=1 to opt in)");
         const int64_t padded_M = ((M + 63) / 64) * 64;
         if (allow_int8) {
@@ -4925,7 +4929,7 @@ static bool xdna_try_match_swiglu(const struct ggml_cgraph * cgraph, int i,
             // behind XDNA_ENABLE_SWIGLU_PREFILL_INT8 (which is for the
             // standalone int8 swiglu dispatch path).
             static const bool prefill_int8_ok =
-                (getenv("XDNA_ENABLE_SWIGLU_PREFILL_INT8") != NULL) ||
+                (xdna_env_enabled("XDNA_ENABLE_SWIGLU_PREFILL_INT8")) ||
                 tblock_w8a16_gate;
             if (!prefill_int8_ok)
                 SWIGLU_REJECT("prefill-int8 disabled (set XDNA_ENABLE_SWIGLU_PREFILL_INT8=1)");
@@ -6538,8 +6542,8 @@ static bool xdna_try_match_transformer_block_prefill(
     // in tblock_fused_upload_w8a16_weight. When W8A16 is off we stick to
     // bf16/f16/f32 weights, which is what trial.is_int8=false signals.
     static const bool tblock_w8a16_gate_tbl =
-        (getenv("XDNA_ENABLE_TBLOCK_FUSED") != NULL) &&
-        (getenv("XDNA_ENABLE_TBLOCK_FUSED_W8A16") != NULL);
+        (xdna_env_enabled("XDNA_ENABLE_TBLOCK_FUSED")) &&
+        (xdna_env_enabled("XDNA_ENABLE_TBLOCK_FUSED_W8A16"));
     int swiglu_anchor = -1;
     xdna_swiglu_match sm{};
     for (int j = ffn_norm_mul_idx + 1; j + 3 < std::min(ffn_norm_mul_idx + 32, n); j++) {
@@ -6868,8 +6872,8 @@ static std::string tblock_fused_slot_name(const char * base, int layer_idx, int 
 // (the base tblock-fused path). Does NOT imply INT8 FFN — that is a
 // separate gate below.
 static bool xdna_tblock_fused_w8a16_enabled() {
-    static const bool v = (getenv("XDNA_ENABLE_TBLOCK_FUSED_W8A16") != NULL) &&
-                          (getenv("XDNA_ENABLE_TBLOCK_FUSED")        != NULL);
+    static const bool v = (xdna_env_enabled("XDNA_ENABLE_TBLOCK_FUSED_W8A16")) &&
+                          (xdna_env_enabled("XDNA_ENABLE_TBLOCK_FUSED"));
     return v;
 }
 
@@ -6878,7 +6882,7 @@ static bool xdna_tblock_fused_w8a16_enabled() {
 // and XDNA_ENABLE_TBLOCK_FUSED_W8A16_FFN=1.
 static bool xdna_tblock_fused_w8a16_ffn_enabled() {
     static const bool v = xdna_tblock_fused_w8a16_enabled() &&
-                          (getenv("XDNA_ENABLE_TBLOCK_FUSED_W8A16_FFN") != NULL);
+                          (xdna_env_enabled("XDNA_ENABLE_TBLOCK_FUSED_W8A16_FFN"));
     return v;
 }
 
@@ -9327,7 +9331,7 @@ static bool xdna_select_rms_norm_params(int64_t size, int max_cols,
     const int tile_size = 32;  // matches the bridge default and IRON test grid
 
     // Support forcing ch=1 via environment variable (useful for matching specific kernels)
-    const bool force_ch1 = getenv("GGML_XDNA_FORCE_CH1") != NULL;
+    const bool force_ch1 = xdna_env_enabled("GGML_XDNA_FORCE_CH1");
     std::vector<int> ch_candidates = force_ch1 ? std::vector<int>{1} : std::vector<int>{2, 1};
 
     // Try widest column counts first, then fall back.
@@ -9478,7 +9482,7 @@ static xdna_rms_norm_entry * get_or_load_rms_norm_kernel(
 // when this returns false.
 static bool ggml_backend_xdna_rms_norm(ggml_backend_xdna_context * ctx,
                                        struct ggml_tensor * node) {
-    static const bool rms_enabled = getenv("XDNA_ENABLE_RMS_NORM") != NULL;
+    static const bool rms_enabled = xdna_env_enabled("XDNA_ENABLE_RMS_NORM");
     if (!rms_enabled) return false;
     if (!ctx->device_valid) return false;
     if (node->op != GGML_OP_RMS_NORM) return false;
@@ -9688,10 +9692,10 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
     xdna_attn_prof_reset();
 
     static const bool debug = getenv("XDNA_DEBUG") != NULL;
-    static const bool attention_prefill_dbg_enabled = getenv("XDNA_ENABLE_ATTENTION_PREFILL") != NULL;
+    static const bool attention_prefill_dbg_enabled = xdna_env_enabled("XDNA_ENABLE_ATTENTION_PREFILL");
     static const bool transformer_block_dbg_enabled =
-        (getenv("XDNA_ENABLE_TRANSFORMER_BLOCK") != NULL) ||
-        (getenv("XDNA_ENABLE_TBLOCK_FUSED") != NULL);
+        (xdna_env_enabled("XDNA_ENABLE_TRANSFORMER_BLOCK")) ||
+        (xdna_env_enabled("XDNA_ENABLE_TBLOCK_FUSED"));
     if (debug) {
         int n_mulmat = 0, n_mulmat_disp = 0;
         int n_glu = 0, n_glu_swiglu = 0, n_swiglu_window = 0, n_swiglu_match = 0;
@@ -9749,14 +9753,14 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
     // dispatch each NPU-capable MUL_MAT individually. View ops are skipped
     // (included in the CPU run — CPU handles them as no-ops but keeping them
     // in-range preserves sched invariants).
-    static const bool swiglu_enabled = getenv("XDNA_ENABLE_SWIGLU") != NULL;
-    static const bool qkv_enabled    = getenv("XDNA_ENABLE_QKV")    != NULL;
-    static const bool rms_norm_enabled = getenv("XDNA_ENABLE_RMS_NORM") != NULL;
-    static const bool attention_prefill_enabled = getenv("XDNA_ENABLE_ATTENTION_PREFILL") != NULL;
+    static const bool swiglu_enabled = xdna_env_enabled("XDNA_ENABLE_SWIGLU");
+    static const bool qkv_enabled    = xdna_env_enabled("XDNA_ENABLE_QKV");
+    static const bool rms_norm_enabled = xdna_env_enabled("XDNA_ENABLE_RMS_NORM");
+    static const bool attention_prefill_enabled = xdna_env_enabled("XDNA_ENABLE_ATTENTION_PREFILL");
     static const bool transformer_block_enabled =
-        (getenv("XDNA_ENABLE_TRANSFORMER_BLOCK") != NULL) ||
-        (getenv("XDNA_ENABLE_TBLOCK_FUSED") != NULL);
-    static const bool flowkv_decode_enabled = getenv("XDNA_ENABLE_FLOWKV_DECODE") != NULL;
+        (xdna_env_enabled("XDNA_ENABLE_TRANSFORMER_BLOCK")) ||
+        (xdna_env_enabled("XDNA_ENABLE_TBLOCK_FUSED"));
+    static const bool flowkv_decode_enabled = xdna_env_enabled("XDNA_ENABLE_FLOWKV_DECODE");
 
     // Pre-scan for QKV triples. Llama.cpp's Qwen3.5 decode interleaves
     // RMSNorm/view ops between Q and K/V MUL_MATs, so a 3-consecutive-node
@@ -9835,13 +9839,13 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
         // inside attn_prefill_warm_gemm_weight skips already-uploaded weights.
         attn_prefill_bulk_prewarm(ctx, cgraph);
     }
-    if (transformer_block_enabled && getenv("XDNA_ENABLE_TBLOCK_FUSED") == NULL) {
+    if (transformer_block_enabled && !xdna_env_enabled("XDNA_ENABLE_TBLOCK_FUSED")) {
         // L3A prewarm uploads per-kernel weight BOs that the fused path
         // doesn't use. Skip it in fused mode — fused weights are written
         // at first dispatch per layer, into the single input_bo.
         tblock_prefill_bulk_prewarm(ctx, cgraph);
     }
-    if (transformer_block_enabled && getenv("XDNA_ENABLE_TBLOCK_FUSED") != NULL) {
+    if (transformer_block_enabled && xdna_env_enabled("XDNA_ENABLE_TBLOCK_FUSED")) {
         // Fused path: upload all per-layer weights/gains into each entry's
         // input_bo in parallel before the first dispatch of this cgraph,
         // eliminating the first-batch 27→150 t/s cliff.
@@ -10275,7 +10279,7 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                     continue;
                 }
                 static const bool tp_fused_enabled =
-                    getenv("XDNA_ENABLE_TBLOCK_FUSED") != NULL;
+                    xdna_env_enabled("XDNA_ENABLE_TBLOCK_FUSED");
                 const bool dispatched = tp_fused_enabled
                     ? ggml_backend_xdna_transformer_block_prefill_fused(ctx, tm, cgraph)
                     : ggml_backend_xdna_transformer_block_prefill(ctx, tm, cgraph);
@@ -10954,7 +10958,7 @@ static bool xdna_shape_dispatchable(int64_t M, int64_t K, int64_t N) {
 //   select_gemv_tiles, any per_col >= 8 with per_col a power-of-two multiple works.
 // Same vocab-proj N cap applies (BD-overflow territory).
 static bool xdna_shape_dispatchable_gemv(int64_t K, int64_t N) {
-    static const bool gemv_enabled = getenv("XDNA_ENABLE_GEMV") != NULL;
+    static const bool gemv_enabled = xdna_env_enabled("XDNA_ENABLE_GEMV");
     static const bool dbg = getenv("XDNA_DEBUG") != NULL;
 
     if (!gemv_enabled) return false;
@@ -10980,7 +10984,7 @@ static bool xdna_shape_dispatchable_gemv(int64_t K, int64_t N) {
 }
 
 static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
-    static const bool rms_norm_enabled = getenv("XDNA_ENABLE_RMS_NORM") != NULL;
+    static const bool rms_norm_enabled = xdna_env_enabled("XDNA_ENABLE_RMS_NORM");
     // Liberal claim list (OpenVINO-style): the scheduler aborts if no backend
     // claims an op. We claim everything we can plausibly run, then decide
     // NPU-vs-CPU inside graph_compute. Unclaimable ops (e.g. training-only)
@@ -11004,7 +11008,7 @@ static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const s
             // ggml_permute(0,2,1,3). We must claim them here so the scheduler
             // assigns them to XDNA; graph_compute's FlowKV matcher handles
             // the actual dispatch decision.
-            static const bool flowkv_decode_enabled_for_supports = getenv("XDNA_ENABLE_FLOWKV_DECODE") != NULL;
+            static const bool flowkv_decode_enabled_for_supports = xdna_env_enabled("XDNA_ENABLE_FLOWKV_DECODE");
             if (flowkv_decode_enabled_for_supports && src1->ne[1] == 1 && src0->ne[0] == 64 && src0->ne[1] > 1) {
                 if (src1->type != GGML_TYPE_F32) return false;
                 if (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_BF16 || src0->type == GGML_TYPE_F16) return true;
@@ -11024,10 +11028,10 @@ static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const s
             // (no standalone gemv_int8 wiring yet) — bare Q8_0 mm falls back
             // to CPU inside graph_compute. Claiming here keeps the scheduler
             // from splitting the attention / FFN pattern across backends.
-            static const bool int8_ok = getenv("XDNA_ENABLE_SWIGLU_INT8") != NULL;
+            static const bool int8_ok = xdna_env_enabled("XDNA_ENABLE_SWIGLU_INT8");
             static const bool tblock_w8a16_ok =
-                (getenv("XDNA_ENABLE_TBLOCK_FUSED") != NULL) &&
-                (getenv("XDNA_ENABLE_TBLOCK_FUSED_W8A16") != NULL);
+                (xdna_env_enabled("XDNA_ENABLE_TBLOCK_FUSED")) &&
+                (xdna_env_enabled("XDNA_ENABLE_TBLOCK_FUSED_W8A16"));
             if (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_BF16 || src0->type == GGML_TYPE_F16) return true;
             if ((int8_ok || tblock_w8a16_ok) && src0->type == GGML_TYPE_Q8_0) return true;
             return false;
@@ -11100,12 +11104,12 @@ static bool ggml_backend_xdna_device_offload_op(ggml_backend_dev_t dev, const st
     // RoPE/FLASH_ATTN_EXT) and multi-node patterns never form. The claimed
     // op list is identical whether QKV or attention-prefill is enabled —
     // the matcher in graph_compute decides which pattern to fire.
-    static const bool qkv_enabled                 = getenv("XDNA_ENABLE_QKV") != NULL;
-    static const bool attention_prefill_enabled   = getenv("XDNA_ENABLE_ATTENTION_PREFILL") != NULL;
+    static const bool qkv_enabled                 = xdna_env_enabled("XDNA_ENABLE_QKV");
+    static const bool attention_prefill_enabled   = xdna_env_enabled("XDNA_ENABLE_ATTENTION_PREFILL");
     static const bool transformer_block_enabled   =
-        (getenv("XDNA_ENABLE_TRANSFORMER_BLOCK") != NULL) ||
-        (getenv("XDNA_ENABLE_TBLOCK_FUSED") != NULL);
-    static const bool flowkv_decode_enabled       = getenv("XDNA_ENABLE_FLOWKV_DECODE") != NULL;
+        (xdna_env_enabled("XDNA_ENABLE_TRANSFORMER_BLOCK")) ||
+        (xdna_env_enabled("XDNA_ENABLE_TBLOCK_FUSED"));
+    static const bool flowkv_decode_enabled       = xdna_env_enabled("XDNA_ENABLE_FLOWKV_DECODE");
     if (qkv_enabled || attention_prefill_enabled || transformer_block_enabled || flowkv_decode_enabled) {
         // Gate aggressive non-MUL_MAT claims on prefill shape. During decode
         // (seq=1), claiming intermediates like ADD/MUL/RMS_NORM/ROPE just
