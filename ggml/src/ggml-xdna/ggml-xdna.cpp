@@ -10885,7 +10885,7 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
         // NPU result. If output matches → FlowKV computes correctly.
         if (flowkv_decode_enabled && flowkv_poc_valid &&
             node->op == GGML_OP_CONT &&
-            node->src[0] && strstr(node->src[0]->name, "kqv_out")) {
+            node->name && strstr(node->name, "kqv_out")) {
 
             struct ggml_tensor * kqv_out = node->src[0];
             static const bool poc_dbg = getenv("XDNA_DEBUG") != NULL;
