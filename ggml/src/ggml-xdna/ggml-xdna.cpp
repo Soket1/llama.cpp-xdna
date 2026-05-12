@@ -4124,6 +4124,11 @@ struct xdna_flowkv_group {
     int64_t head_dim;
     int64_t seq_len;
     int64_t kv_head_idx;                  // which KV head this group belongs to
+    // Cross-segment tensor pointers. When non-NULL, dispatch uses these
+    // directly instead of looking up tensors by cgraph index.
+    const struct ggml_tensor * k_tensor;  // K cache tensor
+    const struct ggml_tensor * v_tensor;  // V cache tensor
+    const struct ggml_tensor * q_tensor;  // Q tensor
 };
 
 // Pre-scan the graph for expanded decode attention patterns and group by KV head.
@@ -4173,6 +4178,13 @@ static std::vector<xdna_flowkv_group> xdna_plan_flowkv(
     // ── Phase 1: Cross-segment matching ──────────────────────────────
     // Check if any MUL_MAT in this segment is the scores@V for a pending
     // Q@K^T from a previous segment.
+    //
+    // In the expanded attention path, scores@V is a batched MUL_MAT that
+    // produces the concatenated output for all heads:
+    //   src[0] = V cache [model_dim, seq_len], src[1] = scores [seq_len, 1]
+    //   output = [model_dim, 1]  where model_dim = head_dim * q_heads_per_kv
+    //
+    // So we match on: MUL_MAT, M=1, ne[0] = model_dim (not head_dim).
     if (!pending_heads.empty()) {
         for (int i = 0; i < n; i++) {
             struct ggml_tensor * node = cgraph->nodes[i];
@@ -4180,11 +4192,17 @@ static std::vector<xdna_flowkv_group> xdna_plan_flowkv(
             if (node->src[1]->ne[1] != 1) continue;
             if (node->ne[0] <= 1) continue;
 
-            // Check if this looks like a scores@V: result dim = head_dim (64)
+            // Check if this is the batched scores@V:
+            //   output ne[0] = model_dim (= V cache width = src[0]->ne[0])
+            //   src[0] ne[1] = seq_len
+            //   output ne[0] > head_dim (it's the full model dim, not per-head)
             int64_t out_dim = node->ne[0];
+            int64_t K_dim = node->src[0]->ne[0];
+            int64_t N_dim = node->src[0]->ne[1];
             bool matched_any = false;
             for (auto & ph : pending_heads) {
-                if (out_dim == ph.head_dim) {
+                if (out_dim > ph.head_dim && out_dim == K_dim &&
+                    N_dim == ph.seq_len) {
                     matched_any = true;
                     break;
                 }
@@ -4210,6 +4228,12 @@ static std::vector<xdna_flowkv_group> xdna_plan_flowkv(
                     grp.head_dim = pending_heads[pidxs[0]].head_dim;
                     grp.seq_len = pending_heads[pidxs[0]].seq_len;
                     grp.kv_head_idx = gidx;
+                    // Cross-segment: store tensor pointers from pending heads.
+                    // K and Q come from the original segment (pending_heads).
+                    // V comes from the current segment (scores@V's src[0]).
+                    grp.k_tensor = nullptr;  // will use k_data pointer directly
+                    grp.v_tensor = node->src[0];  // V cache from scores@V
+                    grp.q_tensor = nullptr;  // will use q_data pointer directly
                     groups.push_back(grp);
                     it = k_to_group.find(k_ptr);
                 }
@@ -4229,7 +4253,8 @@ static std::vector<xdna_flowkv_group> xdna_plan_flowkv(
             // Remove matched pending heads.
             std::vector<xdna_flowkv_pending> remaining;
             for (int pi = 0; pi < (int)pending_heads.size(); pi++) {
-                if (pending_heads[pi].head_dim != out_dim)
+                if (!(out_dim > pending_heads[pi].head_dim &&
+                      out_dim == K_dim && N_dim == pending_heads[pi].seq_len))
                     remaining.push_back(pending_heads[pi]);
             }
             pending_heads = std::move(remaining);
@@ -4322,6 +4347,9 @@ static std::vector<xdna_flowkv_group> xdna_plan_flowkv(
             grp.head_dim = K;
             grp.seq_len = seq_len;
             grp.kv_head_idx = gidx;
+            grp.k_tensor = nullptr;
+            grp.v_tensor = nullptr;
+            grp.q_tensor = nullptr;
             groups.push_back(grp);
             it = k_to_group.find(k_ptr);
         }
@@ -4385,10 +4413,21 @@ static bool ggml_backend_xdna_flowkv_per_head(
         if (group.heads[h].qk_idx != ref_qk) { batched = false; break; }
     }
 
+    // Resolve tensor pointers: use cross-segment pointers when available,
+    // fall back to cgraph index lookup for same-segment groups.
+    struct ggml_tensor * k_tensor = group.k_tensor
+        ? const_cast<struct ggml_tensor *>(group.k_tensor)
+        : cgraph->nodes[ref_qk]->src[0];
+    struct ggml_tensor * v_tensor = group.v_tensor
+        ? const_cast<struct ggml_tensor *>(group.v_tensor)
+        : cgraph->nodes[group.heads[0].pv_idx]->src[0];
+    struct ggml_tensor * q_tensor = group.q_tensor
+        ? const_cast<struct ggml_tensor *>(group.q_tensor)
+        : cgraph->nodes[ref_qk]->src[1];
+
     int64_t n_kv_heads = 1;
     int64_t n_q_heads_total = (int64_t)group.heads.size();
     if (batched && group.heads.size() > 1) {
-        struct ggml_tensor * k_tensor = cgraph->nodes[ref_qk]->src[0];
         n_kv_heads = k_tensor->ne[2];
         if (n_kv_heads < 1) n_kv_heads = 1;
     }
@@ -4426,9 +4465,6 @@ static bool ggml_backend_xdna_flowkv_per_head(
             // --- Prepare KV cache buffer ---
             {
                 auto kv_ptr = entry->bo_kv->map<char *>();
-                struct ggml_tensor * k_tensor = cgraph->nodes[ref_qk]->src[0];
-                struct ggml_tensor * v_tensor =
-                    cgraph->nodes[group.heads[0].pv_idx]->src[0];
                 const char * k_data = (const char *)k_tensor->data;
                 const char * v_data = (const char *)v_tensor->data;
                 size_t row_bytes = head_dim * sizeof(uint16_t);
@@ -4458,9 +4494,8 @@ static bool ggml_backend_xdna_flowkv_per_head(
                 char angle_cos_bf16[2] = {(char)0x80, (char)0x3F};
                 char angle_sin_bf16[2] = {(char)0x00, (char)0x00};
 
-                struct ggml_tensor * q_tensor =
-                    cgraph->nodes[ref_qk]->src[1];
-                const char * q_data = (const char *)q_tensor->data;
+                struct ggml_tensor * q_tsr = q_tensor;
+                const char * q_data = (const char *)q_tsr->data;
 
                 for (int64_t g = 0; g < group_size; g++) {
                     int64_t q_head = batched ? (kv_h * q_heads_per_kv + g) : g;
@@ -11272,10 +11307,6 @@ static bool ggml_backend_xdna_device_offload_op(ggml_backend_dev_t dev, const st
                     if (N % 8 != 0)            return false;
                     return true;
                 }
-                // FlowKV scores@V: K=head_dim=64, N=n_kv_heads, M=seq_len.
-                if (flowkv_decode_enabled && K == 64 && N > 1 && M > 1) {
-                    return true;
-                }
                 return xdna_shape_dispatchable(M, K, N);
             }
             // Intermediate ops between Q/K/V and around the attention core —
@@ -11308,10 +11339,12 @@ static bool ggml_backend_xdna_device_offload_op(ggml_backend_dev_t dev, const st
             case GGML_OP_VIEW:
             case GGML_OP_PERMUTE:
             case GGML_OP_TRANSPOSE:
-                // FlowKV decode: keep VIEW/CONT/RESHAPE/PERMUTE on XDNA
-                // so the scheduler doesn't split the attention pattern
-                // (Q@K^T → SOFT_MAX → scores@V) across segments.
-                if (flowkv_decode_enabled) return true;
+                // During decode, keep these on CPU natively.  The FlowKV
+                // matcher now handles cross-segment matching, so there is
+                // no need to force scheduler grouping via aggressive claims.
+                // (Claiming these during decode fragments scheduling with
+                // delegate_range round-trips and was causing incorrect
+                // output when FlowKV couldn't dispatch.)
                 return is_prefill_op(op);
             default:
                 return false;
