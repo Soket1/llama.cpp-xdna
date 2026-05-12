@@ -9911,11 +9911,10 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
     static int64_t flowkv_poc_num_kv_heads = 0;
     static int64_t flowkv_poc_num_q_heads = 0;
     static bool flowkv_poc_valid = false;
-    static const struct ggml_cgraph * flowkv_poc_last_cgraph = nullptr;
-    if (flowkv_poc_last_cgraph != cgraph) {
-        flowkv_poc_valid = false;
-        flowkv_poc_last_cgraph = cgraph;
-    }
+    // NOTE: Do NOT reset flowkv_poc_valid per cgraph — QKV dispatch and
+    // CONT(kqv_out) are in different cgraphs (scheduler splits them).
+    // Pointers are overwritten per-layer; stale state is harmless because
+    // each layer's QKV dispatch runs before its CONT(kqv_out).
 
     // Pre-scan for QKV triples. Llama.cpp's Qwen3.5 decode interleaves
     // RMSNorm/view ops between Q and K/V MUL_MATs, so a 3-consecutive-node
