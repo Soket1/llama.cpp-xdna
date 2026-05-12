@@ -10953,7 +10953,14 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                     fk_entry->kernel.group_id(5)));
                     }
 
-                    const char * k_data = (const char *)flowkv_poc_k_perm->data;
+                    // Diagnostic: save CPU result before overwriting
+                    static std::vector<float> cpu_save;
+                    static bool cpu_saved = false;
+                    if (poc_dbg && !cpu_saved) {
+                        cpu_save.assign((float *)kqv_out->data,
+                                        (float *)kqv_out->data + num_q_heads * head_dim);
+                        cpu_saved = true;
+                    }
                     const char * v_data = (const char *)flowkv_poc_v_perm->data;
                     const char * q_data = (const char *)flowkv_poc_q_perm->data;
                     size_t k_nb1 = flowkv_poc_k_perm->nb[1];
@@ -11114,6 +11121,16 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
 
                     if (poc_dbg) {
                         fprintf(stderr, "ggml-xdna: [FlowKV-POC] completed, overwrote kqv_out @%d\n", i);
+                        // Compare NPU vs CPU for first head
+                        if (!cpu_save.empty()) {
+                            const float * npu_f32 = (const float *)kqv_out->data;
+                            fprintf(stderr, "  NPU vs CPU head0 first 8 values:\n");
+                            for (int d = 0; d < 8 && d < (int)head_dim; d++) {
+                                fprintf(stderr, "  [%d] NPU=%.6f  CPU=%.6f  diff=%.6f\n",
+                                        d, npu_f32[d], cpu_save[d], npu_f32[d] - cpu_save[d]);
+                            }
+                            cpu_save.clear();
+                        }
                         fflush(stderr);
                     }
                 } catch (const std::exception & e) {
