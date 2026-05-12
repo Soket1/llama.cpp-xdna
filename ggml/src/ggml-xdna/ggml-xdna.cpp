@@ -4106,6 +4106,18 @@ struct xdna_flowkv_head {
     int pv_idx;   // index of scores@V MUL_MAT
 };
 
+// Pending Q@K^T head from a previous segment where scores@V was not found.
+// Stored across graph_compute calls to enable cross-segment matching.
+struct xdna_flowkv_pending {
+    int qk_idx;            // Q@K^T index in original segment (for skip marking)
+    int softmax_idx;       // SOFT_MAX index in original segment
+    const void * k_data;   // K cache data pointer (for KV head grouping)
+    const void * v_data;   // V cache data pointer
+    const void * q_data;   // Q data pointer
+    int64_t head_dim;
+    int64_t seq_len;
+};
+
 struct xdna_flowkv_group {
     std::vector<xdna_flowkv_head> heads;  // per-head MUL_MAT pairs
     const void * k_src_ptr;               // shared K weight pointer (KV head ID)
@@ -4116,12 +4128,26 @@ struct xdna_flowkv_group {
 
 // Pre-scan the graph for expanded decode attention patterns and group by KV head.
 // Returns groups ready for per-KV-head FlowKV dispatch.
+//
+// Handles cross-segment matching: when the graph scheduler splits the attention
+// pattern across segments (Q@K^T + SOFT_MAX in one segment, scores@V in the
+// next), pending Q@K^T heads are stored and matched with scores@V in a
+// subsequent call.
 static std::vector<xdna_flowkv_group> xdna_plan_flowkv(
         const struct ggml_cgraph * cgraph) {
     std::vector<xdna_flowkv_group> groups;
     static const bool dbg = getenv("XDNA_DEBUG") != NULL;
     static const bool sched_dbg = getenv("XNA_SCHED_DEBUG") != NULL;
     int n = cgraph->n_nodes;
+
+    // Persistent state: pending Q@K^T heads from previous segments where
+    // scores@V was not found (graph split across segments).
+    static std::vector<xdna_flowkv_pending> pending_heads;
+    static const struct ggml_cgraph * pending_cgraph = nullptr;
+    if (pending_cgraph != cgraph) {
+        pending_heads.clear();
+        pending_cgraph = cgraph;
+    }
 
     // XNA_SCHED_DEBUG: dump all nodes in this segment for FlowKV analysis
     if (sched_dbg) {
@@ -4144,8 +4170,76 @@ static std::vector<xdna_flowkv_group> xdna_plan_flowkv(
     // Map from K source pointer → group index in 'groups'.
     std::unordered_map<const void *, int> k_to_group;
 
-    // Find all Q@K^T MUL_MATs (M=1, K=64) and their matching
-    // scores@V MUL_MATs (via SOFT_MAX in between).
+    // ── Phase 1: Cross-segment matching ──────────────────────────────
+    // Check if any MUL_MAT in this segment is the scores@V for a pending
+    // Q@K^T from a previous segment.
+    if (!pending_heads.empty()) {
+        for (int i = 0; i < n; i++) {
+            struct ggml_tensor * node = cgraph->nodes[i];
+            if (node->op != GGML_OP_MUL_MAT) continue;
+            if (node->src[1]->ne[1] != 1) continue;
+            if (node->ne[0] <= 1) continue;
+
+            // Check if this looks like a scores@V: result dim = head_dim (64)
+            int64_t out_dim = node->ne[0];
+            bool matched_any = false;
+            for (auto & ph : pending_heads) {
+                if (out_dim == ph.head_dim) {
+                    matched_any = true;
+                    break;
+                }
+            }
+            if (!matched_any) continue;
+
+            // Match found: group pending heads by k_data (KV head identity).
+            std::unordered_map<const void *, std::vector<int>> k_to_pending;
+            for (int pi = 0; pi < (int)pending_heads.size(); pi++) {
+                if (pending_heads[pi].head_dim == out_dim) {
+                    k_to_pending[pending_heads[pi].k_data].push_back(pi);
+                }
+            }
+
+            // Build FlowKV groups from pending heads.
+            for (auto & [k_ptr, pidxs] : k_to_pending) {
+                auto it = k_to_group.find(k_ptr);
+                if (it == k_to_group.end()) {
+                    int gidx = (int)groups.size();
+                    k_to_group[k_ptr] = gidx;
+                    xdna_flowkv_group grp;
+                    grp.k_src_ptr = k_ptr;
+                    grp.head_dim = pending_heads[pidxs[0]].head_dim;
+                    grp.seq_len = pending_heads[pidxs[0]].seq_len;
+                    grp.kv_head_idx = gidx;
+                    groups.push_back(grp);
+                    it = k_to_group.find(k_ptr);
+                }
+                for (int pi : pidxs) {
+                    groups[it->second].heads.push_back(
+                        {pending_heads[pi].qk_idx, i});
+                }
+            }
+
+            if (dbg) {
+                fprintf(stderr, "ggml-xdna: FlowKV cross-segment match: "
+                        "scores@V at [%d] matched %zu pending heads\n",
+                        i, pending_heads.size());
+                fflush(stderr);
+            }
+
+            // Remove matched pending heads.
+            std::vector<xdna_flowkv_pending> remaining;
+            for (int pi = 0; pi < (int)pending_heads.size(); pi++) {
+                if (pending_heads[pi].head_dim != out_dim)
+                    remaining.push_back(pending_heads[pi]);
+            }
+            pending_heads = std::move(remaining);
+            break;  // one scores@V match per segment is enough
+        }
+    }
+
+    // ── Phase 2: Same-segment matching ───────────────────────────────
+    // Find Q@K^T → SOFT_MAX → scores@V within this segment.
+    // Queue unmatched Q@K^T as pending for cross-segment matching.
     for (int i = 0; i < n; i++) {
         struct ggml_tensor * node = cgraph->nodes[i];
         if (node->op != GGML_OP_MUL_MAT) continue;
@@ -4199,15 +4293,24 @@ static std::vector<xdna_flowkv_group> xdna_plan_flowkv(
                 op == GGML_OP_CONT || op == GGML_OP_PERMUTE) continue;
             break;
         }
+
+        const void * k_ptr = node->src[0]->data;
+
         if (pv_idx < 0) {
-            if (sched_dbg) fprintf(stderr, "    FlowKV reject [%d] MUL_MAT: no scores@V MUL_MAT after SOFT_MAX at [%d]\n", i, softmax_idx);
+            // No scores@V in this segment — queue as pending for cross-segment.
+            if (sched_dbg) fprintf(stderr, "    FlowKV pending [%d]: no scores@V after SOFT_MAX at [%d] (cross-segment)\n", i, softmax_idx);
+            pending_heads.push_back({
+                i, softmax_idx,
+                node->src[0]->data,   // k_data
+                nullptr,              // v_data (not needed for cross-seg)
+                node->src[1]->data,   // q_data
+                K, seq_len
+            });
             continue;
         }
 
         // Validate PV shape: src[0] should have same head_dim.
         if (cgraph->nodes[pv_idx]->src[0]->ne[0] != K) continue;
-
-        const void * k_ptr = node->src[0]->data;
 
         // Group by K source pointer (same KV head = same K weight).
         auto it = k_to_group.find(k_ptr);
@@ -4228,8 +4331,9 @@ static std::vector<xdna_flowkv_group> xdna_plan_flowkv(
     if (dbg && !groups.empty()) {
         size_t total_heads = 0;
         for (auto & g : groups) total_heads += g.heads.size();
-        fprintf(stderr, "ggml-xdna: FlowKV plan: %zu KV head groups, %zu total heads\n",
-                groups.size(), total_heads);
+        fprintf(stderr, "ggml-xdna: FlowKV plan: %zu KV head groups, %zu total heads "
+                "(%zu pending)\n",
+                groups.size(), total_heads, pending_heads.size());
         for (size_t g = 0; g < groups.size(); g++) {
             fprintf(stderr, "  group[%zu]: kv_head=%lld seq_len=%lld heads=%zu\n",
                     g, (long long)groups[g].kv_head_idx,
@@ -9903,51 +10007,56 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
         // FlowKV decode attention: per-KV-head dispatch.
         // Pre-scan builds groups of per-head attention MUL_MAT pairs.
         // Each group is dispatched as one FlowKV call (num_kv_heads=1).
-        // We check here if the current node is a Q@K^T MUL_MAT that was
-        // already dispatched as part of a FlowKV group.
+        //
+        // The plan is rebuilt on every segment to enable cross-segment matching:
+        // when the graph scheduler splits the attention pattern (Q@K^T + SOFT_MAX
+        // in one segment, scores@V in the next), pending heads carry over via
+        // static state inside xdna_plan_flowkv().
         if (flowkv_decode_enabled) {
             static std::vector<xdna_flowkv_group> flowkv_groups;
             static std::unordered_set<int> flowkv_dispatched_qk;
             static std::unordered_set<int> flowkv_dispatched_pv;
             static const struct ggml_cgraph * flowkv_last_cgraph = nullptr;
 
-            // Build plan once per cgraph.
+            // Clear dispatched sets when cgraph changes (new inference).
             if (flowkv_last_cgraph != cgraph) {
-                flowkv_groups = xdna_plan_flowkv(cgraph);
                 flowkv_dispatched_qk.clear();
                 flowkv_dispatched_pv.clear();
                 flowkv_last_cgraph = cgraph;
+            }
 
-                // Dispatch all groups eagerly before the main loop.
-                for (auto & grp : flowkv_groups) {
-                    if (cpu_run_start >= 0) {
-                        // Flush CPU run before the first head in this group.
-                        ggml_status s = xdna_delegate_range(
-                            ctx, cgraph, cpu_run_start, grp.heads[0].qk_idx);
-                        if (s != GGML_STATUS_SUCCESS) return s;
-                        cpu_run_start = -1;
-                    }
-                    bool ok = ggml_backend_xdna_flowkv_per_head(ctx, grp, cgraph);
-                    if (ok) {
-                        for (auto & h : grp.heads) {
-                            flowkv_dispatched_qk.insert(h.qk_idx);
-                            flowkv_dispatched_pv.insert(h.pv_idx);
-                            // Also mark intermediate nodes (SCALE, ADD, SOFT_MAX)
-                            // between QK and PV as dispatched.
-                            for (int j = h.qk_idx + 1; j < h.pv_idx; j++) {
-                                enum ggml_op op = cgraph->nodes[j]->op;
-                                if (op == GGML_OP_SCALE || op == GGML_OP_ADD ||
-                                    op == GGML_OP_SOFT_MAX) {
-                                    flowkv_dispatched_qk.insert(j);
-                                }
+            // Rebuild plan every segment (enables cross-segment matching).
+            flowkv_groups = xdna_plan_flowkv(cgraph);
+
+            // Dispatch all groups eagerly before the main loop.
+            for (auto & grp : flowkv_groups) {
+                if (cpu_run_start >= 0) {
+                    // Flush CPU run before the first head in this group.
+                    ggml_status s = xdna_delegate_range(
+                        ctx, cgraph, cpu_run_start, grp.heads[0].qk_idx);
+                    if (s != GGML_STATUS_SUCCESS) return s;
+                    cpu_run_start = -1;
+                }
+                bool ok = ggml_backend_xdna_flowkv_per_head(ctx, grp, cgraph);
+                if (ok) {
+                    for (auto & h : grp.heads) {
+                        flowkv_dispatched_qk.insert(h.qk_idx);
+                        flowkv_dispatched_pv.insert(h.pv_idx);
+                        // Also mark intermediate nodes (SCALE, ADD, SOFT_MAX)
+                        // between QK and PV as dispatched.
+                        for (int j = h.qk_idx + 1; j < h.pv_idx; j++) {
+                            enum ggml_op op = cgraph->nodes[j]->op;
+                            if (op == GGML_OP_SCALE || op == GGML_OP_ADD ||
+                                op == GGML_OP_SOFT_MAX) {
+                                flowkv_dispatched_qk.insert(j);
                             }
                         }
-                    } else if (debug) {
-                        fprintf(stderr, "ggml-xdna: FlowKV group kv=%lld failed, "
-                                "falling back to CPU\n",
-                                (long long)grp.kv_head_idx);
-                        fflush(stderr);
                     }
+                } else if (debug) {
+                    fprintf(stderr, "ggml-xdna: FlowKV group kv=%lld failed, "
+                            "falling back to CPU\n",
+                            (long long)grp.kv_head_idx);
+                    fflush(stderr);
                 }
             }
 
