@@ -1141,6 +1141,15 @@ static xdna_kernel_entry * get_or_load_kernel(ggml_backend_xdna_context * ctx,
         // Get kernel (IRON kernels are always named "MLIR_AIE")
         entry.kernel = xrt::kernel(entry.hw_ctx, "MLIR_AIE");
 
+        // Diagnostic: print GEMM kernel group_ids
+        fprintf(stderr, "ggml-xdna: GEMM kernel group_ids:");
+        for (int a = 0; a < 10; a++) {
+            try { fprintf(stderr, " [%d]=%zu", a, (size_t)entry.kernel.group_id(a)); }
+            catch (...) { fprintf(stderr, " [%d]=ERR", a); break; }
+        }
+        fprintf(stderr, " key=%s\n", cache_key.c_str());
+        fflush(stderr);
+
         // Load instructions
         entry.insts = read_binary_file(insts_path);
         if (entry.insts.empty()) {
@@ -11095,10 +11104,16 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                 fflush(stderr);
                             }
 
-                            // Use positional call syntax (same as working GEMM/GEMV)
-                            auto run = fk_entry->kernel(
-                                3, fk_entry->insts_bo, (uint32_t)fk_entry->insts_data.size(),
-                                *fk_entry->bo_kv, *fk_entry->bo_q, *fk_entry->bo_out);
+                            // Use set_arg with all 8 kernel args
+                            auto run = xrt::run(fk_entry->kernel);
+                            run.set_arg(0, 3u);  // opcode
+                            run.set_arg(1, fk_entry->insts_bo);  // insts
+                            run.set_arg(2, (uint32_t)fk_entry->insts_data.size());  // insts_size
+                            run.set_arg(3, *fk_entry->bo_kv);  // DDR buf 0
+                            run.set_arg(4, *fk_entry->bo_q);   // DDR buf 1
+                            run.set_arg(5, *fk_entry->bo_out); // DDR buf 2
+                            run.set_arg(6, 0u);  // unknown arg
+                            run.set_arg(7, 0u);  // unknown arg
 
                             std::lock_guard<std::mutex> lock(*fk_entry->mu);
                             auto t0 = std::chrono::steady_clock::now();
