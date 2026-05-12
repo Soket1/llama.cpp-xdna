@@ -10942,7 +10942,6 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                     const char * k_data = (const char *)flowkv_poc_k_perm->data;
                     const char * v_data = (const char *)flowkv_poc_v_perm->data;
                     const char * q_data = (const char *)flowkv_poc_q_perm->data;
-                    size_t k_nb0 = flowkv_poc_k_perm->nb[0];
                     size_t k_nb1 = flowkv_poc_k_perm->nb[1];
                     size_t k_nb2 = flowkv_poc_k_perm->nb[2];
                     size_t v_nb0 = flowkv_poc_v_perm->nb[0];
