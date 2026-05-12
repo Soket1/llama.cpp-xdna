@@ -4042,6 +4042,8 @@ static xdna_flowkv_entry * get_or_load_flowkv_kernel(
         std::lock_guard<std::mutex> lock(ctx->cache_mutex);
         auto it = ctx->flowkv_cache.find(cache_key);
         if (it != ctx->flowkv_cache.end()) return &it->second;
+        // Skip if a previous load attempt failed — don't recompile.
+        if (ctx->flowkv_compile_failed.count(cache_key)) return nullptr;
     }
 
     std::string bundle_dir = ctx->cache_dir + "/" + cache_key;
