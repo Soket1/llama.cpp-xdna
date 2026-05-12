@@ -4524,13 +4524,9 @@ static bool ggml_backend_xdna_flowkv_per_head(
             // --- Dispatch ---
             // IRON xclbin arg layout: opcode(0), insts(1), insts_size(2),
             // DDR_buf_0(3)=kv, DDR_buf_1(4)=q, DDR_buf_2(5)=out
-            auto run = xrt::run(entry->kernel);
-            run.set_arg(0, 3u);
-            run.set_arg(1, entry->insts_bo);
-            run.set_arg(2, (uint32_t)entry->insts_data.size());
-            run.set_arg(3, *entry->bo_kv);
-            run.set_arg(4, *entry->bo_q);
-            run.set_arg(5, *entry->bo_out);
+            auto run = entry->kernel(
+                3, entry->insts_bo, (uint32_t)entry->insts_data.size(),
+                *entry->bo_kv, *entry->bo_q, *entry->bo_out);
 
             {
                 std::lock_guard<std::mutex> lock(*entry->mu);
@@ -11091,13 +11087,10 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                 fflush(stderr);
                             }
 
-                            auto run = xrt::run(fk_entry->kernel);
-                            run.set_arg(0, 3u);
-                            run.set_arg(1, fk_entry->insts_bo);
-                            run.set_arg(2, (uint32_t)fk_entry->insts_data.size());
-                            run.set_arg(3, *fk_entry->bo_kv);
-                            run.set_arg(4, *fk_entry->bo_q);
-                            run.set_arg(5, *fk_entry->bo_out);
+                            // Use positional call syntax (same as working GEMM/GEMV)
+                            auto run = fk_entry->kernel(
+                                3, fk_entry->insts_bo, (uint32_t)fk_entry->insts_data.size(),
+                                *fk_entry->bo_kv, *fk_entry->bo_q, *fk_entry->bo_out);
 
                             std::lock_guard<std::mutex> lock(*fk_entry->mu);
                             auto t0 = std::chrono::steady_clock::now();
