@@ -4403,10 +4403,26 @@ static void flowkv_copy_head_slice(
         char * dst, const char * src_base,
         const struct ggml_tensor * t, int64_t head_idx,
         int64_t head_dim, size_t head_bytes) {
-    if (t->ne[2] <= 1) {
-        memcpy(dst, src_base, head_bytes);
+    const char * src = (t->ne[2] <= 1)
+        ? src_base
+        : src_base + head_idx * t->nb[2];
+
+    if (t->type == GGML_TYPE_F16) {
+        // f16 → bf16 conversion
+        for (int64_t d = 0; d < head_dim; d++) {
+            ggml_fp16_t f16_val;
+            memcpy(&f16_val, src + d * sizeof(ggml_fp16_t), sizeof(ggml_fp16_t));
+            float f32_val = ggml_fp16_to_fp32(f16_val);
+            uint16_t bf16_val;
+            f32_to_bf16(&f32_val, &bf16_val, 1);
+            memcpy(dst + d * 2, &bf16_val, 2);
+        }
+    } else if (t->type == GGML_TYPE_F32) {
+        // f32 → bf16 conversion
+        f32_to_bf16((const float *)src, (uint16_t *)dst, (size_t)head_dim);
     } else {
-        memcpy(dst, src_base + head_idx * t->nb[2], head_bytes);
+        // bf16: direct copy
+        memcpy(dst, src, head_bytes);
     }
 }
 
@@ -4500,14 +4516,39 @@ static bool ggml_backend_xdna_flowkv_per_head(
                 size_t v_pos_stride = v_tensor->nb[1];
                 size_t v_head_stride = v_tensor->ne[2] > 1 ? v_tensor->nb[2] : 0;
 
+                const bool k_f16 = (k_tensor->type == GGML_TYPE_F16);
+                const bool v_f16 = (v_tensor->type == GGML_TYPE_F16);
+
                 for (int64_t pos = 0; pos < seq_len; pos++) {
                     size_t dst_k = pos * 2 * row_bytes;
                     size_t src_k = pos * k_pos_stride + kv_h * k_head_stride;
-                    memcpy(kv_ptr + dst_k, k_data + src_k, row_bytes);
+                    if (k_f16) {
+                        for (int64_t d = 0; d < head_dim; d++) {
+                            ggml_fp16_t f16_val;
+                            memcpy(&f16_val, k_data + src_k + d * sizeof(ggml_fp16_t), sizeof(ggml_fp16_t));
+                            float f32_val = ggml_fp16_to_fp32(f16_val);
+                            uint16_t bf16_val;
+                            f32_to_bf16(&f32_val, &bf16_val, 1);
+                            memcpy(kv_ptr + dst_k + d * 2, &bf16_val, 2);
+                        }
+                    } else {
+                        memcpy(kv_ptr + dst_k, k_data + src_k, row_bytes);
+                    }
 
                     size_t dst_v = (pos * 2 + 1) * row_bytes;
                     size_t src_v = pos * v_pos_stride + kv_h * v_head_stride;
-                    memcpy(kv_ptr + dst_v, v_data + src_v, row_bytes);
+                    if (v_f16) {
+                        for (int64_t d = 0; d < head_dim; d++) {
+                            ggml_fp16_t f16_val;
+                            memcpy(&f16_val, v_data + src_v + d * sizeof(ggml_fp16_t), sizeof(ggml_fp16_t));
+                            float f32_val = ggml_fp16_to_fp32(f16_val);
+                            uint16_t bf16_val;
+                            f32_to_bf16(&f32_val, &bf16_val, 1);
+                            memcpy(kv_ptr + dst_v + d * 2, &bf16_val, 2);
+                        }
+                    } else {
+                        memcpy(kv_ptr + dst_v, v_data + src_v, row_bytes);
+                    }
                 }
                 entry->bo_kv->sync(XCL_BO_SYNC_BO_TO_DEVICE);
             }
@@ -11118,18 +11159,32 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                             for (int64_t pos = 0; pos < seq_len; pos++) {
                                 // K: copy head_dim elements → bf16 in KV buffer.
                                 size_t dst_k = pos * 2 * row_bytes;
+                                const bool k_is_f16 = (flowkv_poc_k_perm->type == GGML_TYPE_F16);
                                 if (k_is_f32) {
                                     // f32 K: convert each element to bf16.
                                     const float * src = (const float *)(k_data + pos * k_nb1 + kv_h * k_nb2);
                                     uint16_t * dst = (uint16_t *)(kv_ptr + dst_k);
                                     f32_to_bf16(src, dst, (size_t)head_dim);
+                                } else if (k_is_f16) {
+                                    // f16 K: convert f16→f32→bf16.
+                                    size_t src_k = pos * k_nb1 + kv_h * k_nb2;
+                                    for (int64_t d = 0; d < head_dim; d++) {
+                                        ggml_fp16_t f16_val;
+                                        memcpy(&f16_val, k_data + src_k + d * sizeof(ggml_fp16_t), sizeof(ggml_fp16_t));
+                                        float f32_val = ggml_fp16_to_fp32(f16_val);
+                                        uint16_t bf16_val;
+                                        f32_to_bf16(&f32_val, &bf16_val, 1);
+                                        memcpy(kv_ptr + dst_k + d * 2, &bf16_val, 2);
+                                    }
                                 } else {
+                                    // bf16 K: direct copy.
                                     size_t src_k = pos * k_nb1 + kv_h * k_nb2;
                                     memcpy(kv_ptr + dst_k, k_data + src_k, row_bytes);
                                 }
 
                                 // V: copy head_dim elements → bf16 in KV buffer.
                                 size_t dst_v = (pos * 2 + 1) * row_bytes;
+                                const bool v_is_f16 = (flowkv_poc_v_perm->type == GGML_TYPE_F16);
                                 if (v_is_f32) {
                                     // f32 V: gather with stride conversion.
                                     uint16_t * dst = (uint16_t *)(kv_ptr + dst_v);
@@ -11153,6 +11208,17 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                             }
                                             memcpy(kv_ptr + dst_v + d * 2, &bf, 2);
                                         }
+                                    }
+                                } else if (v_is_f16) {
+                                    // f16 V: convert f16→f32→bf16 with stride gather.
+                                    for (int64_t d = 0; d < head_dim; d++) {
+                                        size_t src_v = pos * v_nb0 + d * v_nb1 + kv_h * v_nb2;
+                                        ggml_fp16_t f16_val;
+                                        memcpy(&f16_val, v_data + src_v, sizeof(ggml_fp16_t));
+                                        float f32_val = ggml_fp16_to_fp32(f16_val);
+                                        uint16_t bf16_val;
+                                        f32_to_bf16(&f32_val, &bf16_val, 1);
+                                        memcpy(kv_ptr + dst_v + d * 2, &bf16_val, 2);
                                     }
                                 } else {
                                     // bf16 V: gather with correct strides.
@@ -11203,12 +11269,21 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                         {
                             auto q_ptr = fk_entry->bo_q->map<char *>();
                             size_t q_head_bytes_bf16 = head_dim * sizeof(uint16_t);
+                            const bool q_is_f16 = (flowkv_poc_q_perm->type == GGML_TYPE_F16);
                             for (int64_t g = 0; g < q_heads_per_kv; g++) {
                                 int64_t q_head = kv_h * q_heads_per_kv + g;
                                 const char * src = q_data + q_head * q_nb2;
                                 char * dst = q_ptr + g * q_head_bytes_bf16;
                                 if (q_is_f32) {
                                     f32_to_bf16((const float *)src, (uint16_t *)dst, (size_t)head_dim);
+                                } else if (q_is_f16) {
+                                    // f16 Q: convert f16→f32→bf16.
+                                    for (int64_t d = 0; d < head_dim; d++) {
+                                        ggml_fp16_t f16_val;
+                                        memcpy(&f16_val, src + d * sizeof(ggml_fp16_t), sizeof(ggml_fp16_t));
+                                        float f32_val = ggml_fp16_to_fp32(f16_val);
+                                        f32_to_bf16(&f32_val, (uint16_t *)(dst + d * 2), 1);
+                                    }
                                 } else {
                                     memcpy(dst, src, q_head_bytes_bf16);
                                 }
