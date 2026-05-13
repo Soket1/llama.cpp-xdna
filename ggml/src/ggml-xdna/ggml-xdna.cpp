@@ -10978,11 +10978,14 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                     const char * k_data = (const char *)flowkv_poc_k_perm->data;
                     const char * v_data = (const char *)flowkv_poc_v_perm->data;
                     const char * q_data = (const char *)flowkv_poc_q_perm->data;
+                    size_t k_nb0 = flowkv_poc_k_perm->nb[0];
                     size_t k_nb1 = flowkv_poc_k_perm->nb[1];
                     size_t k_nb2 = flowkv_poc_k_perm->nb[2];
                     size_t v_nb0 = flowkv_poc_v_perm->nb[0];
                     size_t v_nb1 = flowkv_poc_v_perm->nb[1];
                     size_t v_nb2 = flowkv_poc_v_perm->nb[2];
+                    size_t q_nb0 = flowkv_poc_q_perm->nb[0];
+                    size_t q_nb1 = flowkv_poc_q_perm->nb[1];
                     size_t q_nb2 = flowkv_poc_q_perm->nb[2];
 
                     // Detect tensor types for f32→bf16 conversion.
@@ -10992,6 +10995,116 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                     const bool v_is_f32 = (flowkv_poc_v_perm->type == GGML_TYPE_F32);
                     const bool q_is_f32 = (flowkv_poc_q_perm->type == GGML_TYPE_F32);
                     const bool out_is_f32 = (kqv_out->type == GGML_TYPE_F32);
+
+                    // === DIAG: dump tensor metadata and raw source data ===
+                    if (poc_dbg) {
+                        fprintf(stderr, "\n  [DIAG-FLOWKV] Tensor metadata:\n");
+                        fprintf(stderr, "    K: data=%p type=%d ne=[%lld,%lld,%lld] nb=[%zu,%zu,%zu]\n",
+                                k_data, (int)flowkv_poc_k_perm->type,
+                                (long long)flowkv_poc_k_perm->ne[0], (long long)flowkv_poc_k_perm->ne[1], (long long)flowkv_poc_k_perm->ne[2],
+                                k_nb0, k_nb1, k_nb2);
+                        fprintf(stderr, "    V: data=%p type=%d ne=[%lld,%lld,%lld] nb=[%zu,%zu,%zu]\n",
+                                v_data, (int)flowkv_poc_v_perm->type,
+                                (long long)flowkv_poc_v_perm->ne[0], (long long)flowkv_poc_v_perm->ne[1], (long long)flowkv_poc_v_perm->ne[2],
+                                v_nb0, v_nb1, v_nb2);
+                        fprintf(stderr, "    Q: data=%p type=%d ne=[%lld,%lld,%lld] nb=[%zu,%zu,%zu]\n",
+                                q_data, (int)flowkv_poc_q_perm->type,
+                                (long long)flowkv_poc_q_perm->ne[0], (long long)flowkv_poc_q_perm->ne[1], (long long)flowkv_poc_q_perm->ne[2],
+                                q_nb0, q_nb1, q_nb2);
+                        fprintf(stderr, "    kqv_out: data=%p type=%d ne=[%lld,%lld,%lld]\n",
+                                kqv_out->data, (int)kqv_out->type,
+                                (long long)kqv_out->ne[0], (long long)kqv_out->ne[1], (long long)kqv_out->ne[2]);
+
+                        // Dump raw K data at pos=0, kv_h=0 (first head_dim elements)
+                        fprintf(stderr, "    K src raw [pos=0,kv_h=0] first 8 bf16:");
+                        for (int d = 0; d < 8 && d < (int)head_dim; d++) {
+                            size_t off = 0 * k_nb1 + 0 * k_nb2 + d * k_nb0;
+                            uint16_t val;
+                            memcpy(&val, k_data + off, 2);
+                            fprintf(stderr, " 0x%04X", val);
+                        }
+                        fprintf(stderr, "\n");
+
+                        // Dump raw K data at pos=0, kv_h=0 as f32 (if f32 type)
+                        if (k_is_f32) {
+                            fprintf(stderr, "    K src f32 [pos=0,kv_h=0] first 8:");
+                            for (int d = 0; d < 8 && d < (int)head_dim; d++) {
+                                size_t off = 0 * k_nb1 + 0 * k_nb2 + d * k_nb0;
+                                float val;
+                                memcpy(&val, k_data + off, 4);
+                                fprintf(stderr, " %.6f", val);
+                            }
+                            fprintf(stderr, "\n");
+                        }
+
+                        // Dump raw V data at pos=0, kv_h=0
+                        fprintf(stderr, "    V src raw [pos=0,kv_h=0] first 8 bf16:");
+                        for (int d = 0; d < 8 && d < (int)head_dim; d++) {
+                            size_t off = 0 * v_nb1 + 0 * v_nb2 + d * v_nb0;
+                            uint16_t val;
+                            memcpy(&val, v_data + off, 2);
+                            fprintf(stderr, " 0x%04X", val);
+                        }
+                        fprintf(stderr, "\n");
+
+                        // Dump raw Q data at q_head=0
+                        fprintf(stderr, "    Q src raw [head=0] first 8 bf16:");
+                        for (int d = 0; d < 8 && d < (int)head_dim; d++) {
+                            size_t off = 0 * q_nb2 + d * q_nb0;
+                            uint16_t val;
+                            memcpy(&val, q_data + off, 2);
+                            fprintf(stderr, " 0x%04X", val);
+                        }
+                        fprintf(stderr, "\n");
+
+                        // Also check K/V data at a middle position (pos=128)
+                        fprintf(stderr, "    K src raw [pos=128,kv_h=0] first 8 bf16:");
+                        for (int d = 0; d < 8 && d < (int)head_dim; d++) {
+                            size_t off = 128 * k_nb1 + 0 * k_nb2 + d * k_nb0;
+                            uint16_t val;
+                            memcpy(&val, k_data + off, 2);
+                            fprintf(stderr, " 0x%04X", val);
+                        }
+                        fprintf(stderr, "\n");
+
+                        // Check if K src[0] (the source tensor of the PERMUTE) has different data
+                        struct ggml_tensor * k_src0 = flowkv_poc_k_perm->src[0];
+                        if (k_src0 && k_src0->data && k_src0->data != k_data) {
+                            const char * k_src0_data = (const char *)k_src0->data;
+                            fprintf(stderr, "    K src0 (pre-permute): data=%p type=%d ne=[%lld,%lld,%lld]\n",
+                                    k_src0_data, (int)k_src0->type,
+                                    (long long)k_src0->ne[0], (long long)k_src0->ne[1], (long long)k_src0->ne[2]);
+                            fprintf(stderr, "    K src0 raw [0] first 8 bf16:");
+                            for (int d = 0; d < 8; d++) {
+                                uint16_t val;
+                                memcpy(&val, k_src0_data + d * 2, 2);
+                                fprintf(stderr, " 0x%04X", val);
+                            }
+                            fprintf(stderr, "\n");
+                        } else if (k_src0 && k_src0->data == k_data) {
+                            fprintf(stderr, "    K src0 data == K perm data (same pointer)\n");
+                        }
+
+                        // Check V src[0]
+                        struct ggml_tensor * v_src0 = flowkv_poc_v_perm->src[0];
+                        if (v_src0 && v_src0->data && v_src0->data != v_data) {
+                            const char * v_src0_data = (const char *)v_src0->data;
+                            fprintf(stderr, "    V src0 (pre-permute): data=%p type=%d ne=[%lld,%lld,%lld]\n",
+                                    v_src0_data, (int)v_src0->type,
+                                    (long long)v_src0->ne[0], (long long)v_src0->ne[1], (long long)v_src0->ne[2]);
+                            fprintf(stderr, "    V src0 raw [0] first 8 bf16:");
+                            for (int d = 0; d < 8; d++) {
+                                uint16_t val;
+                                memcpy(&val, v_src0_data + d * 2, 2);
+                                fprintf(stderr, " 0x%04X", val);
+                            }
+                            fprintf(stderr, "\n");
+                        } else if (v_src0 && v_src0->data == v_data) {
+                            fprintf(stderr, "    V src0 data == V perm data (same pointer)\n");
+                        }
+
+                        fflush(stderr);
+                    }
 
                     // Identity RoPE angles (cos=0x3F80, sin=0x0000).
                     char angle_cos_bf16[2] = {(char)0x80, (char)0x3F};  // 0x3F80 = 1.0 bf16
@@ -11057,6 +11170,33 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                 }
                             }
                             fk_entry->bo_kv->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+                            // === DIAG: verify what was copied into bo_kv ===
+                            if (poc_dbg && kv_h == 0) {
+                                auto verify_ptr = fk_entry->bo_kv->map<char *>();
+                                const uint16_t * verify_bf16 = (const uint16_t *)verify_ptr;
+                                fprintf(stderr, "    [DIAG] bo_kv after copy, kv_h=0:\n");
+                                fprintf(stderr, "      K[0][0:8] (offset 0):");
+                                for (int d = 0; d < 8; d++) fprintf(stderr, " 0x%04X", verify_bf16[d]);
+                                fprintf(stderr, "\n");
+                                fprintf(stderr, "      V[0][0:8] (offset 64):");
+                                for (int d = 0; d < 8; d++) fprintf(stderr, " 0x%04X", verify_bf16[64 + d]);
+                                fprintf(stderr, "\n");
+                                fprintf(stderr, "      K[1][0:8] (offset 128):");
+                                for (int d = 0; d < 8; d++) fprintf(stderr, " 0x%04X", verify_bf16[128 + d]);
+                                fprintf(stderr, "\n");
+
+                                // Also dump what SHOULD be at K[0] based on source strides
+                                fprintf(stderr, "      K src expected [pos=0,kv_h=0,d=0:8]:");
+                                for (int d = 0; d < 8 && d < (int)head_dim; d++) {
+                                    size_t off = 0 * k_nb1 + 0 * k_nb2 + d * k_nb0;
+                                    uint16_t val;
+                                    memcpy(&val, k_data + off, 2);
+                                    fprintf(stderr, " 0x%04X", val);
+                                }
+                                fprintf(stderr, "\n");
+                                fflush(stderr);
+                            }
                         }
 
                         // --- Prepare Q buffer (bf16) ---
