@@ -6,7 +6,7 @@
 
 Hardware: STX NPU2, 8 columns, model: llama-3.2-1b-BF16
 
-Статус: decode 1.6 t/s (was 1.0), но output мусор → исправлено (KV layout bug)
+Статус: decode 1.6 t/s (was 1.0), но output мусор → KV layout исправлен, kernel recompilation под вопросом
 
 ---
 
@@ -39,24 +39,37 @@ NPU vs CPU: [0] NPU=0.004333 CPU=-0.879113 diff=0.883446
 
 #### Фикс: contiguous layout [K_all | V_all]
 
-**IRON-windows** (commit a9ec332):
+**IRON-windows** (commits a9ec332, b0446c2):
 - `design.py`: K DMA stride `2*head_dim` → `head_dim`, V DMA offset `+head_dim` → `+kv_region_size`
 - `op.py`: `interleave_kv_cache()` → `contiguous_kv_cache()`
 - `reference.py`: добавлена `contiguous_kv_cache()` функция
 - `test.py`: `KV_interleaved` → `KV_contiguous`
+- **ВАЖНО**: op.py компилирует `aie2p/flowkv.cc`, НЕ `aie2/flowkv.cc`!
+  - Первоначально правили aie2 — это ошибка, kernel не пересобрался
+  - Добавлен diagnostic в aie2p: value_normalize пишет bf16(42.0) в первые 2 элемента output
 
-**llama.cpp-xdna** (commit 15d51cf2b):
+**llama.cpp-xdna** (commits 15d51cf2b, 358024d41):
 - `ggml-xdna.cpp`: оба dispatch пути (per_head + POC):
   - `dst_k = pos * 2 * row_bytes` → `pos * row_bytes`
   - `dst_v = (pos * 2 + 1) * row_bytes` → `kv_region + pos * row_bytes`
 - `ggml-xdna.cpp`: Q diagnostic fix — f32→bf16 конвертация вместо чтения сырых 2 байт
 
+#### Тест kernel recompilation (ожидает проверки):
+
+После `git pull` + очистки кэша + `debug_flowkv.bat`:
+- `bo_out raw` должен показать `0x4250 0x4250` в первых 2 позициях (bf16(42.0))
+- Если старые значения → kernel НЕ пересобран, старый xclbin кэширован
+- Если `0x4250` → kernel пересобран, проблема в вычислениях
+
 #### Дополнительные находки:
 
-- **bf16_to_int()** в kernel — формула `(mant << (exp-7))` корректна для integer bf16 значений
+- **bf16_to_int()** в kernel — формула `(mant << (exp-7))` корректна для integer bf16 значений (42→0x4250→42 ✓)
 - **Q diagnostic** ("Q src raw") обманчиво показывал мусор — читал нижние 2 байта f32 данных (q_nb0=4) как bf16. Реальные bf16 значения в BO check корректны
 - **Q tensor**: type=0 (f32), ne=[64,1,32], nb=[4,8192,256] — stride=4 потому что это f32, не bf16
 - **actual_seq_len=42** читается из angles region в Q buffer — host корректно кодирует как bf16
+- **MLIR обновился корректно**: K DMA stride=64, V DMA offset=16384 — подтверждено в flowkv_debug_new.mlir
+- **Host diagnostic подтверждает contiguous layout**: K[0]@offset 0, K[1]@offset 64, V[0]@offset 16384
+- **Но bo_out идентичен** предыдущему запуску → kernel binary не изменился
 
 ### Осталось:
 
