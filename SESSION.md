@@ -59,24 +59,75 @@ NPU vs CPU: [0] NPU=0.004333 CPU=-0.879113 diff=0.883446
 1. **KV layout фикс работает**: host пишет contiguous (K[0]@0, K[1]@64, V[0]@16384), MLIR DMA stride=64 ✓
 2. **Kernel пересобирается**: bo_out изменился (0xBB55→0xBB51) после фикса ✓
 3. **Но output всё ещё мусор**: NPU=0.004 vs CPU=-0.894 → проблема не в K/V layout
-4. **K diagnostic в процессе**: ожидаем результат — bo_out K_DIAG должен совпасть с host K[0] (0x3E39 0x3D9F...)
+4. **K diagnostic: K_DIAG ≠ host K[0]** — DMA читает совершенно другие данные
 
-#### Что проверить дальше (после K diagnostic):
+#### K diagnostic результат (2026-05-15):
 
-- Если K_DIAG == host K[0] → DMA читает правильно, проблема в attention computation
-- Если K_DIAG ≠ host K[0] → DMA/ObjectFifo issue
-- Возможные проблемы:
-  - Score tile не передаёт packed buffer в value tile (inter-tile FIFO issue)
-  - Online softmax накапливает ошибку (bf16 precision)
-  - Value accumulation не работает правильно (correction factor bug)
-  - Q данные неправильные (RoPE angles или Q buffer layout)
+```
+Host K[0]:    0x3E39 0x3D9F 0x3E28 0x3E02 0xBB90 0x3E08 0xBDF3 0xBD73  ← bo_kv после sync ✓
+K_DIAG NPU:   0xBB1A 0xBAC8 0x3B0D 0xBBF1 0xB9CC 0x3A11 0xBB64 0x3B8A  ← kernel видит ✗
+```
+
+**Ни одно из 8 значений не совпадает.** K_DIAG содержит данные, которых нет ни в:
+- исходном K тензоре (raw f16: 0x31C6 0x2CF7...)
+- bo_kv после f16→bf16 конверсии (0x3E39 0x3D9F...)
+- bo_kv после read-back verif (тот же 0x3E39...)
+
+#### Анализ: DMA config vs host layout
+
+DMA config для K:
+```
+aie.dma_bd(%arg0, 0, 16384, [<size=1,stride=0>, <size=256,stride=64>, <size=1,stride=0>, <size=64,stride=1>])
+```
+
+- offset=0 (K region start) ✓
+- 256 итераций × stride=64 bf16 = contiguous K[0], K[1], ... K[255] ✓
+- Host пишет K[pos] на `pos * row_bytes` (row_bytes=128=64 bf16) → layout совпадает ✓
+- bo_kv size = 65536 bytes = 32768 bf16 (K: 0..16383, V: 16384..32767) ✓
+
+**DMA config корректна.** Данные в bo_kv корректны (read-back подтверждает). Но DMA → tile memory delivers wrong data.
+
+#### Вероятные причины:
+
+1. **NoC cache coherency** (наиболее вероятно): `XCL_BO_SYNC_BO_TO_DEVICE` синхронизирует host→DDR, но AIE NoC DMA controller читает из кэша (stale). Нужен explicit cache invalidation на стороне DMA/NOC.
+2. **bo_kv buffer aliasing**: XRT `host_only` buffer может маппиться в host VA space и AIE DDR space по-разному.
+3. **Shim tile contention**: Q и K оба через `shim_noc_tile_0_0`, возможна NoC интерференция.
+
+#### Диагностический патч (commit d05385a6a):
+
+Добавлен в `ggml-xdna.cpp` (при `XDNA_DEBUG=1`):
+
+1. **Pre-dispatch sync verify**: после bo_kv sync TO_DEVICE, делаем FROM_DEVICE read-back и сравниваем с записанными данными. Если `match=NO` → host cache не сбрасывается в DDR.
+2. **Post-dispatch bo_kv integrity**: после выполнения kernel, проверяем что DMA не испортил source buffer.
+3. **K_DIAG vs host K[0] comparison**: сравниваем что kernel прочитал (K_DIAG из last head output slot) с тем что host записал в bo_kv.
+
+Ожидаемый вывод:
+```
+[DIAG-SYNC] bo_kv verify after FROM_DEVICE:
+  K[0][0:8]: 0x3E39 ...   K[0] match=YES/NO!!
+[DIAG-COMPARE] kv_h=0:
+  Host  K[0][0:8]: 0x3E39 ...
+  K_DIAG    [0:8]: 0xBB1A ...
+  Match count (first 8): 0/8 → ZERO MATCH — DMA reads wrong data!
+```
+
+#### Что проверить дальше:
+
+- Запустить `debug_flowkv.bat` с патчем d05385a6a
+- Если `[DIAG-SYNC] match=NO` → проблема в XRT sync (host→DDR)
+- Если `[DIAG-SYNC] match=YES` но `[DIAG-COMPARE] 0/8` → проблема в NoC/DMA cache (DDR→tile)
+- Возможные фиксы:
+  - Использовать `xrt::bo` с другими флагами (не `host_only`)
+  - Добавить explicit cache flush через XRT API
+  - Проверить, не нужен ли `XCL_BO_CACHEABLE` флаг
+  - Тест: alloc bo_kv как `xrt::bo::flags::cacheable` вместо `host_only`
 
 ### Осталось:
 
-- **Перекомпилировать flowkv.o** на Windows (NPU peano toolchain)
-- Удалить старый кэш: `rmdir /s /q npu_kernels_win_8col\flowkv_H4_KV1_d64_S256_C32_1col`
-- Протестировать — output должен быть "The capital of France is Paris."
-- Если работает → убрать diagnostic код
+- **Запустить debug_flowkv.bat** с патчем d05385a6a на Windows
+- Скинуть лог с `[DIAG-SYNC]`, `[DIAG-POST]`, `[DIAG-COMPARE]` выводом
+- По результатам: фиксить cache coherency (XRT bo flags / explicit flush)
+- После фикса: удалить diagnostic код, протестировать output
 - Дальше: merge QKV+batch, RMSNorm on NPU
 
 ---
