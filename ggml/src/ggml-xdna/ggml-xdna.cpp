@@ -11461,6 +11461,11 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                             fprintf(stderr, "  bo_out raw: first 8 bf16:");
                             for (int d = 0; d < 8; d++) fprintf(stderr, " 0x%04X", raw_bf16[d]);
                             fprintf(stderr, " all_zero=%d\n", all_zero);
+                            // DIAG: print last head's data (K[0] from kernel)
+                            int last_head_off = (q_heads_per_kv - 1) * head_dim;
+                            fprintf(stderr, "  bo_out K_DIAG [last head, off=%d]:", last_head_off);
+                            for (int d = 0; d < 8; d++) fprintf(stderr, " 0x%04X", raw_bf16[last_head_off + d]);
+                            fprintf(stderr, "\n");
                         }
                         // Compare NPU vs CPU for first head
                         if (!cpu_save.empty()) {
