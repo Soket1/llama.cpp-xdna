@@ -11418,6 +11418,31 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                             }
                             fk_entry->bo_kv->sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
+                            // === DIAG: host→DDR coherency check (POC path) ===
+                            if (poc_dbg && kv_h == 0) {
+                                // Save what we wrote
+                                auto kv_map = fk_entry->bo_kv->map<char *>();
+                                uint16_t pre_k0[8];
+                                memcpy(pre_k0, kv_map, 16);
+
+                                // Sync back from device
+                                fk_entry->bo_kv->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+                                auto verify_ptr = reinterpret_cast<const uint16_t*>(kv_map);
+
+                                fprintf(stderr, "  [DIAG-SYNC] bo_kv verify after FROM_DEVICE:\n");
+                                fprintf(stderr, "    K[0][0:8]: 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X\n",
+                                    verify_ptr[0], verify_ptr[1], verify_ptr[2], verify_ptr[3],
+                                    verify_ptr[4], verify_ptr[5], verify_ptr[6], verify_ptr[7]);
+
+                                bool k0_match = (memcmp(pre_k0, kv_map, 16) == 0);
+                                fprintf(stderr, "    K[0] match=%s\n", k0_match ? "YES" : "NO!!");
+                                fflush(stderr);
+
+                                // Re-sync TO_DEVICE
+                                fk_entry->bo_kv->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                            }
+                            // === END DIAG ===
+
                             // === DIAG: verify what was copied into bo_kv ===
                             if (poc_dbg && kv_h == 0) {
                                 auto verify_ptr = fk_entry->bo_kv->map<char *>();
@@ -11541,7 +11566,41 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                 float ms = std::chrono::duration<float, std::milli>(t1 - t0).count();
                                 fprintf(stderr, "ggml-xdna: [FlowKV-POC] kv_h=%lld dispatched %.2f ms\n",
                                         (long long)kv_h, ms);
-                                fflush(stderr);
+
+                                // === DIAG: post-dispatch bo_kv integrity + K_DIAG compare ===
+                                if (kv_h == 0) {
+                                    fk_entry->bo_kv->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+                                    auto post_kv = reinterpret_cast<const uint16_t*>(
+                                        fk_entry->bo_kv->map<char *>());
+                                    fprintf(stderr, "  [DIAG-POST] bo_kv after dispatch:\n");
+                                    fprintf(stderr, "    K[0][0:8]: 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X\n",
+                                        post_kv[0], post_kv[1], post_kv[2], post_kv[3],
+                                        post_kv[4], post_kv[5], post_kv[6], post_kv[7]);
+
+                                    // K_DIAG is in last head slot of bo_out
+                                    fk_entry->bo_out->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+                                    auto out_diag = fk_entry->bo_out->map<char *>();
+                                    size_t out_hb = head_dim * sizeof(uint16_t);
+                                    const uint16_t * kdiag = reinterpret_cast<const uint16_t*>(
+                                        out_diag + (q_heads_per_kv - 1) * out_hb);
+
+                                    fprintf(stderr, "  [DIAG-COMPARE] kv_h=0:\n");
+                                    fprintf(stderr, "    Host  K[0][0:8]: 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X\n",
+                                        post_kv[0], post_kv[1], post_kv[2], post_kv[3],
+                                        post_kv[4], post_kv[5], post_kv[6], post_kv[7]);
+                                    fprintf(stderr, "    K_DIAG    [0:8]: 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X\n",
+                                        kdiag[0], kdiag[1], kdiag[2], kdiag[3],
+                                        kdiag[4], kdiag[5], kdiag[6], kdiag[7]);
+
+                                    int match_count = 0;
+                                    for (int i = 0; i < 8; i++) {
+                                        if (kdiag[i] == post_kv[i]) match_count++;
+                                    }
+                                    fprintf(stderr, "    Match count (first 8): %d/8 → %s\n",
+                                        match_count, match_count > 0 ? "PARTIAL MATCH" : "ZERO MATCH — DMA reads wrong data!");
+                                    fflush(stderr);
+                                }
+                                // === END DIAG ===
                             }
                         }
 
