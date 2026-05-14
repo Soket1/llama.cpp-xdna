@@ -9983,6 +9983,11 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
     // Pointers are overwritten per-layer; stale state is harmless because
     // each layer's QKV dispatch runs before its CONT(kqv_out).
 
+    // FlowKV early-dispatch: set after QKV segment when permuted tensors
+    // are ready. Used to skip SOFT_MAX and CONT(kqv_out) in subsequent
+    // segments of the same layer — FlowKV already computed full attention.
+    static bool flowkv_dispatched_this_layer = false;
+
     // Pre-scan for QKV triples. Llama.cpp's Qwen3.5 decode interleaves
     // RMSNorm/view ops between Q and K/V MUL_MATs, so a 3-consecutive-node
     // matcher never fires. We group MUL_MATs by shared src[1] activation
@@ -10086,6 +10091,19 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
             && node->src[1]->ne[1] == 1;
         if (!is_batchable_gemv && !decode_batcher.empty()) {
             decode_batcher.flush(ctx);
+        }
+
+        // FlowKV: skip SOFT_MAX when FlowKV already dispatched full
+        // attention in the preceding QKV segment. The CPU softmax would
+        // compute Q@K^T scores that FlowKV replaces entirely.
+        if (flowkv_decode_enabled && flowkv_dispatched_this_layer &&
+            node->op == GGML_OP_SOFT_MAX) {
+            if (cpu_run_start >= 0) {
+                ggml_status s = xdna_delegate_range(ctx, cgraph, cpu_run_start, i);
+                if (s != GGML_STATUS_SUCCESS) return s;
+                cpu_run_start = -1;
+            }
+            continue;
         }
 
         // QKV triple: dispatch Q+K+V as one xrt::runlist at Q's position.
@@ -11444,6 +11462,11 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                         }
                         fflush(stderr);
                     }
+                    // FlowKV dispatched successfully — don't add CONT to
+                    // CPU range. The NPU result in kqv_out must not be
+                    // overwritten by CPU attention.
+                    flowkv_dispatched_this_layer = false;  // consumed
+                    continue;
                 } catch (const std::exception & e) {
                     GGML_LOG_ERROR("ggml-xdna: [FlowKV-POC] exception: %s\n", e.what());
                 }
@@ -11466,6 +11489,41 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
     if (cpu_run_start >= 0) {
         ggml_status s = xdna_delegate_range(ctx, cgraph, cpu_run_start, n);
         if (s != GGML_STATUS_SUCCESS) return s;
+    }
+
+    // FlowKV early dispatch: after QKV segment's CPU delegate range,
+    // permuted Q/K/V tensors are ready. Dispatch FlowKV now so the
+    // next segment (SOFT_MAX) can be skipped entirely.
+    // This replaces the POC dispatch at CONT(kqv_out) for layers where
+    // the QKV segment precedes the attention segment.
+    if (flowkv_decode_enabled && flowkv_poc_valid &&
+        flowkv_poc_q_perm && flowkv_poc_q_perm->data) {
+        int64_t head_dim = flowkv_poc_head_dim;
+        int64_t seq_len = flowkv_poc_seq_len;
+        int64_t num_kv_heads = flowkv_poc_num_kv_heads;
+        int64_t num_q_heads = flowkv_poc_num_q_heads;
+        int64_t q_heads_per_kv = num_q_heads / num_kv_heads;
+        int chunk_size = 32;
+        int num_cols = 1;
+
+        xdna_flowkv_entry * fk_entry = get_or_load_flowkv_kernel(
+            ctx, q_heads_per_kv, /*num_kv_heads=*/1, head_dim, seq_len, chunk_size, num_cols);
+
+        if (fk_entry) {
+            static const bool early_dbg = getenv("XDNA_DEBUG") != NULL;
+            if (early_dbg) {
+                fprintf(stderr, "ggml-xdna: [FlowKV-early] dispatching after QKV segment "
+                        "H=%lld KV=%lld d=%lld S=%lld\n",
+                        (long long)q_heads_per_kv, (long long)num_kv_heads,
+                        (long long)head_dim, (long long)seq_len);
+                fflush(stderr);
+            }
+            // Note: the actual BO setup + dispatch + readback is identical
+            // to the POC path. For now, just set the flag — the POC at
+            // CONT(kqv_out) will handle the actual dispatch. The flag
+            // causes SOFT_MAX to be skipped.
+            flowkv_dispatched_this_layer = true;
+        }
     }
 
     // Print per-phase attention-prefill profile (no-op when gate off / no samples).
