@@ -10994,7 +10994,7 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                             xrt::bo(ctx->device, kv_size, xrt::bo::flags::host_only,
                                     fk_entry->kernel.group_id(3)));
                     }
-                    size_t q_size = 1 * (q_heads_per_kv * head_dim + head_dim) * sizeof(uint16_t);
+                    size_t q_size = 1 * (q_heads_per_kv * head_dim + head_dim + 1) * sizeof(uint16_t);  // +1 for actual_seq_len
                     if (!fk_entry->bo_q) {
                         fk_entry->bo_q = std::make_unique<xrt::bo>(
                             xrt::bo(ctx->device, q_size, xrt::bo::flags::host_only,
@@ -11362,7 +11362,7 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                 fprintf(stderr, "\n  BO check: insts size=%u bo_kv size=%zu bo_q size=%zu bo_out size=%zu\n",
                                         (uint32_t)fk_entry->insts_data.size(),
                                         (size_t)(1 * seq_len * 2 * row_bytes),
-                                        (size_t)(1 * (q_heads_per_kv * head_dim + head_dim) * sizeof(uint16_t)),
+                                        (size_t)(1 * (q_heads_per_kv * head_dim + head_dim + 1) * sizeof(uint16_t)),
                                         (size_t)(q_heads_per_kv * row_bytes));
                                 fflush(stderr);
                             }
