@@ -93,9 +93,12 @@ aie.dma_bd(%arg0, 0, 16384, [<size=1,stride=0>, <size=256,stride=64>, <size=1,st
 2. **bo_kv buffer aliasing**: XRT `host_only` buffer может маппиться в host VA space и AIE DDR space по-разному.
 3. **Shim tile contention**: Q и K оба через `shim_noc_tile_0_0`, возможна NoC интерференция.
 
-#### Диагностический патч (commit d05385a6a):
+#### Диагностический патч (commits d05385a6a, 001050108):
 
 Добавлен в `ggml-xdna.cpp` (при `XDNA_DEBUG=1`):
+- **ВАЖНО**: diagnostic добавлен в **оба** dispatch пути: `per_head` и `POC` (POC — основной, используется в production)
+- Первый патч (d05385a6a) стоял только в `per_head` → не работал, т.к. реальный dispatch идёт через POC path
+- Второй патч (001050108) добавил проверки в POC path
 
 1. **Pre-dispatch sync verify**: после bo_kv sync TO_DEVICE, делаем FROM_DEVICE read-back и сравниваем с записанными данными. Если `match=NO` → host cache не сбрасывается в DDR.
 2. **Post-dispatch bo_kv integrity**: после выполнения kernel, проверяем что DMA не испортил source buffer.
@@ -124,7 +127,7 @@ aie.dma_bd(%arg0, 0, 16384, [<size=1,stride=0>, <size=256,stride=64>, <size=1,st
 
 ### Осталось:
 
-- **Запустить debug_flowkv.bat** с патчем d05385a6a на Windows
+- **Запустить debug_flowkv.bat** с патчем 001050108 на Windows (git pull + пересборка)
 - Скинуть лог с `[DIAG-SYNC]`, `[DIAG-POST]`, `[DIAG-COMPARE]` выводом
 - По результатам: фиксить cache coherency (XRT bo flags / explicit flush)
 - После фикса: удалить diagnostic код, протестировать output
