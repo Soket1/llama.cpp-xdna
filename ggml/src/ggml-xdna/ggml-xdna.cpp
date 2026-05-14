@@ -4476,6 +4476,29 @@ static bool ggml_backend_xdna_flowkv_per_head(
     int64_t q_heads_per_kv = n_q_heads_total / n_kv_heads;
 
     bool all_ok = true;
+
+    // === DIAG: print tensor metadata once per FlowKV call ===
+    if (dbg) {
+        fprintf(stderr, "\n[DIAG-FLOWKV] Tensor metadata:\n");
+        fprintf(stderr, "    K: data=%p type=%d ne=[%lld,%lld,%lld] nb=[%lld,%lld,%lld]\n",
+            k_tensor->data, (int)k_tensor->type,
+            (long long)k_tensor->ne[0], (long long)k_tensor->ne[1], (long long)k_tensor->ne[2],
+            (long long)k_tensor->nb[0], (long long)k_tensor->nb[1], (long long)k_tensor->nb[2]);
+        fprintf(stderr, "    V: data=%p type=%d ne=[%lld,%lld,%lld] nb=[%lld,%lld,%lld]\n",
+            v_tensor->data, (int)v_tensor->type,
+            (long long)v_tensor->ne[0], (long long)v_tensor->ne[1], (long long)v_tensor->ne[2],
+            (long long)v_tensor->nb[0], (long long)v_tensor->nb[1], (long long)v_tensor->nb[2]);
+        fprintf(stderr, "    Q: data=%p type=%d ne=[%lld,%lld,%lld] nb=[%lld,%lld,%lld]\n",
+            q_tensor->data, (int)q_tensor->type,
+            (long long)q_tensor->ne[0], (long long)q_tensor->ne[1], (long long)q_tensor->ne[2],
+            (long long)q_tensor->nb[0], (long long)q_tensor->nb[1], (long long)q_tensor->nb[2]);
+        fprintf(stderr, "    seq_len=%lld head_dim=%lld n_kv_heads=%lld group_size=%lld batched=%d\n",
+            (long long)seq_len, (long long)head_dim, (long long)n_kv_heads,
+            (long long)q_heads_per_kv, (int)batched);
+        fflush(stderr);
+    }
+    // === END DIAG ===
+
     for (int64_t kv_h = 0; kv_h < n_kv_heads; kv_h++) {
         int64_t group_size = batched ? q_heads_per_kv : 1;
         int64_t num_heads = group_size;
@@ -4552,6 +4575,46 @@ static bool ggml_backend_xdna_flowkv_per_head(
                     }
                 }
                 entry->bo_kv->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+                // === DIAG: verify host→DDR coherency ===
+                // Re-read bo_kv from device memory and compare with what we wrote.
+                // If these differ → host cache not flushed to DDR.
+                // If these match but kernel still sees wrong data → NoC/DMA cache issue.
+                if (dbg && kv_h == 0) {
+                    // Save what we wrote
+                    uint16_t pre_k0[8], pre_k1[8], pre_v0[8];
+                    memcpy(pre_k0, kv_ptr + 0, 16);
+                    memcpy(pre_k1, kv_ptr + row_bytes, 16);
+                    memcpy(pre_v0, kv_ptr + kv_region, 16);
+
+                    // Sync back from device (read DDR into host buffer)
+                    entry->bo_kv->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+                    auto verify_ptr = reinterpret_cast<const uint16_t*>(kv_ptr);
+
+                    fprintf(stderr, "  [DIAG-SYNC] bo_kv verify after FROM_DEVICE:\n");
+                    fprintf(stderr, "    K[0][0:8]: 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X\n",
+                        verify_ptr[0], verify_ptr[1], verify_ptr[2], verify_ptr[3],
+                        verify_ptr[4], verify_ptr[5], verify_ptr[6], verify_ptr[7]);
+                    fprintf(stderr, "    K[1][0:8]: 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X\n",
+                        verify_ptr[64], verify_ptr[65], verify_ptr[66], verify_ptr[67],
+                        verify_ptr[68], verify_ptr[69], verify_ptr[70], verify_ptr[71]);
+                    fprintf(stderr, "    V[0][0:8]: 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X\n",
+                        verify_ptr[kv_region/2], verify_ptr[kv_region/2+1],
+                        verify_ptr[kv_region/2+2], verify_ptr[kv_region/2+3],
+                        verify_ptr[kv_region/2+4], verify_ptr[kv_region/2+5],
+                        verify_ptr[kv_region/2+6], verify_ptr[kv_region/2+7]);
+
+                    // Check match
+                    bool k0_match = (memcmp(pre_k0, kv_ptr, 16) == 0);
+                    bool k1_match = (memcmp(pre_k1, kv_ptr + row_bytes, 16) == 0);
+                    fprintf(stderr, "    K[0] match=%s  K[1] match=%s\n",
+                        k0_match ? "YES" : "NO!!", k1_match ? "YES" : "NO!!");
+                    fflush(stderr);
+
+                    // Re-sync TO_DEVICE since FROM_DEVICE overwrote our buffer
+                    entry->bo_kv->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                }
+                // === END DIAG ===
             }
 
             // --- Prepare Q buffer ---
@@ -4603,10 +4666,24 @@ static bool ggml_backend_xdna_flowkv_per_head(
 
                 if (dbg) {
                     float ms = std::chrono::duration<float, std::milli>(t1 - t0).count();
-                    fprintf(stderr, "ggml-xdna: FlowKV KV=%lld gs=%lld S=%lld → %.2f ms\n",
-                            (long long)kv_h, (long long)group_size,
-                            (long long)seq_len, ms);
-                    fflush(stderr);
+                    fprintf(stderr, "ggml-xdna: [FlowKV-POC] kv_h=%lld dispatched %.2f ms\n",
+                            (long long)kv_h, ms);
+
+                    // === DIAG: post-dispatch bo_kv integrity check ===
+                    // Verify DMA didn't corrupt the source buffer.
+                    if (kv_h == 0) {
+                        entry->bo_kv->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+                        auto post_ptr = reinterpret_cast<const uint16_t*>(
+                            entry->bo_kv->map<char *>());
+                        fprintf(stderr, "  [DIAG-POST] bo_kv after dispatch:\n");
+                        fprintf(stderr, "    K[0][0:8]: 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X\n",
+                            post_ptr[0], post_ptr[1], post_ptr[2], post_ptr[3],
+                            post_ptr[4], post_ptr[5], post_ptr[6], post_ptr[7]);
+                        fprintf(stderr, "    bo_kv addr=%p bo_out addr=%p\n",
+                            (void*)post_ptr, (void*)entry->bo_out->map<char *>());
+                        fflush(stderr);
+                    }
+                    // === END DIAG ===
                 }
             }
 
@@ -4615,6 +4692,46 @@ static bool ggml_backend_xdna_flowkv_per_head(
             {
                 auto out_ptr = entry->bo_out->map<char *>();
                 size_t out_head_bytes = head_dim * sizeof(uint16_t);
+
+                // === DIAG: compare K_DIAG (from kernel) with host K[0] ===
+                if (dbg && kv_h == 0) {
+                    // K_DIAG is written to the last head slot by the kernel
+                    size_t kdiag_off = (num_heads - 1) * out_head_bytes;
+                    const uint16_t * kdiag = reinterpret_cast<const uint16_t*>(out_ptr + kdiag_off);
+                    // Re-read bo_kv to get host K[0]
+                    entry->bo_kv->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+                    auto kv_verify = reinterpret_cast<const uint16_t*>(entry->bo_kv->map<char *>());
+
+                    fprintf(stderr, "  [DIAG-COMPARE] kv_h=0:\n");
+                    fprintf(stderr, "    Host  K[0][0:8]: 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X\n",
+                        kv_verify[0], kv_verify[1], kv_verify[2], kv_verify[3],
+                        kv_verify[4], kv_verify[5], kv_verify[6], kv_verify[7]);
+                    fprintf(stderr, "    K_DIAG    [0:8]: 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X\n",
+                        kdiag[0], kdiag[1], kdiag[2], kdiag[3],
+                        kdiag[4], kdiag[5], kdiag[6], kdiag[7]);
+
+                    // Check if any of the first 8 match
+                    int match_count = 0;
+                    for (int i = 0; i < 8; i++) {
+                        if (kdiag[i] == kv_verify[i]) match_count++;
+                    }
+                    fprintf(stderr, "    Match count (first 8): %d/8 → %s\n",
+                        match_count, match_count > 0 ? "PARTIAL MATCH" : "ZERO MATCH — DMA reads wrong data!");
+
+                    // Also dump bo_out raw first 8 for context
+                    fprintf(stderr, "    bo_out raw[0:8]: 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X\n",
+                        reinterpret_cast<const uint16_t*>(out_ptr)[0],
+                        reinterpret_cast<const uint16_t*>(out_ptr)[1],
+                        reinterpret_cast<const uint16_t*>(out_ptr)[2],
+                        reinterpret_cast<const uint16_t*>(out_ptr)[3],
+                        reinterpret_cast<const uint16_t*>(out_ptr)[4],
+                        reinterpret_cast<const uint16_t*>(out_ptr)[5],
+                        reinterpret_cast<const uint16_t*>(out_ptr)[6],
+                        reinterpret_cast<const uint16_t*>(out_ptr)[7]);
+                    fflush(stderr);
+                }
+                // === END DIAG ===
+
                 struct ggml_tensor * out_tensor =
                     cgraph->nodes[group.heads[0].pv_idx];
                 const char * out_base = (const char *)out_tensor->data;
