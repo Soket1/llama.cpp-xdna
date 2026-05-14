@@ -4510,6 +4510,7 @@ static bool ggml_backend_xdna_flowkv_per_head(
                 const char * k_data = (const char *)k_tensor->data;
                 const char * v_data = (const char *)v_tensor->data;
                 size_t row_bytes = head_dim * sizeof(uint16_t);
+                size_t kv_region = (size_t)seq_len * row_bytes;  // size of K or V region
 
                 size_t k_pos_stride = k_tensor->nb[1];
                 size_t k_head_stride = k_tensor->ne[2] > 1 ? k_tensor->nb[2] : 0;
@@ -4520,7 +4521,7 @@ static bool ggml_backend_xdna_flowkv_per_head(
                 const bool v_f16 = (v_tensor->type == GGML_TYPE_F16);
 
                 for (int64_t pos = 0; pos < seq_len; pos++) {
-                    size_t dst_k = pos * 2 * row_bytes;
+                    size_t dst_k = pos * row_bytes;
                     size_t src_k = pos * k_pos_stride + kv_h * k_head_stride;
                     if (k_f16) {
                         for (int64_t d = 0; d < head_dim; d++) {
@@ -4535,7 +4536,7 @@ static bool ggml_backend_xdna_flowkv_per_head(
                         memcpy(kv_ptr + dst_k, k_data + src_k, row_bytes);
                     }
 
-                    size_t dst_v = (pos * 2 + 1) * row_bytes;
+                    size_t dst_v = kv_region + pos * row_bytes;
                     size_t src_v = pos * v_pos_stride + kv_h * v_head_stride;
                     if (v_f16) {
                         for (int64_t d = 0; d < head_dim; d++) {
@@ -11106,13 +11107,21 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                         }
                         fprintf(stderr, "\n");
 
-                        // Dump raw Q data at q_head=0
-                        fprintf(stderr, "    Q src raw [head=0] first 8 bf16:");
+                        // Dump raw Q data at q_head=0 (convert to bf16 for comparison)
+                        fprintf(stderr, "    Q src raw [head=0] first 8 (as bf16):");
                         for (int d = 0; d < 8 && d < (int)head_dim; d++) {
                             size_t off = 0 * q_nb2 + d * q_nb0;
-                            uint16_t val;
-                            memcpy(&val, q_data + off, 2);
-                            fprintf(stderr, " 0x%04X", val);
+                            if (q_is_f32) {
+                                float f32_val;
+                                memcpy(&f32_val, q_data + off, 4);
+                                uint16_t bf16_val;
+                                f32_to_bf16(&f32_val, &bf16_val, 1);
+                                fprintf(stderr, " 0x%04X", bf16_val);
+                            } else {
+                                uint16_t val;
+                                memcpy(&val, q_data + off, 2);
+                                fprintf(stderr, " 0x%04X", val);
+                            }
                         }
                         fprintf(stderr, "\n");
 
@@ -11202,15 +11211,18 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
 
                     // Process each KV head.
                     for (int64_t kv_h = 0; kv_h < num_kv_heads; kv_h++) {
-                        // --- Prepare KV buffer (interleaved K/V, bf16) ---
+                        // --- Prepare KV buffer (contiguous K then V, bf16) ---
+                        // Layout: [K_pos0 K_pos1 ... K_posN | V_pos0 V_pos1 ... V_posN]
+                        // Each region = seq_len * head_dim * 2 bytes.
                         {
                             auto kv_ptr = fk_entry->bo_kv->map<char *>();
                             // Zero entire BO first — unused positions must be zero
                             // so the kernel's online softmax doesn't dilute attention.
                             memset(kv_ptr, 0, (size_t)(1 * seq_len * 2 * row_bytes));
+                            size_t kv_region = (size_t)seq_len * row_bytes;  // size of K or V region
                             for (int64_t pos = 0; pos < actual_seq_len; pos++) {
-                                // K: copy head_dim elements → bf16 in KV buffer.
-                                size_t dst_k = pos * 2 * row_bytes;
+                                // K: copy head_dim elements → bf16 in K region.
+                                size_t dst_k = pos * row_bytes;
                                 const bool k_is_f16 = (flowkv_poc_k_perm->type == GGML_TYPE_F16);
                                 if (k_is_f32) {
                                     // f32 K: convert each element to bf16.
@@ -11234,8 +11246,8 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                     memcpy(kv_ptr + dst_k, k_data + src_k, row_bytes);
                                 }
 
-                                // V: copy head_dim elements → bf16 in KV buffer.
-                                size_t dst_v = (pos * 2 + 1) * row_bytes;
+                                // V: copy head_dim elements → bf16 in V region.
+                                size_t dst_v = kv_region + pos * row_bytes;
                                 const bool v_is_f16 = (flowkv_poc_v_perm->type == GGML_TYPE_F16);
                                 if (v_is_f32) {
                                     // f32 V: gather with stride conversion.
@@ -11293,15 +11305,15 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                             if (poc_dbg && kv_h == 0) {
                                 auto verify_ptr = fk_entry->bo_kv->map<char *>();
                                 const uint16_t * verify_bf16 = (const uint16_t *)verify_ptr;
-                                fprintf(stderr, "    [DIAG] bo_kv after copy, kv_h=0:\n");
+                                fprintf(stderr, "    [DIAG] bo_kv after copy, kv_h=0 (contiguous layout):\n");
                                 fprintf(stderr, "      K[0][0:8] (offset 0):");
                                 for (int d = 0; d < 8; d++) fprintf(stderr, " 0x%04X", verify_bf16[d]);
                                 fprintf(stderr, "\n");
-                                fprintf(stderr, "      V[0][0:8] (offset 64):");
-                                for (int d = 0; d < 8; d++) fprintf(stderr, " 0x%04X", verify_bf16[64 + d]);
+                                fprintf(stderr, "      K[1][0:8] (offset %d):", (int)head_dim);
+                                for (int d = 0; d < 8; d++) fprintf(stderr, " 0x%04X", verify_bf16[head_dim + d]);
                                 fprintf(stderr, "\n");
-                                fprintf(stderr, "      K[1][0:8] (offset 128):");
-                                for (int d = 0; d < 8; d++) fprintf(stderr, " 0x%04X", verify_bf16[128 + d]);
+                                fprintf(stderr, "      V[0][0:8] (offset %d):", (int)(seq_len * head_dim));
+                                for (int d = 0; d < 8; d++) fprintf(stderr, " 0x%04X", verify_bf16[seq_len * head_dim + d]);
                                 fprintf(stderr, "\n");
 
                                 // Also dump what SHOULD be at K[0] based on source strides
@@ -11373,7 +11385,7 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                 auto diag_q = fk_entry->bo_q->map<char *>();
                                 const uint16_t * kv_bf16 = (const uint16_t *)diag_kv;
                                 const uint16_t * q_bf16 = (const uint16_t *)diag_q;
-                                fprintf(stderr, "  BO check kv_h=0: KV first 8 bf16:");
+                                fprintf(stderr, "  BO check kv_h=0: K[0] first 8 bf16:");
                                 for (int d = 0; d < 8; d++) fprintf(stderr, " 0x%04X", kv_bf16[d]);
                                 fprintf(stderr, "\n  BO check kv_h=0: Q first 8 bf16:");
                                 for (int d = 0; d < 8; d++) fprintf(stderr, " 0x%04X", q_bf16[d]);
