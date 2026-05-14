@@ -11151,12 +11151,46 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                     char angle_cos_bf16[2] = {(char)0x80, (char)0x3F};  // 0x3F80 = 1.0 bf16
                     char angle_sin_bf16[2] = {(char)0x00, (char)0x00};  // 0x0000 = 0.0 bf16
 
+                    // Determine actual number of filled KV positions.
+                    // k_perm->ne[1] is the padded n_kv (≥256), not the real token count.
+                    // We scan K data to find the last non-zero position.
+                    int64_t actual_seq_len = seq_len;
+                    {
+                        // Quick scan: check if K at position seq_len-1 is all zeros.
+                        // If so, binary search for the boundary.
+                        auto is_k_zero = [&](int64_t pos) -> bool {
+                            for (int64_t d = 0; d < head_dim; d++) {
+                                size_t off = pos * k_nb1 + 0 * k_nb2 + d * k_nb0;
+                                uint16_t val;
+                                memcpy(&val, k_data + off, 2);
+                                if (val != 0) return false;
+                            }
+                            return true;
+                        };
+                        if (is_k_zero(seq_len - 1)) {
+                            int64_t lo = 0, hi = seq_len - 1;
+                            while (lo < hi) {
+                                int64_t mid = (lo + hi + 1) / 2;
+                                if (is_k_zero(mid)) hi = mid - 1;
+                                else lo = mid;
+                            }
+                            actual_seq_len = lo + 1;
+                        }
+                    }
+                    if (poc_dbg) {
+                        fprintf(stderr, "    actual_seq_len=%lld (padded=%lld)\n",
+                                (long long)actual_seq_len, (long long)seq_len);
+                    }
+
                     // Process each KV head.
                     for (int64_t kv_h = 0; kv_h < num_kv_heads; kv_h++) {
                         // --- Prepare KV buffer (interleaved K/V, bf16) ---
                         {
                             auto kv_ptr = fk_entry->bo_kv->map<char *>();
-                            for (int64_t pos = 0; pos < seq_len; pos++) {
+                            // Zero entire BO first — unused positions must be zero
+                            // so the kernel's online softmax doesn't dilute attention.
+                            memset(kv_ptr, 0, (size_t)(1 * seq_len * 2 * row_bytes));
+                            for (int64_t pos = 0; pos < actual_seq_len; pos++) {
                                 // K: copy head_dim elements → bf16 in KV buffer.
                                 size_t dst_k = pos * 2 * row_bytes;
                                 const bool k_is_f16 = (flowkv_poc_k_perm->type == GGML_TYPE_F16);
@@ -11293,6 +11327,20 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                             for (int64_t d = 0; d < head_dim; d += 2) {
                                 memcpy(q_ptr + angles_off + d * 2, angle_cos_bf16, 2);
                                 memcpy(q_ptr + angles_off + d * 2 + 2, angle_sin_bf16, 2);
+                            }
+                            // Encode actual_seq_len as bf16 at angles[64] (byte offset
+                            // angles_off + 128). The kernel reads this to skip empty
+                            // KV positions that would dilute the softmax.
+                            {
+                                float f = (float)actual_seq_len;
+                                uint32_t bits;
+                                memcpy(&bits, &f, 4);
+                                uint16_t bf = (uint16_t)(bits >> 16);
+                                if ((bits & 0x7FFFFFFF) < 0x7F800000) {
+                                    uint32_t rounding = 0x7FFF + ((bf & 1) ^ 1);
+                                    bf = (uint16_t)((bits + rounding) >> 16);
+                                }
+                                memcpy(q_ptr + angles_off + head_dim * 2, &bf, 2);
                             }
                             fk_entry->bo_q->sync(XCL_BO_SYNC_BO_TO_DEVICE);
                         }
