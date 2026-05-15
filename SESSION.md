@@ -6,42 +6,66 @@
 
 Hardware: STX NPU2, 8 columns, model: llama-3.2-1b-BF16
 
-Статус: **DMA OFFSET BUG CONFIRMED** — K DMA систематически читает со смещением +16384 bf16 от BD offset. Это hardware/driver уровень.
+Статус: **ROOT CAUSE FOUND & FIXED** — K/V argument swap в design.py (коммит-диагностик `a7f0bef` не был откачен). Фикс: IRON-windows `7999a4f`.
 
-## Тесты (2026-05-16)
+## 🔧 ФИКС: Argument Swap (2026-05-16 04:39)
+
+### Корневая причина
+
+Коммит `a7f0bef` в IRON-windows **поменял порядок аргументов** runtime sequence как diagnostic test:
+```diff
+-    with rt.sequence(L3_K_ty, L3_V_ty, L3_Q_ty, L3_O_ty) as (K, V, Q, O):
++    with rt.sequence(L3_V_ty, L3_K_ty, L3_Q_ty, L3_O_ty) as (V, K, Q, O):
+```
+Коммит **не был откачен** после тестирования.
+
+### Цепочка маппинга (до фикса)
+
+```
+design.py:  rt.sequence(L3_V_ty, L3_K_ty, ...) → V=arg0, K=arg1
+MLIR:       K_0 DMA reads %arg1, V_0 DMA reads %arg0
+XRT:        arg0 → group_id(3), arg1 → group_id(4)
+host:       bo_k → group_id(3) = arg0 ← design ждёт V!
+            bo_v → group_id(4) = arg1 ← design ждёт K!
+```
+
+**Итого:** K DMA читает V данные, V DMA читает K данные.
+
+### Фикс
+
+IRON-windows commit `7999a4f`:
+1. **Revert arg order**: `L3_V_ty, L3_K_ty` → `L3_K_ty, L3_V_ty`
+2. **Remove DIAG offset +64** в `make_k_tap()` — diagnostic из `f208050`, больше не нужен
+
+### Почему все предыдущие тесты выглядели как "phantom +32KB offset"
+
+- Shared buffer: K DMA читает arg1=V → V data начинается со смещения 16384 bf16 = **32KB** от начала → выглядит как phantom offset ✓
+- Separate buffer: K DMA читает из V-буфера (чужой буфер) → random garbage ✓
+- Swap args: двойной swap → обратно к V data ✓
+- Все тесты стабильны (не random) → потому что swap детерминирован ✓
+
+**Phantom offset гипотеза (driver header alignment) — артефакт argument swap'а.** Не нуждается в отдельном тестировании.
+
+### Статус diagnostic инструментов
+
+- `xdna_diag_offset.cpp` — не использовался, можно удалить
+- `patch_flowkv_diag.patch` — не наложен на код, можно удалить
+- `debug_flowkv_diag.bat` — diagnostic шаг 1.5 не сработал (код не в бинарнике)
+
+### Следующий шаг
+
+Пересобрать IRON MLIR с фиксом → пересобрать llama.cpp-xdna → тест. Ожидание: FlowKV output = корректный текст.
+
+---
+
+## История тестов (2026-05-16, до фикса)
 
 | Тест | K BD offset | K DMA читает из | Ожидание | Результат |
 |------|------------|-----------------|----------|-----------|
-| Shared buffer | 0 | 16384 (V data) | 0 (K data) | BUG: +16384 |
-| Separate buffers | 0 | past buffer end (random) | 0 (K data) | BUG: +16384 |
-| Swap args (%arg1) | 0 | past buffer end (random) | V data | BUG: +16384 |
-| IRON swap MLIR | %arg1 | past buffer end (random) | V data | BUG: +16384 |
-
-**Вывод:** DMA BD offset не применяется корректно. DMA всегда читает со смещением +16384 bf16 (32768 bytes) от начала буфера, независимо от BD offset в MLIR.
-
-**Подтверждение:**
-- Shared buffer (65536 bytes): offset 0 + 16384 = 16384 → V data ✓
-- Separate buffer (32768 bytes): offset 0 + 16384 = 16384 → past end → random ✓
-- Все 240 dispatch'ей в shared buffer тесте: K_DIAG = V[0] (стабильно)
-- Все dispatch'и в separate buffer тесте: K_DIAG = random (каждый раз разный)
-
-## Workaround
-
-Разделить K и V на отдельные буферы **НЕ работает**, т.к. DMA читает за пределы буфера.
-
-**Возможные workaround'ы:**
-1. **Увеличить K буфер до 65536 bytes** (как shared buffer) — DMA будет читать из "V-зоны" (offset 16384), но т.к. V теперь в отдельном буфере, эта зона будет содержать мусор. Не помогает.
-2. **Вернуть shared buffer и поместить K data в V-зону** — DMA читает из offset 16384 → туда положить K data. Но V DMA тоже будет читать из неправильного offset.
-3. **Использовать другой shim tile** для K DMA — попробовать `shim_noc_tile_1_0` вместо `shim_noc_tile_0_0`.
-4. **Изменить BD offset** — проверить, игнорирует ли DMA BD offset полностью, или добавляет +16384 к любому offset.
-
-## Следующий тест
-
-Изменить BD offset K DMA с 0 на другое значение (например 64) и проверить, изменится ли K_DIAG:
-- Если K_DIAG не изменится → DMA полностью игнорирует BD offset
-- Если K_DIAG изменится → DMA добавляет +16384 к BD offset
-
-**Тест запущен (2026-05-16 03:22):** K TAP offset = 64 вместо 0 (IRON-windows `f208050`). Ожидание: K_DIAG изменится если DMA использует BD offset.
+| Shared buffer | 0 | 16384 (V data) | 0 (K data) | swap: читает V ✓ |
+| Separate buffers | 0 | V buffer (чужой) | 0 (K data) | swap: читает V ✓ |
+| Swap args (%arg1) | 0 | V data | V data | double swap ✓ |
+| K TAP offset +64 | 64 | V data + 64 | K data + 64 | swap ✓ |
 
 ---
 
