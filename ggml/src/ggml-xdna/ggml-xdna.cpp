@@ -11495,6 +11495,52 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                 fflush(stderr);
                             }
 
+                            // === PHANTOM OFFSET DIAGNOSTIC ===
+                            {
+                                static bool diag_enabled = xdna_env_enabled("XDNA_DIAG_OFFSET");
+                                if (diag_enabled && kv_h == 0) {
+                                    uint64_t addr_k    = fk_entry->bo_k->address();
+                                    uint64_t addr_v    = fk_entry->bo_v->address();
+                                    uint64_t addr_q    = fk_entry->bo_q->address();
+                                    uint64_t addr_out  = fk_entry->bo_out->address();
+                                    fprintf(stderr, "\n=== XDNA_DIAG_OFFSET: FlowKV BO addresses (kv_h=0) ===\n");
+                                    fprintf(stderr, "  bo_k   (group_id 3): 0x%016llX  size=%zu\n",
+                                            (unsigned long long)addr_k, (size_t)k_size);
+                                    fprintf(stderr, "  bo_v   (group_id 4): 0x%016llX  size=%zu\n",
+                                            (unsigned long long)addr_v, (size_t)v_size);
+                                    fprintf(stderr, "  bo_q   (group_id 5): 0x%016llX  size=%zu\n",
+                                            (unsigned long long)addr_q, (size_t)q_size);
+                                    fprintf(stderr, "  bo_out (group_id 6): 0x%016llX  size=%zu\n",
+                                            (unsigned long long)addr_out, (size_t)out_size);
+                                    fprintf(stderr, "  K→V delta: %lld bytes (%lld KB)\n",
+                                            (long long)(addr_v - addr_k), (long long)(addr_v - addr_k) / 1024);
+                                    fprintf(stderr, "  K→Q delta: %lld bytes (%lld KB)\n",
+                                            (long long)(addr_q - addr_k), (long long)(addr_q - addr_k) / 1024);
+
+                                    // Create a second K buffer with ::normal flag to compare
+                                    try {
+                                        xrt::bo bo_k_normal(ctx->device, k_size, xrt::bo::flags::normal,
+                                                            fk_entry->kernel.group_id(3));
+                                        uint64_t addr_k_normal = bo_k_normal.address();
+                                        fprintf(stderr, "  bo_k_normal (normal flag):   0x%016llX\n",
+                                                (unsigned long long)addr_k_normal);
+                                        int64_t flag_delta = (int64_t)addr_k - (int64_t)addr_k_normal;
+                                        fprintf(stderr, "  host_only - normal delta: %lld bytes (%lld KB)\n",
+                                                (long long)flag_delta, (long long)flag_delta / 1024);
+                                        if (flag_delta == 32768 || flag_delta == -32768) {
+                                            fprintf(stderr, "  *** PHANTOM OFFSET CONFIRMED: 32KB metadata prefix! ***\n");
+                                        } else if (flag_delta == 0) {
+                                            fprintf(stderr, "  No phantom offset (delta=0)\n");
+                                        }
+                                    } catch (const std::exception & e) {
+                                        fprintf(stderr, "  [WARN] normal alloc failed: %s\n", e.what());
+                                    }
+                                    fprintf(stderr, "=== END XDNA_DIAG_OFFSET ===\n\n");
+                                    fflush(stderr);
+                                }
+                            }
+                            // === END PHANTOM OFFSET DIAGNOSTIC ===
+
                             // Use set_arg with all 8 kernel args
                             auto run = xrt::run(fk_entry->kernel);
                             run.set_arg(0, 3u);  // opcode
