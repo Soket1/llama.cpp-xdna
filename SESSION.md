@@ -34,9 +34,15 @@ K_DIAG    [0:8]: 0x3BE7 0x3D0F 0x3CD3 0x3C79 0x3C8C 0xBBC6 0x3C69 0x3C00  ← DM
 - **Phantom offset** — основная причина. `host_only` буфер маппится в AIE address space со смещением.
 - Diagnostic был вставлен в **per_head path** (не используется), нужен в **POC path** (используется) → исправлено в `d1d3dc125`.
 
+### Результат diagnostic (`6b5a5cf83`):
+
+- BO адреса корректны: bo_k=0xC2A000, bo_v=0xC32000, K→V delta=32KB (размер bo_k)
+- `xrt::bo::flags::normal` **не поддерживается** XDNA драйвером: `unsupported buffer type: invalid argument`
+- K[0] в BO правильный (0x3E39...), K_DIAG другой (0x3BE7...) — DMA читает не оттуда
+
 ### Следующий шаг
 
-Запустить `debug_flowkv_diag.bat` с обновлённым кодом (`d1d3dc125`). STEP 2 покажет `XDNA_DIAG_OFFSET` в POC path — адреса всех BO + сравнение `host_only` vs `normal` флаг.
+Запустить `debug_flowkv_diag.bat` с `6b5a5cf83`. STEP 2 попробует `svm`, `p2p`, `cacheable` флаги и сравнит адреса с `host_only`. Если `svm` даёт другой адрес → phantom offset confirmed.
 
 ---
 
