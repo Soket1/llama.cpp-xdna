@@ -180,3 +180,57 @@ ggml scheduler разбивает attention на 3 graph_compute:
 ### Кэш ключ:
 
 `flowkv_H4_KV1_d64_S256_C32_1col` — H=q_heads_per_kv, KV=1, d=head_dim, S=seq_len, C=chunk_size
+
+---
+
+## Сессия 2026-05-16: Подтверждение NoC cache coherency + фикс
+
+### Загружены логи отладки (debug_flowkv.bat):
+
+- step2_output.log — без FlowKV: "The capital of France is Paris." (0.9 t/s) ✓
+- step3_flowkv_output.log — с FlowKV: мусор "Theablicc dio欠..." (1.4 t/s) ✗
+- step3_flowkv_xdna.log — 9.5MB, полный diagnostic вывод
+- step2_xdna.log — нормальный лог без FlowKV
+- flowkv_debug.mlir — MLIR для FlowKV kernel
+- debug_flowkv.bat — скрипт отладки (step0-4)
+
+### Диагностический вывод (240 dispatches, все идентичны):
+
+```
+[DIAG-SYNC] bo_kv verify after FROM_DEVICE:
+  K[0][0:8]: 0x3E39 0x3D9F 0x3E28 0x3E02 0xBB90 0x3E08 0xBDF3 0xBD73
+  K[0] match=YES                          ← host→DDR sync работает ✓
+
+[DIAG-POST] bo_kv after dispatch:
+  K[0][0:8]: 0x3E39 0x3D9F 0x3E28 0x3E02 0xBB90 0x3E08 0xBDF3 0xBD73
+  ← DMA не портит source buffer ✓
+
+[DIAG-COMPARE] kv_h=0:
+  Host  K[0][0:8]: 0x3E39 0x3D9F 0x3E28 0x3E02 0xBB90 0x3E08 0xBDF3 0xBD73
+  K_DIAG    [0:8]: 0x3BD5 0x3D0F 0x3CD3 0x3C7A 0x3C92 0xBBB1 0x3C75 0x3C0F
+  Match count (first 8): 0/8 → ZERO MATCH — DMA reads wrong data! ✗
+```
+
+**Вывод**: проблема 100% в NoC DMA cache coherency. Данные корректны в DDR,
+но DMA controller читает stale данные из кэша. K_DIAG содержит данные,
+которых нет ни в host memory, ни в bo_kv — это мусор из NoC cache.
+
+### Применённый фикс (commit 0e1660509):
+
+```cpp
+// Было (оба места — POC path + per_head path):
+xrt::bo(ctx->device, kv_size, xrt::bo::flags::host_only, ...)
+
+// Стало:
+xrt::bo(ctx->device, kv_size, xrt::bo::flags::cacheable, ...)
+```
+
+`cacheable` уже используется в коде для insts_bo (строки 1162, 1822).
+Флаг включает когерентность кэша между host и AIE NoC DMA controller.
+
+### Следующий шаг:
+
+- Собрать на Windows с фиксом, запустить debug_flowkv.bat
+- Если K_DIAG match > 0 → фикс работает, чистить diagnostic код
+- Если всё ещё 0/8 → попробовать bo_q и bo_out тоже сделать cacheable,
+  или искать explicit cache flush API в XRT
