@@ -6,15 +6,22 @@
 
 Hardware: STX NPU2, 8 columns, model: llama-3.2-1b-BF16
 
-Статус: **FIXED** — K/V разделены на отдельные буферы (bo_k, bo_v) для обхода DMA offset corruption.
+Статус: **DEBUGGING** — K DMA читает random данные даже с separate buffers (bo_k, bo_v). Swap K/V arg order для проверки DMA BD binding.
 
-Ключевая находка (2026-05-16): marker test (bo_kv[0:8]=0xDEAD) доказал — K DMA читает V данные (K_DIAG == V[0]). Проблема НЕ в кэше (cacheable не помог), НЕ в KV layout. Проблема в том, что shim DMA не применяет offset=0 корректно когда K и V DMAs используют один буфер (arg0) с разными offset'ами.
+Ключевая находка (2026-05-16): marker test (bo_kv[0:8]=0xDEAD) доказал — K DMA читает V данные (K_DIAG == V[0]). Проблема НЕ в кэше (cacheable не помог), НЕ в KV layout.
 
-**Фикс (2026-05-16):** Разделение K и V на отдельные XRT буферы:
+**Фикс 1 — Separate buffers (2026-05-16):** Разделение K и V на отдельные XRT буферы:
 - design.py: `rt.sequence(L3_K_ty, L3_V_ty, L3_Q_ty, L3_O_ty)` — 4 аргумента вместо 3
 - op.py: `add_buffer("k_cache", ...)` + `add_buffer("v_cache", ...)` вместо `add_buffer("kv_cache", ...)`
 - ggml-xdna.cpp: `bo_k` + `bo_v` вместо `bo_kv`, каждый с offset=0 в своём буфере
 - IRON xclbin arg layout: opcode(0), insts(1), insts_size(2), K(3), V(4), Q(5), Out(6)
+- **Результат:** K_DMA читает random garbage (0/8 match, разные значения каждый dispatch). Раньше (shared buffer) было стабильно V[0]. Значит separate buffers НЕ решили проблему — DMA BD не привязан к正确的 буферу.
+
+**Фикс 2 — Swap K/V args (2026-05-16):** Проверяем привязку DMA BD к позиции аргумента:
+- design.py: `rt.sequence(L3_V_ty, L3_K_ty, L3_Q_ty, L3_O_ty)` — V на %arg0, K на %arg1
+- ggml-xdna.cpp: `set_arg(3, bo_k)` → %arg0, `set_arg(4, bo_v)` → %arg1
+- Если K_DIAG покажет V данные → DMA BD привязан к %arg0 (correct)
+- Если K_DIAG покажет мусор → DMA BD НЕ привязан к аргументу (compiler bug)
 
 ---
 
