@@ -6,9 +6,15 @@
 
 Hardware: STX NPU2, 8 columns, model: llama-3.2-1b-BF16
 
-Статус: K DMA reads V data despite offset=0 in MLIR — DMA offset corruption when K/V share same buffer (arg0). Testing sequential DMA (separate task_groups) next.
+Статус: **FIXED** — K/V разделены на отдельные буферы (bo_k, bo_v) для обхода DMA offset corruption.
 
-Ключевая находка (2026-05-16): marker test (bo_kv[0:8]=0xDEAD) доказал — K DMA читает V данные (K_DIAG == V[0]). Проблема НЕ в кэше (cacheable не помог), НЕ в KV layout. Проблема в том, что shim DMA не применяет offset=0 корректно когда K и V DMAs запускаются concurrently из одного буфера.
+Ключевая находка (2026-05-16): marker test (bo_kv[0:8]=0xDEAD) доказал — K DMA читает V данные (K_DIAG == V[0]). Проблема НЕ в кэше (cacheable не помог), НЕ в KV layout. Проблема в том, что shim DMA не применяет offset=0 корректно когда K и V DMAs используют один буфер (arg0) с разными offset'ами.
+
+**Фикс (2026-05-16):** Разделение K и V на отдельные XRT буферы:
+- design.py: `rt.sequence(L3_K_ty, L3_V_ty, L3_Q_ty, L3_O_ty)` — 4 аргумента вместо 3
+- op.py: `add_buffer("k_cache", ...)` + `add_buffer("v_cache", ...)` вместо `add_buffer("kv_cache", ...)`
+- ggml-xdna.cpp: `bo_k` + `bo_v` вместо `bo_kv`, каждый с offset=0 в своём буфере
+- IRON xclbin arg layout: opcode(0), insts(1), insts_size(2), K(3), V(4), Q(5), Out(6)
 
 ---
 

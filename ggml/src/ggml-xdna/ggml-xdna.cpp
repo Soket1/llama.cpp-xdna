@@ -572,10 +572,12 @@ struct xdna_flowkv_entry {
     std::string cache_key;
 
     // Persistent BOs (lazy, allocated on first dispatch).
-    //   bo_kv:   interleaved KV cache (num_kv_heads * seq_len * 2 * head_dim bf16)
+    //   bo_k:    K cache (num_kv_heads * seq_len * head_dim bf16)
+    //   bo_v:    V cache (num_kv_heads * seq_len * head_dim bf16)
     //   bo_q:    packed Q + RoPE angles (num_kv_heads * (group_size*head_dim + head_dim) bf16)
     //   bo_out:  attention output (num_heads * head_dim bf16)
-    std::unique_ptr<xrt::bo> bo_kv;
+    std::unique_ptr<xrt::bo> bo_k;
+    std::unique_ptr<xrt::bo> bo_v;
     std::unique_ptr<xrt::bo> bo_q;
     std::unique_ptr<xrt::bo> bo_out;
 
@@ -4508,113 +4510,89 @@ static bool ggml_backend_xdna_flowkv_per_head(
         if (!entry) { all_ok = false; continue; }
 
         try {
-            if (!entry->bo_kv) {
-                size_t kv_size = 1 * seq_len * 2 * head_dim * sizeof(uint16_t);
-                entry->bo_kv = std::make_unique<xrt::bo>(
-                    xrt::bo(ctx->device, kv_size, xrt::bo::flags::host_only,
+            if (!entry->bo_k) {
+                size_t k_size = 1 * seq_len * head_dim * sizeof(uint16_t);
+                entry->bo_k = std::make_unique<xrt::bo>(
+                    xrt::bo(ctx->device, k_size, xrt::bo::flags::host_only,
                             entry->kernel.group_id(3)));
+            }
+            if (!entry->bo_v) {
+                size_t v_size = 1 * seq_len * head_dim * sizeof(uint16_t);
+                entry->bo_v = std::make_unique<xrt::bo>(
+                    xrt::bo(ctx->device, v_size, xrt::bo::flags::host_only,
+                            entry->kernel.group_id(4)));
             }
             if (!entry->bo_q) {
                 size_t q_size = 1 * (group_size * head_dim + head_dim) * sizeof(uint16_t);
                 entry->bo_q = std::make_unique<xrt::bo>(
                     xrt::bo(ctx->device, q_size, xrt::bo::flags::host_only,
-                            entry->kernel.group_id(4)));
+                            entry->kernel.group_id(5)));
             }
             if (!entry->bo_out) {
                 size_t out_size = group_size * head_dim * sizeof(uint16_t);
                 entry->bo_out = std::make_unique<xrt::bo>(
                     xrt::bo(ctx->device, out_size, xrt::bo::flags::host_only,
-                            entry->kernel.group_id(5)));
+                            entry->kernel.group_id(6)));
             }
 
-            // --- Prepare KV cache buffer ---
+            // --- Prepare K cache buffer ---
             {
-                auto kv_ptr = entry->bo_kv->map<char *>();
+                auto k_ptr = entry->bo_k->map<char *>();
                 const char * k_data = (const char *)k_tensor->data;
-                const char * v_data = (const char *)v_tensor->data;
                 size_t row_bytes = head_dim * sizeof(uint16_t);
-                size_t kv_region = (size_t)seq_len * row_bytes;  // size of K or V region
 
                 size_t k_pos_stride = k_tensor->nb[1];
                 size_t k_head_stride = k_tensor->ne[2] > 1 ? k_tensor->nb[2] : 0;
-                size_t v_pos_stride = v_tensor->nb[1];
-                size_t v_head_stride = v_tensor->ne[2] > 1 ? v_tensor->nb[2] : 0;
 
                 const bool k_f16 = (k_tensor->type == GGML_TYPE_F16);
-                const bool v_f16 = (v_tensor->type == GGML_TYPE_F16);
 
                 for (int64_t pos = 0; pos < seq_len; pos++) {
-                    size_t dst_k = pos * row_bytes;
-                    size_t src_k = pos * k_pos_stride + kv_h * k_head_stride;
+                    size_t dst = pos * row_bytes;
+                    size_t src = pos * k_pos_stride + kv_h * k_head_stride;
                     if (k_f16) {
                         for (int64_t d = 0; d < head_dim; d++) {
                             ggml_fp16_t f16_val;
-                            memcpy(&f16_val, k_data + src_k + d * sizeof(ggml_fp16_t), sizeof(ggml_fp16_t));
+                            memcpy(&f16_val, k_data + src + d * sizeof(ggml_fp16_t), sizeof(ggml_fp16_t));
                             float f32_val = ggml_fp16_to_fp32(f16_val);
                             uint16_t bf16_val;
                             f32_to_bf16(&f32_val, &bf16_val, 1);
-                            memcpy(kv_ptr + dst_k + d * 2, &bf16_val, 2);
+                            memcpy(k_ptr + dst + d * 2, &bf16_val, 2);
                         }
                     } else {
-                        memcpy(kv_ptr + dst_k, k_data + src_k, row_bytes);
+                        memcpy(k_ptr + dst, k_data + src, row_bytes);
                     }
+                }
+                entry->bo_k->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            }
 
-                    size_t dst_v = kv_region + pos * row_bytes;
-                    size_t src_v = pos * v_pos_stride + kv_h * v_head_stride;
+            // --- Prepare V cache buffer ---
+            {
+                auto v_ptr = entry->bo_v->map<char *>();
+                const char * v_data = (const char *)v_tensor->data;
+                size_t row_bytes = head_dim * sizeof(uint16_t);
+
+                size_t v_pos_stride = v_tensor->nb[1];
+                size_t v_head_stride = v_tensor->ne[2] > 1 ? v_tensor->nb[2] : 0;
+
+                const bool v_f16 = (v_tensor->type == GGML_TYPE_F16);
+
+                for (int64_t pos = 0; pos < seq_len; pos++) {
+                    size_t dst = pos * row_bytes;
+                    size_t src = pos * v_pos_stride + kv_h * v_head_stride;
                     if (v_f16) {
                         for (int64_t d = 0; d < head_dim; d++) {
                             ggml_fp16_t f16_val;
-                            memcpy(&f16_val, v_data + src_v + d * sizeof(ggml_fp16_t), sizeof(ggml_fp16_t));
+                            memcpy(&f16_val, v_data + src + d * sizeof(ggml_fp16_t), sizeof(ggml_fp16_t));
                             float f32_val = ggml_fp16_to_fp32(f16_val);
                             uint16_t bf16_val;
                             f32_to_bf16(&f32_val, &bf16_val, 1);
-                            memcpy(kv_ptr + dst_v + d * 2, &bf16_val, 2);
+                            memcpy(v_ptr + dst + d * 2, &bf16_val, 2);
                         }
                     } else {
-                        memcpy(kv_ptr + dst_v, v_data + src_v, row_bytes);
+                        memcpy(v_ptr + dst, v_data + src, row_bytes);
                     }
                 }
-                entry->bo_kv->sync(XCL_BO_SYNC_BO_TO_DEVICE);
-
-                // === DIAG: verify host→DDR coherency ===
-                // Re-read bo_kv from device memory and compare with what we wrote.
-                // If these differ → host cache not flushed to DDR.
-                // If these match but kernel still sees wrong data → NoC/DMA cache issue.
-                if (dbg && kv_h == 0) {
-                    // Save what we wrote
-                    uint16_t pre_k0[8], pre_k1[8], pre_v0[8];
-                    memcpy(pre_k0, kv_ptr + 0, 16);
-                    memcpy(pre_k1, kv_ptr + row_bytes, 16);
-                    memcpy(pre_v0, kv_ptr + kv_region, 16);
-
-                    // Sync back from device (read DDR into host buffer)
-                    entry->bo_kv->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-                    auto verify_ptr = reinterpret_cast<const uint16_t*>(kv_ptr);
-
-                    fprintf(stderr, "  [DIAG-SYNC] bo_kv verify after FROM_DEVICE:\n");
-                    fprintf(stderr, "    K[0][0:8]: 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X\n",
-                        verify_ptr[0], verify_ptr[1], verify_ptr[2], verify_ptr[3],
-                        verify_ptr[4], verify_ptr[5], verify_ptr[6], verify_ptr[7]);
-                    fprintf(stderr, "    K[1][0:8]: 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X\n",
-                        verify_ptr[64], verify_ptr[65], verify_ptr[66], verify_ptr[67],
-                        verify_ptr[68], verify_ptr[69], verify_ptr[70], verify_ptr[71]);
-                    fprintf(stderr, "    V[0][0:8]: 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X\n",
-                        verify_ptr[kv_region/2], verify_ptr[kv_region/2+1],
-                        verify_ptr[kv_region/2+2], verify_ptr[kv_region/2+3],
-                        verify_ptr[kv_region/2+4], verify_ptr[kv_region/2+5],
-                        verify_ptr[kv_region/2+6], verify_ptr[kv_region/2+7]);
-
-                    // Check match
-                    bool k0_match = (memcmp(pre_k0, kv_ptr, 16) == 0);
-                    bool k1_match = (memcmp(pre_k1, kv_ptr + row_bytes, 16) == 0);
-                    fprintf(stderr, "    K[0] match=%s  K[1] match=%s\n",
-                        k0_match ? "YES" : "NO!!", k1_match ? "YES" : "NO!!");
-                    fflush(stderr);
-
-                    // Re-sync TO_DEVICE since FROM_DEVICE overwrote our buffer
-                    entry->bo_kv->sync(XCL_BO_SYNC_BO_TO_DEVICE);
-                }
-                // === END DIAG ===
+                entry->bo_v->sync(XCL_BO_SYNC_BO_TO_DEVICE);
             }
 
             // --- Prepare Q buffer ---
@@ -4645,10 +4623,10 @@ static bool ggml_backend_xdna_flowkv_per_head(
 
             // --- Dispatch ---
             // IRON xclbin arg layout: opcode(0), insts(1), insts_size(2),
-            // DDR_buf_0(3)=kv, DDR_buf_1(4)=q, DDR_buf_2(5)=out
+            // DDR_buf_0(3)=k, DDR_buf_1(4)=v, DDR_buf_2(5)=q, DDR_buf_3(6)=out
             auto run = entry->kernel(
                 3, entry->insts_bo, (uint32_t)entry->insts_data.size(),
-                *entry->bo_kv, *entry->bo_q, *entry->bo_out);
+                *entry->bo_k, *entry->bo_v, *entry->bo_q, *entry->bo_out);
 
             {
                 std::lock_guard<std::mutex> lock(*entry->mu);
@@ -4669,17 +4647,16 @@ static bool ggml_backend_xdna_flowkv_per_head(
                     fprintf(stderr, "ggml-xdna: [FlowKV-POC] kv_h=%lld dispatched %.2f ms\n",
                             (long long)kv_h, ms);
 
-                    // === DIAG: post-dispatch bo_kv integrity check ===
-                    // Verify DMA didn't corrupt the source buffer.
+                    // === DIAG: post-dispatch bo_k integrity check ===
                     if (kv_h == 0) {
-                        entry->bo_kv->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+                        entry->bo_k->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
                         auto post_ptr = reinterpret_cast<const uint16_t*>(
-                            entry->bo_kv->map<char *>());
-                        fprintf(stderr, "  [DIAG-POST] bo_kv after dispatch:\n");
+                            entry->bo_k->map<char *>());
+                        fprintf(stderr, "  [DIAG-POST] bo_k after dispatch:\n");
                         fprintf(stderr, "    K[0][0:8]: 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X\n",
                             post_ptr[0], post_ptr[1], post_ptr[2], post_ptr[3],
                             post_ptr[4], post_ptr[5], post_ptr[6], post_ptr[7]);
-                        fprintf(stderr, "    bo_kv addr=%p bo_out addr=%p\n",
+                        fprintf(stderr, "    bo_k addr=%p bo_out addr=%p\n",
                             (void*)post_ptr, (void*)entry->bo_out->map<char *>());
                         fflush(stderr);
                     }
@@ -4698,14 +4675,14 @@ static bool ggml_backend_xdna_flowkv_per_head(
                     // K_DIAG is written to the last head slot by the kernel
                     size_t kdiag_off = (num_heads - 1) * out_head_bytes;
                     const uint16_t * kdiag = reinterpret_cast<const uint16_t*>(out_ptr + kdiag_off);
-                    // Re-read bo_kv to get host K[0]
-                    entry->bo_kv->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-                    auto kv_verify = reinterpret_cast<const uint16_t*>(entry->bo_kv->map<char *>());
+                    // Re-read bo_k to get host K[0]
+                    entry->bo_k->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+                    auto k_verify = reinterpret_cast<const uint16_t*>(entry->bo_k->map<char *>());
 
                     fprintf(stderr, "  [DIAG-COMPARE] kv_h=0:\n");
                     fprintf(stderr, "    Host  K[0][0:8]: 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X\n",
-                        kv_verify[0], kv_verify[1], kv_verify[2], kv_verify[3],
-                        kv_verify[4], kv_verify[5], kv_verify[6], kv_verify[7]);
+                        k_verify[0], k_verify[1], k_verify[2], k_verify[3],
+                        k_verify[4], k_verify[5], k_verify[6], k_verify[7]);
                     fprintf(stderr, "    K_DIAG    [0:8]: 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X\n",
                         kdiag[0], kdiag[1], kdiag[2], kdiag[3],
                         kdiag[4], kdiag[5], kdiag[6], kdiag[7]);
@@ -4713,21 +4690,10 @@ static bool ggml_backend_xdna_flowkv_per_head(
                     // Check if any of the first 8 match
                     int match_count = 0;
                     for (int i = 0; i < 8; i++) {
-                        if (kdiag[i] == kv_verify[i]) match_count++;
+                        if (kdiag[i] == k_verify[i]) match_count++;
                     }
                     fprintf(stderr, "    Match count (first 8): %d/8 → %s\n",
                         match_count, match_count > 0 ? "PARTIAL MATCH" : "ZERO MATCH — DMA reads wrong data!");
-
-                    // Also dump bo_out raw first 8 for context
-                    fprintf(stderr, "    bo_out raw[0:8]: 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X\n",
-                        reinterpret_cast<const uint16_t*>(out_ptr)[0],
-                        reinterpret_cast<const uint16_t*>(out_ptr)[1],
-                        reinterpret_cast<const uint16_t*>(out_ptr)[2],
-                        reinterpret_cast<const uint16_t*>(out_ptr)[3],
-                        reinterpret_cast<const uint16_t*>(out_ptr)[4],
-                        reinterpret_cast<const uint16_t*>(out_ptr)[5],
-                        reinterpret_cast<const uint16_t*>(out_ptr)[6],
-                        reinterpret_cast<const uint16_t*>(out_ptr)[7]);
                     fflush(stderr);
                 }
                 // === END DIAG ===
@@ -11123,24 +11089,30 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
 
                     // Allocate BOs if needed.
                     // IRON xclbin arg layout: opcode(0), insts(1), insts_size(2),
-                    // DDR_buf_0(3)=kv, DDR_buf_1(4)=q, DDR_buf_2(5)=out
-                    size_t kv_size = 1 * seq_len * 2 * row_bytes;
-                    if (!fk_entry->bo_kv) {
-                        fk_entry->bo_kv = std::make_unique<xrt::bo>(
-                            xrt::bo(ctx->device, kv_size, xrt::bo::flags::host_only,
+                    // DDR_buf_0(3)=k, DDR_buf_1(4)=v, DDR_buf_2(5)=q, DDR_buf_3(6)=out
+                    size_t k_size = 1 * seq_len * row_bytes;
+                    if (!fk_entry->bo_k) {
+                        fk_entry->bo_k = std::make_unique<xrt::bo>(
+                            xrt::bo(ctx->device, k_size, xrt::bo::flags::host_only,
                                     fk_entry->kernel.group_id(3)));
+                    }
+                    size_t v_size = 1 * seq_len * row_bytes;
+                    if (!fk_entry->bo_v) {
+                        fk_entry->bo_v = std::make_unique<xrt::bo>(
+                            xrt::bo(ctx->device, v_size, xrt::bo::flags::host_only,
+                                    fk_entry->kernel.group_id(4)));
                     }
                     size_t q_size = 1 * (q_heads_per_kv * head_dim + head_dim + 2) * sizeof(uint16_t);  // +2 for actual_seq_len + DMA alignment
                     if (!fk_entry->bo_q) {
                         fk_entry->bo_q = std::make_unique<xrt::bo>(
                             xrt::bo(ctx->device, q_size, xrt::bo::flags::host_only,
-                                    fk_entry->kernel.group_id(4)));
+                                    fk_entry->kernel.group_id(5)));
                     }
                     size_t out_size = q_heads_per_kv * row_bytes;
                     if (!fk_entry->bo_out) {
                         fk_entry->bo_out = std::make_unique<xrt::bo>(
                             xrt::bo(ctx->device, out_size, xrt::bo::flags::host_only,
-                                    fk_entry->kernel.group_id(5)));
+                                    fk_entry->kernel.group_id(6)));
                     }
 
                     // Diagnostic: save CPU result before overwriting
@@ -11328,26 +11300,18 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
 
                     // Process each KV head.
                     for (int64_t kv_h = 0; kv_h < num_kv_heads; kv_h++) {
-                        // --- Prepare KV buffer (contiguous K then V, bf16) ---
-                        // Layout: [K_pos0 K_pos1 ... K_posN | V_pos0 V_pos1 ... V_posN]
-                        // Each region = seq_len * head_dim * 2 bytes.
+                        // --- Prepare K buffer (bf16) ---
                         {
-                            auto kv_ptr = fk_entry->bo_kv->map<char *>();
-                            // Zero entire BO first — unused positions must be zero
-                            // so the kernel's online softmax doesn't dilute attention.
-                            memset(kv_ptr, 0, (size_t)(1 * seq_len * 2 * row_bytes));
-                            size_t kv_region = (size_t)seq_len * row_bytes;  // size of K or V region
+                            auto k_ptr = fk_entry->bo_k->map<char *>();
+                            memset(k_ptr, 0, (size_t)(1 * seq_len * row_bytes));
                             for (int64_t pos = 0; pos < actual_seq_len; pos++) {
-                                // K: copy head_dim elements → bf16 in K region.
-                                size_t dst_k = pos * row_bytes;
+                                size_t dst = pos * row_bytes;
                                 const bool k_is_f16 = (flowkv_poc_k_perm->type == GGML_TYPE_F16);
                                 if (k_is_f32) {
-                                    // f32 K: convert each element to bf16.
                                     const float * src = (const float *)(k_data + pos * k_nb1 + kv_h * k_nb2);
-                                    uint16_t * dst = (uint16_t *)(kv_ptr + dst_k);
-                                    f32_to_bf16(src, dst, (size_t)head_dim);
+                                    uint16_t * dst_bf16 = (uint16_t *)(k_ptr + dst);
+                                    f32_to_bf16(src, dst_bf16, (size_t)head_dim);
                                 } else if (k_is_f16) {
-                                    // f16 K: convert f16→f32→bf16.
                                     size_t src_k = pos * k_nb1 + kv_h * k_nb2;
                                     for (int64_t d = 0; d < head_dim; d++) {
                                         ggml_fp16_t f16_val;
@@ -11355,43 +11319,43 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                         float f32_val = ggml_fp16_to_fp32(f16_val);
                                         uint16_t bf16_val;
                                         f32_to_bf16(&f32_val, &bf16_val, 1);
-                                        memcpy(kv_ptr + dst_k + d * 2, &bf16_val, 2);
+                                        memcpy(k_ptr + dst + d * 2, &bf16_val, 2);
                                     }
                                 } else {
-                                    // bf16 K: direct copy.
                                     size_t src_k = pos * k_nb1 + kv_h * k_nb2;
-                                    memcpy(kv_ptr + dst_k, k_data + src_k, row_bytes);
+                                    memcpy(k_ptr + dst, k_data + src_k, row_bytes);
                                 }
+                            }
+                            fk_entry->bo_k->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                        }
 
-                                // V: copy head_dim elements → bf16 in V region.
-                                size_t dst_v = kv_region + pos * row_bytes;
+                        // --- Prepare V buffer (bf16) ---
+                        {
+                            auto v_ptr = fk_entry->bo_v->map<char *>();
+                            memset(v_ptr, 0, (size_t)(1 * seq_len * row_bytes));
+                            for (int64_t pos = 0; pos < actual_seq_len; pos++) {
+                                size_t dst = pos * row_bytes;
                                 const bool v_is_f16 = (flowkv_poc_v_perm->type == GGML_TYPE_F16);
                                 if (v_is_f32) {
-                                    // f32 V: gather with stride conversion.
-                                    uint16_t * dst = (uint16_t *)(kv_ptr + dst_v);
+                                    uint16_t * dst_bf16 = (uint16_t *)(v_ptr + dst);
                                     if (v_nb0 == (size_t)head_dim * 4) {
-                                        // V layout: [head_dim, seq_len, kv_heads] → contiguous f32
                                         const float * src = (const float *)(v_data + pos * v_nb1 + kv_h * v_nb2);
-                                        f32_to_bf16(src, dst, (size_t)head_dim);
+                                        f32_to_bf16(src, dst_bf16, (size_t)head_dim);
                                     } else {
-                                        // V layout: [seq_len, head_dim, kv_heads] → strided f32
                                         for (int64_t d = 0; d < head_dim; d++) {
                                             const float * src = (const float *)(v_data + pos * v_nb0 + d * v_nb1 + kv_h * v_nb2);
                                             float val = *src;
-                                            // Manual f32→bf16 round-to-nearest-even.
                                             uint32_t bits;
                                             memcpy(&bits, &val, 4);
                                             uint16_t bf = (uint16_t)(bits >> 16);
-                                            // Round: add 0x7FFF + round-bit, then shift.
                                             if ((bits & 0x7FFFFFFF) < 0x7F800000) {
                                                 uint32_t rounding = 0x7FFF + ((bf & 1) ^ 1);
                                                 bf = (uint16_t)((bits + rounding) >> 16);
                                             }
-                                            memcpy(kv_ptr + dst_v + d * 2, &bf, 2);
+                                            memcpy(v_ptr + dst + d * 2, &bf, 2);
                                         }
                                     }
                                 } else if (v_is_f16) {
-                                    // f16 V: convert f16→f32→bf16 with stride gather.
                                     for (int64_t d = 0; d < head_dim; d++) {
                                         size_t src_v = pos * v_nb0 + d * v_nb1 + kv_h * v_nb2;
                                         ggml_fp16_t f16_val;
@@ -11399,76 +11363,21 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                         float f32_val = ggml_fp16_to_fp32(f16_val);
                                         uint16_t bf16_val;
                                         f32_to_bf16(&f32_val, &bf16_val, 1);
-                                        memcpy(kv_ptr + dst_v + d * 2, &bf16_val, 2);
+                                        memcpy(v_ptr + dst + d * 2, &bf16_val, 2);
                                     }
                                 } else {
-                                    // bf16 V: gather with correct strides.
                                     if (v_nb0 == (size_t)head_dim * 2) {
-                                        // V layout: [head_dim, seq_len, kv_heads] → contiguous bf16
                                         size_t src_v = pos * v_nb1 + kv_h * v_nb2;
-                                        memcpy(kv_ptr + dst_v, v_data + src_v, row_bytes);
+                                        memcpy(v_ptr + dst, v_data + src_v, row_bytes);
                                     } else {
-                                        // V layout: [seq_len, head_dim, kv_heads] → strided bf16
                                         for (int64_t d = 0; d < head_dim; d++) {
                                             size_t src_v = pos * v_nb0 + d * v_nb1 + kv_h * v_nb2;
-                                            memcpy(kv_ptr + dst_v + d * 2, v_data + src_v, 2);
+                                            memcpy(v_ptr + dst + d * 2, v_data + src_v, 2);
                                         }
                                     }
                                 }
                             }
-                            fk_entry->bo_kv->sync(XCL_BO_SYNC_BO_TO_DEVICE);
-
-                            // === DIAG: host→DDR coherency check (POC path) ===
-                            if (poc_dbg && kv_h == 0) {
-                                // Save what we wrote
-                                auto kv_map = fk_entry->bo_kv->map<char *>();
-                                uint16_t pre_k0[8];
-                                memcpy(pre_k0, kv_map, 16);
-
-                                // Sync back from device
-                                fk_entry->bo_kv->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-                                auto verify_ptr = reinterpret_cast<const uint16_t*>(kv_map);
-
-                                fprintf(stderr, "  [DIAG-SYNC] bo_kv verify after FROM_DEVICE:\n");
-                                fprintf(stderr, "    K[0][0:8]: 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X\n",
-                                    verify_ptr[0], verify_ptr[1], verify_ptr[2], verify_ptr[3],
-                                    verify_ptr[4], verify_ptr[5], verify_ptr[6], verify_ptr[7]);
-
-                                bool k0_match = (memcmp(pre_k0, kv_map, 16) == 0);
-                                fprintf(stderr, "    K[0] match=%s\n", k0_match ? "YES" : "NO!!");
-                                fflush(stderr);
-
-                                // Re-sync TO_DEVICE
-                                fk_entry->bo_kv->sync(XCL_BO_SYNC_BO_TO_DEVICE);
-                            }
-                            // === END DIAG ===
-
-                            // === DIAG: verify what was copied into bo_kv ===
-                            if (poc_dbg && kv_h == 0) {
-                                auto verify_ptr = fk_entry->bo_kv->map<char *>();
-                                const uint16_t * verify_bf16 = (const uint16_t *)verify_ptr;
-                                fprintf(stderr, "    [DIAG] bo_kv after copy, kv_h=0 (contiguous layout):\n");
-                                fprintf(stderr, "      K[0][0:8] (offset 0):");
-                                for (int d = 0; d < 8; d++) fprintf(stderr, " 0x%04X", verify_bf16[d]);
-                                fprintf(stderr, "\n");
-                                fprintf(stderr, "      K[1][0:8] (offset %d):", (int)head_dim);
-                                for (int d = 0; d < 8; d++) fprintf(stderr, " 0x%04X", verify_bf16[head_dim + d]);
-                                fprintf(stderr, "\n");
-                                fprintf(stderr, "      V[0][0:8] (offset %d):", (int)(seq_len * head_dim));
-                                for (int d = 0; d < 8; d++) fprintf(stderr, " 0x%04X", verify_bf16[seq_len * head_dim + d]);
-                                fprintf(stderr, "\n");
-
-                                // Also dump what SHOULD be at K[0] based on source strides
-                                fprintf(stderr, "      K src expected [pos=0,kv_h=0,d=0:8]:");
-                                for (int d = 0; d < 8 && d < (int)head_dim; d++) {
-                                    size_t off = 0 * k_nb1 + 0 * k_nb2 + d * k_nb0;
-                                    uint16_t val;
-                                    memcpy(&val, k_data + off, 2);
-                                    fprintf(stderr, " 0x%04X", val);
-                                }
-                                fprintf(stderr, "\n");
-                                fflush(stderr);
-                            }
+                            fk_entry->bo_v->sync(XCL_BO_SYNC_BO_TO_DEVICE);
                         }
 
                         // --- Prepare Q buffer (bf16) ---
@@ -11519,61 +11428,36 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
 
                         // --- Dispatch FlowKV kernel ---
                         // IRON xclbin arg layout: opcode(0), insts(1), insts_size(2),
-                        // DDR_buf_0(3)=kv, DDR_buf_1(4)=q, DDR_buf_2(5)=out
+                        // DDR_buf_0(3)=k, DDR_buf_1(4)=v, DDR_buf_2(5)=q, DDR_buf_3(6)=out
                         {
                             // Diagnostic: verify BO data before dispatch
                             if (poc_dbg && kv_h == 0) {
-                                auto diag_kv = fk_entry->bo_kv->map<char *>();
+                                auto diag_k = fk_entry->bo_k->map<char *>();
                                 auto diag_q = fk_entry->bo_q->map<char *>();
-                                const uint16_t * kv_bf16 = (const uint16_t *)diag_kv;
+                                const uint16_t * k_bf16 = (const uint16_t *)diag_k;
                                 const uint16_t * q_bf16 = (const uint16_t *)diag_q;
                                 fprintf(stderr, "  BO check kv_h=0: K[0] first 8 bf16:");
-                                for (int d = 0; d < 8; d++) fprintf(stderr, " 0x%04X", kv_bf16[d]);
+                                for (int d = 0; d < 8; d++) fprintf(stderr, " 0x%04X", k_bf16[d]);
                                 fprintf(stderr, "\n  BO check kv_h=0: Q first 8 bf16:");
                                 for (int d = 0; d < 8; d++) fprintf(stderr, " 0x%04X", q_bf16[d]);
-                                fprintf(stderr, "\n  BO check: insts size=%u bo_kv size=%zu bo_q size=%zu bo_out size=%zu\n",
+                                fprintf(stderr, "\n  BO check: insts size=%u bo_k size=%zu bo_v size=%zu bo_q size=%zu bo_out size=%zu\n",
                                         (uint32_t)fk_entry->insts_data.size(),
-                                        (size_t)(1 * seq_len * 2 * row_bytes),
+                                        (size_t)(1 * seq_len * row_bytes),
+                                        (size_t)(1 * seq_len * row_bytes),
                                         (size_t)(1 * (q_heads_per_kv * head_dim + head_dim + 2) * sizeof(uint16_t)),
                                         (size_t)(q_heads_per_kv * row_bytes));
                                 fflush(stderr);
                             }
-
-                            // === DIAG: marker test — fill bo_kv with 0xDEAD ===
-                            // If K_DIAG shows 0xDEAD → DMA reads from bo_kv.
-                            // If K_DIAG shows something else → DMA reads from wrong address.
-                            if (poc_dbg && kv_h == 0) {
-                                auto marker_ptr = fk_entry->bo_kv->map<uint16_t *>();
-                                for (size_t i = 0; i < 64; i++) marker_ptr[i] = 0xDEAD;
-                                fk_entry->bo_kv->sync(XCL_BO_SYNC_BO_TO_DEVICE);
-                                fprintf(stderr, "  [DIAG-MARKER] bo_kv[0:8] set to 0xDEAD, synced TO_DEVICE\n");
-                                fprintf(stderr, "  [DIAG-ADDR] bo_kv handle=%p address=%p size=%zu\n",
-                                    (void*)&(*fk_entry->bo_kv), (void*)marker_ptr,
-                                    (size_t)(1 * seq_len * 2 * row_bytes));
-                                fprintf(stderr, "  [DIAG-ADDR] bo_q  handle=%p address=%p\n",
-                                    (void*)&(*fk_entry->bo_q), (void*)fk_entry->bo_q->map<char*>());
-                                fprintf(stderr, "  [DIAG-ADDR] bo_out handle=%p address=%p\n",
-                                    (void*)&(*fk_entry->bo_out), (void*)fk_entry->bo_out->map<char*>());
-
-                                // Also dump what's at V region offset in bo_kv
-                                auto kv_all = fk_entry->bo_kv->map<uint16_t *>();
-                                size_t v_offset = seq_len * head_dim;  // = 16384 bf16
-                                fprintf(stderr, "  [DIAG-V-REGION] bo_kv[V offset=%zu][0:8]:", v_offset);
-                                for (int d = 0; d < 8; d++) fprintf(stderr, " 0x%04X", kv_all[v_offset + d]);
-                                fprintf(stderr, "\n");
-                                fflush(stderr);
-                            }
-                            // === END DIAG ===
 
                             // Use set_arg with all 8 kernel args
                             auto run = xrt::run(fk_entry->kernel);
                             run.set_arg(0, 3u);  // opcode
                             run.set_arg(1, fk_entry->insts_bo);  // insts
                             run.set_arg(2, (uint32_t)fk_entry->insts_data.size());  // insts_size
-                            run.set_arg(3, *fk_entry->bo_kv);  // DDR buf 0
-                            run.set_arg(4, *fk_entry->bo_q);   // DDR buf 1
-                            run.set_arg(5, *fk_entry->bo_out); // DDR buf 2
-                            run.set_arg(6, 0u);  // unknown arg
+                            run.set_arg(3, *fk_entry->bo_k);    // DDR buf 0 = K
+                            run.set_arg(4, *fk_entry->bo_v);    // DDR buf 1 = V
+                            run.set_arg(5, *fk_entry->bo_q);    // DDR buf 2 = Q
+                            run.set_arg(6, *fk_entry->bo_out);  // DDR buf 3 = Out
                             run.set_arg(7, 0u);  // unknown arg
 
                             std::lock_guard<std::mutex> lock(*fk_entry->mu);
@@ -11593,15 +11477,15 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                 fprintf(stderr, "ggml-xdna: [FlowKV-POC] kv_h=%lld dispatched %.2f ms\n",
                                         (long long)kv_h, ms);
 
-                                // === DIAG: post-dispatch bo_kv integrity + K_DIAG compare ===
+                                // === DIAG: post-dispatch K_DIAG compare ===
                                 if (kv_h == 0) {
-                                    fk_entry->bo_kv->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-                                    auto post_kv = reinterpret_cast<const uint16_t*>(
-                                        fk_entry->bo_kv->map<char *>());
-                                    fprintf(stderr, "  [DIAG-POST] bo_kv after dispatch:\n");
+                                    fk_entry->bo_k->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+                                    auto post_k = reinterpret_cast<const uint16_t*>(
+                                        fk_entry->bo_k->map<char *>());
+                                    fprintf(stderr, "  [DIAG-POST] bo_k after dispatch:\n");
                                     fprintf(stderr, "    K[0][0:8]: 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X\n",
-                                        post_kv[0], post_kv[1], post_kv[2], post_kv[3],
-                                        post_kv[4], post_kv[5], post_kv[6], post_kv[7]);
+                                        post_k[0], post_k[1], post_k[2], post_k[3],
+                                        post_k[4], post_k[5], post_k[6], post_k[7]);
 
                                     // K_DIAG is in last head slot of bo_out
                                     fk_entry->bo_out->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
@@ -11612,28 +11496,19 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
 
                                     fprintf(stderr, "  [DIAG-COMPARE] kv_h=0:\n");
                                     fprintf(stderr, "    Host  K[0][0:8]: 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X\n",
-                                        post_kv[0], post_kv[1], post_kv[2], post_kv[3],
-                                        post_kv[4], post_kv[5], post_kv[6], post_kv[7]);
+                                        post_k[0], post_k[1], post_k[2], post_k[3],
+                                        post_k[4], post_k[5], post_k[6], post_k[7]);
                                     fprintf(stderr, "    K_DIAG    [0:8]: 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X\n",
                                         kdiag[0], kdiag[1], kdiag[2], kdiag[3],
                                         kdiag[4], kdiag[5], kdiag[6], kdiag[7]);
 
                                     int match_count = 0;
                                     for (int i = 0; i < 8; i++) {
-                                        if (kdiag[i] == post_kv[i]) match_count++;
+                                        if (kdiag[i] == post_k[i]) match_count++;
                                     }
                                     fprintf(stderr, "    Match count (first 8): %d/8 → %s\n",
                                         match_count, match_count > 0 ? "PARTIAL MATCH" : "ZERO MATCH — DMA reads wrong data!");
-
-                                    // === DIAG: marker test result ===
-                                    bool marker_detected = true;
-                                    for (int i = 0; i < 8; i++) {
-                                        if (kdiag[i] != 0xDEAD) { marker_detected = false; break; }
-                                    }
-                                    fprintf(stderr, "    [DIAG-MARKER] K_DIAG == 0xDEAD? %s\n",
-                                        marker_detected ? "YES — DMA reads from bo_kv!" : "NO — DMA reads from WRONG buffer!");
                                     fflush(stderr);
-                                    // === END MARKER ===
                                 }
                                 // === END DIAG ===
                             }
