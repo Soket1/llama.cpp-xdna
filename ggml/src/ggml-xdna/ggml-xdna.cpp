@@ -4511,7 +4511,7 @@ static bool ggml_backend_xdna_flowkv_per_head(
             if (!entry->bo_kv) {
                 size_t kv_size = 1 * seq_len * 2 * head_dim * sizeof(uint16_t);
                 entry->bo_kv = std::make_unique<xrt::bo>(
-                    xrt::bo(ctx->device, kv_size, xrt::bo::flags::host_only,
+                    xrt::bo(ctx->device, kv_size, xrt::bo::flags::cacheable,
                             entry->kernel.group_id(3)));
             }
             if (!entry->bo_q) {
@@ -11127,7 +11127,7 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                     size_t kv_size = 1 * seq_len * 2 * row_bytes;
                     if (!fk_entry->bo_kv) {
                         fk_entry->bo_kv = std::make_unique<xrt::bo>(
-                            xrt::bo(ctx->device, kv_size, xrt::bo::flags::host_only,
+                            xrt::bo(ctx->device, kv_size, xrt::bo::flags::cacheable,
                                     fk_entry->kernel.group_id(3)));
                     }
                     size_t q_size = 1 * (q_heads_per_kv * head_dim + head_dim + 2) * sizeof(uint16_t);  // +2 for actual_seq_len + DMA alignment
