@@ -11493,6 +11493,32 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                         (size_t)(1 * (q_heads_per_kv * head_dim + head_dim + 2) * sizeof(uint16_t)),
                                         (size_t)(q_heads_per_kv * row_bytes));
                                 fflush(stderr);
+
+                                // MARKER TEST: overwrite K[0:8]=0xDEAD, V[0:8]=0xBEEF
+                                // If K_DIAG==0xDEAD → DMA reads K buffer (correct)
+                                // If K_DIAG==0xBEEF → DMA reads V buffer (arg swap)
+                                // If K_DIAG==random → DMA reads from elsewhere
+                                static bool marker_done = false;
+                                if (xdna_env_enabled("XDNA_DIAG_OFFSET") && !marker_done) {
+                                    marker_done = true;
+                                    auto mk = fk_entry->bo_k->map<char *>();
+                                    auto mv = fk_entry->bo_v->map<char *>();
+                                    // Save originals
+                                    uint16_t orig_k[8], orig_v[8];
+                                    memcpy(orig_k, mk, 16);
+                                    memcpy(orig_v, mv, 16);
+                                    // Write markers
+                                    for (int d = 0; d < 8; d++) {
+                                        uint16_t dead = 0xDEAD, beef = 0xBEEF;
+                                        memcpy(mk + d*2, &dead, 2);
+                                        memcpy(mv + d*2, &beef, 2);
+                                    }
+                                    fk_entry->bo_k->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                                    fk_entry->bo_v->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                                    fprintf(stderr, "  [MARKER] K[0:8]=0xDEAD V[0:8]=0xBEEF written and synced\n");
+                                    fflush(stderr);
+                                    // Restore after dispatch (done below)
+                                }
                             }
 
                             // === PHANTOM OFFSET DIAGNOSTIC ===
@@ -11608,6 +11634,22 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                     }
                                     fprintf(stderr, "    Match count (first 8): %d/8 → %s\n",
                                         match_count, match_count > 0 ? "PARTIAL MATCH" : "ZERO MATCH — DMA reads wrong data!");
+
+                                    // Marker detection
+                                    int dead_count = 0, beef_count = 0;
+                                    for (int i = 0; i < 8; i++) {
+                                        if (kdiag[i] == 0xDEAD) dead_count++;
+                                        if (kdiag[i] == 0xBEEF) beef_count++;
+                                    }
+                                    if (dead_count > 0 || beef_count > 0) {
+                                        fprintf(stderr, "    [MARKER RESULT] 0xDEAD=%d/8 0xBEEF=%d/8 → %s\n",
+                                            dead_count, beef_count,
+                                            dead_count >= 4 ? "DMA reads K buffer (CORRECT!)" :
+                                            beef_count >= 4 ? "DMA reads V buffer (ARG SWAP!)" :
+                                            "DMA reads MIXED");
+                                    } else {
+                                        fprintf(stderr, "    [MARKER RESULT] no markers found → DMA reads from ELSEWHERE (not K, not V)\n");
+                                    }
                                     fflush(stderr);
                                 }
                                 // === END DIAG ===
