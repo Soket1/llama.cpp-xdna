@@ -15,7 +15,8 @@ Hardware: STX NPU2, 8 columns, model: llama-3.2-1b-BF16
 3. **BO адреса корректны**: bo_k=0xC2A000, bo_v=0xC32000, K→V delta=32KB
 4. **`xrt::bo::flags::normal`** не поддерживается XDNA драйвером (`unsupported buffer type`)
 5. **`cacheable`** в прошлых тестах давал K_DIAG = all zeros (ухудшил)
-6. **Следующий шаг**: попробовать `svm` / `p2p` / `cacheable` флаги (`6b5a5cf83`) — если `svm` даёт другой адрес → phantom offset подтверждён на уровне IOMMU mapping
+6. **`svm` и `p2p` не поддерживаются** XDNA драйвером. `cacheable` из другого memory pool (delta -18844 KB)
+7. **Marker test** (`5d1feb002`): K[0:8]=0xDEAD, V[0:8]=0xBEEF. Если K_DIAG=0xDEAD → DMA читает K. Если 0xBEEF → V. Если random → phantom offset confirmed.
 7. **Диагностические инструменты**: `xdna_diag_offset.cpp`, `patch_flowkv_diag.patch` — standalone тесты, не использовались
 
 ## 🧪 Тест после arg swap фикса (2026-05-16 04:55)
