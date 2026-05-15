@@ -254,3 +254,33 @@ offset (0) — shared DMA register or buffer mapping bug.
 IRON-windows commit 1603071: K and V fills are now in separate task_groups.
 If K reads correct data → concurrent DMA offset corruption confirmed.
 If K still reads V data → DMA offset is fundamentally broken for arg0.
+
+---
+
+## Сессия 2026-05-16 (продолжение 3): Phantom Offset Diagnostic
+
+### Анализ от внешней нейросети
+Получен анализ 3 гипотез корневой причины:
+1. **Argument swap** — уже найден и подтверждён (K→V slot, V→K slot)
+2. **Driver header alignment** — kipudrv.inf может добавлять 32KB метаданных к host_only аллокациям
+3. **Compiler bitmask defect** — спекулятивная, менее вероятная
+
+### Созданы диагностические инструменты
+- `xdna_diag_offset.cpp` — автономный диагност (4 теста: host_only vs normal, DMA registers, export, K/V aliasing)
+- `patch_flowkv_diag.patch` — встроенная диагностика в FlowKV путь (XDNA_DIAG_OFFSET=1)
+- `debug_flowkv_diag.bat` — обновлённый bat-файл с STEP 1.5 diagnostic
+
+### Что тестирует STEP 1.5
+1. Запускает llama-cli с XDNA_DIAG_OFFSET=1
+2. Логирует адреса всех BO (bo_k, bo_v, bo_q, bo_out)
+3. Создаёт второй K-буфер с флагом `normal` вместо `host_only`
+4. Считает delta между host_only и normal
+5. **Если delta = 32768 (32KB) → гипотеза 2 ПОДТВЕРЖДЕНА**
+
+### Следующий шаг
+Запустить `debug_flowkv_diag.bat` на Windows-машине с NPU.
+Результат: `step1.5_diag_offset.log` — искать "XDNA_DIAG_OFFSET" и "PHANTOM OFFSET".
+
+### Commits
+- `d84d5bba9` (llama.cpp-xdna ggml-xdna): diag: phantom DMA offset diagnostic tools
+- IRON-windows: K TAP offset +64 test (f208050) — результат: мусор, DMA добавляет +16384 к любому offset
