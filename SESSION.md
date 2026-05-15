@@ -6,7 +6,17 @@
 
 Hardware: STX NPU2, 8 columns, model: llama-3.2-1b-BF16
 
-Статус: **ARG SWAP FIXED — НО НЕ ПОМОГЛО. Phantom offset ПОДТВЕРЖДЁН.** K/V swap исправлен (IRON `7999a4f`), но FlowKV всё ещё мусор. Host K[0] в BO правильный (0x3E39...), DMA читает другие данные (0x3BE7...). Проблема на уровне XRT/driver — `host_only` буфер маппится с phantom offset.
+Статус: **PHANTOM OFFSET — КОРНЕВАЯ ПРИЧИНА.** DMA controller читает из неверного физического адреса для `host_only` буферов.
+
+## Ключевые находки
+
+1. **Arg swap** (`a7f0bef` не откачен) — исправлен (`7999a4f`), **не помог**
+2. **Phantom offset** — host K[0] в BO правильный (0x3E39...), DMA читает другие данные (0x3BE7...), 0/8 match
+3. **BO адреса корректны**: bo_k=0xC2A000, bo_v=0xC32000, K→V delta=32KB
+4. **`xrt::bo::flags::normal`** не поддерживается XDNA драйвером (`unsupported buffer type`)
+5. **`cacheable`** в прошлых тестах давал K_DIAG = all zeros (ухудшил)
+6. **Следующий шаг**: попробовать `svm` / `p2p` / `cacheable` флаги (`6b5a5cf83`) — если `svm` даёт другой адрес → phantom offset подтверждён на уровне IOMMU mapping
+7. **Диагностические инструменты**: `xdna_diag_offset.cpp`, `patch_flowkv_diag.patch` — standalone тесты, не использовались
 
 ## 🧪 Тест после arg swap фикса (2026-05-16 04:55)
 
