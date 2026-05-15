@@ -11517,23 +11517,31 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                     fprintf(stderr, "  K→Q delta: %lld bytes (%lld KB)\n",
                                             (long long)(addr_q - addr_k), (long long)(addr_q - addr_k) / 1024);
 
-                                    // Create a second K buffer with ::normal flag to compare
-                                    try {
-                                        xrt::bo bo_k_normal(ctx->device, k_size, xrt::bo::flags::normal,
-                                                            fk_entry->kernel.group_id(3));
-                                        uint64_t addr_k_normal = bo_k_normal.address();
-                                        fprintf(stderr, "  bo_k_normal (normal flag):   0x%016llX\n",
-                                                (unsigned long long)addr_k_normal);
-                                        int64_t flag_delta = (int64_t)addr_k - (int64_t)addr_k_normal;
-                                        fprintf(stderr, "  host_only - normal delta: %lld bytes (%lld KB)\n",
-                                                (long long)flag_delta, (long long)flag_delta / 1024);
-                                        if (flag_delta == 32768 || flag_delta == -32768) {
-                                            fprintf(stderr, "  *** PHANTOM OFFSET CONFIRMED: 32KB metadata prefix! ***\n");
-                                        } else if (flag_delta == 0) {
-                                            fprintf(stderr, "  No phantom offset (delta=0)\n");
+                                    // Try different buffer flags to compare addresses
+                                    const char * flag_names[] = {"svm", "p2p", "cacheable"};
+                                    xrt::bo::flags flag_vals[] = {
+                                        xrt::bo::flags::svm,
+                                        xrt::bo::flags::p2p,
+                                        xrt::bo::flags::cacheable
+                                    };
+                                    for (int fi = 0; fi < 3; fi++) {
+                                        try {
+                                            xrt::bo bo_k_test(ctx->device, k_size, flag_vals[fi],
+                                                              fk_entry->kernel.group_id(3));
+                                            uint64_t addr_k_test = bo_k_test.address();
+                                            fprintf(stderr, "  bo_k_%s:  0x%016llX\n",
+                                                    flag_names[fi], (unsigned long long)addr_k_test);
+                                            int64_t flag_delta = (int64_t)addr_k - (int64_t)addr_k_test;
+                                            fprintf(stderr, "    host_only - %s delta: %lld bytes (%lld KB)\n",
+                                                    flag_names[fi], (long long)flag_delta, (long long)flag_delta / 1024);
+                                            if (flag_delta == 32768 || flag_delta == -32768) {
+                                                fprintf(stderr, "    *** PHANTOM OFFSET 32KB with %s! ***\n", flag_names[fi]);
+                                            } else if (flag_delta == 0) {
+                                                fprintf(stderr, "    No delta (same address)\n");
+                                            }
+                                        } catch (const std::exception & e) {
+                                            fprintf(stderr, "  bo_k_%s: FAILED (%s)\n", flag_names[fi], e.what());
                                         }
-                                    } catch (const std::exception & e) {
-                                        fprintf(stderr, "  [WARN] normal alloc failed: %s\n", e.what());
                                     }
                                     fprintf(stderr, "=== END XDNA_DIAG_OFFSET ===\n\n");
                                     fflush(stderr);
