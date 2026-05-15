@@ -41,6 +41,8 @@ Hardware: STX NPU2, 8 columns, model: llama-3.2-1b-BF16
 - Если K_DIAG не изменится → DMA полностью игнорирует BD offset
 - Если K_DIAG изменится → DMA добавляет +16384 к BD offset
 
+**Тест запущен (2026-05-16 03:22):** K TAP offset = 64 вместо 0 (IRON-windows `f208050`). Ожидание: K_DIAG изменится если DMA использует BD offset.
+
 ---
 
 ## Текущая сессия (2026-05-15)
