@@ -4535,6 +4535,52 @@ static bool ggml_backend_xdna_flowkv_per_head(
                             entry->kernel.group_id(6)));
             }
 
+            // ====================================================================
+            // DIAG: Phantom offset diagnostic — dump all BO addresses
+            // Enable with env var XDNA_DIAG_OFFSET=1
+            // ====================================================================
+            static bool diag_offset_enabled = xdna_env_enabled("XDNA_DIAG_OFFSET");
+            if (diag_offset_enabled && kv_h == 0) {
+                uint64_t addr_k    = entry->bo_k->address();
+                uint64_t addr_v    = entry->bo_v->address();
+                uint64_t addr_q    = entry->bo_q->address();
+                uint64_t addr_out  = entry->bo_out->address();
+                fprintf(stderr, "\n=== XDNA_DIAG_OFFSET: FlowKV BO addresses (kv_h=0) ===\n");
+                fprintf(stderr, "  bo_k   (group_id 3): 0x%016llX  size=%zu\n",
+                        (unsigned long long)addr_k, (size_t)(1 * seq_len * head_dim * sizeof(uint16_t)));
+                fprintf(stderr, "  bo_v   (group_id 4): 0x%016llX  size=%zu\n",
+                        (unsigned long long)addr_v, (size_t)(1 * seq_len * head_dim * sizeof(uint16_t)));
+                fprintf(stderr, "  bo_q   (group_id 5): 0x%016llX  size=%zu\n",
+                        (unsigned long long)addr_q, (size_t)(1 * (group_size * head_dim + head_dim) * sizeof(uint16_t)));
+                fprintf(stderr, "  bo_out (group_id 6): 0x%016llX  size=%zu\n",
+                        (unsigned long long)addr_out, (size_t)(group_size * head_dim * sizeof(uint16_t)));
+                fprintf(stderr, "  K→V delta: %lld bytes (%lld KB)\n",
+                        (long long)(addr_v - addr_k), (long long)(addr_v - addr_k) / 1024);
+                fprintf(stderr, "  K→Q delta: %lld bytes (%lld KB)\n",
+                        (long long)(addr_q - addr_k), (long long)(addr_q - addr_k) / 1024);
+
+                // Create a second K buffer with ::normal flag to compare
+                try {
+                    size_t k_size = 1 * seq_len * head_dim * sizeof(uint16_t);
+                    xrt::bo bo_k_normal(ctx->device, k_size, xrt::bo::flags::normal,
+                                        entry->kernel.group_id(3));
+                    uint64_t addr_k_normal = bo_k_normal.address();
+                    fprintf(stderr, "  bo_k_normal (normal flag):   0x%016llX\n",
+                            (unsigned long long)addr_k_normal);
+                    int64_t flag_delta = (int64_t)addr_k - (int64_t)addr_k_normal;
+                    fprintf(stderr, "  host_only - normal delta: %lld bytes (%lld KB)\n",
+                            (long long)flag_delta, (long long)flag_delta / 1024);
+                    if (flag_delta == 32768 || flag_delta == -32768) {
+                        fprintf(stderr, "  *** PHANTOM OFFSET CONFIRMED: 32KB metadata prefix! ***\n");
+                    }
+                } catch (const std::exception & e) {
+                    fprintf(stderr, "  [WARN] normal alloc failed: %s\n", e.what());
+                }
+                fprintf(stderr, "=== END XDNA_DIAG_OFFSET ===\n\n");
+                fflush(stderr);
+            }
+            // ====================================================================
+
             // --- Prepare K cache buffer ---
             {
                 auto k_ptr = entry->bo_k->map<char *>();
