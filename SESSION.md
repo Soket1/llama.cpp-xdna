@@ -198,3 +198,24 @@ DMA controller читает из другого места, не из bo_kv.
 Добавлен diagnostic marker test — заполняем bo_kv[0:8] = 0xDEAD перед dispatch.
 Если K_DIAG == 0xDEAD → DMA читает из bo_kv (проблема в данных).
 Если K_DIAG ≠ 0xDEAD → DMA читает из WRONG buffer (проблема в адресе).
+
+---
+
+## Сессия 2026-05-16 (продолжение 2): Marker test — DMA reads WRONG buffer
+
+### Marker test result:
+```
+bo_kv[0:8] = 0xDEAD 0xDEAD ... (marker, synced to device)
+K_DIAG[0:8] = 0xB928 0x3B4A ... (this is V[0] data!)
+→ K DMA reads from V region (offset 16384 bf16) despite DMA config offset=0
+```
+
+### Root cause hypothesis:
+Both K and V DMAs read from the same buffer (arg0) with different offsets.
+When started concurrently, the V DMA's offset (16384) overwrites K DMA's
+offset (0) — shared DMA register or buffer mapping bug.
+
+### Test: separate K/V into different task_groups (sequential DMA)
+IRON-windows commit 1603071: K and V fills are now in separate task_groups.
+If K reads correct data → concurrent DMA offset corruption confirmed.
+If K still reads V data → DMA offset is fundamentally broken for arg0.
