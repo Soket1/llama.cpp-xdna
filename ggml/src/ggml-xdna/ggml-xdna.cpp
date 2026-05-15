@@ -11547,6 +11547,20 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                 for (size_t i = 0; i < 64; i++) marker_ptr[i] = 0xDEAD;
                                 fk_entry->bo_kv->sync(XCL_BO_SYNC_BO_TO_DEVICE);
                                 fprintf(stderr, "  [DIAG-MARKER] bo_kv[0:8] set to 0xDEAD, synced TO_DEVICE\n");
+                                fprintf(stderr, "  [DIAG-ADDR] bo_kv handle=%p address=%p size=%zu\n",
+                                    (void*)&(*fk_entry->bo_kv), (void*)marker_ptr,
+                                    (size_t)(1 * seq_len * 2 * row_bytes));
+                                fprintf(stderr, "  [DIAG-ADDR] bo_q  handle=%p address=%p\n",
+                                    (void*)&(*fk_entry->bo_q), (void*)fk_entry->bo_q->map<char*>());
+                                fprintf(stderr, "  [DIAG-ADDR] bo_out handle=%p address=%p\n",
+                                    (void*)&(*fk_entry->bo_out), (void*)fk_entry->bo_out->map<char*>());
+
+                                // Also dump what's at V region offset in bo_kv
+                                auto kv_all = fk_entry->bo_kv->map<uint16_t *>();
+                                size_t v_offset = seq_len * head_dim;  // = 16384 bf16
+                                fprintf(stderr, "  [DIAG-V-REGION] bo_kv[V offset=%zu][0:8]:", v_offset);
+                                for (int d = 0; d < 8; d++) fprintf(stderr, " 0x%04X", kv_all[v_offset + d]);
+                                fprintf(stderr, "\n");
                                 fflush(stderr);
                             }
                             // === END DIAG ===
