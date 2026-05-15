@@ -6,7 +6,39 @@
 
 Hardware: STX NPU2, 8 columns, model: llama-3.2-1b-BF16
 
-Статус: **ROOT CAUSE FOUND & FIXED** — K/V argument swap в design.py (коммит-диагностик `a7f0bef` не был откачен). Фикс: IRON-windows `7999a4f`.
+Статус: **ARG SWAP FIXED — НО НЕ ПОМОГЛО. Phantom offset ПОДТВЕРЖДЁН.** K/V swap исправлен (IRON `7999a4f`), но FlowKV всё ещё мусор. Host K[0] в BO правильный (0x3E39...), DMA читает другие данные (0x3BE7...). Проблема на уровне XRT/driver — `host_only` буфер маппится с phantom offset.
+
+## 🧪 Тест после arg swap фикса (2026-05-16 04:55)
+
+### Результаты (build b8883-20566573b):
+
+| Тест | Output |
+|------|--------|
+| STEP 1: FlowKV + swap fix | `"TheDED欠ificio whificio whdio zd wh exclude欠 Bret欠 wh.sub"` — мусор |
+| STEP 2: Phantom diag + FlowKV | `"The sometimesieiagma Ler flight scaperorbitsachteiritわり欠 Bretntenioso"` — мусор |
+| STEP 3: Baseline (no FlowKV) | `"The capital of France is Paris."` — правильно ✓ |
+
+### Ключевое наблюдение из POC diagnostic:
+
+```
+BO check kv_h=0: K[0] first 8 bf16: 0x3E39 0x3D9F 0x3E28 0x3E02 0xBB90 0x3E08 0xBDF3 0xBD73  ← host K[0] ✓
+K_DIAG    [0:8]: 0x3BE7 0x3D0F 0x3CD3 0x3C79 0x3C8C 0xBBC6 0x3C69 0x3C00  ← DMA читает ✗
+```
+
+**Host K[0] в bo_k правильный** (0x3E39..., совпадает с предыдущими сессиями).
+**K_DIAG — данные, которых нет ни в K, ни в V.** DMA читает из неверного адреса.
+
+### Вывод:
+
+- **Arg swap** (коммит `a7f0bef`) — был реальным багом, но его фикс **не решает** проблему.
+- **Phantom offset** — основная причина. `host_only` буфер маппится в AIE address space со смещением.
+- Diagnostic был вставлен в **per_head path** (не используется), нужен в **POC path** (используется) → исправлено в `d1d3dc125`.
+
+### Следующий шаг
+
+Запустить `debug_flowkv_diag.bat` с обновлённым кодом (`d1d3dc125`). STEP 2 покажет `XDNA_DIAG_OFFSET` в POC path — адреса всех BO + сравнение `host_only` vs `normal` флаг.
+
+---
 
 ## 🔧 ФИКС: Argument Swap (2026-05-16 04:39)
 
