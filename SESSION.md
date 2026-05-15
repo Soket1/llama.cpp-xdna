@@ -6,7 +6,9 @@
 
 Hardware: STX NPU2, 8 columns, model: llama-3.2-1b-BF16
 
-Статус: decode 1.6 t/s (was 1.0), но output мусор → KV layout исправлен, kernel пересобирается, проблема в computation
+Статус: K DMA reads V data despite offset=0 in MLIR — DMA offset corruption when K/V share same buffer (arg0). Testing sequential DMA (separate task_groups) next.
+
+Ключевая находка (2026-05-16): marker test (bo_kv[0:8]=0xDEAD) доказал — K DMA читает V данные (K_DIAG == V[0]). Проблема НЕ в кэше (cacheable не помог), НЕ в KV layout. Проблема в том, что shim DMA не применяет offset=0 корректно когда K и V DMAs запускаются concurrently из одного буфера.
 
 ---
 
