@@ -11539,6 +11539,18 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                 fflush(stderr);
                             }
 
+                            // === DIAG: marker test — fill bo_kv with 0xDEAD ===
+                            // If K_DIAG shows 0xDEAD → DMA reads from bo_kv.
+                            // If K_DIAG shows something else → DMA reads from wrong address.
+                            if (poc_dbg && kv_h == 0) {
+                                auto marker_ptr = fk_entry->bo_kv->map<uint16_t *>();
+                                for (size_t i = 0; i < 64; i++) marker_ptr[i] = 0xDEAD;
+                                fk_entry->bo_kv->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                                fprintf(stderr, "  [DIAG-MARKER] bo_kv[0:8] set to 0xDEAD, synced TO_DEVICE\n");
+                                fflush(stderr);
+                            }
+                            // === END DIAG ===
+
                             // Use set_arg with all 8 kernel args
                             auto run = xrt::run(fk_entry->kernel);
                             run.set_arg(0, 3u);  // opcode
@@ -11598,7 +11610,16 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                     }
                                     fprintf(stderr, "    Match count (first 8): %d/8 → %s\n",
                                         match_count, match_count > 0 ? "PARTIAL MATCH" : "ZERO MATCH — DMA reads wrong data!");
+
+                                    // === DIAG: marker test result ===
+                                    bool marker_detected = true;
+                                    for (int i = 0; i < 8; i++) {
+                                        if (kdiag[i] != 0xDEAD) { marker_detected = false; break; }
+                                    }
+                                    fprintf(stderr, "    [DIAG-MARKER] K_DIAG == 0xDEAD? %s\n",
+                                        marker_detected ? "YES — DMA reads from bo_kv!" : "NO — DMA reads from WRONG buffer!");
                                     fflush(stderr);
+                                    // === END MARKER ===
                                 }
                                 // === END DIAG ===
                             }

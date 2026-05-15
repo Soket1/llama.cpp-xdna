@@ -180,3 +180,21 @@ ggml scheduler разбивает attention на 3 graph_compute:
 ### Кэш ключ:
 
 `flowkv_H4_KV1_d64_S256_C32_1col` — H=q_heads_per_kv, KV=1, d=head_dim, S=seq_len, C=chunk_size
+
+---
+
+## Сессия 2026-05-16 (продолжение): cacheable не помогает
+
+### Результат теста `cacheable`:
+- `host_only`: K_DIAG = random non-zero data (0x3BD5, 0x3D0F, ...)
+- `cacheable`: K_DIAG = all zeros (0x0000)
+- `cacheable` **ухудшил** ситуацию — DMA вообще не видит данные
+
+### Вывод:
+Проблема НЕ в NoC cache coherency. Проблема в адресном пространстве:
+DMA controller читает из другого места, не из bo_kv.
+
+### Следующий шаг:
+Добавлен diagnostic marker test — заполняем bo_kv[0:8] = 0xDEAD перед dispatch.
+Если K_DIAG == 0xDEAD → DMA читает из bo_kv (проблема в данных).
+Если K_DIAG ≠ 0xDEAD → DMA читает из WRONG buffer (проблема в адресе).
