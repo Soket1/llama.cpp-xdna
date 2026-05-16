@@ -6,7 +6,7 @@
 
 Hardware: STX NPU2, 8 columns, model: llama-3.2-1b-BF16
 
-Статус: **Both DMAs read arg1 (IRON compiler bug). K+V combined in bo_v. DMA echo test проходит environment fix + cacheable crash fix, ожидает тестирования на NPU.**
+Статус: **aiecc deadlock починен. axpy тест: compilation OK, NPU kernel timeout — fix в процессе (insts_bo sync).**
 
 ## Ключевые находки
 
@@ -26,6 +26,8 @@ Hardware: STX NPU2, 8 columns, model: llama-3.2-1b-BF16
 9. **`pyxrt.bo.cacheable` crash на XDNA** — access violation при создании insts buffer через CachedXRTRuntime. `host_only` работает. Фикс: monkey-patch в conftest.py
 10. **pyxrt.pyd = cp313** — скомпилирован под Python 3.13, несовместим с conda Python 3.12 (ABI mismatch). Весь тестовый стек должен работать на Python 3.13
 11. **Environment isolation** — PYTHONPATH не должен включать conda site-packages целиком (конфликт numpy/pytest). Только XRT SDK python + llvm-aie
+12. **aiecc.py → aiecc.exe deadlock (ROOT CAUSE FOUND & FIXED)** — `aiecc.py` вызывает `subprocess.run([aiecc.exe, ...])` **без** `stdin=DEVNULL`. Фикс: на Windows `_resolve_aiecc` предпочитает `aiecc.exe` напрямую. Коммит `1f5f7c5` (IRON-windows devel)
+13. **insts_bo sync для host_only** — `pyxrt.bo.cacheable` крашит на XDNA → monkey-patch на `host_only`. Но `host_only` буферы не видны NPU без явного `sync_bo(TO_DEVICE)`. Hostruntime НЕ вызывает sync (предполагает cacheable=coherent). Фикс: monkey-patch `XRTHostRuntime.run` для sync insts_bo. Коммит `5048d27` (IRON-windows devel)
 
 ## 🧪 Тест после arg swap фикса (2026-05-16 04:55)
 
@@ -750,3 +752,42 @@ base.py → subprocess.run(python.exe, aiecc.py, stdin=DEVNULL ✓)
 - `git pull` на Windows, запустить axpy тест
 - Подтвердить отсутствие зомби-процессов и успешное выполнение
 - **Отозвать GitHub PAT** `github_pat_11ASJ3NRA...` — был использован для push
+
+---
+
+## Сессия 2026-05-17: axpy тест — aiecc deadlock fix + NPU timeout debug
+
+### aiecc deadlock — подтверждён и починен
+
+Фикс `1f5f7c5` работает: `aiecc.exe` вызывается напрямую, zero zombie processes, компиляция завершена за ~30 секунд.
+
+### NPU kernel timeout — root cause: insts_bo не синхронизирован
+
+После фикса aiecc, axpy тест падает с `ERT_CMD_STATE_TIMEOUT` (NPU kernel hang).
+
+**Root cause chain:**
+1. `pyxrt.bo.cacheable` крашит на XDNA → monkey-patch на `host_only` (conftest.py)
+2. Hostruntime создаёт `insts_bo` с `host_only` (через monkey-patch)
+3. `host_only` буфер = только host memory, NPU **не видит** без explicit sync
+4. Hostruntime **не вызывает** `sync_bo(TO_DEVICE)` — предполагает `cacheable` = coherent
+5. NPU читает stale/zero data → kernel hang → `ERT_CMD_STATE_TIMEOUT`
+
+**Фикс:** monkey-patch `XRTHostRuntime.run` — добавить `insts_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE)` после создания/получения insts_bo.
+
+### Отладка monkey-patch
+
+1. `_hostrt.XRTRuntime.run` — **не существует** (`AttributeError`). Правильное имя: `_hostrt.XRTHostRuntime.run`
+2. Sync стоял только в `else` ветке (fresh creation), но `kernel_handle.insts_bo` был закэширован → sync пропускался. Фикс: sync **всегда** после if/else.
+
+### Коммиты (IRON-windows devel)
+
+- `1f5f7c5` fix(aiecc): call aiecc.exe directly on Windows
+- `5048d27` fix: sync insts_bo always, not only on first creation
+- `8f56621` fix: use XRTHostRuntime instead of XRTRuntime
+- `74fe1c4` diag: add prints to verify conftest monkey-patch
+
+### Следующий шаг
+
+- Запустить axpy тест с фиксом `5048d27`
+- Ожидание: `[CONFTEST] insts_bo synced to device (420 bytes)` → `PASSED`
+- Если всё ещё timeout — проблема глубже (xclbin format, DMA config, NPU driver)
