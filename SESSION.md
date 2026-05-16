@@ -6,7 +6,7 @@
 
 Hardware: STX NPU2, 8 columns, model: llama-3.2-1b-BF16
 
-Статус: **ARG SWAP ПОДТВЕРЖДЁН MARKER TEST → ИСПРАВЛЕН (1920fd641). Ожидает тестирования.**
+Статус: **ARG SWAP ПОДТВЕРЖДЁН MARKER TEST. Data-swap фикс (855fa12b1). Ожидает тестирования.**
 
 ## Ключевые находки
 
@@ -424,4 +424,37 @@ If K still reads V data → DMA offset is fundamentally broken for arg0.
 - `7999a4f` (IRON-windows devel): fix(flowkv): revert K/V arg swap, remove DIAG offset +64
 - `d3afe055e` (llama.cpp-xdna ggml-xdna): docs: SESSION.md — svm/p2p failed, marker test next
 - `5d1feb002` (llama.cpp-xdna ggml-xdna): diag: marker test (НЕ включён в протестированный бинарник)
-- `1920fd641` (llama.cpp-xdna ggml-xdna): **fix(flowkv): swap bo_k/bo_v — K DMA reads arg1** ← ИСПРАВЛЕНИЕ
+- `1920fd641` (llama.cpp-xdna ggml-xdna): fix(flowkv): swap bo_k/bo_v in set_arg — **не помог** (K_DIAG=0xDC04)
+- `bfc33c7ac` (llama.cpp-xdna ggml-xdna): fix: correct diagnostics after arg swap — **не помог**
+- `bd1f27af9` (llama.cpp-xdna ggml-xdna): **fix(flowkv): swap K/V data between bo_k and bo_v** ← DATA-SWAP
+- `855fa12b1` (llama.cpp-xdna ggml-xdna): fix: update marker test for data swap
+
+---
+
+## Сессия 2026-05-16 (продолжение): Тестирование фиксов
+
+### Тест 1: arg-swap (set_arg) — `bfc33c7ac`
+- Build: `b8894-bfc33c7ac`
+- Marker test: K_DIAG = `0xDC04 × 8` — ELSEWHERE (не 0xDEAD, не 0xBEEF)
+- Swap set_arg НЕ работает — DMA читает из неизвестного места
+- Возможная причина: xclbin кэширует mapping DMA→buffer, set_arg swap не компенсирует
+
+### Тест 2: data-swap — `855fa12b1` (текущий)
+- Подход: K data → bo_v (arg1), V data → bo_k (arg0), set_arg порядок оригинальный
+- K DMA → arg1 = bo_v = K data
+- V DMA → arg0 = bo_k = V data
+- Marker test обновлён: 0xBEEF = CORRECT (K DMA читает arg1)
+- **Ожидает тестирования**
+
+### Почему arg-swap не работает
+Простой swap bo_k↔bo_v в set_arg не компенсирует проблему:
+- До swap: K DMA → arg1 = bo_v = V data (0xBEEF)
+- После swap: K DMA → arg1 = bo_k = ???  (0xDC04, ELSEWHERE)
+- 0xDC04 — не K data, не V data, не маркеры → DMA читает из "phantom" адреса
+- Вывод: DMA address mapping зависит не только от set_arg позиции, но и от физического буфера
+
+### Почему data-swap должен работать
+- Не меняем mapping буферов (bo_k@arg0, bo_v@arg1)
+- Меняем только КАКИЕ ДАННЫЕ кладём в каждый буфер
+- K DMA всегда читает arg1 = bo_v → кладём K данные в bo_v
+- V DMA всегда читает arg0 = bo_k → кладём V данные в bo_k
