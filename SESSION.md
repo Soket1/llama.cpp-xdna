@@ -6,7 +6,7 @@
 
 Hardware: STX NPU2, 8 columns, model: llama-3.2-1b-BF16
 
-Статус: **Both DMAs read arg1 (IRON compiler bug). K+V combined in bo_v. Ожидает тестирования.**
+Статус: **Both DMAs read arg1 (IRON compiler bug). K+V combined in bo_v. DMA echo test infrastructure готов, ожидает компиляции и тестирования.**
 
 ## Ключевые находки
 
@@ -556,3 +556,35 @@ aie.dma_bd(%arg1 : memref<262144xbf16>, 131072, 16384, ...)  ← OK, within boun
 
 Файлы: `IRON-windows/iron/operators/dma_echo/design.py`, `aie_kernels/aie2p/echo.cc`
 Коммит: `faa6c8a` (IRON-windows devel)
+
+### DMA echo инфраструктура (2026-05-17)
+
+Сборка и тест echo через IRON фреймворк. aiecc.exe зависает (PyInstaller), используем aiecc.py.
+
+**Проблемы при создании:**
+1. `aiecc.exe --help` зависает → используем `aiecc.py` (IRON ищет .py первым)
+2. `import iron` тянет `pyxrt` через цепочку → нужен XRT SDK на PYTHONPATH
+3. `iron_repo` конфликт с `IRON-windows` → фильтрация из sys.path
+4. `opt.exe`/`llc.exe` не в win64.o Peano → лежат в `C:\Python313\Lib\site-packages\llvm-aie\bin`
+5. XDNA NPU не поддерживает `device.load_xclbin()` → используем ELF path (insts.bin → pyxrt.elf → hw_context)
+
+**Файлы:**
+- `compile_echo.py` — сборка через IRON compilation framework (aiecc.py)
+- `test_echo.py` — запуск на NPU, проверка DMA (ELF path)
+- `run_echo.bat` — обёртка с правильным окружением (как debug_flowkv.bat)
+- `__init__.py` — package marker
+
+**Ключевые решения:**
+- Peano (clang): `win64.o/tools/peano` (AIE-targeted)
+- LLVM-AIE (opt/llc): `C:\Python313\Lib\site-packages\llvm-aie` (для aiecc.py)
+- Python: `C:\Python313\python.exe` + PYTHONPATH с XRT SDK (не conda Python)
+- NPU runtime: ELF path через `pyxrt.elf` + `pyxrt.hw_context` + `pyxrt.ext.kernel`
+
+**Коммиты (IRON-windows devel):**
+- `8804c5c` feat: build/test infrastructure
+- `3ae2568..d8813f8` fix: environment, paths, unicodeescape
+- `6694b23` fix: llvm-aie for aiecc opt/llc
+- `7bb31fb` fix: ELF path for NPU
+
+**Следующий шаг:**
+Запустить `run_echo.bat 1` на Windows. Если v1 проходит → DMA path работает, тестировать v2.
