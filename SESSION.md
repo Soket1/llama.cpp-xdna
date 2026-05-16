@@ -10,14 +10,19 @@ Hardware: STX NPU2, 8 columns, model: llama-3.2-1b-BF16
 
 ## Ключевые находки
 
-1. **Arg swap** (`a7f0bef` не откачен) — исправлен (`7999a4f`), **не помог**
-2. **Phantom offset** — host K[0] в BO правильный (0x3E39...), DMA читает другие данные (0x3BE7...), 0/8 match
-3. **BO адреса корректны**: bo_k=0xC2A000, bo_v=0xC32000, K→V delta=32KB
-4. **`xrt::bo::flags::normal`** не поддерживается XDNA драйвером (`unsupported buffer type`)
-5. **`cacheable`** в прошлых тестах давал K_DIAG = all zeros (ухудшил)
-6. **`svm` и `p2p` не поддерживаются** XDNA драйвером. `cacheable` из другого memory pool (delta -18844 KB)
-7. **Marker test** (`5d1feb002`): K[0:8]=0xDEAD, V[0:8]=0xBEEF. Если K_DIAG=0xDEAD → DMA читает K. Если 0xBEEF → V. Если random → phantom offset confirmed.
-7. **Диагностические инструменты**: `xdna_diag_offset.cpp`, `patch_flowkv_diag.patch` — standalone тесты, не использовались
+1. **IRON compiler bug: BOTH K_fifos и V_fifos DMA читают из arg1** (а не K→arg0, V→arg1)
+   - Marker test подтвердил: K DMA → arg1 (0xBEEF marker из bo_v)
+   - Data-swap подтвердил: V DMA тоже → arg1 (NPU output = 0xBEEF constant = K marker из bo_v)
+2. **Фикс: K+V объединены в одном буфере (bo_v = arg1)**
+   - K data: offset 0 в bo_v
+   - V data: offset kv_region_size в bo_v
+   - V TAP: tensor_dims=(2*kv_region), offset=kv_region_size
+3. **Arg swap** (`a7f0bef` не откачен) — исправлен (`7999a4f`), **не помог**
+4. **BO адреса корректны**: bo_k=0xC2A000, bo_v=0xC32000, K→V delta=32KB
+5. **`xrt::bo::flags::normal`** не поддерживается XDNA драйвером
+6. **`svm` и `p2p` не поддерживаются** XDNA драйвером
+7. **`cacheable`** из другого memory pool (delta -52888 KB), K_DIAG = all zeros
+8. **Диагностические инструменты**: marker test (`5d1feb002`), phantom offset diagnostic
 
 ## 🧪 Тест после arg swap фикса (2026-05-16 04:55)
 
