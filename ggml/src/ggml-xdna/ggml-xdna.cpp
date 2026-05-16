@@ -4581,9 +4581,9 @@ static bool ggml_backend_xdna_flowkv_per_head(
             }
             // ====================================================================
 
-            // --- Prepare K cache buffer ---
+            // --- Prepare K cache buffer (SWAPPED: K data → bo_v) ---
             {
-                auto k_ptr = entry->bo_k->map<char *>();
+                auto k_ptr = entry->bo_v->map<char *>();
                 const char * k_data = (const char *)k_tensor->data;
                 size_t row_bytes = head_dim * sizeof(uint16_t);
 
@@ -4608,12 +4608,12 @@ static bool ggml_backend_xdna_flowkv_per_head(
                         memcpy(k_ptr + dst, k_data + src, row_bytes);
                     }
                 }
-                entry->bo_k->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                entry->bo_v->sync(XCL_BO_SYNC_BO_TO_DEVICE);
             }
 
-            // --- Prepare V cache buffer ---
+            // --- Prepare V cache buffer (SWAPPED: V data → bo_k) ---
             {
-                auto v_ptr = entry->bo_v->map<char *>();
+                auto v_ptr = entry->bo_k->map<char *>();
                 const char * v_data = (const char *)v_tensor->data;
                 size_t row_bytes = head_dim * sizeof(uint16_t);
 
@@ -4638,7 +4638,7 @@ static bool ggml_backend_xdna_flowkv_per_head(
                         memcpy(v_ptr + dst, v_data + src, row_bytes);
                     }
                 }
-                entry->bo_v->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                entry->bo_k->sync(XCL_BO_SYNC_BO_TO_DEVICE);
             }
 
             // --- Prepare Q buffer ---
@@ -4670,12 +4670,10 @@ static bool ggml_backend_xdna_flowkv_per_head(
             // --- Dispatch ---
             // IRON xclbin arg layout: opcode(0), insts(1), insts_size(2),
             // DDR_buf_0(3), DDR_buf_1(4), DDR_buf_2(5)=q, DDR_buf_3(6)=out
-            //
-            // MARKER TEST RESULT: K DMA reads from arg1 (V buffer), V DMA
-            // reads from arg0 (K buffer). Swap bo_k/bo_v to compensate.
+            // Data is swapped: K data in bo_v (arg1), V data in bo_k (arg0).
             auto run = entry->kernel(
                 3, entry->insts_bo, (uint32_t)entry->insts_data.size(),
-                *entry->bo_v, *entry->bo_k, *entry->bo_q, *entry->bo_out);
+                *entry->bo_k, *entry->bo_v, *entry->bo_q, *entry->bo_out);
 
             {
                 std::lock_guard<std::mutex> lock(*entry->mu);
@@ -11350,10 +11348,12 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                     }
 
                     // Process each KV head.
+                    // SWAPPED: K data → bo_v (arg1, K DMA reads here)
+                    //          V data → bo_k (arg0, V DMA reads here)
                     for (int64_t kv_h = 0; kv_h < num_kv_heads; kv_h++) {
-                        // --- Prepare K buffer (bf16) ---
+                        // --- Prepare V buffer: write K data into bo_v (arg1) ---
                         {
-                            auto k_ptr = fk_entry->bo_k->map<char *>();
+                            auto k_ptr = fk_entry->bo_v->map<char *>();
                             memset(k_ptr, 0, (size_t)(1 * seq_len * row_bytes));
                             for (int64_t pos = 0; pos < actual_seq_len; pos++) {
                                 size_t dst = pos * row_bytes;
@@ -11377,12 +11377,12 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                     memcpy(k_ptr + dst, k_data + src_k, row_bytes);
                                 }
                             }
-                            fk_entry->bo_k->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                            fk_entry->bo_v->sync(XCL_BO_SYNC_BO_TO_DEVICE);
                         }
 
-                        // --- Prepare V buffer (bf16) ---
+                        // --- Prepare K buffer: write V data into bo_k (arg0) ---
                         {
-                            auto v_ptr = fk_entry->bo_v->map<char *>();
+                            auto v_ptr = fk_entry->bo_k->map<char *>();
                             memset(v_ptr, 0, (size_t)(1 * seq_len * row_bytes));
                             for (int64_t pos = 0; pos < actual_seq_len; pos++) {
                                 size_t dst = pos * row_bytes;
@@ -11428,7 +11428,7 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                     }
                                 }
                             }
-                            fk_entry->bo_v->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                            fk_entry->bo_k->sync(XCL_BO_SYNC_BO_TO_DEVICE);
                         }
 
                         // --- Prepare Q buffer (bf16) ---
@@ -11581,14 +11581,15 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                             // === END PHANTOM OFFSET DIAGNOSTIC ===
 
                             // Use set_arg with all 8 kernel args
-                            // MARKER TEST RESULT: K DMA reads arg1, V DMA reads arg0.
-                            // Swap bo_k/bo_v to compensate.
+                            // MARKER TEST: K DMA reads arg1, but simple swap doesn't fix it.
+                            // Instead: swap data — write K into bo_v (arg1), V into bo_k (arg0).
+                            // This way K DMA reads K data from arg1 regardless of BO mapping.
                             auto run = xrt::run(fk_entry->kernel);
                             run.set_arg(0, 3u);  // opcode
                             run.set_arg(1, fk_entry->insts_bo);  // insts
                             run.set_arg(2, (uint32_t)fk_entry->insts_data.size());  // insts_size
-                            run.set_arg(3, *fk_entry->bo_v);    // DDR buf 0 → V DMA reads here
-                            run.set_arg(4, *fk_entry->bo_k);    // DDR buf 1 → K DMA reads here
+                            run.set_arg(3, *fk_entry->bo_k);    // DDR buf 0 (V DMA reads here)
+                            run.set_arg(4, *fk_entry->bo_v);    // DDR buf 1 (K DMA reads here)
                             run.set_arg(5, *fk_entry->bo_q);    // DDR buf 2 = Q
                             run.set_arg(6, *fk_entry->bo_out);  // DDR buf 3 = Out
                             run.set_arg(7, 0u);  // unknown arg
