@@ -357,3 +357,70 @@ If K still reads V data → DMA offset is fundamentally broken for arg0.
 ### Commits
 - `d84d5bba9` (llama.cpp-xdna ggml-xdna): diag: phantom DMA offset diagnostic tools
 - IRON-windows: K TAP offset +64 test (f208050) — результат: мусор, DMA добавляет +16384 к любому offset
+
+---
+
+## Сессия 2026-05-16: Анализ diagnostic logs
+
+### Получены файлы
+- `step1_fix_output.log` + `step1_fix_xdna.log` — FlowKV + arg-swap fix (без DIAG)
+- `step2_diag_output.log` + `step2_diag_offset.log` — FlowKV + XDNA_DIAG_OFFSET=1
+- `step3_baseline_output.log` + `step3_baseline_xdna.log` — Baseline (FlowKV OFF)
+- `debug_flowkv_diag.bat` — bat-файл для запуска
+
+### Результаты
+| Тест | Output | Статус |
+|------|--------|--------|
+| STEP 1 (FlowKV fix) | "Theicc dio CallableNormalize tend.raw336udio..." | ❌ мусор |
+| STEP 2 (FlowKV + DIAG) | "The Glassuding Forgot lã tendakisachte Bret..." | ❌ мусор |
+| STEP 3 (Baseline) | "The capital of France is Paris." | ✅ правильно |
+
+### Анализ step2_diag_offset.log (240 dispatch'ей)
+
+**BO адреса (стабильные):**
+- bo_k (group_id 3): `0x0000000002DA9000` size=32768
+- bo_v (group_id 4): `0x0000000002DB1000` size=32768
+- K→V delta: 32768 bytes (32KB) — корректно
+- bo_k_cacheable: `0x0000000004010000` (delta -18844 KB — другой memory pool)
+- svm/p2p: FAILED (unsupported)
+
+**K_DIAG vs Host K[0]:**
+- 0/8 match на ВСЕХ 240 dispatch'ах
+- Host K[0] стабильный: `0x3E39 0x3D9F 0x3E28 0x3E02 0xBB90 0x3E08 0xBDF3 0xBD73`
+- K_DIAG **меняется каждую итерацию** — 240 уникальных паттернов из 240
+- K_DIAG[0]: 211 уникальных значений из 240
+- K_DIAG значения: bf16 floats в диапазоне ~[-0.2, 0.4] (похоже на веса/attention scores)
+- bo_k после dispatch (DIAG-POST) не испорчен — данные intact
+
+**Критическая находка: MARKER TEST НЕ ЗАПУСТИЛСЯ!**
+- Build: `b8888-62b8c20c0` (коммит ДО marker test `5d1feb002`)
+- В логе НЕТ строки `[MARKER] K[0:8]=0xDEAD V[0:8]=0xBEEF`
+- K_DIAG содержит обычные bf16 значения, не 0xDEAD/0xBEEF
+- **Нужен пересбор с текущим HEAD для запуска marker test**
+
+**DIAG-SYNC отсутствует:**
+- Pre-dispatch sync verify (bo_kv read-back после TO_DEVICE) не реализован в коде
+- Только DIAG-POST (bo_k после dispatch) и DIAG-COMPARE (K_DIAG vs host K[0])
+
+### Выводы
+1. DMA читает не из bo_k — данные не совпадают ни с K, ни с V
+2. K_DIAG меняется каждую итерацию → DMA читает из области памяти, которая перезаписывается
+3. Это **не** NoC cache coherency (host_only данные корректны после sync)
+4. Это **не** arg swap (K и V в отдельных буферах, правильный порядок)
+5. **Наиболее вероятная причина**: XRT `host_only` buffer → DMA address mapping сломан
+   - `address()` возвращает host VA, но DMA controller видит другой физический адрес
+   - Или kipudrv.inf добавляет metadata prefix к host_only allocations
+
+### Следующий шаг
+1. **Пересобрать llama.cpp-xdna** с текущим HEAD (`d3afe055e`) — включить marker test
+2. **Запустить debug_flowkv_diag.bat** с новым бинарником
+3. Ожидаемый результат marker test:
+   - K_DIAG == 0xDEAD → DMA читает K buffer (correct!) → проблема в данных
+   - K_DIAG == 0xBEEF → DMA читает V buffer (arg swap regression)
+   - K_DIAG == random → DMA reads from completely wrong address
+4. После marker test: фиксить בהתאם к результату
+
+### Commits сессии
+- `7999a4f` (IRON-windows devel): fix(flowkv): revert K/V arg swap, remove DIAG offset +64
+- `d3afe055e` (llama.cpp-xdna ggml-xdna): docs: SESSION.md — svm/p2p failed, marker test next
+- `5d1feb002` (llama.cpp-xdna ggml-xdna): diag: marker test (НЕ включён в протестированный бинарник)
