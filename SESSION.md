@@ -791,3 +791,39 @@ base.py → subprocess.run(python.exe, aiecc.py, stdin=DEVNULL ✓)
 - Запустить axpy тест с фиксом `5048d27`
 - Ожидание: `[CONFTEST] insts_bo synced to device (420 bytes)` → `PASSED`
 - Если всё ещё timeout — проблема глубже (xclbin format, DMA config, NPU driver)
+
+---
+
+## Сессия 2026-05-17: insts_bo sync — работает, но timeout остаётся
+
+### Результат теста (sync3)
+
+```
+[CONFTEST] pyxrt.bo.cacheable patched to host_only
+[CONFTEST] XRTRuntime.run patched with insts_bo sync
+[CONFTEST] insts_bo synced to device (420 bytes)  ← sync работает!
+FAILED - Kernel returned ert_cmd_state.ERT_CMD_STATE_TIMEOUT
+```
+
+Sync **применяется** (420 bytes → device), но kernel всё ещё timeout. Проблема **не в sync**.
+
+### Анализ
+
+- Data buffers (x, y, z) sync'ятся через `XRTTensor.to("npu")` → `_sync_to_device()` ✓
+- insts_bo sync'ится через наш monkey-patch ✓
+- `aiecc.exe` генерирует xclbin (9239 bytes) + insts.bin (420 bytes) — размеры выглядят нормально
+- `xclbinutil --info` показывает: UUID, Sections (MEM_TOPOLOGY, AIE_PARTITION, etc.) — структура OK
+
+### Возможные причины timeout
+
+1. **xclbin format mismatch** — `aiecc.exe` (native C++) vs `aiecc.py` (Python wrapper) могут генерировать xclbin по-разному
+2. **NPU driver state** — NPU может быть в bad state после FlowKV экспериментов
+3. **DMA configuration** — ObjectFifo DMA config в xclbin может быть неправильной для данного NPU
+4. **MLIR-AIE / XRT version mismatch** — mlir_aie версия может быть несовместима с XRT 2.21.0
+
+### Следующий шаг
+
+- Проверить, работал ли **какой-нибудь** AIE/NPU тест на этой машине
+- Попробовать mlir_aie example напрямую (без IRON)
+- Проверить mlir_aie версию: `python -c "import aie; print(aie.__version__)"`
+- Если mlir_aie examples тоже timeout → проблема в NPU driver/xclbin, не в IRON
