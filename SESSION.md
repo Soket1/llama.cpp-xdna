@@ -6,7 +6,7 @@
 
 Hardware: STX NPU2, 8 columns, model: llama-3.2-1b-BF16
 
-Статус: **ARG SWAP ПОДТВЕРЖДЁН MARKER TEST. Data-swap фикс (855fa12b1). Ожидает тестирования.**
+Статус: **Both DMAs read arg1 (IRON compiler bug). K+V combined in bo_v. Ожидает тестирования.**
 
 ## Ключевые находки
 
@@ -426,8 +426,36 @@ If K still reads V data → DMA offset is fundamentally broken for arg0.
 - `5d1feb002` (llama.cpp-xdna ggml-xdna): diag: marker test (НЕ включён в протестированный бинарник)
 - `1920fd641` (llama.cpp-xdna ggml-xdna): fix(flowkv): swap bo_k/bo_v in set_arg — **не помог** (K_DIAG=0xDC04)
 - `bfc33c7ac` (llama.cpp-xdna ggml-xdna): fix: correct diagnostics after arg swap — **не помог**
-- `bd1f27af9` (llama.cpp-xdna ggml-xdna): **fix(flowkv): swap K/V data between bo_k and bo_v** ← DATA-SWAP
+- `bd1f27af9` (llama.cpp-xdna ggml-xdna): fix(flowkv): swap K/V data — **не помог** (V DMA тоже читает arg1)
 - `855fa12b1` (llama.cpp-xdna ggml-xdna): fix: update marker test for data swap
+- `0b8e622` (IRON-windows devel): **fix(flowkv): combine K+V in single buffer (arg1)** ← V TAP offset
+- `cbfbc9009` (llama.cpp-xdna ggml-xdna): **fix(flowkv): combine K+V in bo_v (arg1)** ← host-side
+
+---
+
+## Сессия 2026-05-16 (продолжение 2): Root cause — BOTH DMAs read arg1
+
+### Открытие
+При data-swap тесте: NPU output head0 = `-0.466797` для ВСЕХ 8 значений = `0xBEEF` = V marker.
+Это значит **V DMA тоже читает из arg1 (bo_v)**, а не из arg0 (bo_k).
+
+**IRON compiler bug: и K_fifos, и V_fifos DMA маппятся на один и тот же DDR arg (arg1).**
+
+### Marker test подтверждения
+1. **Оригинал** (K in bo_k@arg0, V in bo_v@arg1): K_DIAG = 0xBEEF (V marker) → K DMA читает arg1
+2. **Data-swap** (K in bo_v@arg1, V in bo_k@arg0): K_DIAG = 0xBEEF (K marker в bo_v) → K DMA читает arg1 ✓
+3. NPU output = 0xBEEF constant → V DMA тоже читает arg1 = bo_v = K data ✗
+
+### Фикс: объединить K+V в одном буфере
+Раз оба DMA читают arg1, кладём K и V в один буфер (bo_v):
+- K data: offset 0 в bo_v
+- V data: offset kv_region_size в bo_v
+- V TAP: tensor_dims=(2*kv_region), offset=kv_region_size
+- bo_v size: 2 × num_kv_heads × seq_len × head_dim × sizeof(bf16)
+
+### Commits фикса
+- IRON-windows `0b8e622`: V TAP offset + kv_region_size, tensor_dims doubled
+- llama.cpp-xdna `cbfbc9009`: K+V data written to bo_v, bo_v size doubled
 
 ---
 
