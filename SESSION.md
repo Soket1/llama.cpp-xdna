@@ -491,3 +491,38 @@ If K still reads V data → DMA offset is fundamentally broken for arg0.
 - Меняем только КАКИЕ ДАННЫЕ кладём в каждый буфер
 - K DMA всегда читает arg1 = bo_v → кладём K данные в bo_v
 - V DMA всегда читает arg0 = bo_k → кладём V данные в bo_k
+
+### Анализ TAP offset → DMA BD (2026-05-16)
+
+**Вопрос:** Генерирует ли IRON compiler DMA BD offset из TAP offset для ObjectFifo fill?
+
+**Ответ: Да, путь полностью трассирован.**
+
+```
+fill(in_fifo, source, tap)
+  → DMATask.resolve()
+    → shim_dma_single_bd_task(alloc, mem, tap=tap)
+      → offset = int(tap.offset)         ← напрямую из TAP
+      → shim_dma_bd(mem, offset=offset, sizes, strides)
+        → dma_bd(mem, offset=offset, ...)
+          → DMABDOp в MLIR
+```
+
+**Единицы:** offset, len, sizes, strides — всё в element width (не байтах). Подтверждено документацией AIE MLIR:
+> "offset, len, sizes and strides are all denominated in element width"
+
+**Итого для K+V combined подхода:**
+- `make_k_tap(0)`: offset=0 → DMA BD offset=0 на arg1 (bo_v) → K[0] data ✓
+- `make_v_tap(0)`: offset=kv_region_size → DMA BD offset=131072 на arg1 (bo_v) → V[0] data ✓
+- `tensor_dims` в TAP НЕ используется при генерации DMA BD (только offset/sizes/strides)
+
+**Статус:** Теоретически подтверждено. Ожидает тестирования на hardware.
+
+### Анализ логов (загруженные файлы)
+
+- `step3_baseline_output.log`: "The capital of France is Paris." — baseline OK (build b8900-795aa56e4)
+- `step1_fix_output.log`: мусор — FlowKV + arg-swap fix (тот же build)
+- `step2_diag_output.log`: мусор — FlowKV + XDNA_DIAG_OFFSET=1
+- `step2_diag_offset.log`: K_DIAG = all zeros (cacheable flag), marker test показал 0xDEAD/0xBEEF markers записаны, но DMA читает 0x0000 → cacheable ухудшает ситуацию
+
+Все три теста — ДО коммитов K+V combined (cbfbc9009, 0b8e622). Combined подход ещё не тестировался.
