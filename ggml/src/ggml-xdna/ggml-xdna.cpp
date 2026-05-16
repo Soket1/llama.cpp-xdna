@@ -4669,10 +4669,13 @@ static bool ggml_backend_xdna_flowkv_per_head(
 
             // --- Dispatch ---
             // IRON xclbin arg layout: opcode(0), insts(1), insts_size(2),
-            // DDR_buf_0(3)=k, DDR_buf_1(4)=v, DDR_buf_2(5)=q, DDR_buf_3(6)=out
+            // DDR_buf_0(3), DDR_buf_1(4), DDR_buf_2(5)=q, DDR_buf_3(6)=out
+            //
+            // MARKER TEST RESULT: K DMA reads from arg1 (V buffer), V DMA
+            // reads from arg0 (K buffer). Swap bo_k/bo_v to compensate.
             auto run = entry->kernel(
                 3, entry->insts_bo, (uint32_t)entry->insts_data.size(),
-                *entry->bo_k, *entry->bo_v, *entry->bo_q, *entry->bo_out);
+                *entry->bo_v, *entry->bo_k, *entry->bo_q, *entry->bo_out);
 
             {
                 std::lock_guard<std::mutex> lock(*entry->mu);
@@ -4693,16 +4696,16 @@ static bool ggml_backend_xdna_flowkv_per_head(
                     fprintf(stderr, "ggml-xdna: [FlowKV-POC] kv_h=%lld dispatched %.2f ms\n",
                             (long long)kv_h, ms);
 
-                    // === DIAG: post-dispatch bo_k integrity check ===
+                    // === DIAG: post-dispatch bo_v integrity check (K data is in bo_v after arg swap) ===
                     if (kv_h == 0) {
-                        entry->bo_k->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+                        entry->bo_v->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
                         auto post_ptr = reinterpret_cast<const uint16_t*>(
-                            entry->bo_k->map<char *>());
-                        fprintf(stderr, "  [DIAG-POST] bo_k after dispatch:\n");
+                            entry->bo_v->map<char *>());
+                        fprintf(stderr, "  [DIAG-POST] bo_v (K data) after dispatch:\n");
                         fprintf(stderr, "    K[0][0:8]: 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X\n",
                             post_ptr[0], post_ptr[1], post_ptr[2], post_ptr[3],
                             post_ptr[4], post_ptr[5], post_ptr[6], post_ptr[7]);
-                        fprintf(stderr, "    bo_k addr=%p bo_out addr=%p\n",
+                        fprintf(stderr, "    bo_v addr=%p bo_out addr=%p\n",
                             (void*)post_ptr, (void*)entry->bo_out->map<char *>());
                         fflush(stderr);
                     }
@@ -4717,13 +4720,14 @@ static bool ggml_backend_xdna_flowkv_per_head(
                 size_t out_head_bytes = head_dim * sizeof(uint16_t);
 
                 // === DIAG: compare K_DIAG (from kernel) with host K[0] ===
+                // After arg swap fix: K data is in bo_v (arg1)
                 if (dbg && kv_h == 0) {
                     // K_DIAG is written to the last head slot by the kernel
                     size_t kdiag_off = (num_heads - 1) * out_head_bytes;
                     const uint16_t * kdiag = reinterpret_cast<const uint16_t*>(out_ptr + kdiag_off);
-                    // Re-read bo_k to get host K[0]
-                    entry->bo_k->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-                    auto k_verify = reinterpret_cast<const uint16_t*>(entry->bo_k->map<char *>());
+                    // Re-read bo_v to get host K[0] (K data is in bo_v after arg swap)
+                    entry->bo_v->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+                    auto k_verify = reinterpret_cast<const uint16_t*>(entry->bo_v->map<char *>());
 
                     fprintf(stderr, "  [DIAG-COMPARE] kv_h=0:\n");
                     fprintf(stderr, "    Host  K[0][0:8]: 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X\n",
@@ -11576,12 +11580,14 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                             // === END PHANTOM OFFSET DIAGNOSTIC ===
 
                             // Use set_arg with all 8 kernel args
+                            // MARKER TEST RESULT: K DMA reads arg1, V DMA reads arg0.
+                            // Swap bo_k/bo_v to compensate.
                             auto run = xrt::run(fk_entry->kernel);
                             run.set_arg(0, 3u);  // opcode
                             run.set_arg(1, fk_entry->insts_bo);  // insts
                             run.set_arg(2, (uint32_t)fk_entry->insts_data.size());  // insts_size
-                            run.set_arg(3, *fk_entry->bo_k);    // DDR buf 0 = K
-                            run.set_arg(4, *fk_entry->bo_v);    // DDR buf 1 = V
+                            run.set_arg(3, *fk_entry->bo_v);    // DDR buf 0 → V DMA reads here
+                            run.set_arg(4, *fk_entry->bo_k);    // DDR buf 1 → K DMA reads here
                             run.set_arg(5, *fk_entry->bo_q);    // DDR buf 2 = Q
                             run.set_arg(6, *fk_entry->bo_out);  // DDR buf 3 = Out
                             run.set_arg(7, 0u);  // unknown arg
@@ -11603,12 +11609,14 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                 fprintf(stderr, "ggml-xdna: [FlowKV-POC] kv_h=%lld dispatched %.2f ms\n",
                                         (long long)kv_h, ms);
 
-                                // === DIAG: post-dispatch K_DIAG compare ===
+                                // === DIAG: post-dispatch compare ===
+                                // After arg swap fix: K data is in bo_v (arg1), V data is in bo_k (arg0).
+                                // K_DIAG from kernel should match bo_v (K data).
                                 if (kv_h == 0) {
-                                    fk_entry->bo_k->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+                                    fk_entry->bo_v->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
                                     auto post_k = reinterpret_cast<const uint16_t*>(
-                                        fk_entry->bo_k->map<char *>());
-                                    fprintf(stderr, "  [DIAG-POST] bo_k after dispatch:\n");
+                                        fk_entry->bo_v->map<char *>());
+                                    fprintf(stderr, "  [DIAG-POST] bo_v (contains K data) after dispatch:\n");
                                     fprintf(stderr, "    K[0][0:8]: 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X\n",
                                         post_k[0], post_k[1], post_k[2], post_k[3],
                                         post_k[4], post_k[5], post_k[6], post_k[7]);
@@ -11644,8 +11652,8 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                     if (dead_count > 0 || beef_count > 0) {
                                         fprintf(stderr, "    [MARKER RESULT] 0xDEAD=%d/8 0xBEEF=%d/8 → %s\n",
                                             dead_count, beef_count,
-                                            dead_count >= 4 ? "DMA reads K buffer (CORRECT!)" :
-                                            beef_count >= 4 ? "DMA reads V buffer (ARG SWAP!)" :
+                                            dead_count >= 4 ? "DMA reads arg1 (bo_k, V data) — expected after arg swap fix" :
+                                            beef_count >= 4 ? "DMA reads arg0 (bo_v, K data) — reverse swap needed" :
                                             "DMA reads MIXED");
                                     } else {
                                         fprintf(stderr, "    [MARKER RESULT] no markers found → DMA reads from ELSEWHERE (not K, not V)\n");
