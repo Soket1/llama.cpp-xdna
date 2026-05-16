@@ -592,3 +592,51 @@ aie.dma_bd(%arg1 : memref<262144xbf16>, 131072, 16384, ...)  ← OK, within boun
 **Обновление (02:07):** pyxrt ELF/xclbin ручной loading не работает на XDNA NPU.
 Перешли на IRON test framework: op.py (AIEEchoV1/V2) + test.py (pytest + run_test).
 run_echo.bat теперь вызывает pytest.
+
+---
+
+## Echo Test Debug Session (2026-05-17 03:38–04:11 GMT+8)
+
+### Проблема: Environment hell при запуске run_echo.bat
+
+**Цепочка ошибок и фиксов:**
+
+1. **numpy cp313/cp312 conflict** — PYTHONPATH содержал `C:\Python313\Lib\site-packages` целиком, conda Python 3.12 загружал numpy скомпилированный под 3.13.
+   - Фикс: `PYTHONPATH` → только `C:\Python313\Lib\site-packages\llvm-aie`
+
+2. **pyxrt cp313** — `pyxrt.pyd` скомпилирован под Python 3.13, conda env на 3.12. `ctypes.WinDLL` загружает, `import pyxrt` — нет (ABI mismatch).
+   - Фикс: `CONDA_PYTHON` → `C:\Python313\python.exe`
+
+3. **pytest from conda** — Python 3.13 загружал conda-прежний pytest (3.12), `allow_abbrev` удалён в 3.13.
+   - Фикс: убрать conda site-packages из PYTHONPATH. pytest уже в Python 3.13.
+
+4. **mlir_aie/_mlir C extension cp312** — conda mlir_aie содержит C extensions для 3.13, но Python 3.13 не может их загрузить.
+   - Фикс: `mlir_aie` уже установлен в Python 3.13 (`pip install mlir_aie`). Conda-путь не нужен.
+
+5. **conftest nodeid regex** — regex `r"^(.+?)::(.+?)\[(iter\d+-)?(.+?)\]$"` не матчит `test_echo_v1` (без `[iter0-...]` при `--iterations 1`).
+   - Фикс: `c41dee0` — regex.optional `[...]` + fallback на group(2).
+
+6. **AIEEchoV1 get_callable() not implemented** — `AIEEchoV1/V2` наследуют `AIEOperatorBase`, а `run_test()` требует `get_callable()` и `get_arg_spec()`.
+   - Фикс: `06b0b8b` — реализованы `get_callable()` (через NPUKernel + DefaultNPURuntime) и `get_arg_spec()`.
+
+### Итоговая конфигурация run_echo.bat
+
+```
+CONDA_PYTHON=C:\Python313\python.exe
+PYTHONPATH=XRT_SDK/python;llvm-aie   # НЕ conda site-packages!
+```
+
+Python 3.13 site-packages содержит: mlir_aie, numpy, pytest, torch — всё cp313.
+
+### Коммиты (IRON-windows devel)
+
+- `46c0285` fix(dma_echo): restrict PYTHONPATH to llvm-aie only
+- `413e829` fix(dma_echo): use Python 3.13 for pyxrt cp313
+- `92f1bdf` fix(dma_echo): add only mlir_aie/python to PYTHONPATH
+- `7099548` fix(dma_echo): remove conda mlir_aie from PYTHONPATH
+- `c41dee0` fix: conftest nodeid regex optional for --iterations 1
+- `06b0b8b` feat(dma_echo): implement get_callable() and get_arg_spec()
+
+### Статус
+
+Echo test v1 дошёл до NPU execution. Ожидает тестирования на hardware.
