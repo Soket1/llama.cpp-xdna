@@ -546,3 +546,13 @@ aie.dma_bd(%arg1 : memref<262144xbf16>, 131072, 16384, ...)  ← OK, within boun
 ```
 
 **Это могла быть причина мусора в предыдущих тестах** — DMA читала за пределами буфера.
+
+### DMA echo тест-дизайн (2026-05-16)
+
+Цель: локализовать проблему — DMA path или multi-ObjectFifo sequence.
+
+- **v1**: одна ObjectFifo, один fill/drain. Если не работает → DMA path сломан.
+- **v2**: две ObjectFifos, два fill в task_group. Если v1 работает, а v2 нет → multi-fill sequence проблема.
+
+Файлы: `IRON-windows/iron/operators/dma_echo/design.py`, `aie_kernels/aie2p/echo.cc`
+Коммит: `faa6c8a` (IRON-windows devel)
