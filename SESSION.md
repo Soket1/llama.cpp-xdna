@@ -526,3 +526,23 @@ fill(in_fifo, source, tap)
 - `step2_diag_offset.log`: K_DIAG = all zeros (cacheable flag), marker test показал 0xDEAD/0xBEEF markers записаны, но DMA читает 0x0000 → cacheable ухудшает ситуацию
 
 Все три теста — ДО коммитов K+V combined (cbfbc9009, 0b8e622). Combined подход ещё не тестировался.
+
+### Критический баг: L3_V_ty out-of-bounds (2026-05-16)
+
+**Найден при генерации MLIR из design.py.**
+
+До фикса:
+```
+aie.runtime_sequence(%arg0: memref<131072xbf16>, %arg1: memref<131072xbf16>, ...)
+aie.dma_bd(%arg1 : memref<131072xbf16>, 131072, 16384, ...)  ← offset=131072 OUT OF BOUNDS
+```
+
+`L3_V_ty` была `num_kv_heads * seq_len * head_dim = 131072`, но V DMA BD offset = `kv_region_size = 131072` — за пределами буфера. На hardware это undefined behavior.
+
+После фикса (`5a86030` IRON-windows devel):
+```
+aie.runtime_sequence(%arg0: memref<131072xbf16>, %arg1: memref<262144xbf16>, ...)
+aie.dma_bd(%arg1 : memref<262144xbf16>, 131072, 16384, ...)  ← OK, within bounds
+```
+
+**Это могла быть причина мусора в предыдущих тестах** — DMA читала за пределами буфера.
