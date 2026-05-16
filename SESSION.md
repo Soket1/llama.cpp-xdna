@@ -637,6 +637,12 @@ Python 3.13 site-packages содержит: mlir_aie, numpy, pytest, torch — �
 - `c41dee0` fix: conftest nodeid regex optional for --iterations 1
 - `06b0b8b` feat(dma_echo): implement get_callable() and get_arg_spec()
 
+7. **pyxrt.bo.cacheable crash on XDNA** — `CachedXRTRuntime` (DefaultNPURuntime) создаёт insts buffer с `pyxrt.bo.cacheable`, что вызывает access violation на XDNA driver. `pyxrt.bo.host_only` работает.
+   - Доказано: `pyxrt.bo(d, 300, pyxrt.bo.cacheable, 4)` → crash. `pyxrt.bo(d, 300, pyxrt.bo.host_only, 0)` → OK.
+   - Фикс: `91d692e` — monkey-patch `pyxrt.bo.cacheable = pyxrt.bo.host_only` в conftest.py
+
+- `91d692e` fix: monkey-patch pyxrt.bo.cacheable to host_only for XDNA compatibility
+
 ### Статус
 
-Echo test v1 дошёл до NPU execution. Ожидает тестирования на hardware.
+Echo test v1 проходит environment hell и crash fix. Ожидает тестирования на hardware (NPU execution + DMA verify).
