@@ -688,3 +688,65 @@ taskkill /F /IM aiecc.exe 2>$null; taskkill /F /IM python.exe 2>$null
 
 - Запустить axpy/dequant тесты с фиксом `162642a` на Windows
 - Подтвердить что aiecc не deadlock'ится и тесты проходят
+
+---
+
+## Сессия 2026-05-17: Настоящая причина aiecc deadlock
+
+### Диагностика
+
+Добавлены `[AIECC-RESOLVE]` и `[AIECC-RUN]` prints в `_resolve_aiecc` и `ShellCompilationCommand.run()` (коммит `5550f1b`).
+
+### Результат
+
+```
+[AIECC-RESOLVE] Using: C:\Python313\Lib\site-packages\mlir_aie\bin\aiecc.py (size=347)
+[AIECC-RUN] command=['C:\\Python313\\python.exe', 'C:\\Python313\\Lib\\site-packages\\mlir_aie\\bin\\aiecc.py', '-v', '-j1', ...]
+```
+
+`_resolve_aiecc` correctly returns `aiecc.py`. Фикс `162642a` correctly adds `stdin=DEVNULL` к этому вызову. **Но тест всё равно deadlock'ится** — 736 зомби aiecc.exe.
+
+### Настоящая причина
+
+`aiecc.py` (347 байт) — **НЕ** in-process wrapper:
+
+```python
+import subprocess, shutil
+def _find_aiecc_binary():
+    return shutil.which("aiecc")  # → aiecc.exe
+
+def main():
+    aiecc_bin = _find_aiecc_binary()
+    result = subprocess.run([aiecc_bin, *sys.argv[1:]])  # БЕЗ stdin=DEVNULL!
+```
+
+Цепочка deadlock'а:
+```
+base.py → subprocess.run(python.exe, aiecc.py, stdin=DEVNULL ✓)
+              → aiecc.py → subprocess.run(aiecc.exe, stdin=PIPE ✗ ← DEADLOCK)
+```
+
+Фикс `162642a` добавил `stdin=DEVNULL` к внешнему вызову, но `aiecc.py` **внутри** запускает `aiecc.exe` через `subprocess.run()` **без** `stdin=DEVNULL`. PyInstaller binary deadlock'ится на чтении stdin.
+
+### Фикс
+
+На Windows вызывать `aiecc.exe` напрямую, минуя `aiecc.py`. Изменён `_resolve_aiecc()`:
+- **Windows**: `aiecc.exe` → `aiecc` → `aiecc.py` (exe first)
+- **Linux/macOS**: `aiecc.py` → `aiecc` (unchanged)
+
+`ShellCompilationCommand.run()` уже применяет `stdin=DEVNULL` → `aiecc.exe` получает DEVNULL напрямую.
+
+### Коммиты
+
+- `5550f1b` (IRON-windows devel): diag: add logging for aiecc resolve and subprocess invocation
+- `1f5f7c5` (IRON-windows devel): fix(aiecc): call aiecc.exe directly on Windows, skip aiecc.py wrapper
+
+### Обновление finding #12 в SESSION.md
+
+`aiecc.py` НЕ in-process wrapper. Он вызывает `shutil.which("aiecc")` → `aiecc.exe` через `subprocess.run()` без `stdin=DEVNULL`. SESSION.md содержал ошибку: ~~"aiecc.py — тонкая обёртка, вызывает aiecc.exe через subprocess"~~ — верно, но это **именно и есть** причина deadlock'а, а не что stdin наследуется.
+
+### Следующий шаг
+
+- `git pull` на Windows, запустить axpy тест
+- Подтвердить отсутствие зомби-процессов и успешное выполнение
+- **Отозвать GitHub PAT** `github_pat_11ASJ3NRA...` — был использован для push
