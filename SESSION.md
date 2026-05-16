@@ -588,3 +588,7 @@ aie.dma_bd(%arg1 : memref<262144xbf16>, 131072, 16384, ...)  ← OK, within boun
 
 **Следующий шаг:**
 Запустить `run_echo.bat 1` на Windows. Если v1 проходит → DMA path работает, тестировать v2.
+
+**Обновление (02:07):** pyxrt ELF/xclbin ручной loading не работает на XDNA NPU.
+Перешли на IRON test framework: op.py (AIEEchoV1/V2) + test.py (pytest + run_test).
+run_echo.bat теперь вызывает pytest.
