@@ -11145,7 +11145,9 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                             xrt::bo(ctx->device, k_size, xrt::bo::flags::host_only,
                                     fk_entry->kernel.group_id(3)));
                     }
-                    size_t v_size = 1 * seq_len * row_bytes;
+                    // bo_v holds both K and V data (IRON compiler workaround:
+                    // both K_fifos and V_fifos DMA read from arg1).
+                    size_t v_size = 2 * num_kv_heads * seq_len * row_bytes;
                     if (!fk_entry->bo_v) {
                         fk_entry->bo_v = std::make_unique<xrt::bo>(
                             xrt::bo(ctx->device, v_size, xrt::bo::flags::host_only,
@@ -11348,13 +11350,15 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                     }
 
                     // Process each KV head.
-                    // SWAPPED: K data → bo_v (arg1, K DMA reads here)
-                    //          V data → bo_k (arg0, V DMA reads here)
+                    // IRON compiler bug: both K_fifos and V_fifos DMA read from arg1.
+                    // Workaround: put K+V in bo_v (arg1). K at offset 0, V at offset kv_region.
+                    // bo_k (arg0) is unused but must be allocated for set_arg.
                     for (int64_t kv_h = 0; kv_h < num_kv_heads; kv_h++) {
-                        // --- Prepare V buffer: write K data into bo_v (arg1) ---
+                        size_t kv_region = (size_t)num_kv_heads * seq_len * row_bytes;
+                        // --- Write K data into bo_v at offset 0 ---
                         {
                             auto k_ptr = fk_entry->bo_v->map<char *>();
-                            memset(k_ptr, 0, (size_t)(1 * seq_len * row_bytes));
+                            memset(k_ptr, 0, kv_region);
                             for (int64_t pos = 0; pos < actual_seq_len; pos++) {
                                 size_t dst = pos * row_bytes;
                                 const bool k_is_f16 = (flowkv_poc_k_perm->type == GGML_TYPE_F16);
@@ -11377,13 +11381,12 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                     memcpy(k_ptr + dst, k_data + src_k, row_bytes);
                                 }
                             }
-                            fk_entry->bo_v->sync(XCL_BO_SYNC_BO_TO_DEVICE);
                         }
 
-                        // --- Prepare K buffer: write V data into bo_k (arg0) ---
+                        // --- Write V data into bo_v at offset kv_region ---
                         {
-                            auto v_ptr = fk_entry->bo_k->map<char *>();
-                            memset(v_ptr, 0, (size_t)(1 * seq_len * row_bytes));
+                            auto v_ptr = fk_entry->bo_v->map<char *>() + kv_region;
+                            memset(v_ptr, 0, kv_region);
                             for (int64_t pos = 0; pos < actual_seq_len; pos++) {
                                 size_t dst = pos * row_bytes;
                                 const bool v_is_f16 = (flowkv_poc_v_perm->type == GGML_TYPE_F16);
@@ -11428,8 +11431,9 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                     }
                                 }
                             }
-                            fk_entry->bo_k->sync(XCL_BO_SYNC_BO_TO_DEVICE);
                         }
+                        // Sync combined K+V buffer to device
+                        fk_entry->bo_v->sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
                         // --- Prepare Q buffer (bf16) ---
                         {
