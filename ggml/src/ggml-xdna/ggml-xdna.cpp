@@ -11499,10 +11499,12 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                         (size_t)(q_heads_per_kv * row_bytes));
                                 fflush(stderr);
 
-                                // MARKER TEST: overwrite K[0:8]=0xDEAD, V[0:8]=0xBEEF
-                                // If K_DIAG==0xDEAD → DMA reads K buffer (correct)
-                                // If K_DIAG==0xBEEF → DMA reads V buffer (arg swap)
-                                // If K_DIAG==random → DMA reads from elsewhere
+                                // MARKER TEST: overwrite bo_k[0:8]=0xDEAD, bo_v[0:8]=0xBEEF
+                                // After data swap: bo_k has V data, bo_v has K data.
+                                // K DMA reads arg1 = bo_v. So:
+                                // K_DIAG==0xBEEF → K DMA reads bo_v (K data) → CORRECT
+                                // K_DIAG==0xDEAD → K DMA reads bo_k (V data) → WRONG
+                                // K_DIAG==other → DMA reads from ELSEWHERE
                                 static bool marker_done = false;
                                 if (xdna_env_enabled("XDNA_DIAG_OFFSET") && !marker_done) {
                                     marker_done = true;
@@ -11654,8 +11656,8 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                     if (dead_count > 0 || beef_count > 0) {
                                         fprintf(stderr, "    [MARKER RESULT] 0xDEAD=%d/8 0xBEEF=%d/8 → %s\n",
                                             dead_count, beef_count,
-                                            dead_count >= 4 ? "DMA reads arg1 (bo_k) — CORRECT after arg swap" :
-                                            beef_count >= 4 ? "DMA reads arg0 (bo_v) — swap didn't work!" :
+                                            beef_count >= 4 ? "DMA reads arg1 (bo_v) — K data, CORRECT!" :
+                                            dead_count >= 4 ? "DMA reads arg0 (bo_k) — V data, WRONG!" :
                                             "DMA reads MIXED");
                                     } else {
                                         fprintf(stderr, "    [MARKER RESULT] no markers found → DMA reads from ELSEWHERE (not K, not V)\n");
