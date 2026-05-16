@@ -6,7 +6,7 @@
 
 Hardware: STX NPU2, 8 columns, model: llama-3.2-1b-BF16
 
-Статус: **Both DMAs read arg1 (IRON compiler bug). K+V combined in bo_v. DMA echo test infrastructure готов, ожидает компиляции и тестирования.**
+Статус: **Both DMAs read arg1 (IRON compiler bug). K+V combined in bo_v. DMA echo test проходит environment fix + cacheable crash fix, ожидает тестирования на NPU.**
 
 ## Ключевые находки
 
@@ -23,6 +23,9 @@ Hardware: STX NPU2, 8 columns, model: llama-3.2-1b-BF16
 6. **`svm` и `p2p` не поддерживаются** XDNA драйвером
 7. **`cacheable`** из другого memory pool (delta -52888 KB), K_DIAG = all zeros
 8. **Диагностические инструменты**: marker test (`5d1feb002`), phantom offset diagnostic
+9. **`pyxrt.bo.cacheable` crash на XDNA** — access violation при создании insts buffer через CachedXRTRuntime. `host_only` работает. Фикс: monkey-patch в conftest.py
+10. **pyxrt.pyd = cp313** — скомпилирован под Python 3.13, несовместим с conda Python 3.12 (ABI mismatch). Весь тестовый стек должен работать на Python 3.13
+11. **Environment isolation** — PYTHONPATH не должен включать conda site-packages целиком (конфликт numpy/pytest). Только XRT SDK python + llvm-aie
 
 ## 🧪 Тест после arg swap фикса (2026-05-16 04:55)
 
