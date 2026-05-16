@@ -6,7 +6,7 @@
 
 Hardware: STX NPU2, 8 columns, model: llama-3.2-1b-BF16
 
-Статус: **PHANTOM OFFSET — КОРНЕВАЯ ПРИЧИНА.** DMA controller читает из неверного физического адреса для `host_only` буферов.
+Статус: **ARG SWAP ПОДТВЕРЖДЁН MARKER TEST → ИСПРАВЛЕН (1920fd641). Ожидает тестирования.**
 
 ## Ключевые находки
 
@@ -424,3 +424,4 @@ If K still reads V data → DMA offset is fundamentally broken for arg0.
 - `7999a4f` (IRON-windows devel): fix(flowkv): revert K/V arg swap, remove DIAG offset +64
 - `d3afe055e` (llama.cpp-xdna ggml-xdna): docs: SESSION.md — svm/p2p failed, marker test next
 - `5d1feb002` (llama.cpp-xdna ggml-xdna): diag: marker test (НЕ включён в протестированный бинарник)
+- `1920fd641` (llama.cpp-xdna ggml-xdna): **fix(flowkv): swap bo_k/bo_v — K DMA reads arg1** ← ИСПРАВЛЕНИЕ
