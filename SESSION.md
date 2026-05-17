@@ -121,6 +121,49 @@ tile1 -> out_fifo -> bo_out
 
 Цель v3: проверить inter-tile FIFO + раздельные K/V DMA + task ordering без attention математики.
 
+### v3 FlowKV-like inter FIFO test
+
+`run_echo_custom.bat 3` добавлен и проходит. Топология:
+
+```text
+bo_k -> K_fifo -> tile0
+bo_v -> V_fifo -> tile1
+tile0 -> inter_fifo -> tile1
+tile1 -> out_fifo -> bo_out
+```
+
+Реализация:
+
+- `echo_score_bf16(k, inter, N)` на score tile копирует K в inter FIFO;
+- `echo_value_bf16(inter, v, out, N)` на value tile пишет `out[0:N]=K`, `out[N:2N]=V`;
+- host test version 3 проверяет все `K=128/128` и `V=128/128` элементы;
+- `run_echo_custom.bat all` теперь последовательно прогоняет v1/v2/v3.
+
+Результат:
+
+```text
+run_echo_custom.bat 3
+[echo_test] after v3 wait state=4
+Kernel completed
+Result: K=128/128 V=128/128
+PASS: echo v3
+
+run_echo_custom.bat all
+PASS: echo v1
+PASS: echo v2
+PASS: echo v3
+```
+
+Вывод из v3:
+
+- two-worker / two-tile topology работает;
+- inter-tile ObjectFIFO (`tile0 -> tile1`) работает;
+- separate `bo_k` + `bo_v` DMA в FlowKV-like схеме работает;
+- output FIFO `tile1 -> bo_out` работает;
+- FlowKV garbage теперь не объясняется общим inter FIFO, split K/V BO, host_only BO или custom XRT dispatch failure.
+
+Следующий минимальный тест должен быть `echo_v4`, ещё ближе к FlowKV arg/TAP layout: добавить `bo_q`, порядок args как FlowKV, head/seq-like TAP offsets, но оставить простую marker/copy математику.
+
 
 
 ### Результаты (build b8883-20566573b):
