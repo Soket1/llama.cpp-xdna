@@ -11393,8 +11393,10 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                     // IRON compiler bug: both K_fifos and V_fifos DMA read from arg1.
                     // Workaround: put K+V in bo_v (arg1). K at offset 0, V at offset kv_region.
                     // bo_k (arg0) is unused but must be allocated for set_arg.
+                    // IMPORTANT: kernel is compiled for num_kv_heads=1, so V DMA offset
+                    // is 1*seq_len*head_dim elements = seq_len*row_bytes bytes.
                     for (int64_t kv_h = 0; kv_h < num_kv_heads; kv_h++) {
-                        size_t kv_region = (size_t)num_kv_heads * seq_len * row_bytes;
+                        size_t kv_region = (size_t)seq_len * row_bytes;  // for 1 KV head
                         // --- Write K data into bo_v at offset 0 ---
                         {
                             auto k_ptr = fk_entry->bo_v->map<char *>();
