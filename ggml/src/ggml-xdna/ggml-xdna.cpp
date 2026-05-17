@@ -11152,9 +11152,10 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                             xrt::bo(ctx->device, k_size, xrt::bo::flags::host_only,
                                     fk_entry->kernel.group_id(3)));
                     }
-                    // bo_v holds both K and V data (IRON compiler workaround:
-                    // both K_fifos and V_fifos DMA read from arg1).
-                    size_t v_size = 2 * num_kv_heads * seq_len * row_bytes;
+                    // FlowKV kernel is compiled with num_kv_heads=1 and is dispatched
+                    // once per KV head. MLIR reads K from arg0/bo_k and V from
+                    // arg1/bo_v at offset seq_len * row_bytes.
+                    size_t v_size = 2 * seq_len * row_bytes;
                     if (!fk_entry->bo_v) {
                         fk_entry->bo_v = std::make_unique<xrt::bo>(
                             xrt::bo(ctx->device, v_size, xrt::bo::flags::host_only,
@@ -11427,8 +11428,9 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
 
                         // --- Write V data into bo_v at offset kv_region ---
                         {
-                            auto v_ptr = fk_entry->bo_v->map<char *>() + kv_region;
-                            memset(v_ptr, 0, kv_region);
+                            auto bo_v_ptr = fk_entry->bo_v->map<char *>();
+                            memset(bo_v_ptr, 0, 2 * kv_region);
+                            auto v_ptr = bo_v_ptr + kv_region;
                             for (int64_t pos = 0; pos < actual_seq_len; pos++) {
                                 size_t dst = pos * row_bytes;
                                 const bool v_is_f16 = (flowkv_poc_v_perm->type == GGML_TYPE_F16);
@@ -11474,7 +11476,8 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                 }
                             }
                         }
-                        // Sync combined K+V buffer to device
+                        // Sync K and V buffers to device
+                        fk_entry->bo_k->sync(XCL_BO_SYNC_BO_TO_DEVICE);
                         fk_entry->bo_v->sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
                         // --- Prepare Q buffer (bf16) ---
@@ -11530,47 +11533,45 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                             // Diagnostic: verify BO data before dispatch
                             if (poc_dbg && kv_h == 0) {
                                 auto diag_k = fk_entry->bo_k->map<char *>();
+                                auto diag_v = fk_entry->bo_v->map<char *>();
                                 auto diag_q = fk_entry->bo_q->map<char *>();
                                 const uint16_t * k_bf16 = (const uint16_t *)diag_k;
+                                const uint16_t * v0_bf16 = (const uint16_t *)diag_v;
+                                const uint16_t * v_bf16 = (const uint16_t *)(diag_v + seq_len * row_bytes);
                                 const uint16_t * q_bf16 = (const uint16_t *)diag_q;
-                                fprintf(stderr, "  BO check kv_h=0: K[0] first 8 bf16:");
+                                fprintf(stderr, "  BO check kv_h=0: bo_k K[0] first 8 bf16:");
                                 for (int d = 0; d < 8; d++) fprintf(stderr, " 0x%04X", k_bf16[d]);
+                                fprintf(stderr, "\n  BO check kv_h=0: bo_v[0] first 8 bf16:");
+                                for (int d = 0; d < 8; d++) fprintf(stderr, " 0x%04X", v0_bf16[d]);
+                                fprintf(stderr, "\n  BO check kv_h=0: bo_v V[0] first 8 bf16:");
+                                for (int d = 0; d < 8; d++) fprintf(stderr, " 0x%04X", v_bf16[d]);
                                 fprintf(stderr, "\n  BO check kv_h=0: Q first 8 bf16:");
                                 for (int d = 0; d < 8; d++) fprintf(stderr, " 0x%04X", q_bf16[d]);
                                 fprintf(stderr, "\n  BO check: insts size=%u bo_k size=%zu bo_v size=%zu bo_q size=%zu bo_out size=%zu\n",
                                         (uint32_t)fk_entry->insts_data.size(),
-                                        (size_t)(1 * seq_len * row_bytes),
-                                        (size_t)(1 * seq_len * row_bytes),
+                                        (size_t)(seq_len * row_bytes),
+                                        (size_t)(2 * seq_len * row_bytes),
                                         (size_t)(1 * (q_heads_per_kv * head_dim + head_dim + 2) * sizeof(uint16_t)),
                                         (size_t)(q_heads_per_kv * row_bytes));
                                 fflush(stderr);
 
-                                // MARKER TEST: overwrite bo_k[0:8]=0xDEAD, bo_v[0:8]=0xBEEF
-                                // After data swap: bo_k has V data, bo_v has K data.
-                                // K DMA reads arg1 = bo_v. So:
-                                // K_DIAG==0xBEEF → K DMA reads bo_v (K data) → CORRECT
-                                // K_DIAG==0xDEAD → K DMA reads bo_k (V data) → WRONG
-                                // K_DIAG==other → DMA reads from ELSEWHERE
+                                // MARKER TEST: overwrite bo_k K[0:8]=0xDEAD,
+                                // bo_v[0:8]=0xAAAA, and bo_v V[0:8]=0xBEEF.
                                 static bool marker_done = false;
                                 if (xdna_env_enabled("XDNA_DIAG_OFFSET") && !marker_done) {
                                     marker_done = true;
                                     auto mk = fk_entry->bo_k->map<char *>();
                                     auto mv = fk_entry->bo_v->map<char *>();
-                                    // Save originals
-                                    uint16_t orig_k[8], orig_v[8];
-                                    memcpy(orig_k, mk, 16);
-                                    memcpy(orig_v, mv, 16);
-                                    // Write markers
                                     for (int d = 0; d < 8; d++) {
-                                        uint16_t dead = 0xDEAD, beef = 0xBEEF;
+                                        uint16_t dead = 0xDEAD, aaaa = 0xAAAA, beef = 0xBEEF;
                                         memcpy(mk + d*2, &dead, 2);
-                                        memcpy(mv + d*2, &beef, 2);
+                                        memcpy(mv + d*2, &aaaa, 2);
+                                        memcpy(mv + seq_len * row_bytes + d*2, &beef, 2);
                                     }
                                     fk_entry->bo_k->sync(XCL_BO_SYNC_BO_TO_DEVICE);
                                     fk_entry->bo_v->sync(XCL_BO_SYNC_BO_TO_DEVICE);
-                                    fprintf(stderr, "  [MARKER] K[0:8]=0xDEAD V[0:8]=0xBEEF written and synced\n");
+                                    fprintf(stderr, "  [MARKER] bo_k K[0:8]=0xDEAD bo_v[0:8]=0xAAAA bo_v V[0:8]=0xBEEF written and synced\n");
                                     fflush(stderr);
-                                    // Restore after dispatch (done below)
                                 }
                             }
 
@@ -11628,16 +11629,15 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                             }
                             // === END PHANTOM OFFSET DIAGNOSTIC ===
 
-                            // Use set_arg with all 8 kernel args
-                            // MARKER TEST: K DMA reads arg1, but simple swap doesn't fix it.
-                            // Instead: swap data — write K into bo_v (arg1), V into bo_k (arg0).
-                            // This way K DMA reads K data from arg1 regardless of BO mapping.
+                            // Use set_arg with all 8 kernel args. The FlowKV kernel is
+                            // compiled for one KV head: bo_k carries K, bo_v carries V
+                            // at offset seq_len * row_bytes.
                             auto run = xrt::run(fk_entry->kernel);
                             run.set_arg(0, 3u);  // opcode
                             run.set_arg(1, fk_entry->insts_bo);  // insts
                             run.set_arg(2, (uint32_t)fk_entry->insts_data.size());  // insts_size
-                            run.set_arg(3, *fk_entry->bo_k);    // DDR buf 0 (V DMA reads here)
-                            run.set_arg(4, *fk_entry->bo_v);    // DDR buf 1 (K DMA reads here)
+                            run.set_arg(3, *fk_entry->bo_k);    // DDR buf 0 (unused by workaround)
+                            run.set_arg(4, *fk_entry->bo_v);    // DDR buf 1 = K+V combined workaround
                             run.set_arg(5, *fk_entry->bo_q);    // DDR buf 2 = Q
                             run.set_arg(6, *fk_entry->bo_out);  // DDR buf 3 = Out
                             run.set_arg(7, 0u);  // unknown arg
@@ -11660,8 +11660,6 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                         (long long)kv_h, ms);
 
                                 // === DIAG: post-dispatch compare ===
-                                // K data is still in bo_k (host writes K to bo_k).
-                                // After arg swap: bo_k is at arg1, where K DMA reads.
                                 if (kv_h == 0) {
                                     fk_entry->bo_k->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
                                     auto post_k = reinterpret_cast<const uint16_t*>(
@@ -11694,16 +11692,18 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                         match_count, match_count > 0 ? "PARTIAL MATCH" : "ZERO MATCH — DMA reads wrong data!");
 
                                     // Marker detection
-                                    int dead_count = 0, beef_count = 0;
+                                    int dead_count = 0, aaaa_count = 0, beef_count = 0;
                                     for (int i = 0; i < 8; i++) {
                                         if (kdiag[i] == 0xDEAD) dead_count++;
+                                        if (kdiag[i] == 0xAAAA) aaaa_count++;
                                         if (kdiag[i] == 0xBEEF) beef_count++;
                                     }
-                                    if (dead_count > 0 || beef_count > 0) {
-                                        fprintf(stderr, "    [MARKER RESULT] 0xDEAD=%d/8 0xBEEF=%d/8 → %s\n",
-                                            dead_count, beef_count,
-                                            beef_count >= 4 ? "DMA reads arg1 (bo_v) — K data, CORRECT!" :
-                                            dead_count >= 4 ? "DMA reads arg0 (bo_k) — V data, WRONG!" :
+                                    if (dead_count > 0 || aaaa_count > 0 || beef_count > 0) {
+                                        fprintf(stderr, "    [MARKER RESULT] 0xDEAD=%d/8 0xAAAA=%d/8 0xBEEF=%d/8 → %s\n",
+                                            dead_count, aaaa_count, beef_count,
+                                            dead_count >= 4 ? "K DMA reads bo_k K region, CORRECT" :
+                                            aaaa_count >= 4 ? "K DMA reads bo_v offset 0, WRONG" :
+                                            beef_count >= 4 ? "K DMA reads bo_v V region, WRONG" :
                                             "DMA reads MIXED");
                                     } else {
                                         fprintf(stderr, "    [MARKER RESULT] no markers found → DMA reads from ELSEWHERE (not K, not V)\n");
