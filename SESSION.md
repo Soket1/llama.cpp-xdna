@@ -875,3 +875,83 @@ V DMA читал из bo_v → получал K data вместо V data.
 
 ### Статус: фиксы закоммичены, ожидают тестирования на hardware
 
+
+---
+
+## 2026-05-17: Анализ логов после фиксов + Echo Test через custom dispatch
+
+### Результат теста (build b8914-b38e4a68d)
+
+| Test | Output | Status |
+|------|--------|--------|
+| STEP 2 (без FlowKV) | "The capital of France is Paris." | ✅ |
+| STEP 3 (с FlowKV) | "The sometimes Turingagmaaclesagmaagma..." | ❌ другой мусор |
+
+### Анализ xdna лога (generation phase)
+
+**FlowKV-early dispatch'ится** (H=4 KV=8 d=64 S=256), но **POC path produce all zeros:**
+```
+bo_out raw: first 8 bf16: 0x0000 0x0000 ... all_zero=1
+```
+
+**K data в bo_v = нули**, хотя source K data не нулевой:
+```
+BO check kv_h=0: K[0] first 8 bf16: 0x0000 ... ← DMA видит нули
+K src raw [pos=0,kv_h=0] first 8 bf16: 0x1CF7 0xA33A ... ← данные есть
+```
+
+**BO address diagnostic:**
+```
+bo_k group_id: 1114112
+bo_v group_id: 1114112   ← одинаковые!
+V-K delta: 36093952 bytes (35248 KB) вместо ожидаемых 32768 (32 KB)
+*** UNEXPECTED DELTA — driver may be adding metadata! ***
+```
+
+**Marker test не запущен** (XDNA_DIAG_OFFSET не задан в bat-файле).
+
+### Ключевой вывод
+
+DMA читает из ELSEWHERE — не из bo_k, не из bo_v. Все предыдущие фиксы (L3_V_ty,
+combined bo_v, POC offset) не решают фундаментальную проблему: **XRT host_only buffer
+address не совпадает с тем, что видит DMA controller.**
+
+### Что уже пробовали (и не помогло)
+
+- ❌ Arg swap (a7f0bef → 7999a4f)
+- ❌ swap bo_k/bo_v в set_arg (1920fd641)
+- ❌ swap K/V data (bd1f27af9)
+- ❌ combine K+V в bo_v (cbfbc9009 + 0b8e622)
+- ❌ L3_V_ty doubling (b1c9911)
+- ❌ cacheable flag → DMA видит нули
+- ❌ svm/p2p → unsupported
+
+### Что НЕ работает: IRON framework tests
+
+- axpy тест → ERT_CMD_STATE_TIMEOUT (insts_bo sync не помогает)
+- echo test через IRON framework → тоже будет timeout (тот же CachedXRTRuntime path)
+- IRON framework + XDNA = broken path
+
+### Что РАБОТАЕТ: custom XRT dispatch
+
+- STEP 2 (QKV, GEMV, SwiGLU через custom dispatch в ggml-xdna.cpp) → "The capital of France is Paris." ✅
+- Custom dispatch: xrt::xclbin + xrt::kernel + xrt::run → работает на XDNA
+
+### Следующий шаг: Echo Test через custom dispatch
+
+Создан `echo_test.cpp` — standalone XRT dispatch, bypass IRON framework.
+Загружает echo xclbin через xrt::xclbin, dispatch'ит через xrt::run.
+
+**Если echo v1 PASS** → DMA path работает, проблема специфична для FlowKV
+**Если echo v1 FAIL** → DMA path сломан фундаментально
+
+Файлы: `iron/operators/dma_echo/echo_test.cpp`, `run_echo_custom.bat`
+Коммит: `085cb68` (IRON-windows devel)
+
+### Также: фикс POC path V offset
+
+POC path писал V data на offset `num_kv_heads * seq_len * row_bytes` (262144),
+но kernel (compiled for 1 KV head) читает V с offset `seq_len * row_bytes` (32768).
+Фикс: `kv_region = seq_len * row_bytes`.
+Коммит: `95cc4da4e` (llama.cpp-xdna ggml-xdna)
+
