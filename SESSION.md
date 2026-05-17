@@ -29,10 +29,11 @@ Hardware: STX NPU2, 8 columns, model: llama-3.2-1b-BF16
 12. **aiecc.py → aiecc.exe deadlock (ROOT CAUSE FOUND & FIXED)** — `aiecc.py` вызывает `subprocess.run([aiecc.exe, ...])` **без** `stdin=DEVNULL`. Фикс: на Windows `_resolve_aiecc` предпочитает `aiecc.exe` напрямую. Коммит `1f5f7c5` (IRON-windows devel)
 13. **insts_bo sync для host_only** — `pyxrt.bo.cacheable` крашит на XDNA → monkey-patch на `host_only`. Но `host_only` буферы не видны NPU без явного `sync_bo(TO_DEVICE)`. Hostruntime НЕ вызывает sync (предполагает cacheable=coherent). Фикс: monkey-patch `XRTHostRuntime.run` для sync insts_bo. Коммит `5048d27` (IRON-windows devel)
 14. **echo_custom v1 PASS (2026-05-17)** — standalone raw DMA echo через custom XRT dispatch работает: `run_echo_custom.bat 1` собрал xclbin/insts, скомпилил `echo_test.exe`, `run.start(); run.wait()` завершился `state=4`, output `256/256 match`.
-15. **Вывод из echo_custom v1** — `host_only` BO и single ObjectFIFO DMA сами по себе исправны. FlowKV баг теперь сужен до FlowKV-specific path: multi-FIFO/runtime_sequence/TAP offsets/NPU instruction descriptor binding, а не общий XRT/host_only/raw-DMA сбой.
-16. **Важный runtime факт** — в custom XRT dispatch нужен явный `run.start()` перед `run.wait()`. Без `run.start()` `echo_test.exe` падал с `0xC0000409` после `set_arg`.
+15. **echo_custom v2 PASS (2026-05-17)** — после фикса test design (`out_fifo` должен быть `memref<2*N>`, `N=128` для v2) dual input ObjectFIFO concat работает: `A=128/128 B=128/128`, `PASS: echo v2`.
+16. **Вывод из echo_custom v1/v2** — `host_only` BO, custom XRT dispatch, single ObjectFIFO и dual input ObjectFIFO сами по себе исправны. FlowKV баг теперь сужен до FlowKV-specific path: inter-tile FIFO (`inter_0`), K/V/Q/O task ordering, TAP stride/offset, или generated NPU instruction descriptor binding.
+17. **Важный runtime факт** — в custom XRT dispatch нужен явный `run.start()` перед `run.wait()`. Без `run.start()` `echo_test.exe` падал с `0xC0000409` после `set_arg`.
 
-## echo_custom raw DMA test (2026-05-17)
+## echo_custom raw DMA tests (2026-05-17)
 
 ### Что проверяли
 
@@ -72,16 +73,55 @@ Result: 256/256 match
 PASS: echo v1
 ```
 
-### Вывод
+### v2 dual input FIFO test
 
-- raw single-ObjectFIFO DMA path работает;
-- `xrt::bo::flags::host_only` для input/output работает при явном sync;
-- basic custom XRT dispatch рабочий;
-- FlowKV garbage не объясняется общим XRT/host_only failure;
-- следующий минимальный тест: `run_echo_custom.bat 2` (dual input FIFO + output), ближе к FlowKV K/V pattern.
+Первый запуск `run_echo_custom.bat 2` дошёл до NPU, но вернул `state=8`. Это не было доказательством dual-FIFO bug: test design был некорректен.
+
+Проблемы v2 до фикса:
+
+- MLIR генерировался с `N=128`, а `echo_test.cpp` использовал `N=256`;
+- `echo_concat_bf16` пишет `out[0..2*N-1]`, но `out_fifo` был `memref<N>`;
+- drain пытался слить `2*N` из FIFO элемента размера `N`.
+
+Фикс в IRON-windows working tree:
+
+- `echo_test.cpp`: `N = (version == 1) ? 256 : 128`;
+- `echo_test.cpp`: v2 тоже вызывает `run.start()` перед `run.wait()`;
+- `design.py`: `L1_full = np.ndarray[(2 * N,), dtype_in]`, `out_fifo = ObjectFifo(L1_full, ...)`, `Kernel(... [L1_ty, L1_ty, L1_full, np.int32])`.
+
+Результат после фикса:
+
+```text
+xclbin + insts compiled
+echo_test.exe compiled
+echo_test v2 ... N=128
+insts: 420 bytes
+[echo_test] after v2 start
+[echo_test] after v2 wait state=4
+Kernel completed
+Result: A=128/128 B=128/128
+PASS: echo v2
+```
+
+Вывод:
+
+- dual input ObjectFIFO + output FIFO работает;
+- два `host_only` input BO + output BO работают;
+- concat `A+B -> out[0:N], out[N:2N]` работает;
+- текущий FlowKV bug не объясняется общим dual-FIFO/XRT/host_only failure.
+
+Следующий минимальный тест должен быть `echo_v3`, ближе к FlowKV:
+
+```text
+bo_k -> K_fifo -> tile0
+bo_v -> V_fifo -> tile1
+tile0 -> inter_fifo -> tile1
+tile1 -> out_fifo -> bo_out
+```
+
+Цель v3: проверить inter-tile FIFO + раздельные K/V DMA + task ordering без attention математики.
 
 
-## 🧪 Тест после arg swap фикса (2026-05-16 04:55)
 
 ### Результаты (build b8883-20566573b):
 
