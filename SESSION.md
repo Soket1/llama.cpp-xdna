@@ -28,6 +28,58 @@ Hardware: STX NPU2, 8 columns, model: llama-3.2-1b-BF16
 11. **Environment isolation** — PYTHONPATH не должен включать conda site-packages целиком (конфликт numpy/pytest). Только XRT SDK python + llvm-aie
 12. **aiecc.py → aiecc.exe deadlock (ROOT CAUSE FOUND & FIXED)** — `aiecc.py` вызывает `subprocess.run([aiecc.exe, ...])` **без** `stdin=DEVNULL`. Фикс: на Windows `_resolve_aiecc` предпочитает `aiecc.exe` напрямую. Коммит `1f5f7c5` (IRON-windows devel)
 13. **insts_bo sync для host_only** — `pyxrt.bo.cacheable` крашит на XDNA → monkey-patch на `host_only`. Но `host_only` буферы не видны NPU без явного `sync_bo(TO_DEVICE)`. Hostruntime НЕ вызывает sync (предполагает cacheable=coherent). Фикс: monkey-patch `XRTHostRuntime.run` для sync insts_bo. Коммит `5048d27` (IRON-windows devel)
+14. **echo_custom v1 PASS (2026-05-17)** — standalone raw DMA echo через custom XRT dispatch работает: `run_echo_custom.bat 1` собрал xclbin/insts, скомпилил `echo_test.exe`, `run.start(); run.wait()` завершился `state=4`, output `256/256 match`.
+15. **Вывод из echo_custom v1** — `host_only` BO и single ObjectFIFO DMA сами по себе исправны. FlowKV баг теперь сужен до FlowKV-specific path: multi-FIFO/runtime_sequence/TAP offsets/NPU instruction descriptor binding, а не общий XRT/host_only/raw-DMA сбой.
+16. **Важный runtime факт** — в custom XRT dispatch нужен явный `run.start()` перед `run.wait()`. Без `run.start()` `echo_test.exe` падал с `0xC0000409` после `set_arg`.
+
+## echo_custom raw DMA test (2026-05-17)
+
+### Что проверяли
+
+`IRON-windows\iron\operators\dma_echo\run_echo_custom.bat 1` — минимальный independent test без FlowKV:
+
+```text
+host bo_in -> Shim DMA -> ObjectFIFO -> AIE echo_copy_bf16 -> ObjectFIFO -> Shim DMA -> host bo_out
+```
+
+Цель: отделить общий XRT/host_only/raw DMA сбой от FlowKV-specific descriptor/TAP проблемы.
+
+### Что пришлось починить в IRON-windows
+
+Commit `14ca4a0 fix(dma_echo): repair custom Windows echo runner` в `Soket1/IRON-windows:devel`:
+
+- `run_echo_custom.bat`:
+  - MSVC env через `vcvars64.bat`;
+  - Python313 `mlir_aie\bin\aiecc.exe` напрямую, не через Python wrapper;
+  - `llvm-aie\bin\clang.exe` + правильные `mlir_aie`/`llvm-aie` include paths;
+  - strip `.tctmemtab`, `.tctmemtabl`, `.tctmemstrtab` из `echo.o`;
+  - локальная копия `aiecc_orphan_place.exe`, где `--orphan-handling=error` заменён на `--orphan-handling=place`;
+  - `/Zc:__cplusplus` для MSVC, иначе XRT headers требуют `boost/any.hpp`.
+- `echo_test.cpp`:
+  - include paths под этот XRT SDK: `xrt/experimental/xrt_xclbin.h`, `xrt/experimental/xrt_ext.h`;
+  - явный `run.start()` перед `run.wait()`.
+
+### Результат
+
+```text
+xclbin + insts compiled
+echo_test.exe compiled
+[echo_test] after start
+[echo_test] after wait state=4
+Kernel completed
+Output:    0x3F00 0x3F80 0x3FC0 0x4000 0x4020 0x4040 0x4060 0x4080 ...
+Result: 256/256 match
+PASS: echo v1
+```
+
+### Вывод
+
+- raw single-ObjectFIFO DMA path работает;
+- `xrt::bo::flags::host_only` для input/output работает при явном sync;
+- basic custom XRT dispatch рабочий;
+- FlowKV garbage не объясняется общим XRT/host_only failure;
+- следующий минимальный тест: `run_echo_custom.bat 2` (dual input FIFO + output), ближе к FlowKV K/V pattern.
+
 
 ## 🧪 Тест после arg swap фикса (2026-05-16 04:55)
 
