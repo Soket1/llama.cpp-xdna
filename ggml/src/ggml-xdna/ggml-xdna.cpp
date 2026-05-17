@@ -4510,6 +4510,10 @@ static bool ggml_backend_xdna_flowkv_per_head(
         if (!entry) { all_ok = false; continue; }
 
         try {
+            // IRON compiler bug: BOTH K_fifos and V_fifos DMA read from arg1 (bo_v).
+            // Workaround: combine K+V data in bo_v (arg1).
+            // K data at offset 0, V data at offset kv_region_size.
+            // bo_k (arg0) is unused by DMA but still passed to kernel.
             if (!entry->bo_k) {
                 size_t k_size = 1 * seq_len * head_dim * sizeof(uint16_t);
                 entry->bo_k = std::make_unique<xrt::bo>(
@@ -4517,7 +4521,8 @@ static bool ggml_backend_xdna_flowkv_per_head(
                             entry->kernel.group_id(3)));
             }
             if (!entry->bo_v) {
-                size_t v_size = 1 * seq_len * head_dim * sizeof(uint16_t);
+                // bo_v holds both K and V: [K_all | V_all]
+                size_t v_size = 2 * seq_len * head_dim * sizeof(uint16_t);
                 entry->bo_v = std::make_unique<xrt::bo>(
                     xrt::bo(ctx->device, v_size, xrt::bo::flags::host_only,
                             entry->kernel.group_id(4)));
@@ -4581,64 +4586,65 @@ static bool ggml_backend_xdna_flowkv_per_head(
             }
             // ====================================================================
 
-            // --- Prepare K cache buffer (SWAPPED: K data → bo_v) ---
+            // --- Prepare K+V combined buffer in bo_v (arg1) ---
+            // IRON compiler bug: both K_fifos and V_fifos DMA read from arg1.
+            // K data at offset 0, V data at offset kv_region_size.
             {
-                auto k_ptr = entry->bo_v->map<char *>();
-                const char * k_data = (const char *)k_tensor->data;
+                auto kv_ptr = entry->bo_v->map<char *>();
                 size_t row_bytes = head_dim * sizeof(uint16_t);
+                size_t kv_region_size = seq_len * row_bytes;
 
-                size_t k_pos_stride = k_tensor->nb[1];
-                size_t k_head_stride = k_tensor->ne[2] > 1 ? k_tensor->nb[2] : 0;
+                // K data → bo_v offset 0
+                {
+                    const char * k_data = (const char *)k_tensor->data;
+                    size_t k_pos_stride = k_tensor->nb[1];
+                    size_t k_head_stride = k_tensor->ne[2] > 1 ? k_tensor->nb[2] : 0;
+                    const bool k_f16 = (k_tensor->type == GGML_TYPE_F16);
 
-                const bool k_f16 = (k_tensor->type == GGML_TYPE_F16);
-
-                for (int64_t pos = 0; pos < seq_len; pos++) {
-                    size_t dst = pos * row_bytes;
-                    size_t src = pos * k_pos_stride + kv_h * k_head_stride;
-                    if (k_f16) {
-                        for (int64_t d = 0; d < head_dim; d++) {
-                            ggml_fp16_t f16_val;
-                            memcpy(&f16_val, k_data + src + d * sizeof(ggml_fp16_t), sizeof(ggml_fp16_t));
-                            float f32_val = ggml_fp16_to_fp32(f16_val);
-                            uint16_t bf16_val;
-                            f32_to_bf16(&f32_val, &bf16_val, 1);
-                            memcpy(k_ptr + dst + d * 2, &bf16_val, 2);
+                    for (int64_t pos = 0; pos < seq_len; pos++) {
+                        size_t dst = pos * row_bytes;
+                        size_t src = pos * k_pos_stride + kv_h * k_head_stride;
+                        if (k_f16) {
+                            for (int64_t d = 0; d < head_dim; d++) {
+                                ggml_fp16_t f16_val;
+                                memcpy(&f16_val, k_data + src + d * sizeof(ggml_fp16_t), sizeof(ggml_fp16_t));
+                                float f32_val = ggml_fp16_to_fp32(f16_val);
+                                uint16_t bf16_val;
+                                f32_to_bf16(&f32_val, &bf16_val, 1);
+                                memcpy(kv_ptr + dst + d * 2, &bf16_val, 2);
+                            }
+                        } else {
+                            memcpy(kv_ptr + dst, k_data + src, row_bytes);
                         }
-                    } else {
-                        memcpy(k_ptr + dst, k_data + src, row_bytes);
                     }
                 }
+
+                // V data → bo_v offset kv_region_size
+                {
+                    const char * v_data = (const char *)v_tensor->data;
+                    size_t v_pos_stride = v_tensor->nb[1];
+                    size_t v_head_stride = v_tensor->ne[2] > 1 ? v_tensor->nb[2] : 0;
+                    const bool v_f16 = (v_tensor->type == GGML_TYPE_F16);
+
+                    for (int64_t pos = 0; pos < seq_len; pos++) {
+                        size_t dst = kv_region_size + pos * row_bytes;
+                        size_t src = pos * v_pos_stride + kv_h * v_head_stride;
+                        if (v_f16) {
+                            for (int64_t d = 0; d < head_dim; d++) {
+                                ggml_fp16_t f16_val;
+                                memcpy(&f16_val, v_data + src + d * sizeof(ggml_fp16_t), sizeof(ggml_fp16_t));
+                                float f32_val = ggml_fp16_to_fp32(f16_val);
+                                uint16_t bf16_val;
+                                f32_to_bf16(&f32_val, &bf16_val, 1);
+                                memcpy(kv_ptr + dst + d * 2, &bf16_val, 2);
+                            }
+                        } else {
+                            memcpy(kv_ptr + dst, v_data + src, row_bytes);
+                        }
+                    }
+                }
+
                 entry->bo_v->sync(XCL_BO_SYNC_BO_TO_DEVICE);
-            }
-
-            // --- Prepare V cache buffer (SWAPPED: V data → bo_k) ---
-            {
-                auto v_ptr = entry->bo_k->map<char *>();
-                const char * v_data = (const char *)v_tensor->data;
-                size_t row_bytes = head_dim * sizeof(uint16_t);
-
-                size_t v_pos_stride = v_tensor->nb[1];
-                size_t v_head_stride = v_tensor->ne[2] > 1 ? v_tensor->nb[2] : 0;
-
-                const bool v_f16 = (v_tensor->type == GGML_TYPE_F16);
-
-                for (int64_t pos = 0; pos < seq_len; pos++) {
-                    size_t dst = pos * row_bytes;
-                    size_t src = pos * v_pos_stride + kv_h * v_head_stride;
-                    if (v_f16) {
-                        for (int64_t d = 0; d < head_dim; d++) {
-                            ggml_fp16_t f16_val;
-                            memcpy(&f16_val, v_data + src + d * sizeof(ggml_fp16_t), sizeof(ggml_fp16_t));
-                            float f32_val = ggml_fp16_to_fp32(f16_val);
-                            uint16_t bf16_val;
-                            f32_to_bf16(&f32_val, &bf16_val, 1);
-                            memcpy(v_ptr + dst + d * 2, &bf16_val, 2);
-                        }
-                    } else {
-                        memcpy(v_ptr + dst, v_data + src, row_bytes);
-                    }
-                }
-                entry->bo_k->sync(XCL_BO_SYNC_BO_TO_DEVICE);
             }
 
             // --- Prepare Q buffer ---
@@ -4670,7 +4676,8 @@ static bool ggml_backend_xdna_flowkv_per_head(
             // --- Dispatch ---
             // IRON xclbin arg layout: opcode(0), insts(1), insts_size(2),
             // DDR_buf_0(3), DDR_buf_1(4), DDR_buf_2(5)=q, DDR_buf_3(6)=out
-            // Data is swapped: K data in bo_v (arg1), V data in bo_k (arg0).
+            // IRON compiler bug: both K/V DMAs read from arg1 (bo_v).
+            // K data at offset 0, V data at offset kv_region_size in bo_v.
             auto run = entry->kernel(
                 3, entry->insts_bo, (uint32_t)entry->insts_data.size(),
                 *entry->bo_k, *entry->bo_v, *entry->bo_q, *entry->bo_out);
