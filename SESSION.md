@@ -206,6 +206,50 @@ PASS: echo v4
 
 Остаётся искать в настоящем FlowKV-specific деталях: реальные head/group размеры и stride, multi-chunk sequencing, packed inter buffer layout, softmax/RoPE kernels, O layout и descriptor binding в большом графе.
 
+### v5 FlowKV-like multi-chunk sequencing test
+
+`run_echo_custom.bat 5` добавлен и проходит. Он проверяет следующий слой после v4: multi-chunk sequencing без attention math.
+
+Топология:
+
+```text
+rt.sequence(K, V, Q, O)
+Q_fifo -> score tile, Q удерживается через оба chunk
+for chunk in [0, 1]:
+    K_chunk -> score tile
+    score tile -> inter_fifo -> value tile
+    V_chunk -> value tile
+value tile -> O_fifo -> O
+```
+
+Реализация:
+
+- `echo_score_qk_bf16(q, k, inter, N)` используется на каждом K chunk и пишет `[K_chunk, Q]` в inter FIFO;
+- `echo_value_chunk0_bf16` и `echo_value_chunk1_bf16` явно разворачивают value-side chunk calls, чтобы не зависеть от `if chunk == 0` внутри `range_()`;
+- host version 5 проверяет отдельные output sections: `K0`, `K1`, `Q`, `V0`, `V1`;
+- во время разработки v5 был найден важный IRON/MLIR nuance: переменная `chunk` из `range_()` имеет тип `index`, поэтому её нельзя напрямую передавать в kernel argument `i32`; также branch `if chunk == 0` внутри `range_()` не дал ожидаемого Python-unrolled поведения. Финальная версия использует fixed chunk0/chunk1 kernels.
+
+Результат:
+
+```text
+run_echo_custom.bat 5
+[echo_test] after v5 wait state=4
+Kernel completed
+Result: K0=32/32 K1=32/32 Q=32/32 V0=32/32 V1=32/32
+PASS: echo v5
+```
+
+Вывод из v5:
+
+- multi-chunk Q-held score path работает;
+- repeated K acquire/release работает;
+- repeated inter FIFO acquire/release между score/value tile работает;
+- repeated V acquire/release работает;
+- value-side final O write после двух chunks работает;
+- FlowKV garbage теперь не объясняется простым multi-chunk sequencing failure.
+
+Остаётся искать в настоящем FlowKV-specific деталях: packed inter numerical layout (`F_c/C_c/l`), score/value math kernels, RoPE/softmax state, реальные head/group/chunk strides и O layout.
+
 
 
 ### Результаты (build b8883-20566573b):
