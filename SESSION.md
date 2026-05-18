@@ -248,7 +248,71 @@ PASS: echo v5
 - value-side final O write после двух chunks работает;
 - FlowKV garbage теперь не объясняется простым multi-chunk sequencing failure.
 
-Остаётся искать в настоящем FlowKV-specific деталях: packed inter numerical layout (`F_c/C_c/l`), score/value math kernels, RoPE/softmax state, реальные head/group/chunk strides и O layout.
+Остаётся искать в настоящем FlowKV-specific деталях: score/value math kernels, RoPE/softmax state, реальные head/group/chunk strides, O layout и descriptor binding в большом графе.
+
+### v6 FlowKV packed inter layout test
+
+`run_echo_custom.bat 6` добавлен и проходит. Он проверяет следующий слой после v5: настоящий packed inter contract между score/value tile без attention math.
+
+Топология:
+
+```text
+rt.sequence(K, V, Q, O)
+Q_fifo -> score tile, Q удерживается через оба chunk
+for chunk in [0, 1]:
+    K_chunk -> score tile
+    score tile writes packed inter [F_c | C_c | l]
+    packed inter -> value tile
+    V_chunk -> value tile
+value tile writes [F_c | C_c | l | V_chunk] blocks -> O_fifo -> O
+```
+
+Параметры diagnostic:
+
+```text
+chunk_size = 16
+group_size = 4
+head_dim = 64
+num_chunks = 2
+scores_size = chunk_size * group_size = 64
+packed_inter_size = scores_size + 2 * group_size = 72
+v_chunk_size = chunk_size * head_dim = 1024
+out_block_size = packed_inter_size + v_chunk_size = 1096
+```
+
+Реализация:
+
+- `echo_pack_inter_v6_bf16(k, packed_out, chunk_size, group_size, head_dim)` пишет packed layout `[F_c scores | C_c correction | l denom]`;
+- `F_c` — marker copy из первых `chunk_size * group_size` элементов K chunk;
+- `C_c` и `l` — bf16 `1.0` по `group_size` элементов;
+- `echo_value_v6_chunk0_bf16` и `echo_value_v6_chunk1_bf16` явно разворачивают value-side chunk calls;
+- `echo_value_v6_bf16` копирует packed inter и затем append'ит V chunk в output block;
+- host version 6 проверяет отдельные sections: `F0/C0/L0/V0/F1/C1/L1/V1`.
+
+Важная деталь v6:
+
+- `packed_inter_size = 72` не кратен vector width 16;
+- первая версия value copy с `aie::vector<bfloat16, 16>` давала mismatch в `C0/L0/V0`;
+- фикс: копировать packed inter и V append через `aie::vector<bfloat16, 8>`, т.к. `72` и `1024` кратны 8.
+
+Результат:
+
+```text
+run_echo_custom.bat 6
+[echo_test] after v6 wait state=4
+Kernel completed
+Result: F0=64/64 C0=4/4 L0=4/4 V0=1024/1024 F1=64/64 C1=4/4 L1=4/4 V1=1024/1024
+PASS: echo v6
+```
+
+Вывод из v6:
+
+- packed inter FIFO layout `[F_c | C_c | l]` работает в минимальном FlowKV-like графе;
+- score tile -> packed inter FIFO -> value tile работает для packed size 72 bf16;
+- value tile output block `[F_c | C_c | l | V_chunk]` работает;
+- FlowKV garbage теперь не объясняется самим packed inter layout или его FIFO/DMA sequencing.
+
+Остаётся искать в настоящем FlowKV-specific деталях: score math, value accumulation/normalization math, RoPE/softmax running state, реальные head/group/chunk strides, O layout и descriptor binding в большом графе.
 
 
 
