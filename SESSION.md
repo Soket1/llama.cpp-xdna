@@ -164,6 +164,48 @@ PASS: echo v3
 
 Следующий минимальный тест должен быть `echo_v4`, ещё ближе к FlowKV arg/TAP layout: добавить `bo_q`, порядок args как FlowKV, head/seq-like TAP offsets, но оставить простую marker/copy математику.
 
+### v4 FlowKV-like Q/K/V arg + TAP test
+
+`run_echo_custom.bat 4` добавлен и проходит. Топология ближе к FlowKV, чем v3:
+
+```text
+rt.sequence(K, V, Q, O)
+arg3=K, arg4=V, arg5=Q, arg6=O
+Q_fifo + K_fifo -> score tile
+score tile -> inter_fifo -> value tile
+V_fifo -> value tile
+value tile -> O_fifo -> O
+```
+
+Реализация:
+
+- `echo_score_qk_bf16(q, k, inter, N)` пишет в inter FIFO `[K, Q]`;
+- `echo_value_qkv_bf16(inter, v, out, N)` пишет в output `[K, Q, V]`;
+- `echo_v4()` использует `rt.sequence(L3_K_ty, L3_V_ty, L3_Q_ty, L3_O_ty) as (K, V, Q, O)` как FlowKV;
+- host test version 4 ставит `run.set_arg(3, bo_k)`, `set_arg(4, bo_v)`, `set_arg(5, bo_q)`, `set_arg(6, bo_out)`;
+- V TAP читает с offset `N` внутри `bo_v`, чтобы проверить offset-region read, не просто offset 0;
+- host проверяет все `K=64/64`, `Q=64/64`, `V=64/64` элементы.
+
+Результат:
+
+```text
+run_echo_custom.bat 4
+[echo_test] after v4 wait state=4
+Kernel completed
+Result: K=64/64 Q=64/64 V=64/64
+PASS: echo v4
+```
+
+Вывод из v4:
+
+- FlowKV-like arg order `K,V,Q,O` работает в custom XRT dispatch;
+- `arg3=K,arg4=V,arg5=Q,arg6=O` не ломает descriptor binding в минимальном графе;
+- Q+K на score tile + inter FIFO + V на value tile работает;
+- простой V TAP offset работает;
+- FlowKV garbage теперь не объясняется общей ошибкой arg order, Q/K/V BO binding или простым V-region TAP offset.
+
+Остаётся искать в настоящем FlowKV-specific деталях: реальные head/group размеры и stride, multi-chunk sequencing, packed inter buffer layout, softmax/RoPE kernels, O layout и descriptor binding в большом графе.
+
 
 
 ### Результаты (build b8883-20566573b):
