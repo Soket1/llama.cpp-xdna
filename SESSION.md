@@ -385,7 +385,67 @@ PASS: echo v7
 
 
 
-### Результаты (build b8883-20566573b):
+### v8 FlowKV value math diagnostic
+
+`run_echo_custom.bat 8` добавлен и проходит. Он проверяет следующий слой после v7: value-side accumulation/normalization на host-controlled packed inter и V, без score tile.
+
+Топология:
+
+```text
+rt.sequence(P, V, O)
+value_init()
+value_accum(P0, V0)
+value_accum(P1, V1)
+value_normalize(O)
+```
+
+Параметры diagnostic:
+
+```text
+chunk_size = 16
+group_size = 4
+num_chunks = 2
+head_dim = 64
+packed_inter_size = chunk_size * group_size + 2 * group_size = 72
+kv_size = chunk_size * head_dim = 1024
+out_size = group_size * head_dim = 256
+```
+
+Host input:
+
+```text
+chunk0: F=1, C=0, l=16, V=2
+chunk1: F=1, C=1, l=32, V=4
+```
+
+Ожидаемая математика:
+
+```text
+Y0 = 0 * 0 + 16 * 2 = 32
+Y1 = 1 * 32 + 16 * 4 = 96
+O = 96 / 32 = 3
+```
+
+Результат:
+
+```text
+run_echo_custom.bat 8
+[echo_test] after v8 wait state=4
+Kernel completed
+Result: O=256/256 expected=3.000000
+Samples: O0=3.000000 O63=3.000000 O64=3.000000 O255=3.000000
+PASS: echo v8
+```
+
+Вывод из v8:
+
+- value_init / value_accum / value_normalize работают в минимальном графе;
+- packed inter `[F_c | C_c | l]` и saved_denom contract корректны;
+- controlled value-side math тоже не объясняет FlowKV garbage на простом input.
+
+Остаётся искать в настоящем FlowKV-specific деталях: реальные production Q/K/V данные, реальные head/group/chunk strides, O layout и descriptor binding в большом графе.
+
+
 
 | Тест | Output |
 |------|--------|
