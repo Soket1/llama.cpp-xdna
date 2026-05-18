@@ -312,7 +312,76 @@ PASS: echo v6
 - value tile output block `[F_c | C_c | l | V_chunk]` работает;
 - FlowKV garbage теперь не объясняется самим packed inter layout или его FIFO/DMA sequencing.
 
-Остаётся искать в настоящем FlowKV-specific деталях: score math, value accumulation/normalization math, RoPE/softmax running state, реальные head/group/chunk strides, O layout и descriptor binding в большом графе.
+Остаётся искать в настоящем FlowKV-specific деталях: value accumulation/normalization math, реальные production Q/K/V данные, реальные head/group/chunk strides, O layout и descriptor binding в большом графе.
+
+### v7 FlowKV score math packed inter test
+
+`run_echo_custom.bat 7` добавлен и проходит. Он проверяет следующий слой после v6: реальную score-side online-softmax математику, которая создаёт packed inter `[F_c | C_c | l]`, но без value accumulation/normalization.
+
+Топология:
+
+```text
+rt.sequence(K, Q, O)
+Q_fifo -> score tile, Q удерживается через оба chunk
+score_init()
+score_rope_q(Q)
+for chunk in [0, 1]:
+    K_chunk -> score tile
+    score_chunk(Q, K_chunk) writes packed inter [F_c | C_c | l]
+    packed inter -> drain worker
+ drain worker writes packed chunk blocks -> O_fifo -> O
+```
+
+Параметры diagnostic:
+
+```text
+chunk_size = 16
+group_size = 4
+head_dim = 64
+num_chunks = 2
+scores_size = chunk_size * group_size = 64
+packed_inter_size = scores_size + 2 * group_size = 72
+q_stride = group_size * head_dim + head_dim + 2 = 322
+output = num_chunks * packed_inter_size = 144 bf16
+```
+
+Реализация:
+
+- `echo_v7_score_init_bf16` сбрасывает running max/sum как FlowKV score tile;
+- `echo_v7_score_rope_q_bf16` копирует Q в static `rotated_q` и читает `actual_seq_len` из Q metadata slot;
+- `echo_v7_score_chunk_bf16` повторяет FlowKV score-side dot product + online softmax + packed `[F_c | C_c | l]`;
+- `echo_v7_copy_pack_chunk0_bf16` и `echo_v7_copy_pack_chunk1_bf16` сливают packed inter chunks в host-visible output;
+- host version 7 использует симметричный Q/K pattern: Q one-hot по dim0, каждый K row one-hot по dim0, `actual_seq_len=32`.
+
+Ожидаемая математика для такого pattern:
+
+```text
+raw dot = 1.0
+scaled score = 1/sqrt(64) = 0.125
+chunk 0: F=1, C=0, l=16
+chunk 1: F=1, C=1, l=32
+```
+
+Результат:
+
+```text
+run_echo_custom.bat 7
+[echo_test] after v7 wait state=4
+Kernel completed
+Result: F0=64/64 C0=4/4 L0=4/4 F1=64/64 C1=4/4 L1=4/4
+Samples: F0=1.000000 C0=0.000000 L0=16.000000 F1=1.000000 C1=1.000000 L1=32.000000
+PASS: echo v7
+```
+
+Вывод из v7:
+
+- FlowKV score-side Q copy / actual_seq_len read работает в минимальном графе;
+- dot product `Q*K/sqrt(64)` работает для контролируемого Q/K;
+- online softmax state across chunks работает (`l: 16 -> 32`, `C: 0 -> 1`);
+- packed score output `[F_c | C_c | l]` численно корректен для симметричного pattern;
+- FlowKV garbage теперь не объясняется самой score-side math или packed score output на простом controlled input.
+
+Остаётся искать в настоящем FlowKV-specific деталях: value accumulation/normalization math, реальные production Q/K/V данные, реальные head/group/chunk strides, O layout и descriptor binding в большом графе.
 
 
 
