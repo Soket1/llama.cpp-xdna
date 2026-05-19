@@ -11398,10 +11398,14 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                     // is 1*seq_len*head_dim elements = seq_len*row_bytes bytes.
                     for (int64_t kv_h = 0; kv_h < num_kv_heads; kv_h++) {
                         size_t kv_region = (size_t)seq_len * row_bytes;  // for 1 KV head
+                        // Zero combined bo_v before writing K and V.
+                        {
+                            auto bo_v_ptr = fk_entry->bo_v->map<char *>();
+                            memset(bo_v_ptr, 0, 2 * kv_region);
+                        }
                         // --- Write K data into bo_v at offset 0 ---
                         {
                             auto k_ptr = fk_entry->bo_v->map<char *>();
-                            memset(k_ptr, 0, kv_region);
                             for (int64_t pos = 0; pos < actual_seq_len; pos++) {
                                 size_t dst = pos * row_bytes;
                                 const bool k_is_f16 = (flowkv_poc_k_perm->type == GGML_TYPE_F16);
@@ -11425,11 +11429,18 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                 }
                             }
                         }
+                        // Mirror K data into bo_k (arg0) because the IRON compiler
+                        // maps K FIFO DMA to arg0, not arg1 as the workaround assumed.
+                        {
+                            auto k_dst = fk_entry->bo_k->map<char *>();
+                            auto k_src = fk_entry->bo_v->map<char *>();
+                            memcpy(k_dst, k_src, kv_region);
+                            fk_entry->bo_k->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                        }
 
                         // --- Write V data into bo_v at offset kv_region ---
                         {
                             auto bo_v_ptr = fk_entry->bo_v->map<char *>();
-                            memset(bo_v_ptr, 0, 2 * kv_region);
                             auto v_ptr = bo_v_ptr + kv_region;
                             for (int64_t pos = 0; pos < actual_seq_len; pos++) {
                                 size_t dst = pos * row_bytes;
@@ -11522,6 +11533,12 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                     bf = (uint16_t)((bits + rounding) >> 16);
                                 }
                                 memcpy(q_ptr + angles_off + head_dim * 2, &bf, 2);
+                            }
+                            // V10 PROBE: write magic to angles[head_dim + 1] under XDNA_FLOWKV_REAL_PROBE
+                            {
+                                static bool flowkv_real_probe = xdna_env_enabled("XDNA_FLOWKV_REAL_PROBE");
+                                uint16_t probe_val = flowkv_real_probe ? 0x7A10 : 0x0000;
+                                memcpy(q_ptr + angles_off + (head_dim + 1) * 2, &probe_val, 2);
                             }
                             fk_entry->bo_q->sync(XCL_BO_SYNC_BO_TO_DEVICE);
                         }
@@ -11659,58 +11676,42 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                 fprintf(stderr, "ggml-xdna: [FlowKV-POC] kv_h=%lld dispatched %.2f ms\n",
                                         (long long)kv_h, ms);
 
-                                // === DIAG: post-dispatch compare ===
-                                if (kv_h == 0) {
-                                    fk_entry->bo_k->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-                                    auto post_k = reinterpret_cast<const uint16_t*>(
-                                        fk_entry->bo_k->map<char *>());
-                                    fprintf(stderr, "  [DIAG-POST] bo_k after dispatch:\n");
-                                    fprintf(stderr, "    K[0][0:8]: 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X\n",
-                                        post_k[0], post_k[1], post_k[2], post_k[3],
-                                        post_k[4], post_k[5], post_k[6], post_k[7]);
-
-                                    // K_DIAG is in last head slot of bo_out
+                                // === V10 PROBE: real-data inline diagnostic ===
+                                static bool flowkv_real_probe = xdna_env_enabled("XDNA_FLOWKV_REAL_PROBE");
+                                if (flowkv_real_probe && kv_h == 0) {
                                     fk_entry->bo_out->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-                                    auto out_diag = fk_entry->bo_out->map<char *>();
-                                    size_t out_hb = head_dim * sizeof(uint16_t);
-                                    const uint16_t * kdiag = reinterpret_cast<const uint16_t*>(
-                                        out_diag + (q_heads_per_kv - 1) * out_hb);
-
-                                    fprintf(stderr, "  [DIAG-COMPARE] kv_h=0:\n");
-                                    fprintf(stderr, "    Host  K[0][0:8]: 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X\n",
-                                        post_k[0], post_k[1], post_k[2], post_k[3],
-                                        post_k[4], post_k[5], post_k[6], post_k[7]);
-                                    fprintf(stderr, "    K_DIAG    [0:8]: 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X 0x%04X\n",
-                                        kdiag[0], kdiag[1], kdiag[2], kdiag[3],
-                                        kdiag[4], kdiag[5], kdiag[6], kdiag[7]);
-
-                                    int match_count = 0;
-                                    for (int i = 0; i < 8; i++) {
-                                        if (kdiag[i] == post_k[i]) match_count++;
+                                    auto out_ptr = fk_entry->bo_out->map<char *>();
+                                    const uint16_t * obf16 = (const uint16_t *)out_ptr;
+                                    fk_entry->bo_q->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+                                    auto q_ptr = fk_entry->bo_q->map<char *>();
+                                    const uint16_t * q_bf16 = (const uint16_t *)q_ptr;
+                                    fk_entry->bo_v->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+                                    auto v_ptr = fk_entry->bo_v->map<char *>();
+                                    const uint16_t * v_bf16 = (const uint16_t *)v_ptr;
+                                    size_t kv_region_elems = (size_t)seq_len * head_dim;
+                                    int q_match = 0, k_match = 0, v_match = 0, meta_match = 0;
+                                    for (int d = 0; d < 64; d++) {
+                                        if (obf16[d] == q_bf16[d]) q_match++;
+                                        if (obf16[head_dim + d] == v_bf16[d]) k_match++;
+                                        if (obf16[2 * head_dim + d] == v_bf16[kv_region_elems + d]) v_match++;
                                     }
-                                    fprintf(stderr, "    Match count (first 8): %d/8 → %s\n",
-                                        match_count, match_count > 0 ? "PARTIAL MATCH" : "ZERO MATCH — DMA reads wrong data!");
-
-                                    // Marker detection
-                                    int dead_count = 0, aaaa_count = 0, beef_count = 0;
-                                    for (int i = 0; i < 8; i++) {
-                                        if (kdiag[i] == 0xDEAD) dead_count++;
-                                        if (kdiag[i] == 0xAAAA) aaaa_count++;
-                                        if (kdiag[i] == 0xBEEF) beef_count++;
-                                    }
-                                    if (dead_count > 0 || aaaa_count > 0 || beef_count > 0) {
-                                        fprintf(stderr, "    [MARKER RESULT] 0xDEAD=%d/8 0xAAAA=%d/8 0xBEEF=%d/8 → %s\n",
-                                            dead_count, aaaa_count, beef_count,
-                                            dead_count >= 4 ? "K DMA reads bo_k K region, CORRECT" :
-                                            aaaa_count >= 4 ? "K DMA reads bo_v offset 0, WRONG" :
-                                            beef_count >= 4 ? "K DMA reads bo_v V region, WRONG" :
-                                            "DMA reads MIXED");
-                                    } else {
-                                        fprintf(stderr, "    [MARKER RESULT] no markers found → DMA reads from ELSEWHERE (not K, not V)\n");
-                                    }
+                                    uint16_t host_meta = q_bf16[q_heads_per_kv * head_dim + head_dim];
+                                    if (obf16[3 * head_dim] == host_meta) meta_match = 1;
+                                    fprintf(stderr, "  [V10-FLOWKV-PROBE] kv_h=0: Qmatch=%d Kmatch=%d Vmatch=%d Mmatch=%d\n",
+                                        q_match, k_match, v_match, meta_match);
+                                    fprintf(stderr, "    Q[0..3]: 0x%04X 0x%04X 0x%04X 0x%04X\n",
+                                        (unsigned)obf16[0], (unsigned)obf16[1], (unsigned)obf16[2], (unsigned)obf16[3]);
+                                    fprintf(stderr, "    K[0..3]: 0x%04X 0x%04X 0x%04X 0x%04X\n",
+                                        (unsigned)obf16[head_dim], (unsigned)obf16[head_dim+1], (unsigned)obf16[head_dim+2], (unsigned)obf16[head_dim+3]);
+                                    fprintf(stderr, "    V[0..3]: 0x%04X 0x%04X 0x%04X 0x%04X\n",
+                                        (unsigned)obf16[2*head_dim], (unsigned)obf16[2*head_dim+1], (unsigned)obf16[2*head_dim+2], (unsigned)obf16[2*head_dim+3]);
+                                    fprintf(stderr, "    META seq=0x%04X magic=0x%04X\n",
+                                        (unsigned)obf16[3*head_dim], (unsigned)obf16[3*head_dim+1]);
+                                    fprintf(stderr, "    [V10-FLOWKV-PROBE] probe mode overwrote FlowKV output; generated tokens are invalid\n");
                                     fflush(stderr);
                                 }
-                                // === END DIAG ===
+                                    (void)0; // v10 probe handles diag
+
                             }
                         }
 

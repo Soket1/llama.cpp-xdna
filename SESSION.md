@@ -445,6 +445,27 @@ PASS: echo v8
 
 Остаётся искать в настоящем FlowKV-specific деталях: реальные production Q/K/V данные, реальные head/group/chunk strides, O layout и descriptor binding в большом графе.
 
+### v10 FlowKV inline real-data probe
+
+Env-gated inline probe via `XDNA_FLOWKV_REAL_PROBE=1`:
+- AIE kernel: score tile reads magic from `Q[angles[head_dim+1]]`, forwards Q/K/metadata through inter FIFO instead of running softmax.
+- AIE kernel: value tile captures from packed_in + v_chunk, writes to output heads 0-3.
+- Host: post-dispatch compare of output against bo_q/bo_v contents.
+
+v10 confirmed: **the IRON compiler bug workaround is BROKEN**.
+
+```
+  [V10-FLOWKV-PROBE] kv_h=0: Qmatch=64 Kmatch=64 Vmatch=64 Mmatch=1
+```
+
+Root cause: both K_fifos and V_fifos DMA read from arg0 (bo_k), NOT arg1 (bo_v) as the workaround assumes. The host writes K data only into bo_v at offset 0, but the tile reads from the empty bo_k buffer, so it sees all zeros.
+
+Fix applied: mirror K data into bo_k (arg0) via memcpy after writing to bo_v. With this fix, all 64 K values match.
+
+Files modified:
+- `IRON-windows/aie_kernels/aie2p/flowkv.cc`: v10 probe kernel-side (score_tile forwards Q/K/meta, value_tile captures and writes to output)
+- `ggml/src/ggml-xdna/ggml-xdna.cpp`: host-side probe magic, bo_k mirror fix, post-dispatch compare
+
 ### v9 production-layout probe
 
 `run_echo_custom.bat 9` подтвердил production-layout ABI/TAP/Q metadata path без математики:
