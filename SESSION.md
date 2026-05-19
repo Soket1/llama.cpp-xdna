@@ -447,6 +447,16 @@ PASS: echo v8
 
 ### v10 FlowKV inline real-data probe
 
+**Корень проблемы найден и исправлен:** K FIFO читает из `bo_k` (arg0), не из `bo_v` (arg1) — workaround сломан.
+
+```
+Qmatch=64  Kmatch=64  Vmatch=64  Mmatch=1
+```
+
+Фикс: mirror K data в `bo_k` после записи в `bo_v[0]`.
+
+**Но реальный вывод всё ещё garbage:** `Theutches.WHITE l├г[frame...` вместо `The capital of France is Paris.`. Данные видны, значит attention math/state сломан. Следующий шаг — v11 diagnostic.
+
 Env-gated inline probe via `XDNA_FLOWKV_REAL_PROBE=1`:
 - AIE kernel: score tile reads magic from `Q[angles[head_dim+1]]`, forwards Q/K/metadata through inter FIFO instead of running softmax.
 - AIE kernel: value tile captures from packed_in + v_chunk, writes to output heads 0-3.
