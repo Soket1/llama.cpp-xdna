@@ -445,6 +445,28 @@ PASS: echo v8
 
 Остаётся искать в настоящем FlowKV-specific деталях: реальные production Q/K/V данные, реальные head/group/chunk strides, O layout и descriptor binding в большом графе.
 
+### v9 production-layout probe
+
+`run_echo_custom.bat 9` подтвердил production-layout ABI/TAP/Q metadata path без математики:
+
+```text
+run_echo_custom.bat 9
+[echo_test] after v9 wait state=4
+Kernel completed
+Result: Q=64/64 K=64/64 V=64/64 META=1/1 TAIL=63/63
+Samples: Q0=4992.000000 K0=1000.000000 V0=4000.000000 META=32.000000 Qmeta=32.000000
+PASS: echo v9
+=== DONE ===
+EXIT=0
+```
+
+Вывод из v9:
+
+- production runtime order `K, V, Q, O` matches the host dispatch;
+- Q metadata slot at `group_size * head_dim + head_dim` is visible to the tile;
+- K and V taps land on the expected tile-visible regions;
+- the remaining FlowKV issue is not the raw production layout probe.
+
 
 
 | Тест | Output |
