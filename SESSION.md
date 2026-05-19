@@ -455,7 +455,22 @@ Qmatch=64  Kmatch=64  Vmatch=64  Mmatch=1
 
 Фикс: mirror K data в `bo_k` после записи в `bo_v[0]`.
 
-**Но реальный вывод всё ещё garbage:** `Theutches.WHITE l├г[frame...` вместо `The capital of France is Paris.`. Данные видны, значит attention math/state сломан. Следующий шаг — v11 diagnostic.
+### v11 FlowKV attention math diagnostic
+
+V11 подтвердил: **attention math правильный** (`max_abs=0.000479`).
+
+Проблема была не в attention, а в graph flow:
+- `continue` пропускал CONT node после FlowKV dispatch
+- MUL_MAT для `attn_output.weight` читал из CONT output buffer (пустой)
+- FlowKV писал в CONT src[0] buffer (kqv_out->data)
+
+**Фикс:** убрал `continue`, дал CONT выполниться и скопировать данные в output buffer.
+
+Результат: **"The capital of France is Paris."** — FlowKV decode работает корректно.
+
+Root cause summary:
+1. **K DMA routing** (v10): K FIFO читает arg0, не arg1 → mirror K в bo_k
+2. **CONT skip** (v11): `continue` пропускал CONT node → MUL_MAT читал пустой buffer
 
 Env-gated inline probe via `XDNA_FLOWKV_REAL_PROBE=1`:
 - AIE kernel: score tile reads magic from `Q[angles[head_dim+1]]`, forwards Q/K/metadata through inter FIFO instead of running softmax.

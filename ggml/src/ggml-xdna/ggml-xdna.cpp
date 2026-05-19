@@ -745,6 +745,47 @@ static void bf16_to_f32(const uint16_t * src, float * dst, size_t n) {
     }
 }
 
+// Compute CPU-side attention reference in float32.
+// q_bf16: (group_size, head_dim) bf16
+// k_bf16: (seq_len, head_dim) bf16   -- one KV head
+// v_bf16: (seq_len, head_dim) bf16   -- one KV head
+// out_f32: (group_size, head_dim) float32 output
+// actual_seq: number of valid KV positions
+static void flowkv_cpu_reference(
+        const uint16_t * q_bf16, const uint16_t * k_bf16, const uint16_t * v_bf16,
+        float * out_f32, int group_size, int head_dim, int seq_len, int actual_seq) {
+    const float inv_sqrt_d = 1.0f / sqrtf((float)head_dim);
+    if (actual_seq > seq_len) actual_seq = seq_len;
+    if (actual_seq <= 0) actual_seq = 1;
+    static float scores[2048];  // static to avoid stack overflow
+    for (int g = 0; g < group_size; g++) {
+        float q_f32[64];
+        bf16_to_f32(q_bf16 + g * head_dim, q_f32, (size_t)head_dim);
+        float max_score = -1e30f;
+        for (int pos = 0; pos < actual_seq; pos++) {
+            float k_f32[64];
+            bf16_to_f32(k_bf16 + pos * head_dim, k_f32, (size_t)head_dim);
+            float dot = 0;
+            for (int d = 0; d < head_dim; d++) dot += q_f32[d] * k_f32[d];
+            scores[pos] = dot * inv_sqrt_d;
+            if (scores[pos] > max_score) max_score = scores[pos];
+        }
+        float denom = 0;
+        for (int pos = 0; pos < actual_seq; pos++) {
+            scores[pos] = expf(scores[pos] - max_score);
+            denom += scores[pos];
+        }
+        for (int d = 0; d < head_dim; d++) out_f32[g * head_dim + d] = 0;
+        for (int pos = 0; pos < actual_seq; pos++) {
+            float v_f32[64];
+            bf16_to_f32(v_bf16 + pos * head_dim, v_f32, (size_t)head_dim);
+            float w = scores[pos] / denom;
+            for (int d = 0; d < head_dim; d++)
+                out_f32[g * head_dim + d] += w * v_f32[d];
+        }
+    }
+}
+
 // Convert an IEEE fp16 (half) value to bf16. Q8_0 block scales are stored as
 // ggml_half (fp16); the IRON gemv_int8 kernel expects bf16 per-group scales.
 // Implementation: expand fp16 → fp32 (exact), then truncate to bf16 with
@@ -11733,6 +11774,54 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                 }
                             }
                         }
+                        // === V11 MATH DIAG: CPU reference comparison ===
+                        {
+                            static bool math_diag = xdna_env_enabled("XDNA_FLOWKV_MATH_DIAG");
+                            if (math_diag && kv_h == 0) {
+                                auto q_ptr_d = fk_entry->bo_q->map<char *>();
+                                auto v_ptr_d = fk_entry->bo_v->map<char *>();
+                                auto out_ptr_d = fk_entry->bo_out->map<char *>();
+                                const uint16_t * q_bf16 = (const uint16_t *)q_ptr_d;
+                                const uint16_t * k_bf16 = (const uint16_t *)v_ptr_d;
+                                const uint16_t * v_bf16 = (const uint16_t *)(v_ptr_d + seq_len * row_bytes);
+                                const uint16_t * out_bf16 = (const uint16_t *)out_ptr_d;
+                                int angles_off_elems = q_heads_per_kv * head_dim + head_dim;
+                                uint16_t asl_bits = q_bf16[angles_off_elems];
+                                uint32_t asl_f32 = ((uint32_t)asl_bits) << 16;
+                                float asl_f;
+                                memcpy(&asl_f, &asl_f32, 4);
+                                int actual_seq = (int)asl_f;
+                                if (actual_seq <= 0 || actual_seq > (int)seq_len) actual_seq = (int)seq_len;
+                                float cpu_out[4 * 64];
+                                flowkv_cpu_reference(q_bf16, k_bf16, v_bf16,
+                                    cpu_out, (int)q_heads_per_kv, (int)head_dim,
+                                    (int)seq_len, actual_seq);
+                                fprintf(stderr, "  [V11-MATH-DIAG] kv_h=0 actual_seq=%d\n", actual_seq);
+                                float max_abs = 0, max_rel = 0, rms_sum = 0;
+                                for (int d = 0; d < head_dim; d++) {
+                                    uint32_t npu_bits = ((uint32_t)out_bf16[d]) << 16;
+                                    float npu_f;
+                                    memcpy(&npu_f, &npu_bits, 4);
+                                    float cpu_f = cpu_out[d];
+                                    float diff = fabsf(npu_f - cpu_f);
+                                    float rel = (fabsf(cpu_f) > 1e-6f) ? diff / fabsf(cpu_f) : 0;
+                                    if (diff > max_abs) max_abs = diff;
+                                    if (rel > max_rel) max_rel = rel;
+                                    rms_sum += diff * diff;
+                                    if (d < 8) {
+                                        fprintf(stderr, "    [%d] NPU=%.6f CPU=%.6f diff=%.6f rel=%.4f\n",
+                                            d, npu_f, cpu_f, diff, rel);
+                                    }
+                                }
+                                float rms = sqrtf(rms_sum / head_dim);
+                                fprintf(stderr, "  [V11-MATH-DIAG] max_abs=%.6f max_rel=%.4f rms=%.6f\n",
+                                    max_abs, max_rel, rms);
+                                fprintf(stderr, "  [V11-MATH-DIAG] %s\n",
+                                    (max_abs < 0.15f && max_rel < 0.10f) ? "PASS" : "FAIL");
+                                fflush(stderr);
+                            }
+                        }
+                        // === END V11 MATH DIAG ===
                     } // for kv_h
 
                     if (poc_dbg) {
@@ -11766,11 +11855,14 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                         }
                         fflush(stderr);
                     }
-                    // FlowKV dispatched successfully — don't add CONT to
-                    // CPU range. The NPU result in kqv_out must not be
-                    // overwritten by CPU attention.
-                    flowkv_dispatched_this_layer = false;  // consumed
-                    continue;
+                    // FlowKV dispatched successfully. The NPU result
+                    // is now in kqv_out->data.
+                    // IMPORTANT: do NOT skip the CONT node. Downstream
+                    // MUL_MAT reads from CONT's output buffer, which is
+                    // only populated when CONT actually runs. Let the
+                    // CONT fall through to the CPU range.
+                    flowkv_dispatched_this_layer = false;
+                    // fall through to cpu_run_start below
                 } catch (const std::exception & e) {
                     GGML_LOG_ERROR("ggml-xdna: [FlowKV-POC] exception: %s\n", e.what());
                 }
