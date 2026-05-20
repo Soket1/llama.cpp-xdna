@@ -9711,25 +9711,16 @@ static std::string make_rms_norm_cache_key(int64_t size, const char * dtype,
 static bool xdna_select_rms_norm_params(int64_t size, int max_cols,
                                         int * out_cols, int * out_channels,
                                         int * out_tile_size) {
-    const int tile_size = 32;  // matches the bridge default and IRON test grid
+    // tile_size = entire row: single core processes full vector.
+    // Avoids per-tile independent normalization bug (tile_size=32).
+    // One AIE core handles 2048 bf16 = 4KB, fits in tile memory (32KB).
+    const int tile_size = (int)size;
 
-    // Support forcing ch=1 via environment variable (useful for matching specific kernels)
-    const bool force_ch1 = xdna_env_enabled("GGML_XDNA_FORCE_CH1");
-    std::vector<int> ch_candidates = force_ch1 ? std::vector<int>{1} : std::vector<int>{2, 1};
-
-    // Try widest column counts first, then fall back.
-    for (int cols : {max_cols, 4, 2, 1}) {
-        if (cols < 1 || cols > max_cols) continue;
-        for (int ch : ch_candidates) {
-            if ((int64_t)cols * ch * tile_size == 0) continue;
-            if (size % ((int64_t)cols * ch * tile_size) != 0) continue;
-            *out_cols       = cols;
-            *out_channels   = ch;
-            *out_tile_size  = tile_size;
-            return true;
-        }
-    }
-    return false;
+    // Single core, single channel — one pass over full row.
+    *out_cols       = 1;
+    *out_channels   = 1;
+    *out_tile_size  = tile_size;
+    return true;
 }
 
 static bool rms_norm_bundle_present(const std::string & bundle_dir) {
