@@ -11161,12 +11161,14 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                         fk_entry->bo_k = std::make_unique<xrt::bo>(
                             xrt::bo(ctx->device, k_size, xrt::bo::flags::host_only,
                                     fk_entry->kernel.group_id(3)));
+                        memset(fk_entry->bo_k->map<void*>(), 0, k_size);
                     }
                     size_t v_size = (aligned_v_region_offset_elems + kv_region_elems) * dtype_size;
                     if (!fk_entry->bo_v) {
                         fk_entry->bo_v = std::make_unique<xrt::bo>(
                             xrt::bo(ctx->device, v_size, xrt::bo::flags::host_only,
                                     fk_entry->kernel.group_id(4)));
+                        memset(fk_entry->bo_v->map<void*>(), 0, v_size);
                     }
                     size_t q_group_stride_bytes = (q_heads_per_kv * head_dim + head_dim + 2) * dtype_size;
                     size_t aligned_q_group_stride_bytes = (q_group_stride_bytes + 63) & ~63;
@@ -11837,43 +11839,19 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
         if (s != GGML_STATUS_SUCCESS) return s;
     }
 
-    // FlowKV early dispatch: after QKV segment's CPU delegate range,
-    // permuted Q/K/V tensors are ready. Dispatch FlowKV now so the
-    // next segment (SOFT_MAX) can be skipped entirely.
-    // This replaces the POC dispatch at CONT(kqv_out) for layers where
-    // the QKV segment precedes the attention segment.
-    if (flowkv_decode_enabled && flowkv_poc_valid &&
-        flowkv_poc_q_perm && flowkv_poc_q_perm->data) {
-        int64_t head_dim = flowkv_poc_head_dim;
-        int64_t seq_len = flowkv_poc_seq_len;
-        int64_t num_kv_heads = flowkv_poc_num_kv_heads;
-        int64_t num_q_heads = flowkv_poc_num_q_heads;
-        int64_t q_heads_per_kv = num_q_heads / num_kv_heads;
-        int chunk_size = 32;
-        int num_cols = 1;
-
-        xdna_flowkv_entry * fk_entry = get_or_load_flowkv_kernel(
-            ctx, q_heads_per_kv, /*num_kv_heads=*/1, head_dim, seq_len, chunk_size, num_cols);
-
-        if (fk_entry) {
-            static const bool early_dbg = getenv("XDNA_DEBUG") != NULL;
-            if (early_dbg) {
-                fprintf(stderr, "ggml-xdna: [FlowKV-early] dispatching after QKV segment "
-                        "H=%lld KV=%lld d=%lld S=%lld\n",
-                        (long long)q_heads_per_kv, (long long)num_kv_heads,
-                        (long long)head_dim, (long long)seq_len);
-                fflush(stderr);
-            }
-            // Note: the actual BO setup + dispatch + readback is identical
-            // to the POC path. For now, just set the flag — the POC at
-            // CONT(kqv_out) will handle the actual dispatch. The flag
-            // causes SOFT_MAX to be skipped.
-            flowkv_dispatched_this_layer = true;
-        }
-    }
+    // FlowKV early dispatch: DISABLED.
+    // Early dispatch used stale flowkv_poc_valid pointers from previous
+    // graph evaluations, causing garbage on long prompts and chat mode.
+    // FlowKV dispatch happens at CONT(kqv_out) handler instead.
 
     // Print per-phase attention-prefill profile (no-op when gate off / no samples).
     xdna_attn_prof_print();
+
+    // Invalidate FlowKV POC pointers — they may become stale between evaluations.
+    flowkv_poc_valid = false;
+    flowkv_poc_q_perm = nullptr;
+    flowkv_poc_k_perm = nullptr;
+    flowkv_poc_v_perm = nullptr;
 
     return GGML_STATUS_SUCCESS;
 
