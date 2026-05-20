@@ -10339,25 +10339,29 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                             flowkv_poc_num_kv_heads = k_perm->ne[2];   // 8
                             flowkv_poc_num_q_heads = q_perm->ne[2];    // 32
                             // Capture RoPE position for actual_seq_len.
-                            // ROPE node at i+2: Q MUL_MAT → Q RESHAPE → Q ROPE.
+                            // Search forward from Q MUL_MAT for ROPE node.
                             // src[1] = position tensor (int32). For decode M=1,
                             // max position = n_past (tokens before current).
                             flowkv_poc_n_past = 0;
-                            if (i + 2 < n) {
-                                struct ggml_tensor * rope_node = cgraph->nodes[i + 2];
-                                if (rope_node->op == GGML_OP_ROPE &&
-                                    rope_node->src[1] &&
-                                    rope_node->src[1]->type == GGML_TYPE_I32) {
-                                    const int32_t * pos = (const int32_t *)rope_node->src[1]->data;
-                                    int64_t n_pos = rope_node->src[1]->ne[0];
+                            for (int ri = i + 1; ri < n && ri < i + 10; ri++) {
+                                struct ggml_tensor * rn = cgraph->nodes[ri];
+                                if (rn->op == GGML_OP_ROPE &&
+                                    rn->src[1] &&
+                                    rn->src[1]->type == GGML_TYPE_I32) {
+                                    const int32_t * pos = (const int32_t *)rn->src[1]->data;
+                                    int64_t n_pos = rn->src[1]->ne[0];
                                     int32_t max_pos = 0;
                                     for (int64_t pi = 0; pi < n_pos; pi++) {
                                         if (pos[pi] > max_pos) max_pos = pos[pi];
                                     }
                                     flowkv_poc_n_past = max_pos;
+                                    break;
                                 }
                             }
                             flowkv_poc_valid = true;
+                            fprintf(stderr, "ggml-xdna: [FlowKV-POC] n_past=%d seq_len=%lld rope_at=%d\n",
+                                    (int)flowkv_poc_n_past, (long long)flowkv_poc_seq_len, (int)(i+2));
+                            fflush(stderr);
                             fprintf(stderr, "ggml-xdna: [FlowKV-POC] Saved Q=%p[%lld,%lld,%lld] "
                                     "K=%p[%lld,%lld,%lld] V=%p[%lld,%lld,%lld]\n",
                                     q_perm->data, (long long)q_perm->ne[0], (long long)q_perm->ne[1], (long long)q_perm->ne[2],
