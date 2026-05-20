@@ -11161,7 +11161,7 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
             int64_t num_q_heads = flowkv_poc_num_q_heads;
             int64_t q_heads_per_kv = num_q_heads / num_kv_heads;
             int chunk_size = 32;
-            int num_cols = 4;  // batch 4 KV heads per dispatch
+            int num_cols = 4;  // batch 4 KV heads per dispatch (XDNA 2 max 4 cols per XRT context)
 
             if (poc_dbg) {
                 fprintf(stderr, "ggml-xdna: [FlowKV-POC] CONT(kqv_out) @%d: "
