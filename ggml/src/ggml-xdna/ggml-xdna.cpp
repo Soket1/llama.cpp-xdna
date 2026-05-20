@@ -10143,6 +10143,7 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
     static const struct ggml_tensor * flowkv_poc_v_perm = nullptr;
     static const void * flowkv_poc_q_data = nullptr;  // detect stale pointers across queries
     static int32_t flowkv_poc_n_past = 0;  // RoPE position for decode token
+    static int64_t flowkv_poc_saved_seq_len = 0;  // detect seq_len changes (kernel recompile)
     static int64_t flowkv_poc_head_dim = 0;
     static int64_t flowkv_poc_seq_len = 0;
     static int64_t flowkv_poc_num_kv_heads = 0;
@@ -10315,6 +10316,7 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                             flowkv_poc_k_perm = k_perm;
                             flowkv_poc_v_perm = v_perm;
                             flowkv_poc_q_data = q_perm->data;  // for staleness check
+                            flowkv_poc_saved_seq_len = k_perm->ne[1];  // detect seq_len changes
                             // Capture RoPE position for actual_seq_len detection.
                             // ROPE node is at i+2 (Q MUL_MAT → Q RESHAPE → Q ROPE).
                             flowkv_poc_n_past = 0;
@@ -11133,9 +11135,18 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
             node->op == GGML_OP_CONT &&
             node->name && strstr(node->name, "kqv_out")) {
 
-            // Staleness check: if Q data pointer changed, the pointers are
-            // from a previous query. Invalidate and fall through to CPU path.
+            // Staleness check: invalidate if Q data pointer changed (new query)
+            // or seq_len changed (kernel recompile due to KV cache growth).
             if (flowkv_poc_q_perm && flowkv_poc_q_perm->data != flowkv_poc_q_data) {
+                flowkv_poc_valid = false;
+                flowkv_poc_q_perm = nullptr;
+                flowkv_poc_k_perm = nullptr;
+                flowkv_poc_v_perm = nullptr;
+                flowkv_poc_q_data = nullptr;
+            }
+            // Check if seq_len changed (KV cache grew → different kernel)
+            if (flowkv_poc_valid && flowkv_poc_k_perm &&
+                flowkv_poc_k_perm->ne[1] != flowkv_poc_saved_seq_len) {
                 flowkv_poc_valid = false;
                 flowkv_poc_q_perm = nullptr;
                 flowkv_poc_k_perm = nullptr;
