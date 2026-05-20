@@ -11214,39 +11214,6 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                     fk_entry->kernel.group_id(6)));
                     }
 
-                    // === BO ADDRESS DIAGNOSTIC ===
-                    {
-                        uint64_t addr_k   = fk_entry->bo_k->address();
-                        uint64_t addr_v   = fk_entry->bo_v->address();
-                        uint64_t addr_q   = fk_entry->bo_q->address();
-                        uint64_t addr_out = fk_entry->bo_out->address();
-                        fprintf(stderr, "\n=== BO ADDRESS DIAGNOSTIC ===\n");
-                        fprintf(stderr, "  bo_k   (group_id 3): addr=0x%016llX  size=%zu  expected_arg=DDR_buf_0\n",
-                                (unsigned long long)addr_k, k_size);
-                        fprintf(stderr, "  bo_v   (group_id 4): addr=0x%016llX  size=%zu  expected_arg=DDR_buf_1\n",
-                                (unsigned long long)addr_v, v_size);
-                        fprintf(stderr, "  bo_q   (group_id 5): addr=0x%016llX  size=%zu\n",
-                                (unsigned long long)addr_q, q_size);
-                        fprintf(stderr, "  bo_out (group_id 6): addr=0x%016llX  size=%zu\n",
-                                (unsigned long long)addr_out, out_size);
-                        int64_t kv_delta = (int64_t)addr_v - (int64_t)addr_k;
-                        fprintf(stderr, "  V-K delta: %lld bytes (%lld KB)\n",
-                                (long long)kv_delta, (long long)kv_delta / 1024);
-                        int64_t expected_delta = (int64_t)k_size;
-                        fprintf(stderr, "  Expected V-K delta (k_size): %lld bytes (%lld KB)\n",
-                                (long long)expected_delta, (long long)expected_delta / 1024);
-                        if (kv_delta != expected_delta && kv_delta != (int64_t)v_size) {
-                            fprintf(stderr, "  *** UNEXPECTED DELTA — driver may be adding metadata! ***\n");
-                            fprintf(stderr, "  Delta diff from k_size: %lld bytes\n",
-                                    (long long)(kv_delta - expected_delta));
-                        }
-                        fprintf(stderr, "  bo_k group_id: %zu\n", (size_t)fk_entry->kernel.group_id(3));
-                        fprintf(stderr, "  bo_v group_id: %zu\n", (size_t)fk_entry->kernel.group_id(4));
-                        fprintf(stderr, "=== END BO ADDRESS DIAGNOSTIC ===\n\n");
-                        fflush(stderr);
-                    }
-                    // === END BO ADDRESS DIAGNOSTIC ===
-
                     // Diagnostic: save CPU result before overwriting
                     static std::vector<float> cpu_save;
                     static bool cpu_saved = false;
