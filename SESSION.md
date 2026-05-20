@@ -6,9 +6,40 @@
 
 Hardware: STX NPU2, 8 columns, model: llama-3.2-1b-BF16
 
-Статус: **FlowKV decode работает.** "The capital of France is Paris." через `debug_flowkv.bat`.
+Статус: **FlowKV decode работает, batch num_cols=4, 5.4 t/s.** Baseline 6.0 t/s.
 
 ## Ключевые находки
+
+### FlowKV batch num_cols=4 (2026-05-20)
+
+Root cause batch garbage: `num_heads` param к `get_or_load_flowkv_kernel()` был `q_heads_per_kv` (4) вместо `q_heads_per_kv * num_cols` (16). Kernel скомпилирован с `group_size=1`, host готовил данные для `group_size=4`.
+
+Фикс: передавать `q_heads_per_kv * num_cols` как `num_heads`. Cache key: `flowkv_H16_KV4_d64_S256_C32_4col`.
+
+### FlowKV dispatch profiling
+
+| Фаза | ms/dispatch | ms/token (×24) |
+|------|-------------|----------------|
+| KV+Q memcpy+sync | 0.07 | 1.7 |
+| NPU exec (avg) | 0.56 | 13.4 |
+| **Итого** | | **~15 ms** |
+
+**83% overhead = NPU execution time.** Host optimization не поможет.
+
+### Что не помогло
+
+- persistent xrt::run (num_cols=1): 3.9 vs 4.8 t/s
+- persistent xrt::run (num_cols=4): 5.0 vs 5.3 t/s
+- CONT skip + bf16 passthrough: ~5.0 t/s (в пределах noise)
+- num_cols=8: XRT runtime выделяет только 4 columns (остальные — Windows Studio Effects)
+
+### Fused FlowKV + O_proj (будущее)
+
+Новый IRON kernel: attention + O_proj в одном xclbin. Экономия ~5 ms/token. ROI низкий (сложность vs выигрыж). Сохранено в NPU_PLAN.md как Priority 5.
+
+### Probe удалён из kernel (2026-05-20)
+
+`g_probe_enabled`, `FLOWKV_PROBE_MAGIC`, diag arrays удалены из `flowkv.cc`.
 
 ### Bug 1 (v10): K DMA routing — mirror K into bo_k
 
@@ -53,32 +84,14 @@ ggml scheduler разбивает attention на 3 graph_compute:
 - `XDNA_ENABLE_FLOWKV_DECODE=1` — включить FlowKV
 - `XDNA_DEBUG=1` — diagnostic вывод
 - `XNA_SCHED_DEBUG=1` — scheduler logging
-- `XDNA_FLOWKV_REAL_PROBE=1` — v10 inline probe (data transport)
 - `XDNA_FLOWKV_MATH_DIAG=1` — v11 CPU reference (attention math)
+- `XDNA_FLOWKV_PROFILE=1` — dispatch profiling (KV+Q memcpy, run_create, exec, sync, scatter)
 
 ### Кэш ключ
 
-`flowkv_H4_KV1_d64_S256_C32_1col` — H=q_heads_per_kv, KV=1, d=head_dim, S=seq_len, C=chunk_size
+`flowkv_H16_KV4_d64_S256_C32_4col` — H=q_heads_per_kv*num_cols, KV=num_cols, d=head_dim, S=seq_len, C=chunk_size
 
-## v10 FlowKV inline real-data probe
-
-Env-gated inline probe: score tile forwards Q/K/metadata through inter FIFO, value tile captures and writes to output heads.
-
-```
-Qmatch=64  Kmatch=64  Vmatch=64  Mmatch=1
-```
-
-Подтвердил: K DMA routing сломан (K FIFO читает arg0, не arg1). Фикс: mirror K в bo_k.
-
-## v11 FlowKV attention math diagnostic
-
-Host-side CPU reference comparison: вычисляет attention на CPU в float32 и сравнивает с NPU output.
-
-```
-max_abs=0.000479  max_rel=0.5468  rms=0.000178
-```
-
-Подтвердил: **attention math правильный**. Проблема была в graph flow (CONT skip).
+## debug_flowkv.bat результат
 
 ## debug_flowkv.bat результат
 
