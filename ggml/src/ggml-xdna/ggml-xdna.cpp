@@ -4627,14 +4627,7 @@ static bool ggml_backend_xdna_flowkv_per_head(
             }
             // ====================================================================
 
-            // --- FlowKV profiling ---
-            static bool fk_prof = xdna_env_enabled("XDNA_FLOWKV_PROFILE");
-            static bool fk_prof_init = (fprintf(stderr, "  [FK-PROF] enabled=%d\n", (int)fk_prof), fflush(stderr), true);
-            (void)fk_prof_init;
-            std::chrono::steady_clock::time_point fk_t0, fk_t1, fk_t2, fk_t3, fk_t4, fk_t5, fk_t6;
-
             // --- Prepare K+V combined buffer in bo_v (arg1) ---
-            if (fk_prof) fk_t0 = std::chrono::steady_clock::now();
             {
                 auto kv_ptr = entry->bo_v->map<char *>();
                 size_t row_bytes = head_dim * sizeof(uint16_t);
@@ -4692,7 +4685,7 @@ static bool ggml_backend_xdna_flowkv_per_head(
 
                 entry->bo_v->sync(XCL_BO_SYNC_BO_TO_DEVICE);
             }
-            if (fk_prof) fk_t1 = std::chrono::steady_clock::now();
+
 
             // --- Prepare Q buffer ---
             {
@@ -4719,13 +4712,13 @@ static bool ggml_backend_xdna_flowkv_per_head(
                 }
                 entry->bo_q->sync(XCL_BO_SYNC_BO_TO_DEVICE);
             }
-            if (fk_prof) fk_t2 = std::chrono::steady_clock::now();
+
 
             // --- Dispatch ---
             auto run = entry->kernel(
                 3, entry->insts_bo, (uint32_t)entry->insts_data.size(),
                 *entry->bo_k, *entry->bo_v, *entry->bo_q, *entry->bo_out);
-            if (fk_prof) fk_t3 = std::chrono::steady_clock::now();
+
 
             {
                 std::lock_guard<std::mutex> lock(*entry->mu);
@@ -4741,7 +4734,7 @@ static bool ggml_backend_xdna_flowkv_per_head(
                     continue;
                 }
 
-                if (fk_prof) fk_t4 = std::chrono::steady_clock::now();
+
 
                 if (dbg) {
                     float ms = std::chrono::duration<float, std::milli>(t1 - t0).count();
@@ -4764,7 +4757,7 @@ static bool ggml_backend_xdna_flowkv_per_head(
 
             // --- Read back output and scatter ---
             entry->bo_out->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-            if (fk_prof) fk_t5 = std::chrono::steady_clock::now();
+
             {
                 auto out_ptr = entry->bo_out->map<char *>();
                 size_t out_head_bytes = head_dim * sizeof(uint16_t);
@@ -4814,20 +4807,6 @@ static bool ggml_backend_xdna_flowkv_per_head(
                                out_head_bytes);
                     }
                 }
-            }
-            if (fk_prof) fk_t6 = std::chrono::steady_clock::now();
-
-            if (fk_prof) {
-                float ms_kv   = std::chrono::duration<float, std::milli>(fk_t1 - fk_t0).count();
-                float ms_q    = std::chrono::duration<float, std::milli>(fk_t2 - fk_t1).count();
-                float ms_run  = std::chrono::duration<float, std::milli>(fk_t3 - fk_t2).count();
-                float ms_exec = std::chrono::duration<float, std::milli>(fk_t4 - fk_t3).count();
-                float ms_sync = std::chrono::duration<float, std::milli>(fk_t5 - fk_t4).count();
-                float ms_sc   = std::chrono::duration<float, std::milli>(fk_t6 - fk_t5).count();
-                float ms_total = std::chrono::duration<float, std::milli>(fk_t6 - fk_t0).count();
-                fprintf(stderr, "  [FK-PROF] kv_h=%lld  KV=%.2f Q=%.2f run_create=%.2f exec=%.2f sync=%.2f scatter=%.2f TOTAL=%.2f ms\n",
-                        (long long)kv_h, ms_kv, ms_q, ms_run, ms_exec, ms_sync, ms_sc, ms_total);
-                fflush(stderr);
             }
         } catch (const std::exception & e) {
             GGML_LOG_ERROR("ggml-xdna: FlowKV per-head exception: %s\n", e.what());
@@ -11464,12 +11443,7 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                     // Shim DMA requires 64-byte alignment for parallel channels.
                     // (aligned stride variables defined in BO allocation section above)
 
-                    // --- FlowKV profiling ---
-                    static bool fk_prof = xdna_env_enabled("XDNA_FLOWKV_PROFILE");
-                    std::chrono::steady_clock::time_point fk_t0, fk_t1, fk_t2, fk_t3, fk_t4, fk_t5;
-
                     for (int64_t kv_h = 0; kv_h < num_kv_heads; kv_h += num_cols) {
-                        fk_t0 = std::chrono::steady_clock::now();
                         // Zero entire bo_v before writing K and V for all columns.
                         {
                             auto bo_v_ptr = fk_entry->bo_v->map<char *>();
@@ -11616,7 +11590,6 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                             } // end col loop
                             fk_entry->bo_q->sync(XCL_BO_SYNC_BO_TO_DEVICE);
                         }
-                        fk_t1 = std::chrono::steady_clock::now();
 
                         // --- Dispatch FlowKV kernel ---
                         // IRON xclbin arg layout: opcode(0), insts(1), insts_size(2),
@@ -11733,13 +11706,10 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                             run.set_arg(5, *fk_entry->bo_q);    // DDR buf 2 = Q
                             run.set_arg(6, *fk_entry->bo_out);  // DDR buf 3 = Out
                             run.set_arg(7, 0u);  // unknown arg
-                            fk_t2 = std::chrono::steady_clock::now();
 
                             std::lock_guard<std::mutex> lock(*fk_entry->mu);
-                            fk_t3 = std::chrono::steady_clock::now();
                             run.start();
                             auto state = run.wait(30000);
-                            fk_t4 = std::chrono::steady_clock::now();
 
                             if (state != ERT_CMD_STATE_COMPLETED) {
                                 GGML_LOG_ERROR("ggml-xdna: [FlowKV-POC] dispatch failed state=%d kv_h=%lld\n",
@@ -11748,9 +11718,8 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                             }
 
                             if (poc_dbg) {
-                                float ms = std::chrono::duration<float, std::milli>(fk_t4 - fk_t3).count();
-                                fprintf(stderr, "ggml-xdna: [FlowKV-POC] kv_h=%lld dispatched %.2f ms\n",
-                                        (long long)kv_h, ms);
+                                fprintf(stderr, "ggml-xdna: [FlowKV-POC] kv_h=%lld dispatched\n",
+                                        (long long)kv_h);
 
                                 // === V10 PROBE: real-data inline diagnostic ===
                                 static bool flowkv_real_probe = xdna_env_enabled("XDNA_FLOWKV_REAL_PROBE");
@@ -11802,7 +11771,6 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
 
                         // --- Read back and scatter output for all columns ---
                         fk_entry->bo_out->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-                        fk_t5 = std::chrono::steady_clock::now();
                         {
                             auto out_ptr = fk_entry->bo_out->map<char *>();
                             char * kqv_data = (char *)kqv_out->data;
@@ -11824,19 +11792,6 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                     }
                                 }
                             }
-                        }
-                        if (fk_prof) {
-                            auto fk_t6 = std::chrono::steady_clock::now();
-                            float ms_kv   = std::chrono::duration<float, std::milli>(fk_t1 - fk_t0).count();
-                            float ms_q    = 0;  // Q included in kv time (separate would need split)
-                            float ms_run  = std::chrono::duration<float, std::milli>(fk_t3 - fk_t2).count();
-                            float ms_exec = std::chrono::duration<float, std::milli>(fk_t4 - fk_t3).count();
-                            float ms_sync = std::chrono::duration<float, std::milli>(fk_t5 - fk_t4).count();
-                            float ms_sc   = std::chrono::duration<float, std::milli>(fk_t6 - fk_t5).count();
-                            float ms_total = std::chrono::duration<float, std::milli>(fk_t6 - fk_t0).count();
-                            fprintf(stderr, "  [FK-PROF] kv_h=%lld  KV+Q_memcpy+sync=%.2f run_create=%.2f exec=%.2f output_sync=%.2f scatter=%.2f TOTAL=%.2f ms\n",
-                                    (long long)kv_h, ms_kv, ms_run, ms_exec, ms_sync, ms_sc, ms_total);
-                            fflush(stderr);
                         }
                         // === V11 MATH DIAG: CPU reference comparison ===
                         {
