@@ -11847,11 +11847,12 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
     // Print per-phase attention-prefill profile (no-op when gate off / no samples).
     xdna_attn_prof_print();
 
-    // Invalidate FlowKV POC pointers — they may become stale between evaluations.
-    flowkv_poc_valid = false;
-    flowkv_poc_q_perm = nullptr;
-    flowkv_poc_k_perm = nullptr;
-    flowkv_poc_v_perm = nullptr;
+    // Note: do NOT invalidate flowkv_poc_valid here. There are two graph
+    // evaluations per decode token: the first sets pointers (QKV triple),
+    // the second uses them (CONT handler). Invalidation between evaluations
+    // breaks FlowKV. Early dispatch (which caused chat garbage) is already
+    // disabled. Stale pointers between tokens are handled by the QKV section
+    // overwriting pointers on each decode evaluation.
 
     return GGML_STATUS_SUCCESS;
 
