@@ -11875,13 +11875,6 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
     // Print per-phase attention-prefill profile (no-op when gate off / no samples).
     xdna_attn_prof_print();
 
-    // Invalidate FlowKV POC pointers — they point to ggml tensors that may be
-    // freed or reused between graph evaluations. Must re-scan each time.
-    flowkv_poc_valid = false;
-    flowkv_poc_q_perm = nullptr;
-    flowkv_poc_k_perm = nullptr;
-    flowkv_poc_v_perm = nullptr;
-
     return GGML_STATUS_SUCCESS;
 
     GGML_UNUSED(backend);
