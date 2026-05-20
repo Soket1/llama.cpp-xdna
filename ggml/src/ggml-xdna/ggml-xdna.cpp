@@ -11161,7 +11161,7 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
             int64_t num_q_heads = flowkv_poc_num_q_heads;
             int64_t q_heads_per_kv = num_q_heads / num_kv_heads;
             int chunk_size = 32;
-            int num_cols = 1;
+            int num_cols = 4;  // batch 4 KV heads per dispatch
 
             if (poc_dbg) {
                 fprintf(stderr, "ggml-xdna: [FlowKV-POC] CONT(kqv_out) @%d: "
@@ -11178,37 +11178,49 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
 
             // Ensure FlowKV kernel is compiled and loaded.
             xdna_flowkv_entry * fk_entry = get_or_load_flowkv_kernel(
-                ctx, q_heads_per_kv, /*num_kv_heads=*/1, head_dim, seq_len, chunk_size, num_cols);
+                ctx, q_heads_per_kv * num_cols, /*num_kv_heads=*/num_cols, head_dim, seq_len, chunk_size, num_cols);
 
             if (fk_entry) {
                 try {
                     size_t row_bytes = head_dim * sizeof(uint16_t);
 
-                    // Allocate BOs if needed.
+                    // Allocate BOs with 64-byte aligned strides for Shim DMA.
                     // IRON xclbin arg layout: opcode(0), insts(1), insts_size(2),
                     // DDR_buf_0(3)=k, DDR_buf_1(4)=v, DDR_buf_2(5)=q, DDR_buf_3(6)=out
-                    size_t k_size = 1 * seq_len * row_bytes;
+                    const size_t dtype_size = 2;  // bf16
+                    size_t raw_head_bytes = seq_len * row_bytes;
+                    size_t aligned_head_stride_bytes = (raw_head_bytes + 63) & ~63;
+                    size_t aligned_head_stride_elems = aligned_head_stride_bytes / dtype_size;
+                    size_t kv_region_elems = num_cols * aligned_head_stride_elems;
+                    size_t total_k_region_bytes = num_cols * aligned_head_stride_bytes;
+                    size_t aligned_v_region_offset_bytes = (total_k_region_bytes + 63) & ~63;
+                    size_t aligned_v_region_offset_elems = aligned_v_region_offset_bytes / dtype_size;
+
+                    size_t k_size = kv_region_elems * dtype_size;
                     if (!fk_entry->bo_k) {
                         fk_entry->bo_k = std::make_unique<xrt::bo>(
                             xrt::bo(ctx->device, k_size, xrt::bo::flags::host_only,
                                     fk_entry->kernel.group_id(3)));
                     }
-                    // FlowKV kernel is compiled with num_kv_heads=1 and is dispatched
-                    // once per KV head. MLIR reads K from arg0/bo_k and V from
-                    // arg1/bo_v at offset seq_len * row_bytes.
-                    size_t v_size = 2 * seq_len * row_bytes;
+                    size_t v_size = (aligned_v_region_offset_elems + kv_region_elems) * dtype_size;
                     if (!fk_entry->bo_v) {
                         fk_entry->bo_v = std::make_unique<xrt::bo>(
                             xrt::bo(ctx->device, v_size, xrt::bo::flags::host_only,
                                     fk_entry->kernel.group_id(4)));
                     }
-                    size_t q_size = 1 * (q_heads_per_kv * head_dim + head_dim + 2) * sizeof(uint16_t);  // +2 for actual_seq_len + DMA alignment
+                    size_t q_group_stride_bytes = (q_heads_per_kv * head_dim + head_dim + 2) * dtype_size;
+                    size_t aligned_q_group_stride_bytes = (q_group_stride_bytes + 63) & ~63;
+                    size_t aligned_q_group_stride_elems = aligned_q_group_stride_bytes / dtype_size;
+                    size_t q_size = num_cols * aligned_q_group_stride_elems * dtype_size;
                     if (!fk_entry->bo_q) {
                         fk_entry->bo_q = std::make_unique<xrt::bo>(
                             xrt::bo(ctx->device, q_size, xrt::bo::flags::host_only,
                                     fk_entry->kernel.group_id(5)));
                     }
-                    size_t out_size = q_heads_per_kv * row_bytes;
+                    size_t raw_out_bytes = q_heads_per_kv * row_bytes;
+                    size_t aligned_out_stride_bytes = (raw_out_bytes + 63) & ~63;
+                    size_t aligned_out_stride_elems = aligned_out_stride_bytes / dtype_size;
+                    size_t out_size = num_cols * aligned_out_stride_elems * dtype_size;
                     if (!fk_entry->bo_out) {
                         fk_entry->bo_out = std::make_unique<xrt::bo>(
                             xrt::bo(ctx->device, out_size, xrt::bo::flags::host_only,
@@ -11431,116 +11443,116 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                 (long long)actual_seq_len, (long long)seq_len);
                     }
 
-                    // Process each KV head.
-                    // IRON compiler bug: both K_fifos and V_fifos DMA read from arg1.
-                    // Workaround: put K+V in bo_v (arg1). K at offset 0, V at offset kv_region.
-                    // bo_k (arg0) is unused but must be allocated for set_arg.
-                    // IMPORTANT: kernel is compiled for num_kv_heads=1, so V DMA offset
-                    // is 1*seq_len*head_dim elements = seq_len*row_bytes bytes.
-                    for (int64_t kv_h = 0; kv_h < num_kv_heads; kv_h++) {
-                        size_t kv_region = (size_t)seq_len * row_bytes;  // for 1 KV head
-                        // Zero combined bo_v before writing K and V.
+                    // Batch num_cols KV heads per dispatch with 64-byte aligned strides.
+                    // Shim DMA requires 64-byte alignment for parallel channels.
+                    // (aligned stride variables defined in BO allocation section above)
+
+                    for (int64_t kv_h = 0; kv_h < num_kv_heads; kv_h += num_cols) {
+                        // Zero entire bo_v before writing K and V for all columns.
                         {
                             auto bo_v_ptr = fk_entry->bo_v->map<char *>();
-                            memset(bo_v_ptr, 0, 2 * kv_region);
+                            memset(bo_v_ptr, 0, (aligned_v_region_offset_elems + num_cols * aligned_head_stride_elems) * dtype_size);
                         }
-                        // --- Write K data into bo_v at offset 0 ---
+                        // --- Write K and V data for each column ---
                         {
-                            auto k_ptr = fk_entry->bo_v->map<char *>();
-                            for (int64_t pos = 0; pos < actual_seq_len; pos++) {
-                                size_t dst = pos * row_bytes;
-                                const bool k_is_f16 = (flowkv_poc_k_perm->type == GGML_TYPE_F16);
-                                if (k_is_f32) {
-                                    const float * src = (const float *)(k_data + pos * k_nb1 + kv_h * k_nb2);
-                                    uint16_t * dst_bf16 = (uint16_t *)(k_ptr + dst);
-                                    f32_to_bf16(src, dst_bf16, (size_t)head_dim);
-                                } else if (k_is_f16) {
-                                    size_t src_k = pos * k_nb1 + kv_h * k_nb2;
-                                    for (int64_t d = 0; d < head_dim; d++) {
-                                        ggml_fp16_t f16_val;
-                                        memcpy(&f16_val, k_data + src_k + d * sizeof(ggml_fp16_t), sizeof(ggml_fp16_t));
-                                        float f32_val = ggml_fp16_to_fp32(f16_val);
-                                        uint16_t bf16_val;
-                                        f32_to_bf16(&f32_val, &bf16_val, 1);
-                                        memcpy(k_ptr + dst + d * 2, &bf16_val, 2);
+                            auto bo_v_ptr = fk_entry->bo_v->map<char *>();
+                            for (int64_t col = 0; col < num_cols && (kv_h + col) < num_kv_heads; col++) {
+                                int64_t cur_kv_h = kv_h + col;
+                                // K at aligned stride offset
+                                char * k_col_ptr = bo_v_ptr + col * aligned_head_stride_bytes;
+                                for (int64_t pos = 0; pos < actual_seq_len; pos++) {
+                                    size_t dst = pos * row_bytes;
+                                    const bool k_is_f16 = (flowkv_poc_k_perm->type == GGML_TYPE_F16);
+                                    if (k_is_f32) {
+                                        const float * src = (const float *)(k_data + pos * k_nb1 + cur_kv_h * k_nb2);
+                                        f32_to_bf16(src, (uint16_t *)(k_col_ptr + dst), (size_t)head_dim);
+                                    } else if (k_is_f16) {
+                                        size_t src_k = pos * k_nb1 + cur_kv_h * k_nb2;
+                                        for (int64_t d = 0; d < head_dim; d++) {
+                                            ggml_fp16_t f16_val;
+                                            memcpy(&f16_val, k_data + src_k + d * sizeof(ggml_fp16_t), sizeof(ggml_fp16_t));
+                                            float f32_val = ggml_fp16_to_fp32(f16_val);
+                                            uint16_t bf16_val;
+                                            f32_to_bf16(&f32_val, &bf16_val, 1);
+                                            memcpy(k_col_ptr + dst + d * 2, &bf16_val, 2);
+                                        }
+                                    } else {
+                                        size_t src_k = pos * k_nb1 + cur_kv_h * k_nb2;
+                                        memcpy(k_col_ptr + dst, k_data + src_k, row_bytes);
                                     }
-                                } else {
-                                    size_t src_k = pos * k_nb1 + kv_h * k_nb2;
-                                    memcpy(k_ptr + dst, k_data + src_k, row_bytes);
                                 }
-                            }
+                                // V at aligned V region offset + col * aligned stride
+                                char * v_col_ptr = bo_v_ptr + aligned_v_region_offset_bytes + col * aligned_head_stride_bytes;
+                                for (int64_t pos = 0; pos < actual_seq_len; pos++) {
+                                    size_t dst = pos * row_bytes;
+                                    const bool v_is_f16 = (flowkv_poc_v_perm->type == GGML_TYPE_F16);
+                                    if (v_is_f32) {
+                                        uint16_t * dst_bf16 = (uint16_t *)(v_col_ptr + dst);
+                                        if (v_nb0 == (size_t)head_dim * 4) {
+                                            const float * src = (const float *)(v_data + pos * v_nb1 + cur_kv_h * v_nb2);
+                                            f32_to_bf16(src, dst_bf16, (size_t)head_dim);
+                                        } else {
+                                            for (int64_t d = 0; d < head_dim; d++) {
+                                                const float * src = (const float *)(v_data + pos * v_nb0 + d * v_nb1 + cur_kv_h * v_nb2);
+                                                float val = *src;
+                                                uint32_t bits;
+                                                memcpy(&bits, &val, 4);
+                                                uint16_t bf = (uint16_t)(bits >> 16);
+                                                if ((bits & 0x7FFFFFFF) < 0x7F800000) {
+                                                    uint32_t rounding = 0x7FFF + ((bf & 1) ^ 1);
+                                                    bf = (uint16_t)((bits + rounding) >> 16);
+                                                }
+                                                memcpy(v_col_ptr + dst + d * 2, &bf, 2);
+                                            }
+                                        }
+                                    } else if (v_is_f16) {
+                                        for (int64_t d = 0; d < head_dim; d++) {
+                                            size_t src_v = pos * v_nb0 + d * v_nb1 + cur_kv_h * v_nb2;
+                                            ggml_fp16_t f16_val;
+                                            memcpy(&f16_val, v_data + src_v, sizeof(ggml_fp16_t));
+                                            float f32_val = ggml_fp16_to_fp32(f16_val);
+                                            uint16_t bf16_val;
+                                            f32_to_bf16(&f32_val, &bf16_val, 1);
+                                            memcpy(v_col_ptr + dst + d * 2, &bf16_val, 2);
+                                        }
+                                    } else {
+                                        if (v_nb0 == (size_t)head_dim * 2) {
+                                            size_t src_v = pos * v_nb1 + cur_kv_h * v_nb2;
+                                            memcpy(v_col_ptr + dst, v_data + src_v, row_bytes);
+                                        } else {
+                                            for (int64_t d = 0; d < head_dim; d++) {
+                                                size_t src_v = pos * v_nb0 + d * v_nb1 + cur_kv_h * v_nb2;
+                                                memcpy(v_col_ptr + dst + d * 2, v_data + src_v, 2);
+                                            }
+                                        }
+                                    }
+                                }
+                            } // end col loop
                         }
-                        // Mirror K data into bo_k (arg0) because the IRON compiler
-                        // maps K FIFO DMA to arg0, not arg1 as the workaround assumed.
+                        // Mirror K data into bo_k (arg0)
                         {
                             auto k_dst = fk_entry->bo_k->map<char *>();
                             auto k_src = fk_entry->bo_v->map<char *>();
-                            memcpy(k_dst, k_src, kv_region);
+                            memcpy(k_dst, k_src, num_cols * aligned_head_stride_bytes);
                             fk_entry->bo_k->sync(XCL_BO_SYNC_BO_TO_DEVICE);
                         }
-
-                        // --- Write V data into bo_v at offset kv_region ---
-                        {
-                            auto bo_v_ptr = fk_entry->bo_v->map<char *>();
-                            auto v_ptr = bo_v_ptr + kv_region;
-                            for (int64_t pos = 0; pos < actual_seq_len; pos++) {
-                                size_t dst = pos * row_bytes;
-                                const bool v_is_f16 = (flowkv_poc_v_perm->type == GGML_TYPE_F16);
-                                if (v_is_f32) {
-                                    uint16_t * dst_bf16 = (uint16_t *)(v_ptr + dst);
-                                    if (v_nb0 == (size_t)head_dim * 4) {
-                                        const float * src = (const float *)(v_data + pos * v_nb1 + kv_h * v_nb2);
-                                        f32_to_bf16(src, dst_bf16, (size_t)head_dim);
-                                    } else {
-                                        for (int64_t d = 0; d < head_dim; d++) {
-                                            const float * src = (const float *)(v_data + pos * v_nb0 + d * v_nb1 + kv_h * v_nb2);
-                                            float val = *src;
-                                            uint32_t bits;
-                                            memcpy(&bits, &val, 4);
-                                            uint16_t bf = (uint16_t)(bits >> 16);
-                                            if ((bits & 0x7FFFFFFF) < 0x7F800000) {
-                                                uint32_t rounding = 0x7FFF + ((bf & 1) ^ 1);
-                                                bf = (uint16_t)((bits + rounding) >> 16);
-                                            }
-                                            memcpy(v_ptr + dst + d * 2, &bf, 2);
-                                        }
-                                    }
-                                } else if (v_is_f16) {
-                                    for (int64_t d = 0; d < head_dim; d++) {
-                                        size_t src_v = pos * v_nb0 + d * v_nb1 + kv_h * v_nb2;
-                                        ggml_fp16_t f16_val;
-                                        memcpy(&f16_val, v_data + src_v, sizeof(ggml_fp16_t));
-                                        float f32_val = ggml_fp16_to_fp32(f16_val);
-                                        uint16_t bf16_val;
-                                        f32_to_bf16(&f32_val, &bf16_val, 1);
-                                        memcpy(v_ptr + dst + d * 2, &bf16_val, 2);
-                                    }
-                                } else {
-                                    if (v_nb0 == (size_t)head_dim * 2) {
-                                        size_t src_v = pos * v_nb1 + kv_h * v_nb2;
-                                        memcpy(v_ptr + dst, v_data + src_v, row_bytes);
-                                    } else {
-                                        for (int64_t d = 0; d < head_dim; d++) {
-                                            size_t src_v = pos * v_nb0 + d * v_nb1 + kv_h * v_nb2;
-                                            memcpy(v_ptr + dst + d * 2, v_data + src_v, 2);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        // Sync K and V buffers to device
-                        fk_entry->bo_k->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                        // Sync V buffer to device
                         fk_entry->bo_v->sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
-                        // --- Prepare Q buffer (bf16) ---
+                        // --- Prepare Q buffer (bf16) for all columns ---
                         {
                             auto q_ptr = fk_entry->bo_q->map<char *>();
                             size_t q_head_bytes_bf16 = head_dim * sizeof(uint16_t);
+                            size_t q_group_stride_bytes = (q_heads_per_kv * head_dim + head_dim + 2) * dtype_size;
+                            size_t aligned_q_group_stride_bytes = (q_group_stride_bytes + 63) & ~63;
                             const bool q_is_f16 = (flowkv_poc_q_perm->type == GGML_TYPE_F16);
+                            for (int64_t col = 0; col < num_cols && (kv_h + col) < num_kv_heads; col++) {
+                            int64_t cur_kv_h = kv_h + col;
+                            char * q_col_ptr = q_ptr + col * aligned_q_group_stride_bytes;
                             for (int64_t g = 0; g < q_heads_per_kv; g++) {
-                                int64_t q_head = kv_h * q_heads_per_kv + g;
+                                int64_t q_head = cur_kv_h * q_heads_per_kv + g;
                                 const char * src = q_data + q_head * q_nb2;
-                                char * dst = q_ptr + g * q_head_bytes_bf16;
+                                char * dst = q_col_ptr + g * q_head_bytes_bf16;
                                 if (q_is_f32) {
                                     f32_to_bf16((const float *)src, (uint16_t *)dst, (size_t)head_dim);
                                 } else if (q_is_f16) {
@@ -11558,12 +11570,10 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                             // Append identity RoPE angles.
                             size_t angles_off = q_heads_per_kv * q_head_bytes_bf16;
                             for (int64_t d = 0; d < head_dim; d += 2) {
-                                memcpy(q_ptr + angles_off + d * 2, angle_cos_bf16, 2);
-                                memcpy(q_ptr + angles_off + d * 2 + 2, angle_sin_bf16, 2);
+                                memcpy(q_col_ptr + angles_off + d * 2, angle_cos_bf16, 2);
+                                memcpy(q_col_ptr + angles_off + d * 2 + 2, angle_sin_bf16, 2);
                             }
-                            // Encode actual_seq_len as bf16 at angles[64] (byte offset
-                            // angles_off + 128). The kernel reads this to skip empty
-                            // KV positions that would dilute the softmax.
+                            // Encode actual_seq_len as bf16 at angles[64].
                             {
                                 float f = (float)actual_seq_len;
                                 uint32_t bits;
@@ -11573,14 +11583,15 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                     uint32_t rounding = 0x7FFF + ((bf & 1) ^ 1);
                                     bf = (uint16_t)((bits + rounding) >> 16);
                                 }
-                                memcpy(q_ptr + angles_off + head_dim * 2, &bf, 2);
+                                memcpy(q_col_ptr + angles_off + head_dim * 2, &bf, 2);
                             }
-                            // V10 PROBE: write magic to angles[head_dim + 1] under XDNA_FLOWKV_REAL_PROBE
+                            // V10 PROBE magic
                             {
                                 static bool flowkv_real_probe = xdna_env_enabled("XDNA_FLOWKV_REAL_PROBE");
                                 uint16_t probe_val = flowkv_real_probe ? 0x7A10 : 0x0000;
-                                memcpy(q_ptr + angles_off + (head_dim + 1) * 2, &probe_val, 2);
+                                memcpy(q_col_ptr + angles_off + (head_dim + 1) * 2, &probe_val, 2);
                             }
+                            } // end col loop
                             fk_entry->bo_q->sync(XCL_BO_SYNC_BO_TO_DEVICE);
                         }
 
@@ -11722,32 +11733,41 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                 if (flowkv_real_probe && kv_h == 0) {
                                     fk_entry->bo_out->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
                                     auto out_ptr = fk_entry->bo_out->map<char *>();
-                                    const uint16_t * obf16 = (const uint16_t *)out_ptr;
                                     fk_entry->bo_q->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
                                     auto q_ptr = fk_entry->bo_q->map<char *>();
-                                    const uint16_t * q_bf16 = (const uint16_t *)q_ptr;
                                     fk_entry->bo_v->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
                                     auto v_ptr = fk_entry->bo_v->map<char *>();
-                                    const uint16_t * v_bf16 = (const uint16_t *)v_ptr;
-                                    size_t kv_region_elems = (size_t)seq_len * head_dim;
-                                    int q_match = 0, k_match = 0, v_match = 0, meta_match = 0;
-                                    for (int d = 0; d < 64; d++) {
-                                        if (obf16[d] == q_bf16[d]) q_match++;
-                                        if (obf16[head_dim + d] == v_bf16[d]) k_match++;
-                                        if (obf16[2 * head_dim + d] == v_bf16[kv_region_elems + d]) v_match++;
+
+                                    size_t out_head_elems = (size_t)head_dim;
+                                    size_t q_group_stride_elems = aligned_q_group_stride_bytes / sizeof(uint16_t);
+                                    size_t out_stride_elems = aligned_out_stride_bytes / sizeof(uint16_t);
+                                    size_t head_stride_elems = aligned_head_stride_bytes / sizeof(uint16_t);
+                                    size_t v_region_offset_elems = aligned_v_region_offset_bytes / sizeof(uint16_t);
+
+                                    for (int col = 0; col < num_cols && col < num_kv_heads; col++) {
+                                        const uint16_t * obf16 = (const uint16_t *)out_ptr + col * out_stride_elems;
+                                        const uint16_t * q_bf16 = (const uint16_t *)q_ptr + col * q_group_stride_elems;
+                                        const uint16_t * k_bf16 = (const uint16_t *)v_ptr + col * head_stride_elems;
+                                        const uint16_t * v_bf16 = (const uint16_t *)v_ptr + v_region_offset_elems + col * head_stride_elems;
+                                        int q_match = 0, k_match = 0, v_match = 0, meta_match = 0;
+                                        for (int d = 0; d < 64; d++) {
+                                            if (obf16[d] == q_bf16[d]) q_match++;
+                                            if (obf16[head_dim + d] == k_bf16[d]) k_match++;
+                                            if (obf16[2 * head_dim + d] == v_bf16[d]) v_match++;
+                                        }
+                                        uint16_t host_meta = q_bf16[q_heads_per_kv * head_dim + head_dim];
+                                        if (obf16[3 * head_dim] == host_meta) meta_match = 1;
+                                        fprintf(stderr, "  [V10-FLOWKV-PROBE] col=%d: Qmatch=%d Kmatch=%d Vmatch=%d Mmatch=%d\n",
+                                            col, q_match, k_match, v_match, meta_match);
+                                        fprintf(stderr, "    Q[0..3]: 0x%04X 0x%04X 0x%04X 0x%04X\n",
+                                            (unsigned)obf16[0], (unsigned)obf16[1], (unsigned)obf16[2], (unsigned)obf16[3]);
+                                        fprintf(stderr, "    K[0..3]: 0x%04X 0x%04X 0x%04X 0x%04X\n",
+                                            (unsigned)obf16[head_dim], (unsigned)obf16[head_dim+1], (unsigned)obf16[head_dim+2], (unsigned)obf16[head_dim+3]);
+                                        fprintf(stderr, "    V[0..3]: 0x%04X 0x%04X 0x%04X 0x%04X\n",
+                                            (unsigned)obf16[2*head_dim], (unsigned)obf16[2*head_dim+1], (unsigned)obf16[2*head_dim+2], (unsigned)obf16[2*head_dim+3]);
+                                        fprintf(stderr, "    META seq=0x%04X magic=0x%04X\n",
+                                            (unsigned)obf16[3*head_dim], (unsigned)obf16[3*head_dim+1]);
                                     }
-                                    uint16_t host_meta = q_bf16[q_heads_per_kv * head_dim + head_dim];
-                                    if (obf16[3 * head_dim] == host_meta) meta_match = 1;
-                                    fprintf(stderr, "  [V10-FLOWKV-PROBE] kv_h=0: Qmatch=%d Kmatch=%d Vmatch=%d Mmatch=%d\n",
-                                        q_match, k_match, v_match, meta_match);
-                                    fprintf(stderr, "    Q[0..3]: 0x%04X 0x%04X 0x%04X 0x%04X\n",
-                                        (unsigned)obf16[0], (unsigned)obf16[1], (unsigned)obf16[2], (unsigned)obf16[3]);
-                                    fprintf(stderr, "    K[0..3]: 0x%04X 0x%04X 0x%04X 0x%04X\n",
-                                        (unsigned)obf16[head_dim], (unsigned)obf16[head_dim+1], (unsigned)obf16[head_dim+2], (unsigned)obf16[head_dim+3]);
-                                    fprintf(stderr, "    V[0..3]: 0x%04X 0x%04X 0x%04X 0x%04X\n",
-                                        (unsigned)obf16[2*head_dim], (unsigned)obf16[2*head_dim+1], (unsigned)obf16[2*head_dim+2], (unsigned)obf16[2*head_dim+3]);
-                                    fprintf(stderr, "    META seq=0x%04X magic=0x%04X\n",
-                                        (unsigned)obf16[3*head_dim], (unsigned)obf16[3*head_dim+1]);
                                     fprintf(stderr, "    [V10-FLOWKV-PROBE] probe mode overwrote FlowKV output; generated tokens are invalid\n");
                                     fflush(stderr);
                                 }
@@ -11756,21 +11776,27 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                             }
                         }
 
-                        // --- Read back and write to kqv_out (bf16→f32 if needed) ---
+                        // --- Read back and scatter output for all columns ---
                         fk_entry->bo_out->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
                         {
                             auto out_ptr = fk_entry->bo_out->map<char *>();
                             char * kqv_data = (char *)kqv_out->data;
                             size_t out_head_bytes = head_dim * sizeof(uint16_t);
-                            for (int64_t g = 0; g < q_heads_per_kv; g++) {
-                                int64_t q_head = kv_h * q_heads_per_kv + g;
-                                if (out_is_f32) {
-                                    bf16_to_f32((const uint16_t *)(out_ptr + g * out_head_bytes),
-                                                (float *)(kqv_data + q_head * head_dim * sizeof(float)),
-                                                (size_t)head_dim);
-                                } else {
-                                    memcpy(kqv_data + q_head * out_head_bytes,
-                                           out_ptr + g * out_head_bytes, out_head_bytes);
+                            size_t raw_out_bytes = q_heads_per_kv * out_head_bytes;
+                            size_t aligned_out_stride_bytes = (raw_out_bytes + 63) & ~63;
+                            for (int64_t col = 0; col < num_cols && (kv_h + col) < num_kv_heads; col++) {
+                                int64_t cur_kv_h = kv_h + col;
+                                const char * col_out = out_ptr + col * aligned_out_stride_bytes;
+                                for (int64_t g = 0; g < q_heads_per_kv; g++) {
+                                    int64_t q_head = cur_kv_h * q_heads_per_kv + g;
+                                    if (out_is_f32) {
+                                        bf16_to_f32((const uint16_t *)(col_out + g * out_head_bytes),
+                                                    (float *)(kqv_data + q_head * head_dim * sizeof(float)),
+                                                    (size_t)head_dim);
+                                    } else {
+                                        memcpy(kqv_data + q_head * out_head_bytes,
+                                               col_out + g * out_head_bytes, out_head_bytes);
+                                    }
                                 }
                             }
                         }
