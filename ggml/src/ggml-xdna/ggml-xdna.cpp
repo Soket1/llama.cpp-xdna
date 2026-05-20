@@ -10142,6 +10142,7 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
     static const struct ggml_tensor * flowkv_poc_k_perm = nullptr;
     static const struct ggml_tensor * flowkv_poc_v_perm = nullptr;
     static const void * flowkv_poc_q_data = nullptr;  // detect stale pointers across queries
+    static int32_t flowkv_poc_n_past = 0;  // RoPE position for decode token
     static int64_t flowkv_poc_head_dim = 0;
     static int64_t flowkv_poc_seq_len = 0;
     static int64_t flowkv_poc_num_kv_heads = 0;
@@ -10314,6 +10315,23 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                             flowkv_poc_k_perm = k_perm;
                             flowkv_poc_v_perm = v_perm;
                             flowkv_poc_q_data = q_perm->data;  // for staleness check
+                            // Capture RoPE position for actual_seq_len detection.
+                            // ROPE node is at i+2 (Q MUL_MAT → Q RESHAPE → Q ROPE).
+                            flowkv_poc_n_past = 0;
+                            if (i + 2 < n) {
+                                struct ggml_tensor * rope_node = cgraph->nodes[i + 2];
+                                if (rope_node->op == GGML_OP_ROPE &&
+                                    rope_node->src[1] &&
+                                    rope_node->src[1]->type == GGML_TYPE_I32) {
+                                    const int32_t * pos_data = (const int32_t *)rope_node->src[1]->data;
+                                    int64_t n_pos = rope_node->src[1]->ne[0];
+                                    int32_t max_pos = 0;
+                                    for (int64_t pi = 0; pi < n_pos; pi++) {
+                                        if (pos_data[pi] > max_pos) max_pos = pos_data[pi];
+                                    }
+                                    flowkv_poc_n_past = max_pos;
+                                }
+                            }
                             flowkv_poc_head_dim = q_perm->ne[0];       // 64
                             flowkv_poc_seq_len = k_perm->ne[1];        // seq_len
                             flowkv_poc_num_kv_heads = k_perm->ne[2];   // 8
@@ -11359,12 +11377,16 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                     char angle_sin_bf16[2] = {(char)0x00, (char)0x00};  // 0x0000 = 0.0 bf16
 
                     // Determine actual number of filled KV positions.
-                    // k_perm->ne[1] is the padded n_kv (≥256), not the real token count.
-                    // We scan K data to find the last non-zero position.
+                    // Use RoPE position (n_past) for accurate count.
+                    // n_past = max position in RoPE tensor = number of tokens before current.
+                    // actual_seq_len = n_past + 1 (including current decode token).
                     int64_t actual_seq_len = seq_len;
-                    {
-                        // Quick scan: check if K at position seq_len-1 is all zeros.
-                        // If so, binary search for the boundary.
+                    if (flowkv_poc_n_past > 0) {
+                        actual_seq_len = (int64_t)flowkv_poc_n_past + 1;
+                        // Clamp to seq_len
+                        if (actual_seq_len > seq_len) actual_seq_len = seq_len;
+                    } else {
+                        // Fallback: binary search on K data zeros.
                         auto is_k_zero = [&](int64_t pos) -> bool {
                             for (int64_t d = 0; d < head_dim; d++) {
                                 size_t off = pos * k_nb1 + 0 * k_nb2 + d * k_nb0;
