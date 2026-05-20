@@ -10141,9 +10141,6 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
     static const struct ggml_tensor * flowkv_poc_q_perm = nullptr;
     static const struct ggml_tensor * flowkv_poc_k_perm = nullptr;
     static const struct ggml_tensor * flowkv_poc_v_perm = nullptr;
-    static const void * flowkv_poc_q_data = nullptr;  // detect stale pointers across queries
-    static int32_t flowkv_poc_n_past = 0;  // RoPE position for decode token
-    static int64_t flowkv_poc_saved_seq_len = 0;  // detect seq_len changes (kernel recompile)
     static int64_t flowkv_poc_head_dim = 0;
     static int64_t flowkv_poc_seq_len = 0;
     static int64_t flowkv_poc_num_kv_heads = 0;
@@ -10295,6 +10292,27 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                     ctx, q_mm, k_mm, v_mm,
                     q_mm->src[0], k_mm->src[0], v_mm->src[0],
                     q_mm->src[1]);
+                // ── FlowKV diagnostic: log QKV tensors and surrounding nodes ──
+                if (flowkv_decode_enabled) {
+                    fprintf(stderr, "ggml-xdna: [FlowKV-DIAG] QKV @%d: "
+                            "q_mm dst=%s ne=[%lld,%lld] src1=%s ne=[%lld,%lld]\n",
+                            i, q_mm->name,
+                            (long long)q_mm->ne[0], (long long)q_mm->ne[1],
+                            q_mm->src[1]->name,
+                            (long long)q_mm->src[1]->ne[0], (long long)q_mm->src[1]->ne[1]);
+                    // Log nodes i..i+20 (the QKV + cache section)
+                    int log_end = i + 20 < n ? i + 20 : n;
+                    for (int j = i; j < log_end; j++) {
+                        struct ggml_tensor * nd = cgraph->nodes[j];
+                        fprintf(stderr, "  [%d] op=%d name=%s ne=[%lld,%lld,%lld] "
+                                "src0=%s src1=%s\n",
+                                j, (int)nd->op, nd->name,
+                                (long long)nd->ne[0], (long long)nd->ne[1], (long long)nd->ne[2],
+                                nd->src[0] ? nd->src[0]->name : "(null)",
+                                nd->src[1] ? nd->src[1]->name : "(null)");
+                    }
+                    fflush(stderr);
+                }
                 // ── FlowKV POC: save permuted Q/K/V tensor pointers ──
                 // The segment structure after Q MUL_MAT is fixed:
                 //   +15 = PERMUTE cache_v (V cache permuted)
@@ -10315,30 +10333,17 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                             flowkv_poc_q_perm = q_perm;
                             flowkv_poc_k_perm = k_perm;
                             flowkv_poc_v_perm = v_perm;
-                            flowkv_poc_q_data = q_perm->data;  // for staleness check
-                            flowkv_poc_saved_seq_len = k_perm->ne[1];  // detect seq_len changes
-                            // Capture RoPE position for actual_seq_len detection.
-                            // ROPE node is at i+2 (Q MUL_MAT → Q RESHAPE → Q ROPE).
-                            flowkv_poc_n_past = 0;
-                            if (i + 2 < n) {
-                                struct ggml_tensor * rope_node = cgraph->nodes[i + 2];
-                                if (rope_node->op == GGML_OP_ROPE &&
-                                    rope_node->src[1] &&
-                                    rope_node->src[1]->type == GGML_TYPE_I32) {
-                                    const int32_t * pos_data = (const int32_t *)rope_node->src[1]->data;
-                                    int64_t n_pos = rope_node->src[1]->ne[0];
-                                    int32_t max_pos = 0;
-                                    for (int64_t pi = 0; pi < n_pos; pi++) {
-                                        if (pos_data[pi] > max_pos) max_pos = pos_data[pi];
-                                    }
-                                    flowkv_poc_n_past = max_pos;
-                                }
-                            }
                             flowkv_poc_head_dim = q_perm->ne[0];       // 64
                             flowkv_poc_seq_len = k_perm->ne[1];        // seq_len
                             flowkv_poc_num_kv_heads = k_perm->ne[2];   // 8
                             flowkv_poc_num_q_heads = q_perm->ne[2];    // 32
                             flowkv_poc_valid = true;
+                            fprintf(stderr, "ggml-xdna: [FlowKV-POC] Saved Q=%p[%lld,%lld,%lld] "
+                                    "K=%p[%lld,%lld,%lld] V=%p[%lld,%lld,%lld]\n",
+                                    q_perm->data, (long long)q_perm->ne[0], (long long)q_perm->ne[1], (long long)q_perm->ne[2],
+                                    k_perm->data, (long long)k_perm->ne[0], (long long)k_perm->ne[1], (long long)k_perm->ne[2],
+                                    v_perm->data, (long long)v_perm->ne[0], (long long)v_perm->ne[1], (long long)v_perm->ne[2]);
+                            fflush(stderr);
                         }
                     }
                 }
@@ -11135,30 +11140,6 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
             node->op == GGML_OP_CONT &&
             node->name && strstr(node->name, "kqv_out")) {
 
-            // Staleness check: invalidate if Q data pointer changed (new query)
-            // or seq_len changed (kernel recompile due to KV cache growth).
-            if (flowkv_poc_q_perm && flowkv_poc_q_perm->data != flowkv_poc_q_data) {
-                flowkv_poc_valid = false;
-                flowkv_poc_q_perm = nullptr;
-                flowkv_poc_k_perm = nullptr;
-                flowkv_poc_v_perm = nullptr;
-                flowkv_poc_q_data = nullptr;
-            }
-            // Check if seq_len changed (KV cache grew → different kernel)
-            if (flowkv_poc_valid && flowkv_poc_k_perm &&
-                flowkv_poc_k_perm->ne[1] != flowkv_poc_saved_seq_len) {
-                flowkv_poc_valid = false;
-                flowkv_poc_q_perm = nullptr;
-                flowkv_poc_k_perm = nullptr;
-                flowkv_poc_v_perm = nullptr;
-                flowkv_poc_q_data = nullptr;
-            }
-            if (!flowkv_poc_valid) {
-                // Stale or not set — fall through to CPU path.
-                if (cpu_run_start < 0) cpu_run_start = i;
-                continue;
-            }
-
             struct ggml_tensor * kqv_out = node->src[0];
             static const bool poc_dbg = getenv("XDNA_DEBUG") != NULL;
             int64_t head_dim = flowkv_poc_head_dim;
@@ -11207,14 +11188,12 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                         fk_entry->bo_k = std::make_unique<xrt::bo>(
                             xrt::bo(ctx->device, k_size, xrt::bo::flags::host_only,
                                     fk_entry->kernel.group_id(3)));
-                        memset(fk_entry->bo_k->map<void*>(), 0, k_size);
                     }
                     size_t v_size = (aligned_v_region_offset_elems + kv_region_elems) * dtype_size;
                     if (!fk_entry->bo_v) {
                         fk_entry->bo_v = std::make_unique<xrt::bo>(
                             xrt::bo(ctx->device, v_size, xrt::bo::flags::host_only,
                                     fk_entry->kernel.group_id(4)));
-                        memset(fk_entry->bo_v->map<void*>(), 0, v_size);
                     }
                     size_t q_group_stride_bytes = (q_heads_per_kv * head_dim + head_dim + 2) * dtype_size;
                     size_t aligned_q_group_stride_bytes = (q_group_stride_bytes + 63) & ~63;
@@ -11234,6 +11213,39 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                             xrt::bo(ctx->device, out_size, xrt::bo::flags::host_only,
                                     fk_entry->kernel.group_id(6)));
                     }
+
+                    // === BO ADDRESS DIAGNOSTIC ===
+                    {
+                        uint64_t addr_k   = fk_entry->bo_k->address();
+                        uint64_t addr_v   = fk_entry->bo_v->address();
+                        uint64_t addr_q   = fk_entry->bo_q->address();
+                        uint64_t addr_out = fk_entry->bo_out->address();
+                        fprintf(stderr, "\n=== BO ADDRESS DIAGNOSTIC ===\n");
+                        fprintf(stderr, "  bo_k   (group_id 3): addr=0x%016llX  size=%zu  expected_arg=DDR_buf_0\n",
+                                (unsigned long long)addr_k, k_size);
+                        fprintf(stderr, "  bo_v   (group_id 4): addr=0x%016llX  size=%zu  expected_arg=DDR_buf_1\n",
+                                (unsigned long long)addr_v, v_size);
+                        fprintf(stderr, "  bo_q   (group_id 5): addr=0x%016llX  size=%zu\n",
+                                (unsigned long long)addr_q, q_size);
+                        fprintf(stderr, "  bo_out (group_id 6): addr=0x%016llX  size=%zu\n",
+                                (unsigned long long)addr_out, out_size);
+                        int64_t kv_delta = (int64_t)addr_v - (int64_t)addr_k;
+                        fprintf(stderr, "  V-K delta: %lld bytes (%lld KB)\n",
+                                (long long)kv_delta, (long long)kv_delta / 1024);
+                        int64_t expected_delta = (int64_t)k_size;
+                        fprintf(stderr, "  Expected V-K delta (k_size): %lld bytes (%lld KB)\n",
+                                (long long)expected_delta, (long long)expected_delta / 1024);
+                        if (kv_delta != expected_delta && kv_delta != (int64_t)v_size) {
+                            fprintf(stderr, "  *** UNEXPECTED DELTA — driver may be adding metadata! ***\n");
+                            fprintf(stderr, "  Delta diff from k_size: %lld bytes\n",
+                                    (long long)(kv_delta - expected_delta));
+                        }
+                        fprintf(stderr, "  bo_k group_id: %zu\n", (size_t)fk_entry->kernel.group_id(3));
+                        fprintf(stderr, "  bo_v group_id: %zu\n", (size_t)fk_entry->kernel.group_id(4));
+                        fprintf(stderr, "=== END BO ADDRESS DIAGNOSTIC ===\n\n");
+                        fflush(stderr);
+                    }
+                    // === END BO ADDRESS DIAGNOSTIC ===
 
                     // Diagnostic: save CPU result before overwriting
                     static std::vector<float> cpu_save;
@@ -11388,16 +11400,12 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                     char angle_sin_bf16[2] = {(char)0x00, (char)0x00};  // 0x0000 = 0.0 bf16
 
                     // Determine actual number of filled KV positions.
-                    // Use RoPE position (n_past) for accurate count.
-                    // n_past = max position in RoPE tensor = number of tokens before current.
-                    // actual_seq_len = n_past + 1 (including current decode token).
+                    // k_perm->ne[1] is the padded n_kv (≥256), not the real token count.
+                    // We scan K data to find the last non-zero position.
                     int64_t actual_seq_len = seq_len;
-                    if (flowkv_poc_n_past > 0) {
-                        actual_seq_len = (int64_t)flowkv_poc_n_past + 1;
-                        // Clamp to seq_len
-                        if (actual_seq_len > seq_len) actual_seq_len = seq_len;
-                    } else {
-                        // Fallback: binary search on K data zeros.
+                    {
+                        // Quick scan: check if K at position seq_len-1 is all zeros.
+                        // If so, binary search for the boundary.
                         auto is_k_zero = [&](int64_t pos) -> bool {
                             for (int64_t d = 0; d < head_dim; d++) {
                                 size_t off = pos * k_nb1 + 0 * k_nb2 + d * k_nb0;
@@ -11889,10 +11897,40 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
         if (s != GGML_STATUS_SUCCESS) return s;
     }
 
-    // FlowKV early dispatch: DISABLED.
-    // Early dispatch used stale flowkv_poc_valid pointers from previous
-    // graph evaluations, causing garbage on long prompts and chat mode.
-    // FlowKV dispatch happens at CONT(kqv_out) handler instead.
+    // FlowKV early dispatch: after QKV segment's CPU delegate range,
+    // permuted Q/K/V tensors are ready. Dispatch FlowKV now so the
+    // next segment (SOFT_MAX) can be skipped entirely.
+    // This replaces the POC dispatch at CONT(kqv_out) for layers where
+    // the QKV segment precedes the attention segment.
+    if (flowkv_decode_enabled && flowkv_poc_valid &&
+        flowkv_poc_q_perm && flowkv_poc_q_perm->data) {
+        int64_t head_dim = flowkv_poc_head_dim;
+        int64_t seq_len = flowkv_poc_seq_len;
+        int64_t num_kv_heads = flowkv_poc_num_kv_heads;
+        int64_t num_q_heads = flowkv_poc_num_q_heads;
+        int64_t q_heads_per_kv = num_q_heads / num_kv_heads;
+        int chunk_size = 32;
+        int num_cols = 1;
+
+        xdna_flowkv_entry * fk_entry = get_or_load_flowkv_kernel(
+            ctx, q_heads_per_kv, /*num_kv_heads=*/1, head_dim, seq_len, chunk_size, num_cols);
+
+        if (fk_entry) {
+            static const bool early_dbg = getenv("XDNA_DEBUG") != NULL;
+            if (early_dbg) {
+                fprintf(stderr, "ggml-xdna: [FlowKV-early] dispatching after QKV segment "
+                        "H=%lld KV=%lld d=%lld S=%lld\n",
+                        (long long)q_heads_per_kv, (long long)num_kv_heads,
+                        (long long)head_dim, (long long)seq_len);
+                fflush(stderr);
+            }
+            // Note: the actual BO setup + dispatch + readback is identical
+            // to the POC path. For now, just set the flag — the POC at
+            // CONT(kqv_out) will handle the actual dispatch. The flag
+            // causes SOFT_MAX to be skipped.
+            flowkv_dispatched_this_layer = true;
+        }
+    }
 
     // Print per-phase attention-prefill profile (no-op when gate off / no samples).
     xdna_attn_prof_print();
