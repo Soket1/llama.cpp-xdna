@@ -10141,6 +10141,7 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
     static const struct ggml_tensor * flowkv_poc_q_perm = nullptr;
     static const struct ggml_tensor * flowkv_poc_k_perm = nullptr;
     static const struct ggml_tensor * flowkv_poc_v_perm = nullptr;
+    static const void * flowkv_poc_q_data = nullptr;  // detect stale pointers across queries
     static int64_t flowkv_poc_head_dim = 0;
     static int64_t flowkv_poc_seq_len = 0;
     static int64_t flowkv_poc_num_kv_heads = 0;
@@ -10312,6 +10313,7 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                             flowkv_poc_q_perm = q_perm;
                             flowkv_poc_k_perm = k_perm;
                             flowkv_poc_v_perm = v_perm;
+                            flowkv_poc_q_data = q_perm->data;  // for staleness check
                             flowkv_poc_head_dim = q_perm->ne[0];       // 64
                             flowkv_poc_seq_len = k_perm->ne[1];        // seq_len
                             flowkv_poc_num_kv_heads = k_perm->ne[2];   // 8
@@ -11113,6 +11115,21 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
             node->op == GGML_OP_CONT &&
             node->name && strstr(node->name, "kqv_out")) {
 
+            // Staleness check: if Q data pointer changed, the pointers are
+            // from a previous query. Invalidate and fall through to CPU path.
+            if (flowkv_poc_q_perm && flowkv_poc_q_perm->data != flowkv_poc_q_data) {
+                flowkv_poc_valid = false;
+                flowkv_poc_q_perm = nullptr;
+                flowkv_poc_k_perm = nullptr;
+                flowkv_poc_v_perm = nullptr;
+                flowkv_poc_q_data = nullptr;
+            }
+            if (!flowkv_poc_valid) {
+                // Stale or not set — fall through to CPU path.
+                if (cpu_run_start < 0) cpu_run_start = i;
+                continue;
+            }
+
             struct ggml_tensor * kqv_out = node->src[0];
             static const bool poc_dbg = getenv("XDNA_DEBUG") != NULL;
             int64_t head_dim = flowkv_poc_head_dim;
@@ -11846,13 +11863,6 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
 
     // Print per-phase attention-prefill profile (no-op when gate off / no samples).
     xdna_attn_prof_print();
-
-    // Note: do NOT invalidate flowkv_poc_valid here. There are two graph
-    // evaluations per decode token: the first sets pointers (QKV triple),
-    // the second uses them (CONT handler). Invalidation between evaluations
-    // breaks FlowKV. Early dispatch (which caused chat garbage) is already
-    // disabled. Stale pointers between tokens are handled by the QKV section
-    // overwriting pointers on each decode evaluation.
 
     return GGML_STATUS_SUCCESS;
 
