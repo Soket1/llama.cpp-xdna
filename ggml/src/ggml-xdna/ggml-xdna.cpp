@@ -11802,9 +11802,17 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                 auto q_ptr_d = fk_entry->bo_q->map<char *>();
                                 auto v_ptr_d = fk_entry->bo_v->map<char *>();
                                 auto out_ptr_d = fk_entry->bo_out->map<char *>();
+                                // BO layout for num_cols>1 batching:
+                                //   bo_v = [K_col0 | K_col1 | ... | K_col(N-1) | V_col0 | V_col1 | ...]
+                                //   K region size = num_cols * aligned_head_stride_bytes
+                                //   V region offset = aligned_v_region_offset_bytes (64-byte aligned past K)
+                                // For diag we compare col=0 of group, so:
+                                //   K_col0 = bo_v + 0
+                                //   V_col0 = bo_v + aligned_v_region_offset_bytes
+                                // The old hard-coded `seq_len * row_bytes` only worked for num_cols=1.
                                 const uint16_t * q_bf16 = (const uint16_t *)q_ptr_d;
                                 const uint16_t * k_bf16 = (const uint16_t *)v_ptr_d;
-                                const uint16_t * v_bf16 = (const uint16_t *)(v_ptr_d + seq_len * row_bytes);
+                                const uint16_t * v_bf16 = (const uint16_t *)(v_ptr_d + aligned_v_region_offset_bytes);
                                 const uint16_t * out_bf16 = (const uint16_t *)out_ptr_d;
                                 int angles_off_elems = q_heads_per_kv * head_dim + head_dim;
                                 uint16_t asl_bits = q_bf16[angles_off_elems];
