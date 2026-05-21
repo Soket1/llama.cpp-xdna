@@ -340,6 +340,16 @@ TESTS: list[Test] = [
         min_prefix_match=1,
         description="INT4 + FlowKV + chat-mode composition. Catches interference between Q4_0 dispatch and the decode-batch / FlowKV machinery.",
     ),
+    Test(
+        name="paris_short_q4_0_int4_swiglu",
+        prompt="What is the capital of France?",
+        n_predict=12,
+        mode="single-turn",
+        model=MODEL_Q4_0,
+        variants=["npu_int4_swiglu"],
+        min_prefix_match=1,
+        description="Phase 8.2 dispatch path: Q4_0 SwiGLU routed through the chained INT4 xclbin (dual_fused_dequant_gemv_silu_mul + fused_dequant_gemv).",
+    ),
 ]
 
 # =============================================================================
@@ -616,9 +626,10 @@ class BenchConfig:
 
 def build_bench_configs() -> list[BenchConfig]:
     return [
-        BenchConfig(label="CPU Q4_0",        preset="cpu_baseline",  model=MODEL_Q4_0),
-        BenchConfig(label="NPU bf16",        preset="npu_chat_safe", model=MODEL),
-        BenchConfig(label="NPU INT4 (Q4_0)", preset="npu_int4",      model=MODEL_Q4_0),
+        BenchConfig(label="CPU Q4_0",          preset="cpu_baseline",     model=MODEL_Q4_0),
+        BenchConfig(label="NPU bf16",          preset="npu_chat_safe",    model=MODEL),
+        BenchConfig(label="NPU INT4 (8.1)",    preset="npu_int4",         model=MODEL_Q4_0),
+        BenchConfig(label="NPU INT4 (8.1+8.2)", preset="npu_int4_swiglu", model=MODEL_Q4_0),
     ]
 
 
