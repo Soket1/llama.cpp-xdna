@@ -11696,6 +11696,58 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                             }
                             // === END PHANTOM OFFSET DIAGNOSTIC ===
 
+                            // === XDNA_FLOWKV_BO_PROBE: source vs BO comparison ===
+                            // Gate: XDNA_FLOWKV_BO_PROBE=1. Prints first 8 bf16
+                            // values from (a) the source tensors via flowkv_poc_*_perm
+                            // pointers, and (b) the BO regions right before kernel
+                            // dispatch. Dumps positions 0, mid, last_active to verify
+                            // whether newly-appended K/V (e.g. Q2 prefill tokens) made
+                            // it into the cache and through to the BO.
+                            {
+                                static const bool bo_probe = xdna_env_enabled("XDNA_FLOWKV_BO_PROBE");
+                                if (bo_probe && kv_h == 0 && i < 50) {  // layer 0 only (i is small for layer 0 in segment)
+                                    int64_t pos_last = actual_seq_len > 0 ? actual_seq_len - 1 : 0;
+                                    int64_t pos_mid  = actual_seq_len > 1 ? actual_seq_len / 2 : 0;
+                                    fprintf(stderr, "  [BO-PROBE] node=%d actual_seq=%lld pos_mid=%lld pos_last=%lld\n",
+                                            i, (long long)actual_seq_len, (long long)pos_mid, (long long)pos_last);
+                                    auto dump16 = [](const char * label, const void * p) {
+                                        fprintf(stderr, "    %s:", label);
+                                        for (int d = 0; d < 8; d++) {
+                                            uint16_t v;
+                                            memcpy(&v, (const char *)p + d * 2, 2);
+                                            fprintf(stderr, " 0x%04X", v);
+                                        }
+                                        fprintf(stderr, "\n");
+                                    };
+                                    fprintf(stderr, "    src types Q=%d K=%d V=%d nb_K=[%zu,%zu,%zu] nb_V=[%zu,%zu,%zu]\n",
+                                            (int)flowkv_poc_q_perm->type,
+                                            (int)flowkv_poc_k_perm->type,
+                                            (int)flowkv_poc_v_perm->type,
+                                            k_nb0, k_nb1, k_nb2,
+                                            v_nb0, v_nb1, v_nb2);
+                                    // Source data at multiple positions (kv_h=0, d=0..7)
+                                    dump16("Q_src    ", flowkv_poc_q_perm->data);
+                                    dump16("K_src@0  ", (const char *)flowkv_poc_k_perm->data);
+                                    dump16("K_src@mid", (const char *)flowkv_poc_k_perm->data + pos_mid * k_nb1);
+                                    dump16("K_src@lst", (const char *)flowkv_poc_k_perm->data + pos_last * k_nb1);
+                                    dump16("V_src@0  ", (const char *)flowkv_poc_v_perm->data);
+                                    dump16("V_src@mid", (const char *)flowkv_poc_v_perm->data + pos_mid * v_nb0);
+                                    dump16("V_src@lst", (const char *)flowkv_poc_v_perm->data + pos_last * v_nb0);
+                                    // BO data — what the kernel will actually see.
+                                    auto q_p = fk_entry->bo_q->map<char *>();
+                                    auto v_p = fk_entry->bo_v->map<char *>();
+                                    dump16("Q_bo     ", q_p);
+                                    dump16("K_bo@0   ", v_p);
+                                    dump16("K_bo@mid ", v_p + pos_mid * row_bytes);
+                                    dump16("K_bo@lst ", v_p + pos_last * row_bytes);
+                                    dump16("V_bo@0   ", v_p + aligned_v_region_offset_bytes);
+                                    dump16("V_bo@mid ", v_p + aligned_v_region_offset_bytes + pos_mid * row_bytes);
+                                    dump16("V_bo@lst ", v_p + aligned_v_region_offset_bytes + pos_last * row_bytes);
+                                    fflush(stderr);
+                                }
+                            }
+                            // === END XDNA_FLOWKV_BO_PROBE ===
+
                             // Use set_arg with all 8 kernel args. The FlowKV kernel is
                             // compiled for one KV head: bo_k carries K, bo_v carries V
                             // at offset seq_len * row_bytes.
