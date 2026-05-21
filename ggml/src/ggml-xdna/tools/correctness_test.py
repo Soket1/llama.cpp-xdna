@@ -44,6 +44,15 @@ REPO_ROOT = Path("C:/llama.cpp-xdna")
 LLAMA_CLI = REPO_ROOT / "build" / "bin" / "Release" / "llama-cli.exe"
 MODEL     = REPO_ROOT / "models" / "llama-3.2-1b-instruct-BF16.gguf"
 
+# Quantized variants of the same model, generated via llama-quantize.exe.
+# Used for INT4/INT8 NPU dispatch testing. Today (2026-05-21) the backend
+# does not claim Q4_0/Q4_K mul_mat in supports_op, so these models route
+# all matmuls through CPU; the harness verifies the NPU build still
+# produces the right answer in that fallback regime. When Priority 8
+# INT4 work lands, tighten the tolerances and expand to NPU dispatch.
+MODEL_Q4_0   = REPO_ROOT / "models" / "llama-3.2-1b-instruct-Q4_0.gguf"
+MODEL_Q4_K_M = REPO_ROOT / "models" / "llama-3.2-1b-instruct-Q4_K_M.gguf"
+
 # Driver/SDK paths -- adjust if your install differs.
 BASE_ENV: dict[str, str] = {
     "AMD_DRIVER_DIR":         "C:\\Windows\\System32\\DriverStore\\FileRepository\\kipudrv.inf_amd64_1a1aa059597c4810",
@@ -116,6 +125,9 @@ class Test:
     mode: str                  # "single-turn" or "chat"
     ctx_size: int = 512
     seed: int = 42
+    # Model file to use. Default = BF16. Override per-test for INT8/INT4
+    # quantized variants.
+    model: Path = MODEL
     # Variants to test against the baseline. If not specified, defaults to all
     # NPU presets. Tests expected to fail on certain presets should mark them
     # in `expected_fail`.
@@ -218,6 +230,46 @@ TESTS: list[Test] = [
         min_prefix_match=3,
         description="actual_seq_len crosses the FlowKV chunk_size=32 boundary mid-generation.",
     ),
+
+    # -----------------------------------------------------------------------
+    # Quantized model regression tests (Priority 8 INT4 work prep)
+    # -----------------------------------------------------------------------
+    # Today: Q4_0 / Q4_K not claimed by ggml-xdna supports_op, so the NPU
+    # build routes all matmuls to CPU. These tests verify that fallback
+    # still works correctly (model loads, no crashes, output matches the
+    # CPU-baseline run of the same model). When Phase 8.1 lands and
+    # XDNA_ENABLE_GEMV_INT4 starts dispatching Q4_0 to NPU, the npu_*
+    # variants will start showing bf16-vs-INT4 drift — at that point
+    # `min_prefix_match` should be tuned per test and an `npu_int4`
+    # preset (with XDNA_ENABLE_GEMV_INT4=1) added.
+    Test(
+        name="paris_short_q4_0",
+        prompt="What is the capital of France?",
+        n_predict=16,
+        mode="single-turn",
+        model=MODEL_Q4_0,
+        # Today: CPU fallback → expect byte-exact match across presets.
+        # When INT4 NPU dispatch lands, switch to min_prefix_match~20.
+        description="Q4_0 model sanity. Today routes via CPU fallback (no INT4 NPU dispatch yet). Confirms model loads and matmul fallback path works.",
+    ),
+    Test(
+        name="paris_short_q4_k_m",
+        prompt="What is the capital of France?",
+        n_predict=16,
+        mode="single-turn",
+        model=MODEL_Q4_K_M,
+        description="Q4_K_M model sanity. Same CPU fallback story as paris_short_q4_0. Will become NPU dispatch test in Phase 8.4 (via re-quantize to W4A16).",
+    ),
+    Test(
+        name="multiquery_q4_0_chatsafe",
+        prompt=["What is the capital of France?", "What is 2+2?"],
+        n_predict=24,
+        mode="chat",
+        model=MODEL_Q4_0,
+        variants=["npu_chat_safe"],
+        min_prefix_match=1,
+        description="Q4_0 multi-query under the production NPU config. Catches any RMS-NORM-class interference that might appear if Phase 8.1 lands without the cols>=4 safeguard (review note N9).",
+    ),
 ]
 
 # =============================================================================
@@ -244,7 +296,7 @@ def run_llama(preset: str, test: Test) -> tuple[str, str]:
 
     args = [
         str(LLAMA_CLI),
-        "-m",   str(MODEL),
+        "-m",   str(test.model),
         "-n",   str(test.n_predict),
         "-c",   str(test.ctx_size),
         "-ngl", "100",
@@ -479,23 +531,32 @@ def main():
 
     if args.list:
         for t in TESTS:
-            print(f"  {t.name:30s}  ({t.mode}, n={t.n_predict})  {t.description}")
+            model_tag = ""
+            if t.model != MODEL:
+                model_tag = f" [{t.model.stem.split('-')[-1]}]"
+            print(f"  {t.name:30s}{model_tag}  ({t.mode}, n={t.n_predict})  {t.description}")
         return 0
 
     if not LLAMA_CLI.exists():
         print(f"ERROR: llama-cli not found at {LLAMA_CLI}")
         print("Build first: cmake --build build --config Release --target llama-cli -j")
         return 2
-    if not MODEL.exists():
-        print(f"ERROR: model not found at {MODEL}")
-        return 2
-
+    # Check all model files referenced by selected tests exist.
     tests = TESTS
     if args.test_name:
         tests = [t for t in TESTS if t.name == args.test_name]
         if not tests:
             print(f"ERROR: no test named {args.test_name}")
             return 2
+    missing_models = {t.model for t in tests if not t.model.exists()}
+    if missing_models:
+        for m in missing_models:
+            print(f"ERROR: model not found at {m}")
+            if m.name.startswith("llama-3.2-1b-instruct-Q"):
+                print(f"  generate it via: .\\build\\bin\\Release\\llama-quantize.exe "
+                      f"models\\llama-3.2-1b-instruct-BF16.gguf {m.name} "
+                      f"{m.stem.split('-')[-1].lower()}")
+        return 2
 
     n_pass = 0
     n_fail = 0
