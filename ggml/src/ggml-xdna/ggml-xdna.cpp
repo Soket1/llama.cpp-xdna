@@ -91,6 +91,7 @@ enum xdna_op_kind : int {
     XDNA_OP_RMS_NORM            = 8,  // standalone RMSNorm (bf16, eps=1e-5 baked-in)
     XDNA_OP_ATTENTION_PREFILL   = 9,  // chained attention block (RMSNorm+QKV+RoPE+MHA+O+residual)
     XDNA_OP_GEMV_INT4           = 10, // M==1 fused INT4-dequant + GEMV (Q4_0 weights, bf16 acts)
+    XDNA_OP_SWIGLU_DECODE_INT4  = 11, // M==1 W4A16 fused SwiGLU FFN (Q4_0 weights, bf16 acts; Phase 8.2)
 };
 
 struct xdna_kernel_entry {
@@ -143,6 +144,7 @@ enum xdna_swiglu_slot : int {
 // Per-path kernel counts.
 static constexpr int XDNA_SWIGLU_DECODE_NUM_KERNELS = 2;
 static constexpr int XDNA_SWIGLU_PREFILL_NUM_KERNELS = 3;
+static constexpr int XDNA_SWIGLU_DECODE_INT4_NUM_KERNELS = 2;  // Phase 8.2
 
 // Shorthand aliases for readability in dispatch code.
 #define XDNA_SWIGLU_FUSED     XDNA_SWIGLU_SLOT_0  // decode fused kernel
@@ -172,6 +174,14 @@ static constexpr const char * XDNA_SWIGLU_PREFILL_KERNEL_NAMES[XDNA_SWIGLU_MAX_S
     "swiglu_silu_mul",  // slot 1: fused SiLU + element-wise Mul
     "swiglu_gemm_2",    // slot 2: down GEMM
 };
+// Phase 8.2: W4A16 SwiGLU decode -- 2 slots like bf16 decode but the kernel
+// instance-names inside the xclbin carry the int4 suffix to disambiguate
+// when the same hw_context loads both.
+static constexpr const char * XDNA_SWIGLU_DECODE_INT4_KERNEL_NAMES[XDNA_SWIGLU_MAX_SLOTS] = {
+    "swiglu_fused_int4",  // slot 0: dual_fused_dequant_gemv + silu + mul
+    "swiglu_gemv_2_int4", // slot 1: fused_dequant_gemv for down
+    nullptr,
+};
 
 // Per-slot insts filename tags (no "swiglu_" prefix). The bridge stages insts
 // files as "<cache_dir>/swiglu_<tag>.insts".
@@ -180,6 +190,12 @@ static constexpr const char * XDNA_SWIGLU_DECODE_INSTS_TAGS[XDNA_SWIGLU_MAX_SLOT
 };
 static constexpr const char * XDNA_SWIGLU_PREFILL_INSTS_TAGS[XDNA_SWIGLU_MAX_SLOTS] = {
     "gemm_1", "silu_mul", "gemm_2",
+};
+// Phase 8.2: W4A16 SwiGLU decode -- same 2-slot structure as bf16 decode,
+// just with int4 suffix on the tags to avoid colliding with bf16 .insts in the
+// same hw_context.
+static constexpr const char * XDNA_SWIGLU_DECODE_INT4_INSTS_TAGS[XDNA_SWIGLU_MAX_SLOTS] = {
+    "fused_int4", "gemv_2_int4", nullptr,
 };
 
 struct xdna_swiglu_kernel_entry {
@@ -1958,6 +1974,12 @@ static std::string make_swiglu_cache_key(xdna_op_kind op_kind,
         snprintf(buf, sizeof(buf),
                  "swiglu_decode_int8_K%lld_N%lld_%dcol_g%d",
                  (long long)embedding_dim, (long long)hidden_dim, num_cols, group_size);
+    } else if (op_kind == XDNA_OP_SWIGLU_DECODE_INT4) {
+        // Phase 8.2 INT4 SwiGLU decode. group_size in the key for the same
+        // -DGROUP_SIZE reason; Q4_0 is fixed at 32 today.
+        snprintf(buf, sizeof(buf),
+                 "swiglu_decode_int4_K%lld_N%lld_%dcol_g%d",
+                 (long long)embedding_dim, (long long)hidden_dim, num_cols, group_size);
     } else if (op_kind == XDNA_OP_SWIGLU_PREFILL_INT8) {
         if (tile_n != 64) {
             snprintf(buf, sizeof(buf), "swiglu_prefill_int8_M%lld_K%lld_N%lld_tm%d_tn%d_%dcol",
@@ -2022,6 +2044,10 @@ static bool ensure_swiglu_compiled(ggml_backend_xdna_context * ctx,
             insts_tags = XDNA_SWIGLU_DECODE_INSTS_TAGS;
             num_kernels = XDNA_SWIGLU_DECODE_NUM_KERNELS;
             break;
+        case XDNA_OP_SWIGLU_DECODE_INT4:
+            insts_tags = XDNA_SWIGLU_DECODE_INT4_INSTS_TAGS;
+            num_kernels = XDNA_SWIGLU_DECODE_INT4_NUM_KERNELS;
+            break;
         default:  // XDNA_OP_SWIGLU_PREFILL
             insts_tags = XDNA_SWIGLU_PREFILL_INSTS_TAGS;
             num_kernels = XDNA_SWIGLU_PREFILL_NUM_KERNELS;
@@ -2042,6 +2068,16 @@ static bool ensure_swiglu_compiled(ggml_backend_xdna_context * ctx,
                  num_cols, bundle_dir.c_str(), xdna_null_redirect());
         fprintf(stderr, "ggml-xdna: compiling SwiGLU decode K=%lld N=%lld (first run, will be cached)...\n",
                       (long long)embedding_dim, (long long)hidden_dim);
+    } else if (op_kind == XDNA_OP_SWIGLU_DECODE_INT4) {
+        const int gs = (group_size > 0) ? group_size : 32;
+        snprintf(cmd, sizeof(cmd),
+                 "%s \"%s\" --quiet swiglu-decode-int4 --embedding-dim %lld --hidden-dim %lld "
+                 "--num-aie-columns %d --group-size %d --out \"%s\"%s",
+                 xdna_python_cmd(), ctx->compile_script.c_str(),
+                 (long long)embedding_dim, (long long)hidden_dim,
+                 num_cols, gs, bundle_dir.c_str(), xdna_null_redirect());
+        fprintf(stderr, "ggml-xdna: compiling SwiGLU decode INT4 K=%lld N=%lld g=%d (first run, will be cached)...\n",
+                      (long long)embedding_dim, (long long)hidden_dim, gs);
     } else {
         snprintf(cmd, sizeof(cmd),
                  "%s \"%s\" --quiet swiglu-prefill --seq-len %lld --embedding-dim %lld --hidden-dim %lld "
@@ -2235,6 +2271,11 @@ static xdna_swiglu_kernel_entry * get_or_load_swiglu_kernel(
             kernel_names = XDNA_SWIGLU_DECODE_KERNEL_NAMES;
             insts_tags   = XDNA_SWIGLU_DECODE_INSTS_TAGS;
             num_kernels  = XDNA_SWIGLU_DECODE_NUM_KERNELS;
+            break;
+        case XDNA_OP_SWIGLU_DECODE_INT4:
+            kernel_names = XDNA_SWIGLU_DECODE_INT4_KERNEL_NAMES;
+            insts_tags   = XDNA_SWIGLU_DECODE_INT4_INSTS_TAGS;
+            num_kernels  = XDNA_SWIGLU_DECODE_INT4_NUM_KERNELS;
             break;
         default:  // XDNA_OP_SWIGLU_PREFILL
             kernel_names = XDNA_SWIGLU_PREFILL_KERNEL_NAMES;
