@@ -5916,6 +5916,10 @@ struct xdna_swiglu_match {
     // (ggml_backend_xdna_mul_mat_swiglu_int8) should be used. Bf16 matches
     // leave this false for the existing bf16 dispatcher.
     bool is_int8;
+    // When true the three weights are Q4_0 and the int4 dispatch path
+    // (ggml_backend_xdna_mul_mat_swiglu_int4, Phase 8.2) should be used.
+    // Mutually exclusive with is_int8.
+    bool is_int4;
     // Number of AIE columns to use. Prefer 8 (full NPU2), fall back to 4
     // when hidden_dim/embedding_dim don't tile at 8 cols.
     int num_cols;
@@ -6002,13 +6006,23 @@ static bool xdna_try_match_swiglu(const struct ggml_cgraph * cgraph, int i,
 #endif
                             ;
 
+    // Phase 8.2: INT4 SwiGLU path. Q4_0 weights + XDNA_ENABLE_SWIGLU_INT4=1.
+    // Mutually exclusive with int8 above (Q4_0 vs Q8_0 weight types). Stays
+    // default-off so 8.1 GEMV-INT4 behavior is unchanged when this is not set.
+    static const bool int4_enabled = xdna_env_enabled("XDNA_ENABLE_SWIGLU_INT4");
+    const bool all_q4_0 = (gate_w->type == GGML_TYPE_Q4_0)
+                       && (up_w->type   == GGML_TYPE_Q4_0)
+                       && (down_w->type == GGML_TYPE_Q4_0);
+    const bool allow_int4 = int4_enabled && all_q4_0;
+
     const struct ggml_tensor * ws[3] = { gate_w, up_w, down_w };
     const char * ws_names[3] = { "gate_w", "up_w", "down_w" };
     for (int wi = 0; wi < 3; wi++) {
         const struct ggml_tensor * w = ws[wi];
         const bool bf16_typed = (w->type == GGML_TYPE_F32 || w->type == GGML_TYPE_BF16 || w->type == GGML_TYPE_F16);
         const bool int8_typed = (w->type == GGML_TYPE_Q8_0) && allow_int8;
-        if (!bf16_typed && !int8_typed) {
+        const bool int4_typed = (w->type == GGML_TYPE_Q4_0) && allow_int4;
+        if (!bf16_typed && !int8_typed && !int4_typed) {
             if (dbg) fprintf(stderr, "ggml-xdna: swiglu reject @%d: %s type=%d\n",
                              i, ws_names[wi], w->type);
             return false;
@@ -6056,11 +6070,24 @@ static bool xdna_try_match_swiglu(const struct ggml_cgraph * cgraph, int i,
             if (!xdna_shape_dispatchable_swiglu_decode_int8(
                     embedding_dim, hidden_dim, num_cols, /*group_size=*/32))
                 SWIGLU_REJECT("decode-int8 shape not dispatchable");
+        } else if (allow_int4) {
+            // Phase 8.2: same divisibility as bf16 decode + K must be a
+            // multiple of group_size (Q4_0 = 32). The IRON op asserts the
+            // same; check here for a clean fall-through on shape misses.
+            if (!xdna_shape_dispatchable_swiglu_decode(embedding_dim, hidden_dim, num_cols))
+                SWIGLU_REJECT("decode-int4 shape not dispatchable");
+            if (embedding_dim % 32 != 0 || hidden_dim % 32 != 0)
+                SWIGLU_REJECT("decode-int4 K not a multiple of group_size=32");
         } else {
             if (!xdna_shape_dispatchable_swiglu_decode(embedding_dim, hidden_dim, num_cols))
                 SWIGLU_REJECT("decode shape not dispatchable");
         }
     } else if (M >= 1) {
+        // Phase 8.2 INT4 is decode-only; M > 1 means we'd need a prefill
+        // variant which doesn't exist yet. Reject so the pattern falls
+        // through to the existing Q4_0 fallback path (individual
+        // mul_mat_gemv_int4 dispatches).
+        if (allow_int4) SWIGLU_REJECT("INT4 SwiGLU only supports M=1 (decode)");
         // Prefill path. M is rounded up to the next multiple of 64
         // requires tile_m >= 16 → M % 64 == 0). The M >= 32 floor keeps the
         // padding waste ≤ 2× (padded_M is always 64 for M ≤ 64). Below 32 the
@@ -6111,6 +6138,7 @@ static bool xdna_try_match_swiglu(const struct ggml_cgraph * cgraph, int i,
     out->down_w  = down_w;
     out->input   = input;
     out->is_int8 = allow_int8;
+    out->is_int4 = allow_int4;
     out->num_cols = num_cols;
     return true;
 }
@@ -7704,6 +7732,10 @@ static bool xdna_try_match_transformer_block_prefill(
         struct ggml_tensor * inp_stripped = xdna_strip_view(inp);
         if (inp_stripped != ffn_norm_out && inp != ffn_norm_out) continue;
         if (trial.is_int8 && !tblock_w8a16_gate_tbl) continue;
+        // Phase 8.2: INT4 SwiGLU is consumed by the simple swiglu matcher
+        // (line 11811+), not by tblock fusion. Reject so the tblock pattern
+        // doesn't try to integrate a W4A16 swiglu it can't dispatch.
+        if (trial.is_int4) continue;
         swiglu_anchor = j;
         sm = trial;
         break;
@@ -11844,7 +11876,17 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                     // Fall through to the bf16 path instead of crashing.
                     fprintf(stderr, "ggml-xdna: INT8 SwiGLU not available in IRON-windows build, using bf16 fallback\n");
                 }
-                {
+                if (m.is_int4) {
+                    // Phase 8.2: dispatch through the chained INT4 SwiGLU
+                    // (fused dual-GEMV + silu + mul + down GEMV all in one
+                    // xrt::runlist). The matcher already verified all three
+                    // weights are Q4_0 and M==1.
+                    ggml_backend_xdna_mul_mat_swiglu_int4(
+                        ctx,
+                        m.gate_mm, m.up_mm, m.glu, m.down_mm,
+                        m.gate_w, m.up_w, m.down_w, m.input,
+                        ctx->num_cols);
+                } else {
                     ggml_backend_xdna_mul_mat_swiglu(
                         ctx,
                         m.gate_mm, m.up_mm, m.glu, m.down_mm,

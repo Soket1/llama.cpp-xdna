@@ -122,6 +122,10 @@ PRESETS: dict[str, dict[str, str]] = {
         "XDNA_ENABLE_FLOWKV_DECODE":     "1",
         "XDNA_ENABLE_RMS_NORM":          "0",
         "XDNA_ENABLE_GEMV_INT4":         "1",
+        # Phase 8.2: route Q4_0 SwiGLU FFN through the chained INT4 xclbin
+        # (gate+up+silu+mul fused, then down). Restores fusion on the FFN
+        # path that 8.1 alone broke.
+        "XDNA_ENABLE_SWIGLU_INT4":       "1",
     },
 }
 
