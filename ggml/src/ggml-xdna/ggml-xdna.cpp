@@ -2834,6 +2834,286 @@ static void ggml_backend_xdna_mul_mat_swiglu(ggml_backend_xdna_context * ctx,
     }
 }
 
+// Phase 8.2: SwiGLU decode with INT4 weights (W4A16).
+// Mirror of the bf16 decode path in ggml_backend_xdna_mul_mat_swiglu, but
+// weights are Q4_0 (uint4 nibbles + per-group bf16 scales) and dispatched
+// through the new IRON op AIESwiGLUDecodeInt4 (combined.xclbin with two
+// chained kernels: swiglu_fused_int4 + swiglu_gemv_2_int4).
+//
+// Numerical detail: the fused kernel does kernel-side -8 sub on the
+// dequantized weight (because SiLU is non-linear and host bias would not
+// correctly back-propagate through it). The down kernel keeps the original
+// Phase 8.1 unsigned dequant; we apply host-side bias compensation to its
+// output post-dispatch using the silu(gate)*up intermediate as the
+// activation `S[g]` term.
+static void ggml_backend_xdna_mul_mat_swiglu_int4(
+        ggml_backend_xdna_context * ctx,
+        struct ggml_tensor * /*gate_dst*/,
+        struct ggml_tensor * /*up_dst*/,
+        struct ggml_tensor * /*glu_dst*/,
+        struct ggml_tensor * dst_final,
+        const struct ggml_tensor * src0_gate_w,
+        const struct ggml_tensor * src0_up_w,
+        const struct ggml_tensor * src0_down_w,
+        const struct ggml_tensor * src1_input,
+        int num_cols) {
+    if (!ctx->device_valid) {
+        GGML_LOG_ERROR("ggml-xdna: SwiGLU INT4 called but XRT device invalid\n");
+        return;
+    }
+
+    GGML_ASSERT(src0_gate_w->type == GGML_TYPE_Q4_0);
+    GGML_ASSERT(src0_up_w  ->type == GGML_TYPE_Q4_0);
+    GGML_ASSERT(src0_down_w->type == GGML_TYPE_Q4_0);
+
+    const int64_t M             = src1_input->ne[1];
+    const int64_t embedding_dim = src1_input->ne[0];
+    const int64_t hidden_dim    = src0_gate_w->ne[1];
+    const int group_size = 32;
+    GGML_ASSERT(M == 1 && "SwiGLU INT4 only supports M=1 decode");
+
+    const xdna_op_kind op_kind = XDNA_OP_SWIGLU_DECODE_INT4;
+    const std::string cache_key = make_swiglu_cache_key(
+        op_kind, embedding_dim, hidden_dim, /*seq_len=*/1, num_cols,
+        /*tile_m=*/0, group_size, /*tile_n=*/64);
+
+    if (!ensure_swiglu_compiled(ctx, cache_key, op_kind,
+                                embedding_dim, hidden_dim, /*seq_len=*/1,
+                                num_cols, /*tile_m=*/0, group_size, /*tile_n=*/64)) {
+        GGML_LOG_ERROR("ggml-xdna: SwiGLU INT4 compile failed for %s\n", cache_key.c_str());
+        return;
+    }
+
+    xdna_swiglu_kernel_entry * entry = get_or_load_swiglu_kernel(
+        ctx, cache_key, op_kind, embedding_dim, hidden_dim, /*seq_len=*/1, num_cols,
+        group_size);
+    if (!entry) return;
+
+    try {
+        const size_t input_bytes        = (size_t)embedding_dim * sizeof(uint16_t);
+        const size_t output_bytes       = (size_t)embedding_dim * sizeof(uint16_t);
+        const size_t intermediate_bytes = (size_t)hidden_dim    * sizeof(uint16_t);
+
+        // The fused kernel always runs on _FUSED_COLS=4 columns inside the
+        // xclbin (DMA constraint inherited from bf16 dual-GEMV design),
+        // independent of the device column count used for the down stage.
+        const int fused_cols  = 4;
+        // tile_in selection mirrors the IRON op _compute_fused_tile_in /
+        // _compute_down_tile_in formulas (kept simple: pick from {8,4,2,1}
+        // largest that divides per-col).
+        const auto pick_tile_in = [&](int64_t K, int64_t per_col_rows,
+                                      bool with_static_bufs) -> int {
+            const int bf16 = 2;
+            const int64_t static_bytes = with_static_bufs
+                ? 2 * (hidden_dim / fused_cols) * bf16 : 0;
+            const int64_t bc_static = K * bf16 + 2 * per_col_rows * bf16 + static_bytes;
+            const int64_t budget = 64 * 1024 - bc_static;
+            const int num_groups_per_row = (int)(K / group_size);
+            for (int tsi : {8, 4, 2, 1}) {
+                const int64_t packed_tile_bytes =
+                    tsi * K / 2 + (int64_t)tsi * num_groups_per_row * 2;
+                const int64_t a_bytes = 2 * packed_tile_bytes;
+                if (tsi <= per_col_rows && a_bytes <= budget
+                        && per_col_rows % tsi == 0) {
+                    return tsi;
+                }
+            }
+            return 1;
+        };
+        const int64_t per_col_fused = hidden_dim / fused_cols;
+        const int64_t per_col_down  = embedding_dim / num_cols;
+        const int fused_tile_in = pick_tile_in(embedding_dim, per_col_fused, true);
+        const int down_tile_in  = pick_tile_in(hidden_dim,    per_col_down,  false);
+
+        const int64_t num_groups_emb = embedding_dim / group_size;
+        const int64_t num_groups_hid = hidden_dim    / group_size;
+
+        const size_t fused_packed_tile_bytes =
+            fused_tile_in * embedding_dim / 2 + (size_t)fused_tile_in * num_groups_emb * 2;
+        const int64_t fused_tiles_per_col = per_col_fused / fused_tile_in;
+        const size_t fused_bytes_per_col_per_w = (size_t)fused_tiles_per_col * fused_packed_tile_bytes;
+        const size_t fused_total = 2 * (size_t)fused_cols * fused_bytes_per_col_per_w;
+
+        const size_t down_packed_tile_bytes =
+            down_tile_in * hidden_dim / 2 + (size_t)down_tile_in * num_groups_hid * 2;
+        const int64_t down_tiles_per_col = per_col_down / down_tile_in;
+        const size_t down_total = (size_t)num_cols * down_tiles_per_col * down_packed_tile_bytes;
+
+        // Lazy alloc persistent activation BOs.
+        if (!entry->input_bo) {
+            entry->input_bo = std::make_unique<xrt::bo>(
+                ctx->device, input_bytes, xrt::bo::flags::host_only,
+                entry->kernels[XDNA_SWIGLU_SLOT_0].group_id(4));
+        }
+        if (!entry->intermediate_bo) {
+            entry->intermediate_bo = std::make_unique<xrt::bo>(
+                ctx->device, intermediate_bytes, xrt::bo::flags::host_only,
+                entry->kernels[XDNA_SWIGLU_SLOT_0].group_id(5));
+        }
+        if (!entry->output_bo) {
+            entry->output_bo = std::make_unique<xrt::bo>(
+                ctx->device, output_bytes, xrt::bo::flags::host_only,
+                entry->kernels[XDNA_SWIGLU_SLOT_1].group_id(5));
+        }
+
+        // Warm cached weight BOs keyed by ggml weight ptr pair (gate+up
+        // interleaved) and down separately.
+        xrt::bo * w_fused_bo_ptr = nullptr;
+        xrt::bo * w_down_bo_ptr  = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(*entry->weights_mutex);
+
+            // Fused (gate+up interleaved per column) — keyed by hash of both ptrs.
+            const auto h1 = std::hash<const void*>{}(src0_gate_w->data);
+            const auto h2 = std::hash<const void*>{}(src0_up_w->data);
+            const uint64_t fused_key =
+                h1 ^ (h2 * 0x9e3779b97f4a7c15ULL + 0x9e3779b9 + (h1 << 6) + (h1 >> 2));
+            auto it = entry->w_fused_bo_cache.find(fused_key);
+            if (it != entry->w_fused_bo_cache.end()) {
+                w_fused_bo_ptr = &it->second;
+            } else {
+                xrt::bo new_bo(ctx->device, fused_total, xrt::bo::flags::host_only,
+                               entry->kernels[XDNA_SWIGLU_SLOT_0].group_id(3));
+                std::vector<uint8_t> packed_gate(fused_cols * fused_bytes_per_col_per_w);
+                std::vector<uint8_t> packed_up  (fused_cols * fused_bytes_per_col_per_w);
+                xdna_repack_q4_0_to_fused_int4(
+                    (const uint8_t *)src0_gate_w->data, hidden_dim, embedding_dim,
+                    fused_tile_in, fused_cols, group_size, packed_gate.data());
+                xdna_repack_q4_0_to_fused_int4(
+                    (const uint8_t *)src0_up_w->data, hidden_dim, embedding_dim,
+                    fused_tile_in, fused_cols, group_size, packed_up.data());
+                uint8_t * dst = (uint8_t *)new_bo.map<void*>();
+                const size_t bpc = 2 * fused_bytes_per_col_per_w;
+                for (int col = 0; col < fused_cols; col++) {
+                    memcpy(dst + col * bpc,
+                           packed_gate.data() + col * fused_bytes_per_col_per_w,
+                           fused_bytes_per_col_per_w);
+                    memcpy(dst + col * bpc + fused_bytes_per_col_per_w,
+                           packed_up.data() + col * fused_bytes_per_col_per_w,
+                           fused_bytes_per_col_per_w);
+                }
+                new_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                auto [ins, _] = entry->w_fused_bo_cache.emplace(fused_key, std::move(new_bo));
+                w_fused_bo_ptr = &ins->second;
+                fprintf(stderr, "ggml-xdna: warm int4 swiglu fused K=%lld N=%lld tsi=%d (%zu cached)\n",
+                        (long long)embedding_dim, (long long)hidden_dim, fused_tile_in,
+                        entry->w_fused_bo_cache.size());
+                fflush(stderr);
+            }
+
+            // Down (standard Phase 8.1 layout) — keyed by down weight ptr.
+            auto it3 = entry->w3_bo_cache.find(src0_down_w->data);
+            if (it3 != entry->w3_bo_cache.end()) {
+                w_down_bo_ptr = &it3->second;
+            } else {
+                xrt::bo new_bo(ctx->device, down_total, xrt::bo::flags::host_only,
+                               entry->kernels[XDNA_SWIGLU_SLOT_1].group_id(3));
+                xdna_repack_q4_0_to_fused_int4(
+                    (const uint8_t *)src0_down_w->data, embedding_dim, hidden_dim,
+                    down_tile_in, num_cols, group_size,
+                    (uint8_t *)new_bo.map<void*>());
+                new_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                auto [ins, _] = entry->w3_bo_cache.emplace(src0_down_w->data, std::move(new_bo));
+                w_down_bo_ptr = &ins->second;
+                fprintf(stderr, "ggml-xdna: warm int4 swiglu down K=%lld N=%lld tsi=%d (%zu cached)\n",
+                        (long long)hidden_dim, (long long)embedding_dim, down_tile_in,
+                        entry->w3_bo_cache.size());
+                fflush(stderr);
+            }
+        }
+
+        // Write input activation.
+        if (src1_input->type == GGML_TYPE_F32) {
+            f32_to_bf16((const float *)src1_input->data,
+                        (uint16_t *)entry->input_bo->map<void*>(), (size_t)embedding_dim);
+        } else {
+            memcpy(entry->input_bo->map<void*>(), src1_input->data, input_bytes);
+        }
+        entry->input_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+        // Build runlist: 2 runs (fused + down).
+        xrt::runlist rl(entry->hw_ctx);
+        {
+            xrt::run r(entry->kernels[XDNA_SWIGLU_SLOT_0]);
+            r.set_arg(0, 3u);
+            r.set_arg(1, entry->insts_bo[XDNA_SWIGLU_SLOT_0]);
+            r.set_arg(2, (uint32_t)entry->insts_data[XDNA_SWIGLU_SLOT_0].size());
+            r.set_arg(3, *w_fused_bo_ptr);
+            r.set_arg(4, *entry->input_bo);
+            r.set_arg(5, *entry->intermediate_bo);
+            rl.add(r);
+        }
+        {
+            xrt::run r(entry->kernels[XDNA_SWIGLU_SLOT_1]);
+            r.set_arg(0, 3u);
+            r.set_arg(1, entry->insts_bo[XDNA_SWIGLU_SLOT_1]);
+            r.set_arg(2, (uint32_t)entry->insts_data[XDNA_SWIGLU_SLOT_1].size());
+            r.set_arg(3, *w_down_bo_ptr);
+            r.set_arg(4, *entry->intermediate_bo);
+            r.set_arg(5, *entry->output_bo);
+            rl.add(r);
+        }
+        rl.execute();
+        rl.wait();
+
+        // Sync intermediate (need it for down's bias compensation) and output.
+        entry->intermediate_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        entry->output_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+
+        // Host-side bias compensation for the DOWN matmul only. The fused
+        // kernel already applied the -8 offset internally.
+        const uint16_t * intermediate_bf16 =
+            (const uint16_t *)entry->intermediate_bo->map<void*>();
+        std::vector<float> S((size_t)num_groups_hid, 0.0f);
+        for (int64_t g = 0; g < num_groups_hid; g++) {
+            float sum = 0.0f;
+            for (int k = 0; k < group_size; k++) {
+                uint32_t bits = ((uint32_t)intermediate_bf16[g * group_size + k]) << 16;
+                float v;
+                memcpy(&v, &bits, sizeof(v));
+                sum += v;
+            }
+            S[(size_t)g] = sum;
+        }
+
+        const uint8_t * down_packed = (const uint8_t *)w_down_bo_ptr->map<void*>();
+        const uint16_t * out_bf16 = (const uint16_t *)entry->output_bo->map<void*>();
+        float * dst_f32 = (float *)dst_final->data;
+
+        const int64_t down_rows_per_col = embedding_dim / num_cols;
+        for (int64_t i = 0; i < embedding_dim; i++) {
+            const int64_t col       = i / down_rows_per_col;
+            const int64_t local_row = i % down_rows_per_col;
+            const int64_t tile_idx  = local_row / down_tile_in;
+            const int64_t r_in_tile = local_row % down_tile_in;
+            const int64_t flat_tile = col * down_tiles_per_col + tile_idx;
+            const size_t tile_offset = (size_t)flat_tile * down_packed_tile_bytes;
+            const size_t scale_region_start =
+                tile_offset + (size_t)down_tile_in * (size_t)hidden_dim / 2;
+            const uint16_t * sf_row =
+                (const uint16_t *)(down_packed + scale_region_start
+                    + (size_t)r_in_tile * (size_t)num_groups_hid * 2);
+
+            float bias = 0.0f;
+            for (int64_t g = 0; g < num_groups_hid; g++) {
+                uint32_t bits = ((uint32_t)sf_row[g]) << 16;
+                float sf;
+                memcpy(&sf, &bits, sizeof(sf));
+                bias += sf * S[(size_t)g];
+            }
+            bias *= 8.0f;
+
+            uint32_t out_bits = ((uint32_t)out_bf16[i]) << 16;
+            float out_f;
+            memcpy(&out_f, &out_bits, sizeof(out_f));
+            dst_f32[i] = out_f - bias;
+        }
+
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("ggml-xdna: SwiGLU INT4 XRT dispatch failed (%s)\n", e.what());
+    }
+}
+
 // [DEAD CODE — IRON-windows does not compile INT8 kernels.]
 // Wrapped in #if 0 to avoid compiling unreachable code.
 #if 0
