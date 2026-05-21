@@ -10148,11 +10148,25 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
     static bool flowkv_poc_valid = false;
     static bool flowkv_dispatched_this_layer = false;
 
-    // Reset per graph_compute — stale pointers from previous queries must
-    // not leak into the current evaluation. POC becomes valid only if
-    // the current graph walk successfully captures fresh pointers.
-    flowkv_poc_valid = false;
-    flowkv_dispatched_this_layer = false;
+    // Detect prefill (M > 1 in any QKV MUL_MAT) and invalidate stale
+    // pointers. Between QKV and CONT of the same decode token, statics
+    // must persist — they are in different graph_compute calls.
+    {
+        bool is_prefill = false;
+        for (int pi = 0; pi < n && pi < 30; pi++) {
+            struct ggml_tensor * nd = cgraph->nodes[pi];
+            if (nd->op == GGML_OP_MUL_MAT && nd->src[1] && nd->src[1]->ne[1] > 1) {
+                is_prefill = true;
+                break;
+            }
+        }
+        if (is_prefill) {
+            flowkv_poc_valid = false;
+            flowkv_poc_q_perm = nullptr;
+            flowkv_poc_k_perm = nullptr;
+            flowkv_poc_v_perm = nullptr;
+        }
+    }
 
     // Pre-scan for QKV triples. Llama.cpp's Qwen3.5 decode interleaves
     // RMSNorm/view ops between Q and K/V MUL_MATs, so a 3-consecutive-node
@@ -10312,29 +10326,35 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                     fflush(stderr);
                 }
                 // ── FlowKV POC: save permuted Q/K/V tensor pointers ──
-                // Forward search for 3 PERMUTE nodes after Q MUL_MAT:
-                //   PERMUTE cache_v (V cache permuted)
-                //   PERMUTE cache_k (K cache permuted)
-                //   PERMUTE Qcur    (Q rotated permuted)
-                // Identify by op == GGML_OP_PERMUTE, collecting first 3.
+                // Forward search for 3 PERMUTE nodes after Q MUL_MAT.
+                // Identify each by output shape:
+                //   K cache perm: ne = [head_dim, seq_len, kv_heads] — ne[1] == seq_len, ne[2] > 1
+                //   V cache perm: ne = [seq_len, head_dim, kv_heads] — ne[0] > head_dim, ne[2] > 1
+                //   Q rotated:    ne = [head_dim, 1, q_heads]       — ne[1] == 1
                 if (flowkv_decode_enabled && q_mm->src[1]->ne[1] == 1) {
-                    struct ggml_tensor * perms[3] = {nullptr, nullptr, nullptr};
-                    int found = 0;
-                    for (int si = i + 1; si < n && si < i + 25 && found < 3; si++) {
+                    struct ggml_tensor * k_perm = nullptr;
+                    struct ggml_tensor * v_perm = nullptr;
+                    struct ggml_tensor * q_perm = nullptr;
+                    int64_t head_dim_guess = q_mm->ne[0];  // 64
+                    for (int si = i + 1; si < n && si < i + 30; si++) {
                         struct ggml_tensor * nd = cgraph->nodes[si];
-                        if (nd->op == GGML_OP_PERMUTE) {
-                            perms[found++] = nd;
+                        if (nd->op != GGML_OP_PERMUTE) continue;
+                        if (!k_perm && nd->ne[0] == head_dim_guess && nd->ne[1] > head_dim_guess && nd->ne[2] > 1) {
+                            k_perm = nd;  // [64, seq_len, kv_heads]
+                        } else if (!v_perm && nd->ne[0] > head_dim_guess && nd->ne[1] == head_dim_guess && nd->ne[2] > 1) {
+                            v_perm = nd;  // [seq_len, 64, kv_heads]
+                        } else if (!q_perm && nd->ne[1] == 1 && nd->ne[2] > 1) {
+                            q_perm = nd;  // [64, 1, q_heads]
                         }
                     }
-                    if (found == 3 && perms[0] && perms[1] && perms[2]) {
-                        // Order: V perm, K perm, Q perm (matches graph layout)
-                        flowkv_poc_v_perm = perms[0];
-                        flowkv_poc_k_perm = perms[1];
-                        flowkv_poc_q_perm = perms[2];
-                        flowkv_poc_head_dim = perms[2]->ne[0];       // 64
-                        flowkv_poc_seq_len = perms[1]->ne[1];        // seq_len
-                        flowkv_poc_num_kv_heads = perms[1]->ne[2];   // 8
-                        flowkv_poc_num_q_heads = perms[2]->ne[2];    // 32
+                    if (k_perm && v_perm && q_perm) {
+                        flowkv_poc_k_perm = k_perm;
+                        flowkv_poc_v_perm = v_perm;
+                        flowkv_poc_q_perm = q_perm;
+                        flowkv_poc_head_dim = q_perm->ne[0];       // 64
+                        flowkv_poc_seq_len = k_perm->ne[1];        // seq_len
+                        flowkv_poc_num_kv_heads = k_perm->ne[2];   // 8
+                        flowkv_poc_num_q_heads = q_perm->ne[2];    // 32
                         flowkv_poc_valid = true;
                     }
                 }
