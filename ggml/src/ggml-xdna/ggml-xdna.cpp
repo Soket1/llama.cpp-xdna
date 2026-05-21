@@ -4210,6 +4210,24 @@ struct xdna_flowkv_group {
 static std::vector<xdna_flowkv_group> xdna_plan_flowkv(
         const struct ggml_cgraph * cgraph) {
     std::vector<xdna_flowkv_group> groups;
+
+    // === LEGACY PATH — HARD-DISABLED 2026-05-21 ===
+    // The per-head FlowKV dispatch was the v10/v11 prototype path
+    // (num_cols=1, K mirrored separately, Q buffer without
+    // actual_seq_len). Production has long since moved to the
+    // batched POC path that dispatches at CONT(kqv_out) with
+    // num_cols=4. In Llama-3.2-1B's current cgraph layout this
+    // planner already returns empty (no Q@K^T + scores@V pattern
+    // matched), but if a different model graph ever triggered a
+    // match, this path would silently dispatch with stale/wrong
+    // data layout (see NPU_PLAN.md, "Dangerous code tail").
+    //
+    // To re-enable for testing legacy code paths: set
+    // XDNA_FLOWKV_PER_HEAD_LEGACY=1 in the env.
+    static const bool legacy_enabled =
+        getenv("XDNA_FLOWKV_PER_HEAD_LEGACY") != NULL;
+    if (!legacy_enabled) return groups;
+
     static const bool dbg = getenv("XDNA_DEBUG") != NULL;
     static const bool sched_dbg = getenv("XNA_SCHED_DEBUG") != NULL;
     int n = cgraph->n_nodes;
@@ -4479,6 +4497,16 @@ static bool ggml_backend_xdna_flowkv_per_head(
         ggml_backend_xdna_context * ctx,
         const xdna_flowkv_group & group,
         const struct ggml_cgraph * cgraph) {
+    // === LEGACY PATH — HARD-DISABLED 2026-05-21 ===
+    // See xdna_plan_flowkv() above for the rationale. This function
+    // is only reachable when XDNA_FLOWKV_PER_HEAD_LEGACY=1 is set
+    // in the env, since the planner returns empty otherwise. Even
+    // when re-enabled, expect known data-layout bugs (K not mirrored
+    // for batched layout, Q buffer missing actual_seq_len encoding).
+    static const bool legacy_enabled =
+        getenv("XDNA_FLOWKV_PER_HEAD_LEGACY") != NULL;
+    if (!legacy_enabled) return false;
+
     static const bool dbg = getenv("XDNA_DEBUG") != NULL;
 
     if (!ctx || !ctx->device_valid) return false;
@@ -11201,6 +11229,11 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                     // Allocate BOs with 64-byte aligned strides for Shim DMA.
                     // IRON xclbin arg layout: opcode(0), insts(1), insts_size(2),
                     // DDR_buf_0(3)=k, DDR_buf_1(4)=v, DDR_buf_2(5)=q, DDR_buf_3(6)=out
+                    //
+                    // AUTHORITATIVE ABI documented in:
+                    //   IRON-windows/NPU_PLAN.md, "Authoritative FlowKV ABI" section.
+                    // Earlier comments in design.py and flowkv.cc are
+                    // inconsistent — defer to NPU_PLAN if in doubt.
                     const size_t dtype_size = 2;  // bf16
                     size_t raw_head_bytes = seq_len * row_bytes;
                     size_t aligned_head_stride_bytes = (raw_head_bytes + 63) & ~63;
