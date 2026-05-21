@@ -5384,6 +5384,12 @@ static std::unordered_set<int> xdna_plan_decode_batch(
         const int64_t M = node->src[1]->ne[1];
         if (M != 1) continue;
         n_decode_gemv++;
+        // Decode-batch dispatches assume bf16 weights (a single runlist
+        // sharing one xclbin shape). Skip quantized weights so they fall
+        // through to bare mul_mat_gemv, where the type-specific handler
+        // (e.g. Q4_0 -> ggml_backend_xdna_mul_mat_gemv_int4) picks them up.
+        const enum ggml_type wt = node->src[0]->type;
+        if (wt != GGML_TYPE_F32 && wt != GGML_TYPE_BF16 && wt != GGML_TYPE_F16) continue;
         const int64_t K = node->src[0]->ne[0];
         const int64_t N = node->src[0]->ne[1];
         if (!xdna_shape_dispatchable_gemv(K, N)) continue;
@@ -12661,17 +12667,14 @@ static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const s
             static const bool tblock_w8a16_ok =
                 (xdna_env_enabled("XDNA_ENABLE_TBLOCK_FUSED")) &&
                 (xdna_env_enabled("XDNA_ENABLE_TBLOCK_FUSED_W8A16"));
+            static const bool int4_ok = xdna_env_enabled("XDNA_ENABLE_GEMV_INT4");
             if (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_BF16 || src0->type == GGML_TYPE_F16) return true;
             if ((int8_ok || tblock_w8a16_ok) && src0->type == GGML_TYPE_Q8_0) return true;
-            // Q4_0 (Priority 8.1): supports_op claim DISABLED while QKV/SwiGLU
-            // fused paths can't filter Q4_0 weights — claiming here causes
-            // segfault in those paths under chat/multi-op flows. Re-enable
-            // once mul_mat_qkv / mul_mat_swiglu have a "weight type is
-            // Q4_0 → fall through to bare GEMV INT4" early bail. The
-            // dispatch helper ggml_backend_xdna_mul_mat_gemv_int4() is
-            // already wired and ready; can be tested via a unit harness
-            // that calls it directly without going through ggml-sched.
-            // See IRON-windows/NPU_PLAN_PRIORITY_8.md, Phase 8.1.
+            // Q4_0 (Priority 8.1): claimed only when the INT4 dispatch path
+            // env gate is enabled. QKV matcher rejects non-bf16 weights, so
+            // does SwiGLU matcher; xdna_plan_decode_batch now also skips
+            // Q4_0 -> bare mul_mat_gemv routes Q4_0 to mul_mat_gemv_int4.
+            if (int4_ok && src0->type == GGML_TYPE_Q4_0) return true;
             return false;
         }
 
