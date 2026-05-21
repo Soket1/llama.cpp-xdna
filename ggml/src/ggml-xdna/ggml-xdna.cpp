@@ -980,6 +980,41 @@ static void xdna_repack_q8_0_to_gemv_int8(
 // remove the host bias step entirely. That's blocked on the pyxrt /
 // IRON-compile pipeline working from this env, so we ship the host-bias
 // PoC first.
+
+// Mirror of compile.py:select_gemv_tiles. The IRON compile script picks
+// (tile_in, tile_out) based on L1 budget; we MUST repack with the same
+// tile_in or the kernel will read wrong bytes. Returns (tile_in, tile_out).
+// Kept dead-simple — same constants as compile.py.
+static std::pair<int, int> xdna_select_gemv_tiles_int4(
+        int64_t N, int64_t K, int num_aie_columns) {
+    const int kernel_vector_size = 64;
+    GGML_ASSERT(K % kernel_vector_size == 0);
+    GGML_ASSERT(N % num_aie_columns == 0);
+    const int64_t per_col = N / num_aie_columns;
+    static const int tso_candidates[] = {2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1};
+    int tile_out = 0;
+    for (int tso : tso_candidates) {
+        if ((int64_t)tso <= per_col && per_col % tso == 0) { tile_out = tso; break; }
+    }
+    GGML_ASSERT(tile_out > 0);
+    const int l1_budget_bytes = 64 * 1024;
+    const int bf16 = 2;
+    const int64_t bc_bytes = K * bf16 + 2LL * tile_out * bf16;
+    GGML_ASSERT(bc_bytes < l1_budget_bytes);
+    const int64_t l1_available_for_a = l1_budget_bytes - bc_bytes;
+    const int64_t max_tsi_by_l1 = l1_available_for_a / (2 * K * bf16);
+    static const int tsi_candidates[] = {8, 4, 2, 1};
+    int tile_in = 0;
+    for (int tsi : tsi_candidates) {
+        if (tsi <= tile_out && (int64_t)tsi <= max_tsi_by_l1
+                && tile_out % tsi == 0 && per_col % tsi == 0) {
+            tile_in = tsi; break;
+        }
+    }
+    GGML_ASSERT(tile_in > 0);
+    return {tile_in, tile_out};
+}
+
 static void xdna_repack_q4_0_to_fused_int4(
         const uint8_t * q4_0,
         int64_t M, int64_t K,
@@ -1566,8 +1601,12 @@ static void ggml_backend_xdna_mul_mat_gemv_int4(ggml_backend_xdna_context * ctx,
         const size_t out_bytes = (size_t)N * sizeof(uint16_t);
 
         // Packed buffer layout = same as AIEFusedDequantGEMV._packed_buffer_size().
-        // For m_input=1: per-tile = K/2 weights + (K/g)*2 scales = K/2 + K/16 bytes.
-        const int m_input = 1;
+        // CRITICAL: m_input (tile_size_input) must match what compile.py selected
+        // via select_gemv_tiles — otherwise the kernel reads garbage. The selector
+        // is purely a function of (N, K, num_cols), so we can recompute it locally.
+        const auto [tile_in, tile_out] = xdna_select_gemv_tiles_int4(N, K, num_cols);
+        const int m_input = tile_in;
+        (void)tile_out;
         const int64_t rows_per_col = N / num_cols;
         const int64_t tiles_per_col = rows_per_col / m_input;
         const int64_t num_groups_per_row = K / group_size;
@@ -1611,8 +1650,8 @@ static void ggml_backend_xdna_mul_mat_gemv_int4(ggml_backend_xdna_context * ctx,
                 new_packed.sync(XCL_BO_SYNC_BO_TO_DEVICE);
                 auto [ins, _] = entry->b_bo_cache.emplace(src0->data, std::move(new_packed));
                 weight_bo_ptr = &ins->second;
-                fprintf(stderr, "ggml-xdna: warm int4 weight K=%lld N=%lld weight=%s (%zu cached)\n",
-                        (long long)K, (long long)N, src0->name, entry->b_bo_cache.size());
+                fprintf(stderr, "ggml-xdna: warm int4 weight K=%lld N=%lld m_in=%d weight=%s (%zu cached)\n",
+                        (long long)K, (long long)N, m_input, src0->name, entry->b_bo_cache.size());
                 fflush(stderr);
             } else {
                 weight_bo_ptr = &it->second;
@@ -1648,11 +1687,16 @@ static void ggml_backend_xdna_mul_mat_gemv_int4(ggml_backend_xdna_context * ctx,
 
         for (int64_t i = 0; i < N; i++) {
             const int64_t col = i / rows_per_col;
-            const int64_t tile_idx = i % rows_per_col;  // m_input == 1
+            const int64_t local_row = i % rows_per_col;
+            const int64_t tile_idx = local_row / m_input;
+            const int64_t r_in_tile = local_row % m_input;
             const int64_t flat_tile = col * tiles_per_col + tile_idx;
             const size_t tile_offset = (size_t)flat_tile * packed_bytes_per_tile;
+            const size_t scale_region_start =
+                tile_offset + (size_t)m_input * (size_t)K / 2;
             const uint16_t * sf_row =
-                (const uint16_t *)(packed + tile_offset + (size_t)K / 2);
+                (const uint16_t *)(packed + scale_region_start
+                    + (size_t)r_in_tile * (size_t)num_groups_per_row * 2);
 
             float bias = 0.0f;
             for (int64_t g = 0; g < num_groups_per_row; g++) {
@@ -1667,6 +1711,98 @@ static void ggml_backend_xdna_mul_mat_gemv_int4(ggml_backend_xdna_context * ctx,
             float out_f;
             memcpy(&out_f, &out_bits, sizeof(out_f));
             dst_f32[i] = out_f - bias;
+        }
+
+        // One-shot accuracy probe: dump first 8 values of (raw kernel, bias,
+        // dst, CPU reference) for the FIRST INT4 dispatch to help debug the
+        // "GGGG" output bug. Gated on XDNA_DEBUG=1. Computes CPU reference
+        // by dequantizing Q4_0 in-place and doing a scalar GEMV.
+        static bool probe_done = false;
+        static const bool probe_enabled = getenv("XDNA_DEBUG") != NULL;
+        if (probe_enabled && !probe_done) {
+            probe_done = true;
+            fprintf(stderr, "\n=== INT4 ACCURACY PROBE (first dispatch) ===\n");
+            fprintf(stderr, "  weight=%s shape K=%lld N=%lld cols=%d\n",
+                    src0->name, (long long)K, (long long)N, num_cols);
+
+            // CPU reference: dequant Q4_0 + matmul with bf16 activation
+            // (converting both to fp32 for the reference).
+            std::vector<float> x_f32((size_t)K);
+            for (int64_t k = 0; k < K; k++) {
+                uint32_t bits = ((uint32_t)x_bf16[k]) << 16;
+                memcpy(&x_f32[(size_t)k], &bits, sizeof(float));
+            }
+            const uint8_t * q4_0 = (const uint8_t *)src0->data;
+            const size_t Q4_0_BLOCK_BYTES = 18;
+            std::vector<float> cpu_ref(8, 0.0f);
+            for (int i = 0; i < 8 && i < N; i++) {
+                const uint8_t * row = q4_0 + (size_t)i * (size_t)num_groups_per_row * Q4_0_BLOCK_BYTES;
+                float acc = 0.0f;
+                for (int64_t g = 0; g < num_groups_per_row; g++) {
+                    const uint8_t * blk = row + (size_t)g * Q4_0_BLOCK_BYTES;
+                    uint16_t fp16_d;
+                    memcpy(&fp16_d, blk, 2);
+                    // fp16 -> fp32
+                    uint32_t sign = (uint32_t)(fp16_d & 0x8000) << 16;
+                    uint32_t exp_f16 = (fp16_d >> 10) & 0x1F;
+                    uint32_t mant = fp16_d & 0x3FF;
+                    uint32_t f32_bits;
+                    if (exp_f16 == 0) {
+                        f32_bits = mant ? sign : sign;  // subnormal -> approx 0
+                    } else if (exp_f16 == 0x1F) {
+                        f32_bits = sign | 0x7F800000 | (mant << 13);
+                    } else {
+                        f32_bits = sign | ((exp_f16 + 112) << 23) | (mant << 13);
+                    }
+                    float d;
+                    memcpy(&d, &f32_bits, sizeof(d));
+                    const uint8_t * qs = blk + 2;
+                    for (int j = 0; j < 16; j++) {
+                        int n0 = (qs[j] & 0xF) - 8;
+                        int n1 = ((qs[j] >> 4) & 0xF) - 8;
+                        acc += (float)n0 * d * x_f32[(size_t)(g * 32 + j)];
+                        acc += (float)n1 * d * x_f32[(size_t)(g * 32 + j + 16)];
+                    }
+                }
+                cpu_ref[(size_t)i] = acc;
+            }
+
+            // Per-row bias for the first 8 rows
+            std::vector<float> bias_row(8, 0.0f);
+            for (int i = 0; i < 8; i++) {
+                const int64_t col = i / rows_per_col;
+                const int64_t local_row = i % rows_per_col;
+                const int64_t tile_idx = local_row / m_input;
+                const int64_t r_in_tile = local_row % m_input;
+                const int64_t flat_tile = col * tiles_per_col + tile_idx;
+                const size_t tile_offset = (size_t)flat_tile * packed_bytes_per_tile;
+                const size_t scale_region_start =
+                    tile_offset + (size_t)m_input * (size_t)K / 2;
+                const uint16_t * sf_row =
+                    (const uint16_t *)(packed + scale_region_start
+                        + (size_t)r_in_tile * (size_t)num_groups_per_row * 2);
+                float b = 0.0f;
+                for (int64_t g = 0; g < num_groups_per_row; g++) {
+                    uint32_t bits = ((uint32_t)sf_row[g]) << 16;
+                    float sf;
+                    memcpy(&sf, &bits, sizeof(sf));
+                    b += sf * S[(size_t)g];
+                }
+                bias_row[(size_t)i] = b * 8.0f;
+            }
+
+            fprintf(stderr, "  i  | raw_kernel | bias       | dst (raw-bias) | cpu_ref    | dst - ref\n");
+            fprintf(stderr, "  ---+------------+------------+----------------+------------+-----------\n");
+            for (int i = 0; i < 8 && i < N; i++) {
+                uint32_t b = ((uint32_t)out_bf16[i]) << 16;
+                float raw;
+                memcpy(&raw, &b, sizeof(float));
+                fprintf(stderr, "  %d  | %10.4f | %10.4f | %14.4f | %10.4f | %9.4f\n",
+                        i, raw, bias_row[(size_t)i], dst_f32[i], cpu_ref[(size_t)i],
+                        dst_f32[i] - cpu_ref[(size_t)i]);
+            }
+            fprintf(stderr, "=== END PROBE ===\n\n");
+            fflush(stderr);
         }
     } catch (const std::exception & e) {
         GGML_LOG_ERROR("ggml-xdna: INT4 GEMV XRT dispatch failed (%s)\n", e.what());

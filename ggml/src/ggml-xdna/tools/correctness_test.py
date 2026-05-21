@@ -111,6 +111,18 @@ PRESETS: dict[str, dict[str, str]] = {
         "XDNA_ENABLE_FLOWKV_DECODE":     "1",
         "XDNA_ENABLE_RMS_NORM":          "1",
     },
+    "npu_int4": {
+        # Chat-safe baseline + Q4_0 fused INT4 dequant-GEMV (Priority 8.1).
+        # Use with MODEL_Q4_0 / MODEL_Q4_K_M tests; bf16 models ignore the flag.
+        "XDNA_ENABLE_GEMV":              "1",
+        "XDNA_ENABLE_SWIGLU":            "1",
+        "XDNA_ENABLE_QKV":               "1",
+        "XDNA_ENABLE_DECODE_BATCH":      "1",
+        "XDNA_ENABLE_TRANSFORMER_BLOCK": "1",
+        "XDNA_ENABLE_FLOWKV_DECODE":     "1",
+        "XDNA_ENABLE_RMS_NORM":          "0",
+        "XDNA_ENABLE_GEMV_INT4":         "1",
+    },
 }
 
 # =============================================================================
@@ -269,6 +281,43 @@ TESTS: list[Test] = [
         variants=["npu_chat_safe"],
         min_prefix_match=1,
         description="Q4_0 multi-query under the production NPU config. Catches any RMS-NORM-class interference that might appear if Phase 8.1 lands without the cols>=4 safeguard (review note N9).",
+    ),
+    Test(
+        name="paris_short_q4_0_int4",
+        prompt="What is the capital of France?",
+        n_predict=12,
+        mode="single-turn",
+        model=MODEL_Q4_0,
+        variants=["npu_int4"],
+        min_prefix_match=1,  # Q4_0 quantization + bf16 dequant drift vs CPU Q4_0.
+        description="Phase 8.1 dispatch path: Q4_0 weights routed through fused INT4 dequant-GEMV on NPU. Baseline is CPU-Q4_0; expect minor drift from bf16-vs-fp32 dequant accumulation.",
+    ),
+    Test(
+        name="paris_drift_64_q4_0_int4",
+        prompt="What is the capital of France? Explain in detail.",
+        n_predict=64,
+        mode="single-turn",
+        model=MODEL_Q4_0,
+        variants=["npu_int4"],
+        # Longer generation stresses the INT4 path harder -- every token
+        # re-runs ALL matmul shapes including ffn_down (K=8192 N=2048,
+        # tile_in=1 branch of select_gemv_tiles). bf16-vs-fp32 dequant noise
+        # accumulates more, so we tolerate ~10 chars of prefix match.
+        min_prefix_match=10,
+        description="Longer Q4_0/INT4 generation. Implicitly covers the tile_in=1 branch (ffn_down K=8192) via repeated invocation; catches drift accumulation.",
+    ),
+    Test(
+        name="multiquery_q4_0_int4",
+        prompt=["What is the capital of France?", "What is 2+2?"],
+        n_predict=24,
+        mode="chat",
+        model=MODEL_Q4_0,
+        variants=["npu_int4"],
+        # Multi-query exercises FlowKV decode + INT4 GEMV composition,
+        # plus catches any tile_in=1 path issues that only manifest under
+        # KV-cache-bearing decode.
+        min_prefix_match=1,
+        description="INT4 + FlowKV + chat-mode composition. Catches interference between Q4_0 dispatch and the decode-batch / FlowKV machinery.",
     ),
 ]
 
