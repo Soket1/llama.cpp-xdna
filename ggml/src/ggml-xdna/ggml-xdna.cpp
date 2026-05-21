@@ -10305,7 +10305,12 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                     q_mm->src[0], k_mm->src[0], v_mm->src[0],
                     q_mm->src[1]);
                 // ── FlowKV diagnostic: log QKV tensors and surrounding nodes ──
-                if (flowkv_decode_enabled) {
+                // Gated by XDNA_DEBUG=1 (was unconditionally on when
+                // XDNA_ENABLE_FLOWKV_DECODE=1, which spammed stderr with
+                // 21+ lines per layer per token — making the actual model
+                // output unreadable in chat-mode).
+                static const bool flowkv_diag_enabled = getenv("XDNA_DEBUG") != NULL;
+                if (flowkv_decode_enabled && flowkv_diag_enabled) {
                     fprintf(stderr, "ggml-xdna: [FlowKV-DIAG] QKV @%d: "
                             "q_mm dst=%s ne=[%lld,%lld] src1=%s ne=[%lld,%lld]\n",
                             i, q_mm->name,
@@ -11226,7 +11231,10 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                     }
 
                     // === BO ADDRESS DIAGNOSTIC ===
-                    {
+                    // Gated by XDNA_DEBUG=1 (was unconditional, printed
+                    // ~13 lines per POC dispatch = ~400 lines per token,
+                    // which made model output unreadable in chat-mode).
+                    if (poc_dbg) {
                         uint64_t addr_k   = fk_entry->bo_k->address();
                         uint64_t addr_v   = fk_entry->bo_v->address();
                         uint64_t addr_q   = fk_entry->bo_q->address();
