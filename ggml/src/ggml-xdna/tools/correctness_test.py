@@ -567,6 +567,123 @@ def run_test(test: Test, verbose: bool = False) -> bool:
 
 
 # =============================================================================
+# Benchmark mode (--bench)
+# =============================================================================
+#
+# Goal: measure decode t/s across (preset, model) combos so we can decide
+# whether further INT4 phases (8.2 SwiGLU INT4 etc.) are worth the effort.
+#
+# We don't compare outputs in bench mode -- we just record the
+# `llama_perf_context_print: ... eval time = ... tokens per second` number
+# from stderr. Each combo is run `BENCH_REPEATS` times; we report the median.
+
+EVAL_TPS_RE = re.compile(
+    r"\[\s*Prompt:\s+([\d.]+)\s+t/s\s*\|\s*Generation:\s+([\d.]+)\s+t/s\s*\]"
+)
+BENCH_REPEATS = 2          # 1 warm-up + 1 measured; first run includes any
+                           # inline xclbin compile, the second is the warm rate.
+BENCH_PROMPT = "What is the capital of France? Explain in detail."
+BENCH_N_PREDICT = 64
+
+
+@dataclass
+class BenchConfig:
+    label: str
+    preset: str
+    model: Path
+
+
+def build_bench_configs() -> list[BenchConfig]:
+    return [
+        BenchConfig(label="CPU Q4_0",        preset="cpu_baseline",  model=MODEL_Q4_0),
+        BenchConfig(label="NPU bf16",        preset="npu_chat_safe", model=MODEL),
+        BenchConfig(label="NPU INT4 (Q4_0)", preset="npu_int4",      model=MODEL_Q4_0),
+    ]
+
+
+def run_bench_one(cfg: BenchConfig) -> tuple[float, float]:
+    """Run llama-cli once with cfg, return (decode_tps, prompt_tps).
+    Raises on timeout or non-zero exit."""
+    env = build_env(cfg.preset)
+    args = [
+        str(LLAMA_CLI),
+        "-m",   str(cfg.model),
+        "-n",   str(BENCH_N_PREDICT),
+        "-c",   "512",
+        "-ngl", "100",
+        "--no-mmap",
+        "-fa",  "off",
+        "--temp", "0",
+        "-s",   "42",
+        "-p",   BENCH_PROMPT,
+        "--single-turn",
+    ]
+    timeout = 180 + BENCH_N_PREDICT * 4    # generous: first run may compile xclbins
+    result = subprocess.run(
+        args, env=env, capture_output=True, text=True,
+        timeout=timeout, errors="replace",
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"llama-cli exit {result.returncode} for bench {cfg.label}\n"
+            f"stderr tail:\n{result.stderr[-1500:]}"
+        )
+    # Parser: llama-cli prints "[ Prompt: P t/s | Generation: G t/s ]" to stdout
+    # at the end of each turn. We want the LAST such line in case of multiple.
+    matches = list(EVAL_TPS_RE.finditer(result.stdout))
+    if not matches:
+        raise RuntimeError(
+            f"could not find perf line for {cfg.label}\n"
+            f"stdout tail:\n{result.stdout[-1500:]}"
+        )
+    m = matches[-1]
+    prompt_tps = float(m.group(1))
+    decode_tps = float(m.group(2))
+    return decode_tps, prompt_tps
+
+
+def run_bench() -> int:
+    configs = build_bench_configs()
+    missing = [c.model for c in configs if not c.model.exists()]
+    if missing:
+        for m in missing:
+            print(f"ERROR: model not found at {m}")
+        return 2
+
+    print(f"\n=== bench: prompt={BENCH_PROMPT!r} n_predict={BENCH_N_PREDICT} repeats={BENCH_REPEATS} ===\n")
+    rows: list[tuple[str, list[float], list[float]]] = []
+    for cfg in configs:
+        decodes: list[float] = []
+        prompts: list[float] = []
+        for rep in range(BENCH_REPEATS):
+            tag = "warm" if rep == 0 else f"run{rep+1}"
+            try:
+                d, p = run_bench_one(cfg)
+            except Exception as e:
+                print(f"  {cfg.label:24s} {tag}: ERROR -- {e}")
+                d, p = float("nan"), float("nan")
+            print(f"  {cfg.label:24s} {tag}: decode={d:6.2f} t/s   prompt={p:7.2f} t/s")
+            decodes.append(d)
+            prompts.append(p)
+        rows.append((cfg.label, decodes, prompts))
+
+    # Pick the median (= second of two runs once warm cache settles).
+    def median(xs: list[float]) -> float:
+        xs2 = [x for x in xs if x == x]    # drop NaNs
+        if not xs2: return float("nan")
+        xs2.sort()
+        return xs2[len(xs2) // 2]
+
+    print(f"\n--- median across {BENCH_REPEATS} runs ---")
+    print(f"  {'config':24s}  {'decode t/s':>11s}  {'prompt t/s':>11s}")
+    print(f"  {'-'*24}  {'-'*11}  {'-'*11}")
+    for label, decodes, prompts in rows:
+        print(f"  {label:24s}  {median(decodes):11.2f}  {median(prompts):11.2f}")
+    print()
+    return 0
+
+
+# =============================================================================
 # CLI
 # =============================================================================
 
@@ -576,6 +693,8 @@ def main():
     ap.add_argument("test_name", nargs="?", help="Run only this test by name")
     ap.add_argument("--list", action="store_true", help="List test names and exit")
     ap.add_argument("-v", "--verbose", action="store_true", help="Print response text")
+    ap.add_argument("--bench", action="store_true",
+                    help="Run perf benchmark across CPU/NPU bf16/NPU INT4 presets")
     args = ap.parse_args()
 
     if args.list:
@@ -590,6 +709,9 @@ def main():
         print(f"ERROR: llama-cli not found at {LLAMA_CLI}")
         print("Build first: cmake --build build --config Release --target llama-cli -j")
         return 2
+
+    if args.bench:
+        return run_bench()
     # Check all model files referenced by selected tests exist.
     tests = TESTS
     if args.test_name:
