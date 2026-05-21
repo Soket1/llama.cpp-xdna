@@ -601,9 +601,9 @@ def build_bench_configs() -> list[BenchConfig]:
     ]
 
 
-def run_bench_one(cfg: BenchConfig) -> tuple[float, float]:
-    """Run llama-cli once with cfg, return (decode_tps, prompt_tps).
-    Raises on timeout or non-zero exit."""
+def run_bench_one(cfg: BenchConfig, mode: str) -> tuple[float, float]:
+    """Run llama-cli once with cfg in mode={'single','chat'},
+    return (decode_tps, prompt_tps). Raises on timeout or non-zero exit."""
     env = build_env(cfg.preset)
     args = [
         str(LLAMA_CLI),
@@ -615,17 +615,24 @@ def run_bench_one(cfg: BenchConfig) -> tuple[float, float]:
         "-fa",  "off",
         "--temp", "0",
         "-s",   "42",
-        "-p",   BENCH_PROMPT,
-        "--single-turn",
     ]
+    if mode == "single":
+        args.extend(["-p", BENCH_PROMPT, "--single-turn"])
+        stdin_input = None
+    elif mode == "chat":
+        args.append("-cnv")
+        stdin_input = BENCH_PROMPT + "\n/exit\n"
+    else:
+        raise ValueError(f"unknown bench mode: {mode}")
+
     timeout = 180 + BENCH_N_PREDICT * 4    # generous: first run may compile xclbins
     result = subprocess.run(
         args, env=env, capture_output=True, text=True,
-        timeout=timeout, errors="replace",
+        input=stdin_input, timeout=timeout, errors="replace",
     )
     if result.returncode != 0:
         raise RuntimeError(
-            f"llama-cli exit {result.returncode} for bench {cfg.label}\n"
+            f"llama-cli exit {result.returncode} for bench {cfg.label} ({mode})\n"
             f"stderr tail:\n{result.stderr[-1500:]}"
         )
     # Parser: llama-cli prints "[ Prompt: P t/s | Generation: G t/s ]" to stdout
@@ -633,7 +640,7 @@ def run_bench_one(cfg: BenchConfig) -> tuple[float, float]:
     matches = list(EVAL_TPS_RE.finditer(result.stdout))
     if not matches:
         raise RuntimeError(
-            f"could not find perf line for {cfg.label}\n"
+            f"could not find perf line for {cfg.label} ({mode})\n"
             f"stdout tail:\n{result.stdout[-1500:]}"
         )
     m = matches[-1]
@@ -642,7 +649,12 @@ def run_bench_one(cfg: BenchConfig) -> tuple[float, float]:
     return decode_tps, prompt_tps
 
 
-def run_bench() -> int:
+def run_bench(mode: str) -> int:
+    if mode == "both":
+        rc1 = run_bench("single")
+        rc2 = run_bench("chat")
+        return rc1 or rc2
+
     configs = build_bench_configs()
     missing = [c.model for c in configs if not c.model.exists()]
     if missing:
@@ -650,7 +662,7 @@ def run_bench() -> int:
             print(f"ERROR: model not found at {m}")
         return 2
 
-    print(f"\n=== bench: prompt={BENCH_PROMPT!r} n_predict={BENCH_N_PREDICT} repeats={BENCH_REPEATS} ===\n")
+    print(f"\n=== bench [{mode}]: prompt={BENCH_PROMPT!r} n_predict={BENCH_N_PREDICT} repeats={BENCH_REPEATS} ===\n")
     rows: list[tuple[str, list[float], list[float]]] = []
     for cfg in configs:
         decodes: list[float] = []
@@ -658,7 +670,7 @@ def run_bench() -> int:
         for rep in range(BENCH_REPEATS):
             tag = "warm" if rep == 0 else f"run{rep+1}"
             try:
-                d, p = run_bench_one(cfg)
+                d, p = run_bench_one(cfg, mode)
             except Exception as e:
                 print(f"  {cfg.label:24s} {tag}: ERROR -- {e}")
                 d, p = float("nan"), float("nan")
@@ -674,7 +686,7 @@ def run_bench() -> int:
         xs2.sort()
         return xs2[len(xs2) // 2]
 
-    print(f"\n--- median across {BENCH_REPEATS} runs ---")
+    print(f"\n--- {mode} mode, median across {BENCH_REPEATS} runs ---")
     print(f"  {'config':24s}  {'decode t/s':>11s}  {'prompt t/s':>11s}")
     print(f"  {'-'*24}  {'-'*11}  {'-'*11}")
     for label, decodes, prompts in rows:
@@ -695,6 +707,8 @@ def main():
     ap.add_argument("-v", "--verbose", action="store_true", help="Print response text")
     ap.add_argument("--bench", action="store_true",
                     help="Run perf benchmark across CPU/NPU bf16/NPU INT4 presets")
+    ap.add_argument("--bench-mode", choices=["single", "chat", "both"], default="single",
+                    help="Bench mode: single-turn, chat (-cnv), or both (default: single)")
     args = ap.parse_args()
 
     if args.list:
@@ -711,7 +725,7 @@ def main():
         return 2
 
     if args.bench:
-        return run_bench()
+        return run_bench(args.bench_mode)
     # Check all model files referenced by selected tests exist.
     tests = TESTS
     if args.test_name:
