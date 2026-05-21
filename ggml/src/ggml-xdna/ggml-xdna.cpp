@@ -10331,17 +10331,17 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                 //   K cache perm: ne = [head_dim, seq_len, kv_heads] — ne[1] == seq_len, ne[2] > 1
                 //   V cache perm: ne = [seq_len, head_dim, kv_heads] — ne[0] > head_dim, ne[2] > 1
                 //   Q rotated:    ne = [head_dim, 1, q_heads]       — ne[1] == 1
-                if (flowkv_decode_enabled && q_mm->src[1]->ne[1] == 1) {
+                if (flowkv_decode_enabled && q_mm->src[1]->ne[1] == 1) {  // M=1 decode only
                     struct ggml_tensor * k_perm = nullptr;
                     struct ggml_tensor * v_perm = nullptr;
                     struct ggml_tensor * q_perm = nullptr;
-                    int64_t head_dim_guess = q_mm->ne[0];  // 64
+                    const int64_t hd = 64;  // FlowKV kernel requires head_dim == 64
                     for (int si = i + 1; si < n && si < i + 30; si++) {
                         struct ggml_tensor * nd = cgraph->nodes[si];
                         if (nd->op != GGML_OP_PERMUTE) continue;
-                        if (!k_perm && nd->ne[0] == head_dim_guess && nd->ne[1] > head_dim_guess && nd->ne[2] > 1) {
+                        if (!k_perm && nd->ne[0] == hd && nd->ne[1] > hd && nd->ne[2] > 1) {
                             k_perm = nd;  // [64, seq_len, kv_heads]
-                        } else if (!v_perm && nd->ne[0] > head_dim_guess && nd->ne[1] == head_dim_guess && nd->ne[2] > 1) {
+                        } else if (!v_perm && nd->ne[0] > hd && nd->ne[1] == hd && nd->ne[2] > 1) {
                             v_perm = nd;  // [seq_len, 64, kv_heads]
                         } else if (!q_perm && nd->ne[1] == 1 && nd->ne[2] > 1) {
                             q_perm = nd;  // [64, 1, q_heads]
