@@ -720,6 +720,12 @@ static std::string make_cache_key(xdna_op_kind op_kind,
         // GEMV: M is implicitly 1, key omits it.
         snprintf(buf, sizeof(buf), "gemv_K%lld_N%lld_%s_%dcol",
                  (long long)K, (long long)N, dtype_in, num_cols);
+    } else if (op_kind == XDNA_OP_GEMV_INT4) {
+        // INT4 fused dequant+GEMV: M=1, group_size=32 (Q4_0 block) baked in,
+        // dtype_in is informational only (kernel is fixed uint4 weights +
+        // bf16 acts + bf16 out).
+        snprintf(buf, sizeof(buf), "gemv_int4_K%lld_N%lld_%dcol_g32",
+                 (long long)K, (long long)N, num_cols);
     } else {
         snprintf(buf, sizeof(buf), "gemm_%lldx%lldx%lld_%s_%dcol",
                  (long long)M, (long long)K, (long long)N, dtype_in, num_cols);
@@ -1191,6 +1197,17 @@ static bool ensure_compiled(ggml_backend_xdna_context * ctx,
                  xclbin_path.c_str(), xdna_null_redirect());
         fprintf(stderr, "ggml-xdna: compiling GEMV K=%lld N=%lld (first run, will be cached)...\n",
                       (long long)K, (long long)N);
+    } else if (op_kind == XDNA_OP_GEMV_INT4) {
+        // INT4 fused-dequant GEMV: group_size hard-coded to 32 (Q4_0 block).
+        snprintf(cmd, sizeof(cmd),
+                 "%s \"%s\" --quiet fused-dequant-gemv --N %lld --K %lld "
+                 "--num-aie-columns %d --group-size 32 --out \"%s\"%s",
+                 xdna_python_cmd(), ctx->compile_script.c_str(),
+                 (long long)N, (long long)K,
+                 num_cols,
+                 xclbin_path.c_str(), xdna_null_redirect());
+        fprintf(stderr, "ggml-xdna: compiling INT4 GEMV K=%lld N=%lld (first run, will be cached)...\n",
+                      (long long)K, (long long)N);
     } else {
         // [INT8 GEMM] Use separate dtype_out when provided (e.g. "i32" for i8 input).
         const char * out_dtype = dtype_out ? dtype_out : dtype_in;
@@ -1497,9 +1514,174 @@ static void ggml_backend_xdna_mul_mat_gemm(ggml_backend_xdna_context * ctx, stru
 // IRON GEMV arg order is (matrix, vector, output) — different from GEMM's
 // (A_activation, B_weight, C_output). Kernel group_ids: matrix=3, vector=4, output=5.
 // Matrix layout matches ggml src0 natively ([N,K] row-major), so no transpose.
+static void ggml_backend_xdna_mul_mat_gemv_int4(ggml_backend_xdna_context * ctx,
+                                                 struct ggml_tensor * dst) {
+    // INT4 fused-dequant GEMV dispatch (Priority 8.1).
+    // Weights are Q4_0 (uint4 packed nibbles + fp16 per-block scale).
+    // The IRON kernel computes ((nibble) * scale_bf16) * activation_bf16
+    // — i.e. it treats nibbles as unsigned [0, 15]. GGML's Q4_0 nibbles
+    // represent signed [-8, 7] values (signed = nibble - 8), so we apply
+    // a per-row bias `8 * sum_g(scale[i,g] * S[g])` after the kernel
+    // (where S[g] = sum of activation over group g). This will move to
+    // a kernel-side `aie::sub(8)` once the IRON compile pipeline is
+    // available on this env (see NPU_PLAN_PRIORITY_8.md note N2).
+    const struct ggml_tensor * src0 = dst->src[0];  // Q4_0 weights [K, N]
+    const struct ggml_tensor * src1 = dst->src[1];  // bf16/f32 activation [K]
+
+    GGML_ASSERT(src0->type == GGML_TYPE_Q4_0);
+    const int64_t K = src0->ne[0];
+    const int64_t N = src0->ne[1];
+    const int group_size = 32;
+
+    if (!ctx->device_valid) {
+        GGML_LOG_ERROR("ggml-xdna: int4 gemv called but XRT device invalid\n");
+        return;
+    }
+
+    const int num_cols = ctx->num_cols;
+    if (N % num_cols != 0) {
+        GGML_LOG_ERROR("ggml-xdna: int4 gemv N=%lld not divisible by cols=%d, falling back\n",
+                       (long long)N, num_cols);
+        return;
+    }
+    if (K % group_size != 0) {
+        GGML_LOG_ERROR("ggml-xdna: int4 gemv K=%lld not divisible by group_size=%d\n",
+                       (long long)K, group_size);
+        return;
+    }
+
+    const std::string cache_key = make_cache_key(XDNA_OP_GEMV_INT4, 1, K, N, "uint4", num_cols);
+
+    if (!ensure_compiled(ctx, cache_key, XDNA_OP_GEMV_INT4, 1, K, N, "uint4", num_cols)) {
+        GGML_LOG_ERROR("ggml-xdna: INT4 GEMV compile failed for K=%lld N=%lld\n",
+                       (long long)K, (long long)N);
+        return;
+    }
+
+    xdna_kernel_entry * entry = get_or_load_kernel(ctx, cache_key, XDNA_OP_GEMV_INT4, 1, K, N);
+    if (!entry) return;
+
+    try {
+        const size_t vec_bytes = (size_t)K * sizeof(uint16_t);
+        const size_t out_bytes = (size_t)N * sizeof(uint16_t);
+
+        // Packed buffer layout = same as AIEFusedDequantGEMV._packed_buffer_size().
+        // For m_input=1: per-tile = K/2 weights + (K/g)*2 scales = K/2 + K/16 bytes.
+        const int m_input = 1;
+        const int64_t rows_per_col = N / num_cols;
+        const int64_t tiles_per_col = rows_per_col / m_input;
+        const int64_t num_groups_per_row = K / group_size;
+        const size_t packed_bytes_per_tile =
+            (size_t)m_input * (size_t)K / 2 + (size_t)m_input * (size_t)num_groups_per_row * 2;
+        const size_t packed_total = (size_t)num_cols * tiles_per_col * packed_bytes_per_tile;
+
+        // Lazy alloc input/output BOs (per AIEFusedDequantGEMV arg_spec:
+        // group_id 3 = packed weights, 4 = bf16 vector, 5 = bf16 output).
+        if (!entry->a_bo) {
+            entry->a_bo = std::make_unique<xrt::bo>(
+                ctx->device, vec_bytes, xrt::bo::flags::host_only,
+                entry->kernel.group_id(4));
+        }
+        if (!entry->c_bo) {
+            entry->c_bo = std::make_unique<xrt::bo>(
+                ctx->device, out_bytes, xrt::bo::flags::host_only,
+                entry->kernel.group_id(5));
+        }
+
+        // Write input vector (per-call, changes per token).
+        if (src1->type == GGML_TYPE_F32) {
+            f32_to_bf16((const float *)src1->data,
+                        (uint16_t *)entry->a_bo->map<void*>(), (size_t)K);
+        } else {
+            memcpy(entry->a_bo->map<void*>(), src1->data, vec_bytes);
+        }
+        entry->a_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+        // Cached packed weight (keyed by src0->data, immutable after model load).
+        xrt::bo * weight_bo_ptr = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(*entry->b_bo_mutex);
+            auto it = entry->b_bo_cache.find(src0->data);
+            if (it == entry->b_bo_cache.end()) {
+                xrt::bo new_packed(ctx->device, packed_total, xrt::bo::flags::host_only,
+                                   entry->kernel.group_id(3));
+                xdna_repack_q4_0_to_fused_int4(
+                    (const uint8_t *)src0->data, N, K, m_input, num_cols, group_size,
+                    (uint8_t *)new_packed.map<void*>());
+                new_packed.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                auto [ins, _] = entry->b_bo_cache.emplace(src0->data, std::move(new_packed));
+                weight_bo_ptr = &ins->second;
+                fprintf(stderr, "ggml-xdna: warm int4 weight K=%lld N=%lld weight=%s (%zu cached)\n",
+                        (long long)K, (long long)N, src0->name, entry->b_bo_cache.size());
+                fflush(stderr);
+            } else {
+                weight_bo_ptr = &it->second;
+            }
+        }
+
+        // Dispatch — same arg order as bf16 GEMV (opcode, insts, n_insts, mat, vec, out).
+        auto run = entry->kernel(3, entry->insts_bo, (uint32_t)entry->insts.size(),
+                                  *weight_bo_ptr, *entry->a_bo, *entry->c_bo);
+        run.wait();
+        entry->c_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+
+        // ---- Host-side bias compensation -----------------------------------
+        // S[g] = sum_{k in group g}(x[k])  — one pass over input.
+        const uint16_t * x_bf16 = (const uint16_t *)entry->a_bo->map<void*>();
+        std::vector<float> S((size_t)num_groups_per_row, 0.0f);
+        for (int64_t g = 0; g < num_groups_per_row; g++) {
+            float sum = 0.0f;
+            for (int k = 0; k < group_size; k++) {
+                uint32_t bits = ((uint32_t)x_bf16[g * group_size + k]) << 16;
+                float v;
+                memcpy(&v, &bits, sizeof(v));
+                sum += v;
+            }
+            S[(size_t)g] = sum;
+        }
+
+        // Apply bias[i] = 8 * sum_g(scale[i,g] * S[g]) to each output row.
+        // Scales live at packed_offset + K/2 within each tile.
+        const uint8_t * packed = (const uint8_t *)weight_bo_ptr->map<void*>();
+        const uint16_t * out_bf16 = (const uint16_t *)entry->c_bo->map<void*>();
+        float * dst_f32 = (float *)dst->data;
+
+        for (int64_t i = 0; i < N; i++) {
+            const int64_t col = i / rows_per_col;
+            const int64_t tile_idx = i % rows_per_col;  // m_input == 1
+            const int64_t flat_tile = col * tiles_per_col + tile_idx;
+            const size_t tile_offset = (size_t)flat_tile * packed_bytes_per_tile;
+            const uint16_t * sf_row =
+                (const uint16_t *)(packed + tile_offset + (size_t)K / 2);
+
+            float bias = 0.0f;
+            for (int64_t g = 0; g < num_groups_per_row; g++) {
+                uint32_t bits = ((uint32_t)sf_row[g]) << 16;
+                float sf;
+                memcpy(&sf, &bits, sizeof(sf));
+                bias += sf * S[(size_t)g];
+            }
+            bias *= 8.0f;
+
+            uint32_t out_bits = ((uint32_t)out_bf16[i]) << 16;
+            float out_f;
+            memcpy(&out_f, &out_bits, sizeof(out_f));
+            dst_f32[i] = out_f - bias;
+        }
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("ggml-xdna: INT4 GEMV XRT dispatch failed (%s)\n", e.what());
+    }
+}
+
 static void ggml_backend_xdna_mul_mat_gemv(ggml_backend_xdna_context * ctx, struct ggml_tensor * dst) {
     const struct ggml_tensor * src0 = dst->src[0];  // weight (matrix), [N,K]
     const struct ggml_tensor * src1 = dst->src[1];  // activation (vector), [K]
+
+    // Route Q4_0 to the INT4 fused-dequant kernel.
+    if (src0->type == GGML_TYPE_Q4_0) {
+        ggml_backend_xdna_mul_mat_gemv_int4(ctx, dst);
+        return;
+    }
 
     const int64_t K = src0->ne[0];
     const int64_t N = src0->ne[1];
@@ -12479,14 +12661,17 @@ static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const s
             static const bool tblock_w8a16_ok =
                 (xdna_env_enabled("XDNA_ENABLE_TBLOCK_FUSED")) &&
                 (xdna_env_enabled("XDNA_ENABLE_TBLOCK_FUSED_W8A16"));
-            static const bool int4_ok = xdna_env_enabled("XDNA_ENABLE_GEMV_INT4");
             if (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_BF16 || src0->type == GGML_TYPE_F16) return true;
             if ((int8_ok || tblock_w8a16_ok) && src0->type == GGML_TYPE_Q8_0) return true;
-            // Q4_0 mul_mat: claimed only when the INT4 dispatch path is
-            // gated on. Falls back to CPU inside graph_compute when the
-            // path isn't wired up yet (Phase 8.1 in progress). See
-            // IRON-windows/NPU_PLAN_PRIORITY_8.md.
-            if (int4_ok && src0->type == GGML_TYPE_Q4_0) return true;
+            // Q4_0 (Priority 8.1): supports_op claim DISABLED while QKV/SwiGLU
+            // fused paths can't filter Q4_0 weights — claiming here causes
+            // segfault in those paths under chat/multi-op flows. Re-enable
+            // once mul_mat_qkv / mul_mat_swiglu have a "weight type is
+            // Q4_0 → fall through to bare GEMV INT4" early bail. The
+            // dispatch helper ggml_backend_xdna_mul_mat_gemv_int4() is
+            // already wired and ready; can be tested via a unit harness
+            // that calls it directly without going through ggml-sched.
+            // See IRON-windows/NPU_PLAN_PRIORITY_8.md, Phase 8.1.
             return false;
         }
 
