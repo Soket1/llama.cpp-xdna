@@ -122,9 +122,26 @@ PRESETS: dict[str, dict[str, str]] = {
         "XDNA_ENABLE_FLOWKV_DECODE":     "1",
         "XDNA_ENABLE_RMS_NORM":          "0",
         "XDNA_ENABLE_GEMV_INT4":         "1",
-        # Phase 8.2: route Q4_0 SwiGLU FFN through the chained INT4 xclbin
-        # (gate+up+silu+mul fused, then down). Restores fusion on the FFN
-        # path that 8.1 alone broke.
+        # Phase 8.2 (XDNA_ENABLE_SWIGLU_INT4) intentionally OFF by default:
+        # profiling showed the chained INT4 SwiGLU kernel is compute-bound
+        # and runs ~14 ms/layer (~2.3x slower than bf16 SwiGLU at ~5.7
+        # ms/layer), so enabling it regresses decode t/s. Code is in place
+        # and correctness is byte-exact -- just opt-in until the inner
+        # dequant loop is optimized.
+    },
+    "npu_int4_swiglu": {
+        # Same as npu_int4 but ALSO enables the chained INT4 SwiGLU
+        # dispatch (Phase 8.2). Kept available for regression coverage
+        # and future re-evaluation; do not select for perf measurement
+        # until the kernel is optimized.
+        "XDNA_ENABLE_GEMV":              "1",
+        "XDNA_ENABLE_SWIGLU":            "1",
+        "XDNA_ENABLE_QKV":               "1",
+        "XDNA_ENABLE_DECODE_BATCH":      "1",
+        "XDNA_ENABLE_TRANSFORMER_BLOCK": "1",
+        "XDNA_ENABLE_FLOWKV_DECODE":     "1",
+        "XDNA_ENABLE_RMS_NORM":          "0",
+        "XDNA_ENABLE_GEMV_INT4":         "1",
         "XDNA_ENABLE_SWIGLU_INT4":       "1",
     },
 }

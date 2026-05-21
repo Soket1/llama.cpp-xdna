@@ -3023,6 +3023,9 @@ static void ggml_backend_xdna_mul_mat_swiglu_int4(
         }
 
         // Write input activation.
+        using clk = std::chrono::steady_clock;
+        static const bool prof = getenv("XDNA_DEBUG") != NULL;
+        auto t_in_s = clk::now();
         if (src1_input->type == GGML_TYPE_F32) {
             f32_to_bf16((const float *)src1_input->data,
                         (uint16_t *)entry->input_bo->map<void*>(), (size_t)embedding_dim);
@@ -3030,8 +3033,10 @@ static void ggml_backend_xdna_mul_mat_swiglu_int4(
             memcpy(entry->input_bo->map<void*>(), src1_input->data, input_bytes);
         }
         entry->input_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        auto t_in_e = clk::now();
 
         // Build runlist: 2 runs (fused + down).
+        auto t_build_s = clk::now();
         xrt::runlist rl(entry->hw_ctx);
         {
             xrt::run r(entry->kernels[XDNA_SWIGLU_SLOT_0]);
@@ -3053,15 +3058,24 @@ static void ggml_backend_xdna_mul_mat_swiglu_int4(
             r.set_arg(5, *entry->output_bo);
             rl.add(r);
         }
+        auto t_build_e = clk::now();
+
         rl.execute();
+        auto t_exec_e = clk::now();
+
         rl.wait();
+        auto t_wait_e = clk::now();
 
         // Sync intermediate (need it for down's bias compensation) and output.
+        auto t_si_s = clk::now();
         entry->intermediate_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        auto t_si_e = clk::now();
         entry->output_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        auto t_so_e = clk::now();
 
         // Host-side bias compensation for the DOWN matmul only. The fused
         // kernel already applied the -8 offset internally.
+        auto t_bias_s = clk::now();
         const uint16_t * intermediate_bf16 =
             (const uint16_t *)entry->intermediate_bo->map<void*>();
         std::vector<float> S((size_t)num_groups_hid, 0.0f);
@@ -3107,6 +3121,27 @@ static void ggml_backend_xdna_mul_mat_swiglu_int4(
             float out_f;
             memcpy(&out_f, &out_bits, sizeof(out_f));
             dst_f32[i] = out_f - bias;
+        }
+        auto t_bias_e = clk::now();
+
+        if (prof) {
+            auto us = [](clk::time_point a, clk::time_point b) {
+                return (long long)std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
+            };
+            fprintf(stderr,
+                "ggml-xdna: swiglu_int4_prof K=%lld N=%lld f_tsi=%d d_tsi=%d "
+                "in=%lld rl_build=%lld rl_exec=%lld rl_wait=%lld "
+                "sync_inter=%lld sync_out=%lld bias=%lld total=%lld us\n",
+                (long long)embedding_dim, (long long)hidden_dim,
+                fused_tile_in, down_tile_in,
+                us(t_in_s, t_in_e),
+                us(t_build_s, t_build_e),
+                us(t_build_e, t_exec_e),
+                us(t_exec_e, t_wait_e),
+                us(t_si_s, t_si_e),
+                us(t_si_e, t_so_e),
+                us(t_bias_s, t_bias_e),
+                us(t_in_s, t_bias_e));
         }
 
     } catch (const std::exception & e) {
