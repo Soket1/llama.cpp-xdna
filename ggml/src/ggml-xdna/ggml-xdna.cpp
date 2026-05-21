@@ -10146,15 +10146,13 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
     static int64_t flowkv_poc_num_kv_heads = 0;
     static int64_t flowkv_poc_num_q_heads = 0;
     static bool flowkv_poc_valid = false;
-    // NOTE: Do NOT reset flowkv_poc_valid per cgraph — QKV dispatch and
-    // CONT(kqv_out) are in different cgraphs (scheduler splits them).
-    // Pointers are overwritten per-layer; stale state is harmless because
-    // each layer's QKV dispatch runs before its CONT(kqv_out).
-
-    // FlowKV early-dispatch: set after QKV segment when permuted tensors
-    // are ready. Used to skip SOFT_MAX and CONT(kqv_out) in subsequent
-    // segments of the same layer — FlowKV already computed full attention.
     static bool flowkv_dispatched_this_layer = false;
+
+    // Reset per graph_compute — stale pointers from previous queries must
+    // not leak into the current evaluation. POC becomes valid only if
+    // the current graph walk successfully captures fresh pointers.
+    flowkv_poc_valid = false;
+    flowkv_dispatched_this_layer = false;
 
     // Pre-scan for QKV triples. Llama.cpp's Qwen3.5 decode interleaves
     // RMSNorm/view ops between Q and K/V MUL_MATs, so a 3-consecutive-node
@@ -10314,37 +10312,30 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                     fflush(stderr);
                 }
                 // ── FlowKV POC: save permuted Q/K/V tensor pointers ──
-                // The segment structure after Q MUL_MAT is fixed:
-                //   +15 = PERMUTE cache_v (V cache permuted)
-                //   +17 = PERMUTE cache_k (K cache permuted)
-                //   +19 = PERMUTE Qcur   (Q rotated permuted)
-                // Save these for the CONT(kqv_out) FlowKV dispatch.
+                // Forward search for 3 PERMUTE nodes after Q MUL_MAT:
+                //   PERMUTE cache_v (V cache permuted)
+                //   PERMUTE cache_k (K cache permuted)
+                //   PERMUTE Qcur    (Q rotated permuted)
+                // Identify by op == GGML_OP_PERMUTE, collecting first 3.
                 if (flowkv_decode_enabled && q_mm->src[1]->ne[1] == 1) {
-                    int v_perm_idx = i + 15;
-                    int k_perm_idx = i + 17;
-                    int q_perm_idx = i + 19;
-                    if (q_perm_idx < n) {
-                        struct ggml_tensor * v_perm = cgraph->nodes[v_perm_idx];
-                        struct ggml_tensor * k_perm = cgraph->nodes[k_perm_idx];
-                        struct ggml_tensor * q_perm = cgraph->nodes[q_perm_idx];
-                        if (q_perm->op == GGML_OP_PERMUTE &&
-                            k_perm->op == GGML_OP_PERMUTE &&
-                            v_perm->op == GGML_OP_PERMUTE) {
-                            flowkv_poc_q_perm = q_perm;
-                            flowkv_poc_k_perm = k_perm;
-                            flowkv_poc_v_perm = v_perm;
-                            flowkv_poc_head_dim = q_perm->ne[0];       // 64
-                            flowkv_poc_seq_len = k_perm->ne[1];        // seq_len
-                            flowkv_poc_num_kv_heads = k_perm->ne[2];   // 8
-                            flowkv_poc_num_q_heads = q_perm->ne[2];    // 32
-                            flowkv_poc_valid = true;
-                            fprintf(stderr, "ggml-xdna: [FlowKV-POC] Saved Q=%p[%lld,%lld,%lld] "
-                                    "K=%p[%lld,%lld,%lld] V=%p[%lld,%lld,%lld]\n",
-                                    q_perm->data, (long long)q_perm->ne[0], (long long)q_perm->ne[1], (long long)q_perm->ne[2],
-                                    k_perm->data, (long long)k_perm->ne[0], (long long)k_perm->ne[1], (long long)k_perm->ne[2],
-                                    v_perm->data, (long long)v_perm->ne[0], (long long)v_perm->ne[1], (long long)v_perm->ne[2]);
-                            fflush(stderr);
+                    struct ggml_tensor * perms[3] = {nullptr, nullptr, nullptr};
+                    int found = 0;
+                    for (int si = i + 1; si < n && si < i + 25 && found < 3; si++) {
+                        struct ggml_tensor * nd = cgraph->nodes[si];
+                        if (nd->op == GGML_OP_PERMUTE) {
+                            perms[found++] = nd;
                         }
+                    }
+                    if (found == 3 && perms[0] && perms[1] && perms[2]) {
+                        // Order: V perm, K perm, Q perm (matches graph layout)
+                        flowkv_poc_v_perm = perms[0];
+                        flowkv_poc_k_perm = perms[1];
+                        flowkv_poc_q_perm = perms[2];
+                        flowkv_poc_head_dim = perms[2]->ne[0];       // 64
+                        flowkv_poc_seq_len = perms[1]->ne[1];        // seq_len
+                        flowkv_poc_num_kv_heads = perms[1]->ne[2];   // 8
+                        flowkv_poc_num_q_heads = perms[2]->ne[2];    // 32
+                        flowkv_poc_valid = true;
                     }
                 }
                 continue;  // natural ++i; intermediate CPU nodes still run via accumulator
@@ -11897,40 +11888,11 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
         if (s != GGML_STATUS_SUCCESS) return s;
     }
 
-    // FlowKV early dispatch: after QKV segment's CPU delegate range,
-    // permuted Q/K/V tensors are ready. Dispatch FlowKV now so the
-    // next segment (SOFT_MAX) can be skipped entirely.
-    // This replaces the POC dispatch at CONT(kqv_out) for layers where
-    // the QKV segment precedes the attention segment.
-    if (flowkv_decode_enabled && flowkv_poc_valid &&
-        flowkv_poc_q_perm && flowkv_poc_q_perm->data) {
-        int64_t head_dim = flowkv_poc_head_dim;
-        int64_t seq_len = flowkv_poc_seq_len;
-        int64_t num_kv_heads = flowkv_poc_num_kv_heads;
-        int64_t num_q_heads = flowkv_poc_num_q_heads;
-        int64_t q_heads_per_kv = num_q_heads / num_kv_heads;
-        int chunk_size = 32;
-        int num_cols = 1;
-
-        xdna_flowkv_entry * fk_entry = get_or_load_flowkv_kernel(
-            ctx, q_heads_per_kv, /*num_kv_heads=*/1, head_dim, seq_len, chunk_size, num_cols);
-
-        if (fk_entry) {
-            static const bool early_dbg = getenv("XDNA_DEBUG") != NULL;
-            if (early_dbg) {
-                fprintf(stderr, "ggml-xdna: [FlowKV-early] dispatching after QKV segment "
-                        "H=%lld KV=%lld d=%lld S=%lld\n",
-                        (long long)q_heads_per_kv, (long long)num_kv_heads,
-                        (long long)head_dim, (long long)seq_len);
-                fflush(stderr);
-            }
-            // Note: the actual BO setup + dispatch + readback is identical
-            // to the POC path. For now, just set the flag — the POC at
-            // CONT(kqv_out) will handle the actual dispatch. The flag
-            // causes SOFT_MAX to be skipped.
-            flowkv_dispatched_this_layer = true;
-        }
-    }
+    // FlowKV early dispatch: DISABLED.
+    // Setting flowkv_dispatched_this_layer = true here was premature —
+    // if the POC dispatch at CONT(kqv_out) later fails (stale pointers,
+    // missing kernel, etc.), SOFT_MAX was already skipped and CPU fallback
+    // is broken. The flag is now set only after successful POC dispatch.
 
     // Print per-phase attention-prefill profile (no-op when gate off / no samples).
     xdna_attn_prof_print();
