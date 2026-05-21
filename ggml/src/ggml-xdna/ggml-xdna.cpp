@@ -10145,7 +10145,6 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
     static int64_t flowkv_poc_seq_len = 0;
     static int64_t flowkv_poc_num_kv_heads = 0;
     static int64_t flowkv_poc_num_q_heads = 0;
-    static int32_t flowkv_poc_n_past = 0;  // RoPE position for actual_seq_len
     static bool flowkv_poc_valid = false;
     // NOTE: Do NOT reset flowkv_poc_valid per cgraph — QKV dispatch and
     // CONT(kqv_out) are in different cgraphs (scheduler splits them).
@@ -10293,6 +10292,27 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                     ctx, q_mm, k_mm, v_mm,
                     q_mm->src[0], k_mm->src[0], v_mm->src[0],
                     q_mm->src[1]);
+                // ── FlowKV diagnostic: log QKV tensors and surrounding nodes ──
+                if (flowkv_decode_enabled) {
+                    fprintf(stderr, "ggml-xdna: [FlowKV-DIAG] QKV @%d: "
+                            "q_mm dst=%s ne=[%lld,%lld] src1=%s ne=[%lld,%lld]\n",
+                            i, q_mm->name,
+                            (long long)q_mm->ne[0], (long long)q_mm->ne[1],
+                            q_mm->src[1]->name,
+                            (long long)q_mm->src[1]->ne[0], (long long)q_mm->src[1]->ne[1]);
+                    // Log nodes i..i+20 (the QKV + cache section)
+                    int log_end = i + 20 < n ? i + 20 : n;
+                    for (int j = i; j < log_end; j++) {
+                        struct ggml_tensor * nd = cgraph->nodes[j];
+                        fprintf(stderr, "  [%d] op=%d name=%s ne=[%lld,%lld,%lld] "
+                                "src0=%s src1=%s\n",
+                                j, (int)nd->op, nd->name,
+                                (long long)nd->ne[0], (long long)nd->ne[1], (long long)nd->ne[2],
+                                nd->src[0] ? nd->src[0]->name : "(null)",
+                                nd->src[1] ? nd->src[1]->name : "(null)");
+                    }
+                    fflush(stderr);
+                }
                 // ── FlowKV POC: save permuted Q/K/V tensor pointers ──
                 // The segment structure after Q MUL_MAT is fixed:
                 //   +15 = PERMUTE cache_v (V cache permuted)
@@ -10317,27 +10337,13 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                             flowkv_poc_seq_len = k_perm->ne[1];        // seq_len
                             flowkv_poc_num_kv_heads = k_perm->ne[2];   // 8
                             flowkv_poc_num_q_heads = q_perm->ne[2];    // 32
-                            // Capture RoPE position for actual_seq_len.
-                            // Search forward from Q MUL_MAT for ROPE node.
-                            // src[1] = position tensor (int32). For decode M=1,
-                            // max position = n_past (tokens before current).
-                            flowkv_poc_n_past = 0;
-                            for (int ri = i + 1; ri < n && ri < i + 10; ri++) {
-                                struct ggml_tensor * rn = cgraph->nodes[ri];
-                                if (rn->op == GGML_OP_ROPE &&
-                                    rn->src[1] &&
-                                    rn->src[1]->type == GGML_TYPE_I32) {
-                                    const int32_t * pos = (const int32_t *)rn->src[1]->data;
-                                    int64_t n_pos = rn->src[1]->ne[0];
-                                    int32_t max_pos = 0;
-                                    for (int64_t pi = 0; pi < n_pos; pi++) {
-                                        if (pos[pi] > max_pos) max_pos = pos[pi];
-                                    }
-                                    flowkv_poc_n_past = max_pos;
-                                    break;
-                                }
-                            }
                             flowkv_poc_valid = true;
+                            fprintf(stderr, "ggml-xdna: [FlowKV-POC] Saved Q=%p[%lld,%lld,%lld] "
+                                    "K=%p[%lld,%lld,%lld] V=%p[%lld,%lld,%lld]\n",
+                                    q_perm->data, (long long)q_perm->ne[0], (long long)q_perm->ne[1], (long long)q_perm->ne[2],
+                                    k_perm->data, (long long)k_perm->ne[0], (long long)k_perm->ne[1], (long long)k_perm->ne[2],
+                                    v_perm->data, (long long)v_perm->ne[0], (long long)v_perm->ne[1], (long long)v_perm->ne[2]);
+                            fflush(stderr);
                         }
                     }
                 }
@@ -11208,6 +11214,48 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                     fk_entry->kernel.group_id(6)));
                     }
 
+                    // === BO ADDRESS DIAGNOSTIC ===
+                    {
+                        uint64_t addr_k   = fk_entry->bo_k->address();
+                        uint64_t addr_v   = fk_entry->bo_v->address();
+                        uint64_t addr_q   = fk_entry->bo_q->address();
+                        uint64_t addr_out = fk_entry->bo_out->address();
+                        fprintf(stderr, "\n=== BO ADDRESS DIAGNOSTIC ===\n");
+                        fprintf(stderr, "  bo_k   (group_id 3): addr=0x%016llX  size=%zu  expected_arg=DDR_buf_0\n",
+                                (unsigned long long)addr_k, k_size);
+                        fprintf(stderr, "  bo_v   (group_id 4): addr=0x%016llX  size=%zu  expected_arg=DDR_buf_1\n",
+                                (unsigned long long)addr_v, v_size);
+                        fprintf(stderr, "  bo_q   (group_id 5): addr=0x%016llX  size=%zu\n",
+                                (unsigned long long)addr_q, q_size);
+                        fprintf(stderr, "  bo_out (group_id 6): addr=0x%016llX  size=%zu\n",
+                                (unsigned long long)addr_out, out_size);
+                        int64_t kv_delta = (int64_t)addr_v - (int64_t)addr_k;
+                        fprintf(stderr, "  V-K delta: %lld bytes (%lld KB)\n",
+                                (long long)kv_delta, (long long)kv_delta / 1024);
+                        int64_t expected_delta = (int64_t)k_size;
+                        fprintf(stderr, "  Expected V-K delta (k_size): %lld bytes (%lld KB)\n",
+                                (long long)expected_delta, (long long)expected_delta / 1024);
+                        if (kv_delta != expected_delta && kv_delta != (int64_t)v_size) {
+                            fprintf(stderr, "  *** UNEXPECTED DELTA — driver may be adding metadata! ***\n");
+                            fprintf(stderr, "  Delta diff from k_size: %lld bytes\n",
+                                    (long long)(kv_delta - expected_delta));
+                        }
+                        fprintf(stderr, "  bo_k group_id: %zu\n", (size_t)fk_entry->kernel.group_id(3));
+                        fprintf(stderr, "  bo_v group_id: %zu\n", (size_t)fk_entry->kernel.group_id(4));
+                        fprintf(stderr, "=== END BO ADDRESS DIAGNOSTIC ===\n\n");
+                        fflush(stderr);
+                    }
+                    // === END BO ADDRESS DIAGNOSTIC ===
+
+                    // Diagnostic: save CPU result before overwriting
+                    static std::vector<float> cpu_save;
+                    static bool cpu_saved = false;
+                    if (poc_dbg && !cpu_saved) {
+                        cpu_save.assign((float *)kqv_out->data,
+                                        (float *)kqv_out->data + num_q_heads * head_dim);
+                        cpu_saved = true;
+                    }
+
                     const char * k_data = (const char *)flowkv_poc_k_perm->data;
                     const char * v_data = (const char *)flowkv_poc_v_perm->data;
                     const char * q_data = (const char *)flowkv_poc_q_perm->data;
@@ -11352,14 +11400,34 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                     char angle_sin_bf16[2] = {(char)0x00, (char)0x00};  // 0x0000 = 0.0 bf16
 
                     // Determine actual number of filled KV positions.
-                    // Use RoPE position (n_past) from host graph analysis.
-                    // n_past = max position in RoPE tensor = tokens before current.
-                    // actual_seq_len = n_past + 1 (including current decode token).
-                    // This is exact — no binary search on K data zeros needed.
+                    // k_perm->ne[1] is the padded n_kv (≥256), not the real token count.
+                    // We scan K data to find the last non-zero position.
                     int64_t actual_seq_len = seq_len;
-                    if (flowkv_poc_n_past > 0) {
-                        actual_seq_len = (int64_t)flowkv_poc_n_past + 1;
-                        if (actual_seq_len > seq_len) actual_seq_len = seq_len;
+                    {
+                        // Quick scan: check if K at position seq_len-1 is all zeros.
+                        // If so, binary search for the boundary.
+                        auto is_k_zero = [&](int64_t pos) -> bool {
+                            for (int64_t d = 0; d < head_dim; d++) {
+                                size_t off = pos * k_nb1 + 0 * k_nb2 + d * k_nb0;
+                                uint16_t val;
+                                memcpy(&val, k_data + off, 2);
+                                if (val != 0) return false;
+                            }
+                            return true;
+                        };
+                        if (is_k_zero(seq_len - 1)) {
+                            int64_t lo = 0, hi = seq_len - 1;
+                            while (lo < hi) {
+                                int64_t mid = (lo + hi + 1) / 2;
+                                if (is_k_zero(mid)) hi = mid - 1;
+                                else lo = mid;
+                            }
+                            actual_seq_len = lo + 1;
+                        }
+                    }
+                    if (poc_dbg) {
+                        fprintf(stderr, "    actual_seq_len=%lld (padded=%lld)\n",
+                                (long long)actual_seq_len, (long long)seq_len);
                     }
 
                     // Batch num_cols KV heads per dispatch with 64-byte aligned strides.
@@ -11640,6 +11708,56 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                 continue;
                             }
 
+                            if (poc_dbg) {
+                                fprintf(stderr, "ggml-xdna: [FlowKV-POC] kv_h=%lld dispatched\n",
+                                        (long long)kv_h);
+
+                                // === V10 PROBE: real-data inline diagnostic ===
+                                static bool flowkv_real_probe = xdna_env_enabled("XDNA_FLOWKV_REAL_PROBE");
+                                if (flowkv_real_probe && kv_h == 0) {
+                                    fk_entry->bo_out->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+                                    auto out_ptr = fk_entry->bo_out->map<char *>();
+                                    fk_entry->bo_q->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+                                    auto q_ptr = fk_entry->bo_q->map<char *>();
+                                    fk_entry->bo_v->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+                                    auto v_ptr = fk_entry->bo_v->map<char *>();
+
+                                    size_t out_head_elems = (size_t)head_dim;
+                                    size_t q_group_stride_elems = aligned_q_group_stride_bytes / sizeof(uint16_t);
+                                    size_t out_stride_elems = aligned_out_stride_bytes / sizeof(uint16_t);
+                                    size_t head_stride_elems = aligned_head_stride_bytes / sizeof(uint16_t);
+                                    size_t v_region_offset_elems = aligned_v_region_offset_bytes / sizeof(uint16_t);
+
+                                    for (int col = 0; col < num_cols && col < num_kv_heads; col++) {
+                                        const uint16_t * obf16 = (const uint16_t *)out_ptr + col * out_stride_elems;
+                                        const uint16_t * q_bf16 = (const uint16_t *)q_ptr + col * q_group_stride_elems;
+                                        const uint16_t * k_bf16 = (const uint16_t *)v_ptr + col * head_stride_elems;
+                                        const uint16_t * v_bf16 = (const uint16_t *)v_ptr + v_region_offset_elems + col * head_stride_elems;
+                                        int q_match = 0, k_match = 0, v_match = 0, meta_match = 0;
+                                        for (int d = 0; d < 64; d++) {
+                                            if (obf16[d] == q_bf16[d]) q_match++;
+                                            if (obf16[head_dim + d] == k_bf16[d]) k_match++;
+                                            if (obf16[2 * head_dim + d] == v_bf16[d]) v_match++;
+                                        }
+                                        uint16_t host_meta = q_bf16[q_heads_per_kv * head_dim + head_dim];
+                                        if (obf16[3 * head_dim] == host_meta) meta_match = 1;
+                                        fprintf(stderr, "  [V10-FLOWKV-PROBE] col=%d: Qmatch=%d Kmatch=%d Vmatch=%d Mmatch=%d\n",
+                                            col, q_match, k_match, v_match, meta_match);
+                                        fprintf(stderr, "    Q[0..3]: 0x%04X 0x%04X 0x%04X 0x%04X\n",
+                                            (unsigned)obf16[0], (unsigned)obf16[1], (unsigned)obf16[2], (unsigned)obf16[3]);
+                                        fprintf(stderr, "    K[0..3]: 0x%04X 0x%04X 0x%04X 0x%04X\n",
+                                            (unsigned)obf16[head_dim], (unsigned)obf16[head_dim+1], (unsigned)obf16[head_dim+2], (unsigned)obf16[head_dim+3]);
+                                        fprintf(stderr, "    V[0..3]: 0x%04X 0x%04X 0x%04X 0x%04X\n",
+                                            (unsigned)obf16[2*head_dim], (unsigned)obf16[2*head_dim+1], (unsigned)obf16[2*head_dim+2], (unsigned)obf16[2*head_dim+3]);
+                                        fprintf(stderr, "    META seq=0x%04X magic=0x%04X\n",
+                                            (unsigned)obf16[3*head_dim], (unsigned)obf16[3*head_dim+1]);
+                                    }
+                                    fprintf(stderr, "    [V10-FLOWKV-PROBE] probe mode overwrote FlowKV output; generated tokens are invalid\n");
+                                    fflush(stderr);
+                                }
+                                    (void)0; // v10 probe handles diag
+
+                            }
                         }
 
                         // --- Read back and scatter output for all columns ---
@@ -11666,8 +11784,87 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                 }
                             }
                         }
+                        // === V11 MATH DIAG: CPU reference comparison ===
+                        {
+                            static bool math_diag = xdna_env_enabled("XDNA_FLOWKV_MATH_DIAG");
+                            if (math_diag && kv_h == 0) {
+                                auto q_ptr_d = fk_entry->bo_q->map<char *>();
+                                auto v_ptr_d = fk_entry->bo_v->map<char *>();
+                                auto out_ptr_d = fk_entry->bo_out->map<char *>();
+                                const uint16_t * q_bf16 = (const uint16_t *)q_ptr_d;
+                                const uint16_t * k_bf16 = (const uint16_t *)v_ptr_d;
+                                const uint16_t * v_bf16 = (const uint16_t *)(v_ptr_d + seq_len * row_bytes);
+                                const uint16_t * out_bf16 = (const uint16_t *)out_ptr_d;
+                                int angles_off_elems = q_heads_per_kv * head_dim + head_dim;
+                                uint16_t asl_bits = q_bf16[angles_off_elems];
+                                uint32_t asl_f32 = ((uint32_t)asl_bits) << 16;
+                                float asl_f;
+                                memcpy(&asl_f, &asl_f32, 4);
+                                int actual_seq = (int)asl_f;
+                                if (actual_seq <= 0 || actual_seq > (int)seq_len) actual_seq = (int)seq_len;
+                                float cpu_out[4 * 64];
+                                flowkv_cpu_reference(q_bf16, k_bf16, v_bf16,
+                                    cpu_out, (int)q_heads_per_kv, (int)head_dim,
+                                    (int)seq_len, actual_seq);
+                                fprintf(stderr, "  [V11-MATH-DIAG] kv_h=0 actual_seq=%d\n", actual_seq);
+                                float max_abs = 0, max_rel = 0, rms_sum = 0;
+                                for (int d = 0; d < head_dim; d++) {
+                                    uint32_t npu_bits = ((uint32_t)out_bf16[d]) << 16;
+                                    float npu_f;
+                                    memcpy(&npu_f, &npu_bits, 4);
+                                    float cpu_f = cpu_out[d];
+                                    float diff = fabsf(npu_f - cpu_f);
+                                    float rel = (fabsf(cpu_f) > 1e-6f) ? diff / fabsf(cpu_f) : 0;
+                                    if (diff > max_abs) max_abs = diff;
+                                    if (rel > max_rel) max_rel = rel;
+                                    rms_sum += diff * diff;
+                                    if (d < 8) {
+                                        fprintf(stderr, "    [%d] NPU=%.6f CPU=%.6f diff=%.6f rel=%.4f\n",
+                                            d, npu_f, cpu_f, diff, rel);
+                                    }
+                                }
+                                float rms = sqrtf(rms_sum / head_dim);
+                                fprintf(stderr, "  [V11-MATH-DIAG] max_abs=%.6f max_rel=%.4f rms=%.6f\n",
+                                    max_abs, max_rel, rms);
+                                fprintf(stderr, "  [V11-MATH-DIAG] %s\n",
+                                    (max_abs < 0.15f && max_rel < 0.10f) ? "PASS" : "FAIL");
+                                fflush(stderr);
+                            }
+                        }
+                        // === END V11 MATH DIAG ===
                     } // for kv_h
 
+                    if (poc_dbg) {
+                        fprintf(stderr, "ggml-xdna: [FlowKV-POC] completed, overwrote kqv_out @%d\n", i);
+                        // Diagnostic: check raw bo_out data after sync
+                        {
+                            auto raw = fk_entry->bo_out->map<char *>();
+                            const uint16_t * raw_bf16 = (const uint16_t *)raw;
+                            bool all_zero = true;
+                            for (int d = 0; d < q_heads_per_kv * head_dim; d++) {
+                                if (raw_bf16[d] != 0) { all_zero = false; break; }
+                            }
+                            fprintf(stderr, "  bo_out raw: first 8 bf16:");
+                            for (int d = 0; d < 8; d++) fprintf(stderr, " 0x%04X", raw_bf16[d]);
+                            fprintf(stderr, " all_zero=%d\n", all_zero);
+                            // DIAG: print last head's data (K[0] from kernel)
+                            int last_head_off = (q_heads_per_kv - 1) * head_dim;
+                            fprintf(stderr, "  bo_out K_DIAG [last head, off=%d]:", last_head_off);
+                            for (int d = 0; d < 8; d++) fprintf(stderr, " 0x%04X", raw_bf16[last_head_off + d]);
+                            fprintf(stderr, "\n");
+                        }
+                        // Compare NPU vs CPU for first head
+                        if (!cpu_save.empty()) {
+                            const float * npu_f32 = (const float *)kqv_out->data;
+                            fprintf(stderr, "  NPU vs CPU head0 first 8 values:\n");
+                            for (int d = 0; d < 8 && d < (int)head_dim; d++) {
+                                fprintf(stderr, "  [%d] NPU=%.6f  CPU=%.6f  diff=%.6f\n",
+                                        d, npu_f32[d], cpu_save[d], npu_f32[d] - cpu_save[d]);
+                            }
+                            cpu_save.clear();
+                        }
+                        fflush(stderr);
+                    }
                     // FlowKV dispatched successfully. The NPU result
                     // is now in kqv_out->data.
                     // IMPORTANT: do NOT skip the CONT node. Downstream
