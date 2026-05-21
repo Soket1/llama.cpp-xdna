@@ -9717,6 +9717,17 @@ static bool xdna_select_rms_norm_params(int64_t size, int max_cols,
     const int tile_size = (int)size;
 
     // Single core, single channel — one pass over full row.
+    //
+    // NOTE: this is the ONLY 1-col operator in the pipeline (QKV/SwiGLU=8col,
+    // FlowKV=4col). The 1-col hw_context interacts badly with multi-col
+    // operators in chat-mode multi-query (see IRON-windows/NPU_PLAN.md
+    // "RMS_NORM⊕QKV interference"). Cannot trivially switch to 8-col here:
+    // compile.py requires size = cols*channels*tile_size, so 8 cols forces
+    // tile_size <= 256, which reintroduces the per-tile mean bug
+    // (each core would compute mean over its own 256-element shard, not
+    // the full 2048-element row). Proper fix requires a multi-column IRON
+    // design with cross-core reduction. Until then, RMS_NORM stays 1-col
+    // and the workaround is XDNA_ENABLE_RMS_NORM=0 in chat-mode.
     *out_cols       = 1;
     *out_channels   = 1;
     *out_tile_size  = tile_size;
