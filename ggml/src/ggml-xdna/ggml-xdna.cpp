@@ -90,6 +90,7 @@ enum xdna_op_kind : int {
     XDNA_OP_QKV = 7,  // M==1 fused Q/K/V (single GEMV with concatenated weights)
     XDNA_OP_RMS_NORM            = 8,  // standalone RMSNorm (bf16, eps=1e-5 baked-in)
     XDNA_OP_ATTENTION_PREFILL   = 9,  // chained attention block (RMSNorm+QKV+RoPE+MHA+O+residual)
+    XDNA_OP_GEMV_INT4           = 10, // M==1 fused INT4-dequant + GEMV (Q4_0 weights, bf16 acts)
 };
 
 struct xdna_kernel_entry {
@@ -940,6 +941,100 @@ static void xdna_repack_q8_0_to_gemv_int8(
                     + (size_t)r * (size_t)num_groups_per_row * 2);
                 for (int64_t g = 0; g < num_groups_per_row; g++) {
                     const uint8_t * blk = row_src + (size_t)g * Q8_0_BLOCK_BYTES;
+                    uint16_t fp16_val;
+                    memcpy(&fp16_val, blk, 2);  // little-endian fp16 scale
+                    scale_dst[g] = fp16_to_bf16(fp16_val);
+                }
+            }
+        }
+    }
+}
+
+// Repack GGML Q4_0 weights to IRON fused_dequant_gemv format (Priority 8.1).
+//
+// GGML Q4_0 block layout (32 elements, 18 bytes total):
+//   [fp16 scale d (2B)][uint8 qs[16]: 32 nibbles in interleaved order]
+//   Nibble unpacking: e[j] = qs[j] & 0xF,  e[j+16] = (qs[j] >> 4) & 0xF
+//   The signed value is (e - 8); dequantized x = (e - 8) * d.
+//
+// IRON kernel expects:
+//   - uint4 in [0, 15] (zero-point implicit 0), packed linearly:
+//       byte k = elem[2k] | (elem[2k+1] << 4)
+//   - bf16 scale per group_size=32 elements
+//   - Tile layout: [m_input * K / 2 bytes packed weights]
+//                  [m_input * (K / group_size) * 2 bytes bf16 scales]
+//   - Tile order in DDR: col 0 tiles 0..T-1, then col 1, etc.
+//
+// We pack as if the Q4_0 nibbles were the kernel's uint4 directly (no -8
+// adjustment). The kernel will compute (nibble) * scale instead of
+// (nibble - 8) * scale; the dispatch path must subtract a per-row bias
+// `8 * sum_g(scale[i,g] * sum_{k in g}(x[k]))` from the kernel output.
+// Long-term fix is a kernel-side `aie::sub(8)` after `aie::unpack(I0)`
+// (see IRON-windows/NPU_PLAN_PRIORITY_8.md review note N2), which would
+// remove the host bias step entirely. That's blocked on the pyxrt /
+// IRON-compile pipeline working from this env, so we ship the host-bias
+// PoC first.
+static void xdna_repack_q4_0_to_fused_int4(
+        const uint8_t * q4_0,
+        int64_t M, int64_t K,
+        int m_input, int cols, int group_size,
+        uint8_t * packed_out) {
+    GGML_ASSERT(group_size == 32);  // Q4_0 blocks are fixed at 32 elements.
+    GGML_ASSERT(K % group_size == 0);
+    GGML_ASSERT(M % cols == 0);
+
+    const int64_t rows_per_col = M / cols;
+    GGML_ASSERT(rows_per_col % m_input == 0);
+
+    const int64_t num_groups_per_row = K / group_size;
+    const size_t Q4_0_BLOCK_BYTES = 2 + 16;  // fp16 d + 16 packed nibble bytes
+    const size_t row_stride_q40 = (size_t)num_groups_per_row * Q4_0_BLOCK_BYTES;
+    const size_t weight_bytes_per_row = (size_t)K / 2;  // 4 bits per element
+    const size_t scale_bytes_per_row  = (size_t)num_groups_per_row * 2;  // bf16
+    const size_t packed_bytes_per_tile =
+        (size_t)m_input * weight_bytes_per_row + (size_t)m_input * scale_bytes_per_row;
+    const int64_t tiles_per_col = rows_per_col / m_input;
+
+    for (int col = 0; col < cols; col++) {
+        for (int64_t tile_idx = 0; tile_idx < tiles_per_col; tile_idx++) {
+            const int64_t row_start = (int64_t)col * rows_per_col + tile_idx * m_input;
+            const int64_t flat_tile = (int64_t)col * tiles_per_col + tile_idx;
+            const size_t tile_offset = (size_t)flat_tile * packed_bytes_per_tile;
+
+            // 1. Packed uint4 weights for m_input consecutive rows.
+            for (int r = 0; r < m_input; r++) {
+                const int64_t global_row = row_start + r;
+                const uint8_t * row_src =
+                    q4_0 + (size_t)global_row * row_stride_q40;
+                uint8_t * row_dst = packed_out + tile_offset + (size_t)r * weight_bytes_per_row;
+                // Each Q4_0 block holds 32 nibbles interleaved (j, j+16).
+                // Unpack into linear e[0..31], then re-pack pairwise
+                // (byte k = e[2k] | (e[2k+1] << 4)) — IRON's expected layout.
+                for (int64_t g = 0; g < num_groups_per_row; g++) {
+                    const uint8_t * qs = row_src + (size_t)g * Q4_0_BLOCK_BYTES + 2;
+                    uint8_t e[32];
+                    for (int j = 0; j < 16; j++) {
+                        e[j]      =  qs[j]       & 0x0F;       // unsigned [0..15];
+                        e[j + 16] = (qs[j] >> 4) & 0x0F;       // == (signed + 8)
+                    }
+                    uint8_t * blk_dst = row_dst + (size_t)g * 16;
+                    for (int k = 0; k < 16; k++) {
+                        blk_dst[k] = (uint8_t)(e[2*k] | (e[2*k + 1] << 4));
+                    }
+                }
+            }
+
+            // 2. bf16 scale bytes (converted from fp16 d) for m_input rows.
+            const size_t scale_region_start =
+                tile_offset + (size_t)m_input * weight_bytes_per_row;
+            for (int r = 0; r < m_input; r++) {
+                const int64_t global_row = row_start + r;
+                const uint8_t * row_src =
+                    q4_0 + (size_t)global_row * row_stride_q40;
+                uint16_t * scale_dst = (uint16_t *)(packed_out + scale_region_start
+                    + (size_t)r * scale_bytes_per_row);
+                for (int64_t g = 0; g < num_groups_per_row; g++) {
+                    const uint8_t * blk = row_src + (size_t)g * Q4_0_BLOCK_BYTES;
                     uint16_t fp16_val;
                     memcpy(&fp16_val, blk, 2);  // little-endian fp16 scale
                     scale_dst[g] = fp16_to_bf16(fp16_val);
@@ -12384,8 +12479,14 @@ static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const s
             static const bool tblock_w8a16_ok =
                 (xdna_env_enabled("XDNA_ENABLE_TBLOCK_FUSED")) &&
                 (xdna_env_enabled("XDNA_ENABLE_TBLOCK_FUSED_W8A16"));
+            static const bool int4_ok = xdna_env_enabled("XDNA_ENABLE_GEMV_INT4");
             if (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_BF16 || src0->type == GGML_TYPE_F16) return true;
             if ((int8_ok || tblock_w8a16_ok) && src0->type == GGML_TYPE_Q8_0) return true;
+            // Q4_0 mul_mat: claimed only when the INT4 dispatch path is
+            // gated on. Falls back to CPU inside graph_compute when the
+            // path isn't wired up yet (Phase 8.1 in progress). See
+            // IRON-windows/NPU_PLAN_PRIORITY_8.md.
+            if (int4_ok && src0->type == GGML_TYPE_Q4_0) return true;
             return false;
         }
 

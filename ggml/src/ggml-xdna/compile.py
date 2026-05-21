@@ -94,6 +94,24 @@ def gemv_cache_key(N: int, K: int, dtype_in: str, dtype_out: str,
     return hashlib.sha256(key_json.encode()).hexdigest()[:16]
 
 
+def fused_dequant_gemv_cache_key(N: int, K: int, num_aie_columns: int,
+                                 group_size: int) -> str:
+    """Cache key for an INT4 fused-dequant GEMV (Priority 8.1).
+
+    INT4 weights, bf16 scales, bf16 activations, bf16 output. dtype field is
+    omitted from the key — it's always fixed to those types.
+    """
+    key_data = {
+        "op": "fused_dequant_gemv",
+        "N": N,
+        "K": K,
+        "num_aie_columns": num_aie_columns,
+        "group_size": group_size,
+    }
+    key_json = json.dumps(key_data, sort_keys=True)
+    return hashlib.sha256(key_json.encode()).hexdigest()[:16]
+
+
 def swiglu_decode_cache_key(embedding_dim: int, hidden_dim: int,
                             dtype: str, num_aie_columns: int) -> str:
     """Cache key for a SwiGLU decode (M=1) configuration.
@@ -804,6 +822,54 @@ def compile_gemv(N: int, K: int, dtype_in: str, dtype_out: str,
     return output_path
 
 
+def compile_fused_dequant_gemv(N: int, K: int, num_aie_columns: int,
+                               group_size: int, output_path: str) -> str:
+    """Compile an IRON fused INT4-dequant + GEMV operator (Priority 8.1).
+
+    The kernel reads INT4-packed weights from DDR, dequantizes in-register
+    using per-group bf16 scales, and computes matrix-vector product in a
+    single pass — yielding ~4x DDR-bandwidth reduction vs streaming bf16.
+
+    Args:
+        N: Matrix-row dimension (output length). Maps to IRON op's M.
+        K: Reduction dim (vector length). Must be divisible by group_size.
+        num_aie_columns: Number of AIE columns to use (must divide N).
+        group_size: Number of weight elements sharing one bf16 scale.
+            For GGML Q4_0 this is hard-coded to 32; for Q4_K (re-quantized
+            to W4A16) we also use 32. Must be a multiple of 32 per IRON op.
+        output_path: Destination .xclbin path. The matching .insts file is
+            written alongside (same stem, ".insts" suffix).
+    """
+    from iron.operators.fused_dequant_gemv.op import AIEFusedDequantGEMV
+
+    # Reuse the same tile-selection logic as bf16 GEMV: AIEFusedDequantGEMV
+    # inherits the same constraints (tile_out divisible by tile_in, K %
+    # kernel_vector_size == 0, etc.). The op's own asserts will catch
+    # invalid shapes if we ever drift.
+    tile_in, tile_out = select_gemv_tiles(N, K, num_aie_columns)
+
+    op = AIEFusedDequantGEMV(
+        M=N,
+        K=K,
+        num_aie_columns=num_aie_columns,
+        tile_size_input=tile_in,
+        tile_size_output=tile_out,
+        group_size=group_size,
+    )
+    op.compile()
+
+    build_dir = op.context.build_dir
+    compiled_xclbin = build_dir / op.xclbin_artifact.filename
+    compiled_insts = build_dir / op.insts_artifact.filename
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    shutil.copy2(str(compiled_xclbin), output_path)
+    insts_output = output_path.replace(".xclbin", ".insts")
+    shutil.copy2(str(compiled_insts), insts_output)
+
+    return output_path
+
+
 def compile_swiglu_decode(embedding_dim: int, hidden_dim: int, dtype: str,
                           num_aie_columns: int, output_dir: str) -> str:
     """Compile an IRON SwiGLU decode operator and stage its artifacts into output_dir.
@@ -1150,6 +1216,25 @@ def compile_gemv_cached(N: int, K: int, dtype_in: str = "bf16",
     cache_dir = get_cache_dir()
     output_path = str(cache_dir / f"{cache_key}.xclbin")
     compile_gemv(N, K, dtype_in, dtype_out, num_aie_columns, output_path)
+    return Path(output_path)
+
+
+def compile_fused_dequant_gemv_cached(N: int, K: int,
+                                      num_aie_columns: int = 4,
+                                      group_size: int = 32) -> Path:
+    """Compile an INT4 fused-dequant GEMV with caching.
+
+    Returns path to the xclbin (cached or newly compiled).
+    """
+    cache_key = fused_dequant_gemv_cache_key(N, K, num_aie_columns, group_size)
+
+    cached = get_cached_xclbin(cache_key)
+    if cached is not None:
+        return cached
+
+    cache_dir = get_cache_dir()
+    output_path = str(cache_dir / f"{cache_key}.xclbin")
+    compile_fused_dequant_gemv(N, K, num_aie_columns, group_size, output_path)
     return Path(output_path)
 
 
@@ -2155,6 +2240,18 @@ def main():
     gemv_parser.add_argument("--num-aie-columns", type=int, default=4)
     gemv_parser.add_argument("--out", type=str, help="Output xclbin path (default: cache)")
 
+    # Fused INT4-dequant + GEMV subcommand (Priority 8.1)
+    fdg_parser = subparsers.add_parser(
+        "fused-dequant-gemv",
+        help="Compile INT4-weight + bf16 fused dequant+GEMV (M=1 decode)",
+    )
+    fdg_parser.add_argument("--N", type=int, required=True, help="Matrix-row dim (output length)")
+    fdg_parser.add_argument("--K", type=int, required=True, help="Reduction dim (must be % group_size)")
+    fdg_parser.add_argument("--num-aie-columns", type=int, default=4)
+    fdg_parser.add_argument("--group-size", type=int, default=32,
+                            help="Weights per scale (default 32 = GGML Q4_0 block size)")
+    fdg_parser.add_argument("--out", type=str, help="Output xclbin path (default: cache)")
+
     # SwiGLU decode subcommand
     swd_parser = subparsers.add_parser(
         "swiglu-decode", help="Compile fused SwiGLU FFN (M=1 decode path)"
@@ -2420,6 +2517,19 @@ def main():
                 args.N, args.K,
                 args.dtype_in, args.dtype_out,
                 args.num_aie_columns,
+            )
+        if not args.quiet:
+            print(path)
+    elif args.op == "fused-dequant-gemv":
+        if args.out:
+            path = compile_fused_dequant_gemv(
+                args.N, args.K,
+                args.num_aie_columns, args.group_size, args.out,
+            )
+        else:
+            path = compile_fused_dequant_gemv_cached(
+                args.N, args.K,
+                args.num_aie_columns, args.group_size,
             )
         if not args.quiet:
             print(path)
