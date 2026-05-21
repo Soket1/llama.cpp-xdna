@@ -176,6 +176,27 @@ def swiglu_decode_int8_cache_key(embedding_dim: int, hidden_dim: int,
     return hashlib.sha256(key_json.encode()).hexdigest()[:16]
 
 
+def swiglu_decode_int4_cache_key(embedding_dim: int, hidden_dim: int,
+                                 num_aie_columns: int,
+                                 group_size: int = 32) -> str:
+    """Cache key for a W4A16 INT4 SwiGLU decode (Phase 8.2).
+
+    Disjoint from bf16 / INT8 swiglu keys by virtue of the "op" field.
+    Q4_0 has fixed group_size=32 but we keep it in the key so future
+    Q4_K (W4A16 re-quant) variants with different group sizes don't
+    collide.
+    """
+    key_data = {
+        "op": "swiglu_decode_int4",
+        "embedding_dim": embedding_dim,
+        "hidden_dim": hidden_dim,
+        "num_aie_columns": num_aie_columns,
+        "group_size": group_size,
+    }
+    key_json = json.dumps(key_data, sort_keys=True)
+    return hashlib.sha256(key_json.encode()).hexdigest()[:16]
+
+
 def swiglu_fused_int8_cache_key(embedding_dim: int, hidden_dim: int,
                                 num_aie_columns: int,
                                 group_size: int = 32) -> str:
@@ -331,6 +352,10 @@ SWIGLU_PREFILL_KERNELS = ("gemm_1", "silu_mul", "gemm_2")
 # (they operate on bf16 intermediates), but are keyed under their int8-namespace
 # insts files inside this bundle — the C++ backend loads them via distinct tags.
 SWIGLU_DECODE_INT8_KERNELS = ("gemv_int8_1", "silu", "eltwise_mul", "gemv_int8_2")
+# W4A16 (INT4 weights + bf16 activations) SwiGLU decode, Phase 8.2.
+# 2 sub-kernels (fused gate+up+silu+mul INT4, down INT4 GEMV) chained
+# into one xclbin. Names match _stage_swiglu_decode_int4().
+SWIGLU_DECODE_INT4_KERNELS = ("fused_int4", "gemv_2_int4")
 # Fused gate+up+silu+mul + standalone down GEMV, chained into one xclbin.
 # Names must match chain_swiglu_artifacts() call in chained.py.
 SWIGLU_FUSED_CHAINED_KERNELS = ("fused", "down_gemv_int8")
@@ -913,6 +938,55 @@ def compile_swiglu_decode(embedding_dim: int, hidden_dim: int, dtype: str,
     return output_dir
 
 
+def compile_swiglu_decode_int4(embedding_dim: int, hidden_dim: int,
+                               num_aie_columns: int, output_dir: str,
+                               group_size: int = 32) -> str:
+    """Compile an IRON SwiGLUDecodeInt4 operator and stage artifacts (Phase 8.2).
+
+    Q4_0 weights are dequantized in-kernel on the gate, up, and down GEMVs;
+    SiLU + elementwise mul happen in bf16 between the gate/up paths. The
+    output xclbin chains two sub-kernels:
+      - swiglu_fused_int4   (dual_fused_dequant_gemv + silu + mul)
+      - swiglu_gemv_2_int4  (fused_dequant_gemv for down)
+
+    Output layout:
+        <output_dir>/combined.xclbin
+        <output_dir>/swiglu_fused_int4.insts
+        <output_dir>/swiglu_gemv_2_int4.insts
+    """
+    # Same divisibility rules as bf16 SwiGLU (per-column tile constraints).
+    validate_swiglu_decode_shapes(embedding_dim, hidden_dim, num_aie_columns)
+    if embedding_dim % group_size != 0:
+        raise ValueError(
+            f"embedding_dim={embedding_dim} must be divisible by "
+            f"group_size={group_size}"
+        )
+    if hidden_dim % group_size != 0:
+        raise ValueError(
+            f"hidden_dim={hidden_dim} must be divisible by group_size={group_size}"
+        )
+
+    actual_cols = get_device_cols(num_aie_columns)
+    if actual_cols != num_aie_columns:
+        raise ValueError(
+            f"Device column mismatch: requested {num_aie_columns}, current "
+            f"device reports {actual_cols}. Compile on the target device."
+        )
+
+    from iron.operators.swiglu_decode_int4.op import AIESwiGLUDecodeInt4
+
+    op = AIESwiGLUDecodeInt4(
+        embedding_dim=embedding_dim,
+        hidden_dim=hidden_dim,
+        num_aie_columns=num_aie_columns,
+        group_size=group_size,
+    )
+    op.compile()
+
+    _stage_swiglu_decode_int4(op, output_dir)
+    return output_dir
+
+
 def compile_swiglu_decode_int8(embedding_dim: int, hidden_dim: int,
                                num_aie_columns: int, output_dir: str,
                                group_size: int = 32) -> str:
@@ -1111,6 +1185,29 @@ def _stage_swiglu_decode_new(op, output_dir: str) -> None:
     shutil.copy2(str(gemv_2_insts_src), os.path.join(output_dir, "swiglu_gemv_2.insts"))
 
 
+def _stage_swiglu_decode_int4(op, output_dir: str) -> None:
+    """Stage AIESwiGLUDecodeInt4 artifacts into output_dir (Phase 8.2).
+
+    Output layout:
+        <output_dir>/combined.xclbin
+        <output_dir>/swiglu_fused_int4.insts
+        <output_dir>/swiglu_gemv_2_int4.insts
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    build_dir = op.context.build_dir
+
+    combined_src = build_dir / op.combined_xclbin.filename
+    shutil.copy2(str(combined_src), os.path.join(output_dir, "combined.xclbin"))
+
+    fused_insts_src = build_dir / op.fused_insts.filename
+    shutil.copy2(str(fused_insts_src),
+                 os.path.join(output_dir, "swiglu_fused_int4.insts"))
+
+    gemv_2_insts_src = build_dir / op.gemv_2_insts.filename
+    shutil.copy2(str(gemv_2_insts_src),
+                 os.path.join(output_dir, "swiglu_gemv_2_int4.insts"))
+
+
 def _stage_swiglu_prefill_new(op, output_dir: str) -> None:
     """Stage AIESwiGLUPrefill (IRON-windows) artifacts into output_dir.
 
@@ -1295,6 +1392,30 @@ def compile_swiglu_decode_int8_cached(embedding_dim: int, hidden_dim: int,
 
     output_dir = str(get_cache_dir() / key)
     compile_swiglu_decode_int8(
+        embedding_dim, hidden_dim, num_aie_columns, output_dir,
+        group_size=group_size,
+    )
+    return Path(output_dir)
+
+
+def compile_swiglu_decode_int4_cached(embedding_dim: int, hidden_dim: int,
+                                      num_aie_columns: int = 8,
+                                      group_size: int = 32) -> Path:
+    """Compile a SwiGLUDecodeInt4 operator with caching (Phase 8.2).
+
+    Returns path to the cache directory containing combined.xclbin + 2 insts
+    files (SWIGLU_DECODE_INT4_KERNELS).
+    """
+    key = swiglu_decode_int4_cache_key(
+        embedding_dim, hidden_dim, num_aie_columns, group_size=group_size
+    )
+
+    cached = get_cached_swiglu_dir(key, SWIGLU_DECODE_INT4_KERNELS)
+    if cached is not None:
+        return cached
+
+    output_dir = str(get_cache_dir() / key)
+    compile_swiglu_decode_int4(
         embedding_dim, hidden_dim, num_aie_columns, output_dir,
         group_size=group_size,
     )
@@ -2278,6 +2399,20 @@ def main():
     swdi_parser.add_argument("--out", type=str,
                              help="Output directory (default: cache)")
 
+    # SwiGLU decode INT4 subcommand (W4A16, Phase 8.2)
+    swd4_parser = subparsers.add_parser(
+        "swiglu-decode-int4",
+        help="Compile fused W4A16 SwiGLU FFN (INT4 weights + bf16 activations, "
+             "M=1 decode path; Phase 8.2)",
+    )
+    swd4_parser.add_argument("--embedding-dim", type=int, required=True)
+    swd4_parser.add_argument("--hidden-dim", type=int, required=True)
+    swd4_parser.add_argument("--num-aie-columns", type=int, default=8)
+    swd4_parser.add_argument("--group-size", type=int, default=32,
+                             help="Quantization group size (Q4_0 = 32)")
+    swd4_parser.add_argument("--out", type=str,
+                             help="Output directory (default: cache)")
+
     # SwiGLU fused INT8 subcommand (gate+up+silu+mul fused + standalone down GEMV)
     swfi_parser = subparsers.add_parser(
         "swiglu-fused-int8",
@@ -2555,6 +2690,21 @@ def main():
             )
         else:
             path = compile_swiglu_decode_int8_cached(
+                args.embedding_dim, args.hidden_dim,
+                args.num_aie_columns,
+                group_size=args.group_size,
+            )
+        if not args.quiet:
+            print(path)
+    elif args.op == "swiglu-decode-int4":
+        if args.out:
+            path = compile_swiglu_decode_int4(
+                args.embedding_dim, args.hidden_dim,
+                args.num_aie_columns, args.out,
+                group_size=args.group_size,
+            )
+        else:
+            path = compile_swiglu_decode_int4_cached(
                 args.embedding_dim, args.hidden_dim,
                 args.num_aie_columns,
                 group_size=args.group_size,
