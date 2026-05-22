@@ -12,7 +12,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <fstream>
+#include <functional>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -94,6 +96,14 @@ enum xdna_op_kind : int {
     XDNA_OP_SWIGLU_DECODE_INT4  = 11, // M==1 W4A16 fused SwiGLU FFN (Q4_0 weights, bf16 acts; Phase 8.2)
 };
 
+// Phase 9: per-entry input/output BO ring for async dispatch. Each call
+// to a dispatch fn picks the next slot (round-robin); the slot's previous
+// run is waited on (if any) before the new memcpy overwrites the input.
+// Q_max=4 covers ~1 attention-cycle worth of in-flight ops on Llama 3.2
+// 1B (q+k+v+o ≈ 4 dispatches). Memory cost per entry = 4 * (K + N) * 2
+// bytes, typical ~80KB.
+static constexpr int XDNA_PHASE9_RING_SIZE = 4;
+
 struct xdna_kernel_entry {
     xdna_op_kind  op_kind;
     xrt::xclbin   xclbin;
@@ -107,13 +117,91 @@ struct xdna_kernel_entry {
     // unique_ptr defers construction until first use (needs kernel group_id).
     // GEMM: a_bo = activation (M*K bf16), c_bo = output (M*N bf16)
     // GEMV: a_bo = vector activation (K bf16), c_bo = output (N bf16)
+    //
+    // LEGACY single-slot BOs. Kept for non-Phase-9 dispatch paths (bf16
+    // GEMV/GEMM, INT4 prefill, etc.) that still use the synchronous
+    // wait-per-op pattern. Phase 9 INT4 GEMV dispatch uses the ring below.
     std::unique_ptr<xrt::bo> a_bo;
     std::unique_ptr<xrt::bo> c_bo;
+    // Phase 9 per-call BO ring. Indexed 0..XDNA_PHASE9_RING_SIZE-1.
+    // The ring's per-slot run + deferred lambda live in the context-level
+    // inflight tracker (xdna_inflight_tracker), keyed by slot_dst_data[i].
+    // slot_active[i] is a back-pressure guard: dispatch picks next_slot,
+    // and if active, calls inflight.wait_for(slot_dst_data[slot]) so the
+    // previous slot owner's deferred completion (bias compensation +
+    // write to tensor->data) runs BEFORE the new memcpy overwrites the
+    // input BO. The lambda clears slot_active[i] as a side effect.
+    std::unique_ptr<xrt::bo> a_bo_ring[XDNA_PHASE9_RING_SIZE];
+    std::unique_ptr<xrt::bo> c_bo_ring[XDNA_PHASE9_RING_SIZE];
+    bool                     slot_active[XDNA_PHASE9_RING_SIZE] = {};
+    void *                   slot_dst_data[XDNA_PHASE9_RING_SIZE] = {};
+    int                      next_slot = 0;
     // Cache of per-weight-pointer bf16 weight buffers keyed by src0->data.
     // Weights are immutable after load, so we convert+DMA once and reuse.
     // GEMM: transposed to [K,N] row-major. GEMV: native [N,K] row-major.
     std::unordered_map<const void *, xrt::bo> b_bo_cache;
     std::unique_ptr<std::mutex> b_bo_mutex = std::make_unique<std::mutex>();
+};
+
+// Phase 9: backend-wide tracker of in-flight async dispatches. Each
+// entry holds the run that's executing on the NPU and a deferred lambda
+// that completes the operation host-side (e.g. INT4 GEMV's bias
+// compensation). The dispatch function returns immediately after
+// run.start() and pushes here; the next consumer of the output tensor
+// (or graph_compute end) waits + runs the deferred work.
+//
+// dst_data is the ggml tensor->data pointer the run writes to -- used
+// to match wait_for(consumer_input) requests.
+struct xdna_inflight_entry {
+    xrt::run                       run;
+    void *                         dst_data = nullptr;
+    std::function<void()>          deferred;  // bias compensation, etc.
+};
+
+struct xdna_inflight_tracker {
+    std::deque<xdna_inflight_entry> q;
+    size_t Q_max = XDNA_PHASE9_RING_SIZE;
+
+    // Wait until queue depth is below Q_max (pop+complete oldest if not),
+    // then enqueue the new entry.
+    void submit(xrt::run && run, void * dst_data,
+                std::function<void()> deferred) {
+        while (q.size() >= Q_max) {
+            pop_front_complete();
+        }
+        q.push_back(xdna_inflight_entry{std::move(run), dst_data,
+                                         std::move(deferred)});
+    }
+
+    // Pop and complete entries that produce data_ptr. Typically called
+    // before a consumer reads tensor->data on host.
+    void wait_for(const void * data_ptr) {
+        // The producer may not be at the head, but in practice ggml
+        // graphs run in topological order so the latest write to a
+        // given pointer is the most recent producer in q. Walk forward.
+        for (auto it = q.begin(); it != q.end(); ) {
+            if (it->dst_data == data_ptr) {
+                it->run.wait2();
+                if (it->deferred) it->deferred();
+                it = q.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    // Drain all pending entries. Called at the end of graph_compute.
+    void drain() {
+        while (!q.empty()) pop_front_complete();
+    }
+
+private:
+    void pop_front_complete() {
+        auto & e = q.front();
+        e.run.wait2();
+        if (e.deferred) e.deferred();
+        q.pop_front();
+    }
 };
 
 // ============================================================================
@@ -641,7 +729,21 @@ struct ggml_backend_xdna_context {
     // Our buffers are plain host RAM so CPU can compute on them directly.
     ggml_backend_t cpu_backend;
 
+    // Phase 9 async dispatch state. The tracker holds in-flight runs +
+    // their deferred host-side completion lambdas; consumers call
+    // inflight.wait_for(tensor->data) before reading, and graph_compute
+    // calls drain() at end-of-graph. Q_max is read from the env var
+    // XDNA_PHASE9_QMAX (default 4) at backend init.
+    xdna_inflight_tracker inflight;
+
     ggml_backend_xdna_context() : device_valid(false), cpu_backend(nullptr) {
+        // Phase 9: configurable async pipeline depth.
+        if (const char * qmax_env = getenv("XDNA_PHASE9_QMAX")) {
+            int qmax = std::atoi(qmax_env);
+            if (qmax >= 1 && qmax <= 32) {
+                inflight.Q_max = (size_t)qmax;
+            }
+        }
         // Cache directory
         const char * cache_env = getenv("GGML_XDNA_CACHE_DIR");
         if (cache_env) {
@@ -1830,27 +1932,45 @@ static void ggml_backend_xdna_mul_mat_gemv_int4(ggml_backend_xdna_context * ctx,
             is_q4_K ? (size_t)N * (size_t)num_groups_per_row * 2 : 0;
         const size_t packed_total = per_tile_total + min_section_bytes;
 
-        // Lazy alloc input/output BOs (per AIEFusedDequantGEMV arg_spec:
-        // group_id 3 = packed weights, 4 = bf16 vector, 5 = bf16 output).
-        if (!entry->a_bo) {
-            entry->a_bo = std::make_unique<xrt::bo>(
+        // Phase 9: pick next slot in the per-entry round-robin BO ring.
+        // If the slot's previous run is still in flight, complete it via
+        // ctx->inflight.wait_for(slot_dst_data[slot]) so the deferred
+        // bias compensation (which writes to the OLD dst_data) runs
+        // BEFORE we overwrite a_bo with the new input. The deferred
+        // lambda clears slot_active[slot] as a side effect.
+        const int slot = entry->next_slot;
+        entry->next_slot = (slot + 1) % XDNA_PHASE9_RING_SIZE;
+        if (entry->slot_active[slot]) {
+            ctx->inflight.wait_for(entry->slot_dst_data[slot]);
+        }
+        if (!entry->a_bo_ring[slot]) {
+            entry->a_bo_ring[slot] = std::make_unique<xrt::bo>(
                 ctx->device, vec_bytes, xrt::bo::flags::host_only,
                 entry->kernel.group_id(4));
         }
-        if (!entry->c_bo) {
-            entry->c_bo = std::make_unique<xrt::bo>(
+        if (!entry->c_bo_ring[slot]) {
+            entry->c_bo_ring[slot] = std::make_unique<xrt::bo>(
                 ctx->device, out_bytes, xrt::bo::flags::host_only,
                 entry->kernel.group_id(5));
         }
+        xrt::bo * a_bo_ptr = entry->a_bo_ring[slot].get();
+        xrt::bo * c_bo_ptr = entry->c_bo_ring[slot].get();
+
+        // Phase 9: if src1 is produced by an earlier async dispatch, its
+        // deferred bias compensation must finalize tensor->data before we
+        // memcpy it into the input BO. wait_for is a no-op when there are
+        // no inflight entries with matching dst_data (sync mode, or src1
+        // produced by a sync op, or upstream already drained).
+        ctx->inflight.wait_for(src1->data);
 
         // Write input vector (per-call, changes per token).
         if (src1->type == GGML_TYPE_F32) {
             f32_to_bf16((const float *)src1->data,
-                        (uint16_t *)entry->a_bo->map<void*>(), (size_t)K);
+                        (uint16_t *)a_bo_ptr->map<void*>(), (size_t)K);
         } else {
-            memcpy(entry->a_bo->map<void*>(), src1->data, vec_bytes);
+            memcpy(a_bo_ptr->map<void*>(), src1->data, vec_bytes);
         }
-        entry->a_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        a_bo_ptr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
         // Cached packed weight (keyed by src0->data, immutable after model load).
         xrt::bo * weight_bo_ptr = nullptr;
@@ -1884,13 +2004,91 @@ static void ggml_backend_xdna_mul_mat_gemv_int4(ggml_backend_xdna_context * ctx,
 
         // Dispatch — same arg order as bf16 GEMV (opcode, insts, n_insts, mat, vec, out).
         auto run = entry->kernel(3, entry->insts_bo, (uint32_t)entry->insts.size(),
-                                  *weight_bo_ptr, *entry->a_bo, *entry->c_bo);
+                                  *weight_bo_ptr, *a_bo_ptr, *c_bo_ptr);
+
+        // Phase 9 async path: opt-in via XDNA_ENABLE_PHASE9=1. Capture all
+        // state needed for bias compensation into a deferred lambda + push
+        // to the context-level inflight tracker. The lambda runs at one of:
+        //   (a) end of graph_compute via ctx->inflight.drain()
+        //   (b) next dispatch picking this slot (ring reuse barrier)
+        //   (c) downstream consumer reading dst->data via wait_for(...)
+        // It writes the final bias-corrected float values into dst->data and
+        // clears slot_active[slot] as a side effect.
+        static const bool phase9_async_enabled = xdna_env_enabled("XDNA_ENABLE_PHASE9");
+        if (phase9_async_enabled) {
+            entry->slot_active[slot] = true;
+            entry->slot_dst_data[slot] = dst->data;
+            auto deferred = [entry, slot, a_bo_ptr, c_bo_ptr, weight_bo_ptr,
+                             K, N, num_groups_per_row, m_input, group_size,
+                             rows_per_col, tiles_per_col,
+                             packed_bytes_per_tile, per_tile_total,
+                             is_q4_K, dst_data = dst->data]() {
+                c_bo_ptr->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+                const uint16_t * x_bf16 = (const uint16_t *)a_bo_ptr->map<void*>();
+                std::vector<float> S((size_t)num_groups_per_row, 0.0f);
+                for (int64_t g = 0; g < num_groups_per_row; g++) {
+                    float sum = 0.0f;
+                    for (int k = 0; k < group_size; k++) {
+                        uint32_t bits = ((uint32_t)x_bf16[g * group_size + k]) << 16;
+                        float v;
+                        memcpy(&v, &bits, sizeof(v));
+                        sum += v;
+                    }
+                    S[(size_t)g] = sum;
+                }
+                const uint8_t * packed = (const uint8_t *)weight_bo_ptr->map<void*>();
+                const uint16_t * out_bf16 = (const uint16_t *)c_bo_ptr->map<void*>();
+                float * dst_f32 = (float *)dst_data;
+                for (int64_t i = 0; i < N; i++) {
+                    const int64_t col = i / rows_per_col;
+                    const int64_t local_row = i % rows_per_col;
+                    const int64_t tile_idx = local_row / m_input;
+                    const int64_t r_in_tile = local_row % m_input;
+                    const int64_t flat_tile = col * tiles_per_col + tile_idx;
+                    const size_t tile_offset = (size_t)flat_tile * packed_bytes_per_tile;
+                    const size_t scale_region_start =
+                        tile_offset + (size_t)m_input * (size_t)K / 2;
+                    const uint16_t * sf_row =
+                        (const uint16_t *)(packed + scale_region_start
+                            + (size_t)r_in_tile * (size_t)num_groups_per_row * 2);
+                    float bias = 0.0f;
+                    if (is_q4_K) {
+                        const uint16_t * mn_row =
+                            (const uint16_t *)(packed + per_tile_total
+                                + (size_t)i * (size_t)num_groups_per_row * 2);
+                        for (int64_t g = 0; g < num_groups_per_row; g++) {
+                            uint32_t bits = ((uint32_t)mn_row[g]) << 16;
+                            float mn;
+                            memcpy(&mn, &bits, sizeof(mn));
+                            bias += mn * S[(size_t)g];
+                        }
+                    } else {
+                        for (int64_t g = 0; g < num_groups_per_row; g++) {
+                            uint32_t bits = ((uint32_t)sf_row[g]) << 16;
+                            float sf;
+                            memcpy(&sf, &bits, sizeof(sf));
+                            bias += sf * S[(size_t)g];
+                        }
+                        bias *= 8.0f;
+                    }
+                    uint32_t out_bits = ((uint32_t)out_bf16[i]) << 16;
+                    float out_f;
+                    memcpy(&out_f, &out_bits, sizeof(out_f));
+                    dst_f32[i] = out_f - bias;
+                }
+                entry->slot_active[slot] = false;
+            };
+            ctx->inflight.submit(std::move(run), dst->data, std::move(deferred));
+            return;  // async path complete; bias work deferred
+        }
+
+        // Sync path (Phase 9 disabled). Same as Step 2: wait + inline bias.
         run.wait();
-        entry->c_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        c_bo_ptr->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
 
         // ---- Host-side bias compensation -----------------------------------
         // S[g] = sum_{k in group g}(x[k])  — one pass over input.
-        const uint16_t * x_bf16 = (const uint16_t *)entry->a_bo->map<void*>();
+        const uint16_t * x_bf16 = (const uint16_t *)a_bo_ptr->map<void*>();
         std::vector<float> S((size_t)num_groups_per_row, 0.0f);
         for (int64_t g = 0; g < num_groups_per_row; g++) {
             float sum = 0.0f;
@@ -1906,7 +2104,7 @@ static void ggml_backend_xdna_mul_mat_gemv_int4(ggml_backend_xdna_context * ctx,
         // Apply bias[i] = 8 * sum_g(scale[i,g] * S[g]) to each output row.
         // Scales live at packed_offset + K/2 within each tile.
         const uint8_t * packed = (const uint8_t *)weight_bo_ptr->map<void*>();
-        const uint16_t * out_bf16 = (const uint16_t *)entry->c_bo->map<void*>();
+        const uint16_t * out_bf16 = (const uint16_t *)c_bo_ptr->map<void*>();
         float * dst_f32 = (float *)dst->data;
 
         for (int64_t i = 0; i < N; i++) {
@@ -11156,6 +11354,10 @@ static ggml_status xdna_delegate_range(ggml_backend_xdna_context * ctx,
         GGML_LOG_ERROR("ggml-xdna: CPU backend not initialized, cannot delegate\n");
         return GGML_STATUS_FAILED;
     }
+    // Phase 9: CPU ops read tensor->data directly. Drain pending async
+    // dispatches so their deferred bias compensation lands in tensor->data
+    // BEFORE the CPU backend runs. No-op when XDNA_ENABLE_PHASE9=0.
+    ctx->inflight.drain();
     struct ggml_cgraph sub = xdna_graph_view(cgraph, i0, i1);
     return ggml_backend_graph_compute(ctx->cpu_backend, &sub);
 }
@@ -13106,6 +13308,11 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
 
     // Print per-phase attention-prefill profile (no-op when gate off / no samples).
     xdna_attn_prof_print();
+
+    // Phase 9: drain all async dispatches before returning. Any deferred
+    // bias compensation lambdas execute here, so dst tensor->data buffers
+    // are valid when the caller reads them. No-op when XDNA_ENABLE_PHASE9=0.
+    ctx->inflight.drain();
 
     return GGML_STATUS_SUCCESS;
 
