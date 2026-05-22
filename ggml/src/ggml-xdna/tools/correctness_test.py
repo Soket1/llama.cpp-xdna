@@ -52,6 +52,7 @@ MODEL     = REPO_ROOT / "models" / "llama-3.2-1b-instruct-BF16.gguf"
 # INT4 work lands, tighten the tolerances and expand to NPU dispatch.
 MODEL_Q4_0   = REPO_ROOT / "models" / "llama-3.2-1b-instruct-Q4_0.gguf"
 MODEL_Q4_K_M = REPO_ROOT / "models" / "llama-3.2-1b-instruct-Q4_K_M.gguf"
+MODEL_QWEN35_9B_Q4_0 = REPO_ROOT / "models" / "Qwen3.5-9B-Q4_0.gguf"
 
 # Driver/SDK paths -- adjust if your install differs.
 BASE_ENV: dict[str, str] = {
@@ -155,6 +156,22 @@ PRESETS: dict[str, dict[str, str]] = {
         "XDNA_ENABLE_DECODE_BATCH":      "1",
         "XDNA_ENABLE_TRANSFORMER_BLOCK": "1",
         "XDNA_ENABLE_FLOWKV_DECODE":     "1",
+        "XDNA_ENABLE_RMS_NORM":          "0",
+        "XDNA_ENABLE_GEMV_INT4":         "1",
+    },
+    "npu_int4_gemv_only": {
+        # INT4 GEMV-only preset for models with NON-Llama attention
+        # architecture (e.g. Qwen3.5 with head_dim=256, M-RoPE, SWA).
+        # Disables every attention/FFN-fusion op (which all assume
+        # head_dim=64) and keeps ONLY the pure matmul INT4 path.
+        # Attention runs on CPU via ggml fallback; INT4 GEMV accelerates
+        # FFN/QKV-proj matmuls without architecture assumptions.
+        "XDNA_ENABLE_GEMV":              "0",
+        "XDNA_ENABLE_SWIGLU":            "0",
+        "XDNA_ENABLE_QKV":               "0",
+        "XDNA_ENABLE_DECODE_BATCH":      "0",
+        "XDNA_ENABLE_TRANSFORMER_BLOCK": "0",
+        "XDNA_ENABLE_FLOWKV_DECODE":     "0",
         "XDNA_ENABLE_RMS_NORM":          "0",
         "XDNA_ENABLE_GEMV_INT4":         "1",
     },
@@ -425,6 +442,34 @@ TESTS: list[Test] = [
         variants=["npu_int4_v2"],
         min_prefix_match=1,
         description="V2 + FlowKV + chat-mode composition. Should match the v1 chat test byte-for-byte.",
+    ),
+    # ---- Qwen3.5-9B-Q4_0 -----------------------------------------------
+    # Qwen3.5-9B uses head_dim=256, M-RoPE [11,11,10,0], and SWA with
+    # full_attention_interval=4. Our NPU attention/FFN fusion ops hardcode
+    # head_dim==64 in 9 places (FlowKV, attn_prefill, decode_batch, etc).
+    # npu_int4 (full) WILL produce garbage on Qwen; npu_int4_gemv_only
+    # restricts to pure matmul (architecture-agnostic) and works correctly.
+    # Both Qwen tests use the CPU run as their baseline (printed via -v).
+    Test(
+        name="qwen35_ml_npu_full",
+        prompt="What is machine learning? Answer in 3 sentences.",
+        n_predict=200,
+        mode="single-turn",
+        model=MODEL_QWEN35_9B_Q4_0,
+        variants=["npu_int4"],
+        min_prefix_match=50,
+        expected_fail={"npu_int4"},
+        description="Qwen3.5-9B with full NPU INT4 preset. EXPECTED FAIL: head_dim=256 vs hardcoded 64 in attention dispatch paths produces garbage logits.",
+    ),
+    Test(
+        name="qwen35_ml_npu_gemv_only",
+        prompt="What is machine learning? Answer in 3 sentences.",
+        n_predict=200,
+        mode="single-turn",
+        model=MODEL_QWEN35_9B_Q4_0,
+        variants=["npu_int4_gemv_only"],
+        min_prefix_match=1,
+        description="Qwen3.5-9B with NPU restricted to pure matmul (INT4 GEMV only). Attention runs on CPU; INT4 GEMV accelerates FFN/QKV-proj matmuls. Should match CPU baseline.",
     ),
 ]
 
@@ -710,6 +755,22 @@ def build_bench_configs() -> list[BenchConfig]:
     ]
 
 
+def build_bench_configs_qwen() -> list[BenchConfig]:
+    """Bench configs for Qwen3.5-9B-Q4_0.
+
+    Qwen3.5-9B uses head_dim=256 (vs 64 for Llama), M-RoPE, and SWA --
+    none of our attention/FFN-fusion NPU ops support these (every relevant
+    matcher hardcodes head_dim==64). The full npu_int4 preset would
+    dispatch garbage through those paths; npu_int4_gemv_only restricts
+    NPU usage to pure matmul (architecture-agnostic).
+    """
+    return [
+        BenchConfig(label="Qwen3.5-9B CPU Q4_0",            preset="cpu_baseline",       model=MODEL_QWEN35_9B_Q4_0),
+        BenchConfig(label="Qwen3.5-9B NPU INT4 (full)",     preset="npu_int4",           model=MODEL_QWEN35_9B_Q4_0),
+        BenchConfig(label="Qwen3.5-9B NPU INT4 GEMV-only",  preset="npu_int4_gemv_only", model=MODEL_QWEN35_9B_Q4_0),
+    ]
+
+
 def run_bench_one(cfg: BenchConfig, mode: str) -> tuple[float, float]:
     """Run llama-cli once with cfg in mode={'single','chat'},
     return (decode_tps, prompt_tps). Raises on timeout or non-zero exit."""
@@ -734,7 +795,7 @@ def run_bench_one(cfg: BenchConfig, mode: str) -> tuple[float, float]:
     else:
         raise ValueError(f"unknown bench mode: {mode}")
 
-    timeout = 180 + BENCH_N_PREDICT * 4    # generous: first run may compile xclbins
+    timeout = 300 + BENCH_N_PREDICT * 8    # 9B needs more time
     result = subprocess.run(
         args, env=env, capture_output=True, text=True,
         input=stdin_input, timeout=timeout, errors="replace",
@@ -758,13 +819,13 @@ def run_bench_one(cfg: BenchConfig, mode: str) -> tuple[float, float]:
     return decode_tps, prompt_tps
 
 
-def run_bench(mode: str) -> int:
+def run_bench(mode: str, model: str = "llama") -> int:
     if mode == "both":
-        rc1 = run_bench("single")
-        rc2 = run_bench("chat")
+        rc1 = run_bench("single", model)
+        rc2 = run_bench("chat",   model)
         return rc1 or rc2
 
-    configs = build_bench_configs()
+    configs = build_bench_configs_qwen() if model == "qwen" else build_bench_configs()
     missing = [c.model for c in configs if not c.model.exists()]
     if missing:
         for m in missing:
@@ -818,6 +879,8 @@ def main():
                     help="Run perf benchmark across CPU/NPU bf16/NPU INT4 presets")
     ap.add_argument("--bench-mode", choices=["single", "chat", "both"], default="single",
                     help="Bench mode: single-turn, chat (-cnv), or both (default: single)")
+    ap.add_argument("--model", choices=["llama", "qwen"], default="llama",
+                    help="Bench model: llama (1B Q4_0, default) or qwen (3.5-9B Q4_0)")
     args = ap.parse_args()
 
     if args.list:
@@ -834,7 +897,7 @@ def main():
         return 2
 
     if args.bench:
-        return run_bench(args.bench_mode)
+        return run_bench(args.bench_mode, args.model)
     # Check all model files referenced by selected tests exist.
     tests = TESTS
     if args.test_name:
