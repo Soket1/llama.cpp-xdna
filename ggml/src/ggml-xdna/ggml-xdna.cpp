@@ -41,6 +41,15 @@
 // Returns true when the env var is set AND is not "0", "OFF", or "off".
 static bool xdna_env_enabled(const char * name);
 
+// FlowKV / attention kernels are compiled per-head_dim via -DHEAD_DIM=N
+// (flowkv.cc dot-product unroll + static buffer sizing). Supported set:
+// 64 (Llama 3.2 1B), 128 (Llama 3.1 8B, 3.2 3B, Mistral 7B), 256
+// (Gemma 3, Qwen 3.5 -- subject to other model-specific blockers like
+// sliding window attention and M-RoPE). Used by matcher rejections.
+static inline bool xdna_head_dim_supported(int64_t head_dim) {
+    return head_dim == 64 || head_dim == 128 || head_dim == 256;
+}
+
 // Return the Python interpreter command for invoking compile.py.
 // Honours GGML_XDNA_PYTHON_CMD env var; defaults to "python" (works on
 // Windows and most Linux venvs).  Prefer this over hardcoding "python3".
@@ -5826,7 +5835,7 @@ static bool ggml_backend_xdna_flowkv_per_head(
     int chunk_size = 32;
     int num_cols = 1;
 
-    if (head_dim != 64) return false;
+    if (!xdna_head_dim_supported(head_dim)) return false;
     if (seq_len % chunk_size != 0) return false;
 
     // Detect batched mode: all heads reference the same qk_idx.
@@ -7464,7 +7473,7 @@ static void attn_prefill_bulk_prewarm(ggml_backend_xdna_context * ctx,
     for (const auto & m : matches) {
         const int64_t seq_bucket = xdna_select_attention_prefill_bucket(m.seq_len);
         if (seq_bucket < 0) continue;
-        if (m.head_dim != 64) continue;
+        if (!xdna_head_dim_supported(m.head_dim)) continue;
         if (m.embed_dim <= 0 || m.embed_dim % 8 != 0) continue;
         if ((m.num_kv_heads * m.head_dim) % 64 != 0) continue;
         if (m.num_heads % m.num_kv_heads != 0) continue;
@@ -7831,7 +7840,7 @@ static bool ggml_backend_xdna_attention_prefill(ggml_backend_xdna_context * ctx,
                                                 const xdna_attention_match & m,
                                                 struct ggml_cgraph * cgraph) {
     if (!ctx->device_valid) return false;
-    if (m.head_dim != 64) return false;
+    if (!xdna_head_dim_supported(m.head_dim)) return false;
     if (m.embed_dim <= 0 || m.embed_dim % 8 != 0) return false;
     if ((m.num_kv_heads * m.head_dim) % 64 != 0) return false;
     if (m.num_heads % m.num_kv_heads != 0) return false;
@@ -9135,7 +9144,7 @@ static void tblock_prefill_bulk_prewarm(ggml_backend_xdna_context * ctx,
         const auto & m = tm.attn;
         const int64_t seq_bucket = xdna_select_attention_prefill_bucket(m.seq_len);
         if (seq_bucket < 0) continue;
-        if (m.head_dim != 64) continue;
+        if (!xdna_head_dim_supported(m.head_dim)) continue;
         if (m.embed_dim <= 0 || m.embed_dim % 8 != 0) continue;
         if ((m.num_kv_heads * m.head_dim) % 64 != 0) continue;
         if (m.num_heads % m.num_kv_heads != 0) continue;
@@ -9310,7 +9319,7 @@ static bool ggml_backend_xdna_transformer_block_prefill(
         struct ggml_cgraph * cgraph) {
     if (!ctx->device_valid) return false;
     const auto & m = tm.attn;
-    if (m.head_dim != 64) return false;
+    if (!xdna_head_dim_supported(m.head_dim)) return false;
     if (m.embed_dim <= 0 || m.embed_dim % 8 != 0) return false;
     if ((m.num_kv_heads * m.head_dim) % 64 != 0) return false;
     if (m.num_heads % m.num_kv_heads != 0) return false;
@@ -10377,7 +10386,7 @@ static void tblock_fused_bulk_prewarm(ggml_backend_xdna_context * ctx,
         const auto & m = head.attn;
         const int64_t seq_bucket = xdna_select_attention_prefill_bucket(m.seq_len);
         if (seq_bucket < 0) continue;
-        if (m.head_dim != 64) continue;
+        if (!xdna_head_dim_supported(m.head_dim)) continue;
         if (m.embed_dim <= 0 || m.embed_dim % 8 != 0) continue;
         if ((m.num_kv_heads * m.head_dim) % 64 != 0) continue;
         if (m.num_heads % m.num_kv_heads != 0) continue;
@@ -10446,7 +10455,7 @@ static void tblock_fused_bulk_prewarm(ggml_backend_xdna_context * ctx,
         const auto & m = tm.attn;
         const int64_t seq_bucket = xdna_select_attention_prefill_bucket(m.seq_len);
         if (seq_bucket < 0) continue;
-        if (m.head_dim != 64) continue;
+        if (!xdna_head_dim_supported(m.head_dim)) continue;
         if (m.embed_dim <= 0 || m.embed_dim % 8 != 0) continue;
         if ((m.num_kv_heads * m.head_dim) % 64 != 0) continue;
         if (m.num_heads % m.num_kv_heads != 0) continue;
@@ -10577,7 +10586,7 @@ static bool ggml_backend_xdna_transformer_block_prefill_fused(
         struct ggml_cgraph * cgraph) {
     if (!ctx->device_valid) return false;
     const auto & m = tm.attn;
-    if (m.head_dim != 64) return false;
+    if (!xdna_head_dim_supported(m.head_dim)) return false;
     if (m.embed_dim <= 0 || m.embed_dim % 8 != 0) return false;
     if ((m.num_kv_heads * m.head_dim) % 64 != 0) return false;
     if (m.num_heads % m.num_kv_heads != 0) return false;
@@ -11728,29 +11737,41 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                 //   V cache perm: ne = [seq_len, head_dim, kv_heads] — ne[0] > head_dim, ne[2] > 1
                 //   Q rotated:    ne = [head_dim, 1, q_heads]       — ne[1] == 1
                 if (flowkv_decode_enabled && q_mm->src[1]->ne[1] == 1) {  // M=1 decode only
+                    // Find Q perm first to derive head_dim from its ne[0],
+                    // then match K/V perms by that hd. Q perm is unique:
+                    // ne[1] == 1 (decode batch) AND ne[2] > 1 (heads).
                     struct ggml_tensor * k_perm = nullptr;
                     struct ggml_tensor * v_perm = nullptr;
                     struct ggml_tensor * q_perm = nullptr;
-                    const int64_t hd = 64;  // FlowKV kernel requires head_dim == 64
+                    int64_t hd = 0;
                     for (int si = i + 1; si < n && si < i + 30; si++) {
                         struct ggml_tensor * nd = cgraph->nodes[si];
                         if (nd->op != GGML_OP_PERMUTE) continue;
-                        if (!k_perm && nd->ne[0] == hd && nd->ne[1] > hd && nd->ne[2] > 1) {
-                            k_perm = nd;  // [64, seq_len, kv_heads]
-                        } else if (!v_perm && nd->ne[0] > hd && nd->ne[1] == hd && nd->ne[2] > 1) {
-                            v_perm = nd;  // [seq_len, 64, kv_heads]
-                        } else if (!q_perm && nd->ne[1] == 1 && nd->ne[2] > 1) {
-                            q_perm = nd;  // [64, 1, q_heads]
+                        if (nd->ne[1] == 1 && nd->ne[2] > 1) {
+                            q_perm = nd;             // [head_dim, 1, q_heads]
+                            hd = q_perm->ne[0];
+                            break;
+                        }
+                    }
+                    if (q_perm && xdna_head_dim_supported(hd)) {
+                        for (int si = i + 1; si < n && si < i + 30; si++) {
+                            struct ggml_tensor * nd = cgraph->nodes[si];
+                            if (nd->op != GGML_OP_PERMUTE) continue;
+                            if (!k_perm && nd->ne[0] == hd && nd->ne[1] > hd && nd->ne[2] > 1) {
+                                k_perm = nd;          // [hd, seq_len, kv_heads]
+                            } else if (!v_perm && nd->ne[0] > hd && nd->ne[1] == hd && nd->ne[2] > 1) {
+                                v_perm = nd;          // [seq_len, hd, kv_heads]
+                            }
                         }
                     }
                     if (k_perm && v_perm && q_perm) {
                         flowkv_poc_k_perm = k_perm;
                         flowkv_poc_v_perm = v_perm;
                         flowkv_poc_q_perm = q_perm;
-                        flowkv_poc_head_dim = q_perm->ne[0];       // 64
+                        flowkv_poc_head_dim = q_perm->ne[0];       // 64/128/256
                         flowkv_poc_seq_len = k_perm->ne[1];        // seq_len
-                        flowkv_poc_num_kv_heads = k_perm->ne[2];   // 8
-                        flowkv_poc_num_q_heads = q_perm->ne[2];    // 32
+                        flowkv_poc_num_kv_heads = k_perm->ne[2];
+                        flowkv_poc_num_q_heads = q_perm->ne[2];
                         flowkv_poc_valid = true;
                     }
                 }
