@@ -36,6 +36,17 @@ if (XRT_INCLUDE_DIR AND XRT_COREUTIL_LIB)
     else()
         target_compile_features(ggml-xdna PRIVATE cxx_std_17)
     endif()
+
+    # Phase 9 Day 1 spike: standalone XRT async-dispatch benchmark.
+    # Not part of the backend; links against XRT directly.
+    add_executable(xrt_async_spike tools/xrt_async_spike.cpp)
+    target_include_directories(xrt_async_spike SYSTEM PRIVATE ${XRT_INCLUDE_DIR})
+    target_link_libraries(xrt_async_spike PRIVATE ${XRT_COREUTIL_LIB})
+    if (MSVC)
+        target_compile_options(xrt_async_spike PRIVATE /std:c++17 /Zc:__cplusplus)
+    else()
+        target_compile_features(xrt_async_spike PRIVATE cxx_std_17)
+    endif()
 else()
     message(FATAL_ERROR "XRT not found. Install AMD XRT and source /opt/xilinx/xrt/setup.sh\n"
                         "  XRT_INCLUDE_DIR: ${XRT_INCLUDE_DIR}\n"
