@@ -741,14 +741,16 @@ static std::string make_cache_key(xdna_op_kind op_kind,
         // dtype_in is informational only (kernel is fixed uint4 weights +
         // bf16 acts + bf16 out).
         //
-        // V2 path (XDNA_ENABLE_GEMV_INT4_V2=1) uses the PR #101 optimized
-        // kernel: per-shape compile-time DIM_K/GROUP_SIZE + double-pump +
-        // AIE pipelining hints. ~4x faster on the dominant shapes. The
-        // packed buffer layout and dispatch semantics are identical, so
-        // mul_mat_gemv_int4 can transparently route to either v1 or v2
+        // V2 path (default, opt-out via XDNA_DISABLE_GEMV_INT4_V2=1) uses
+        // the PR #101 optimized kernel: per-shape compile-time
+        // DIM_K/GROUP_SIZE + double-pump + AIE pipelining hints. Measured
+        // ~4× faster per-op and ~1.65× end-to-end on Llama 3.2 1B Q4_0
+        // vs v1; INT4 finally beats NPU bf16 throughput. The packed
+        // buffer layout and dispatch semantics are identical, so
+        // mul_mat_gemv_int4 transparently routes to either v1 or v2
         // by switching the cache key here + the compile cmd below.
-        static const bool v2_enabled = getenv("XDNA_ENABLE_GEMV_INT4_V2") != NULL;
-        if (v2_enabled) {
+        static const bool v2_disabled = getenv("XDNA_DISABLE_GEMV_INT4_V2") != NULL;
+        if (!v2_disabled) {
             snprintf(buf, sizeof(buf), "gemv_int4_v2_K%lld_N%lld_%dcol_g32",
                      (long long)K, (long long)N, num_cols);
         } else {
@@ -1263,13 +1265,13 @@ static bool ensure_compiled(ggml_backend_xdna_context * ctx,
                       (long long)K, (long long)N);
     } else if (op_kind == XDNA_OP_GEMV_INT4) {
         // INT4 fused-dequant GEMV: group_size hard-coded to 32 (Q4_0 block).
-        // V1 uses the runtime-parameterized kernel; v2 (opt-in via env)
-        // uses the per-shape compile-time DIM_K+GROUP_SIZE kernel from
-        // amd/IRON PR #101 -- ~4x faster on the dominant FFN shapes.
-        // Cache key already disambiguates (see make_cache_key above) so
-        // v1 and v2 xclbins coexist in the cache directory.
-        const bool v2 = getenv("XDNA_ENABLE_GEMV_INT4_V2") != NULL;
-        const char * subcmd = v2 ? "fused-dequant-gemv-v2" : "fused-dequant-gemv";
+        // V2 (default) uses the per-shape compile-time DIM_K+GROUP_SIZE
+        // kernel from amd/IRON PR #101 -- ~4x faster on the dominant FFN
+        // shapes. V1 is reachable via XDNA_DISABLE_GEMV_INT4_V2=1 for
+        // regression fallback. Cache key already disambiguates (see
+        // make_cache_key above) so v1 and v2 xclbins coexist.
+        const bool v2_disabled = getenv("XDNA_DISABLE_GEMV_INT4_V2") != NULL;
+        const char * subcmd = v2_disabled ? "fused-dequant-gemv" : "fused-dequant-gemv-v2";
         snprintf(cmd, sizeof(cmd),
                  "%s \"%s\" --quiet %s --N %lld --K %lld "
                  "--num-aie-columns %d --group-size 32 --out \"%s\"%s",
@@ -1278,7 +1280,7 @@ static bool ensure_compiled(ggml_backend_xdna_context * ctx,
                  num_cols,
                  xclbin_path.c_str(), xdna_null_redirect());
         fprintf(stderr, "ggml-xdna: compiling INT4 GEMV %s K=%lld N=%lld (first run, will be cached)...\n",
-                      v2 ? "v2" : "v1", (long long)K, (long long)N);
+                      v2_disabled ? "v1" : "v2", (long long)K, (long long)N);
     } else {
         // [INT8 GEMM] Use separate dtype_out when provided (e.g. "i32" for i8 input).
         const char * out_dtype = dtype_out ? dtype_out : dtype_in;

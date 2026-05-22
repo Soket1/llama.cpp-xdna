@@ -112,8 +112,10 @@ PRESETS: dict[str, dict[str, str]] = {
         "XDNA_ENABLE_RMS_NORM":          "1",
     },
     "npu_int4": {
-        # Chat-safe baseline + Q4_0 fused INT4 dequant-GEMV (Priority 8.1).
-        # Use with MODEL_Q4_0 / MODEL_Q4_K_M tests; bf16 models ignore the flag.
+        # Production preset for Q4_0 models. Uses v2 INT4 GEMV kernel
+        # (PR #101 port) by default -- ~1.65x faster end-to-end than v1,
+        # 6% over NPU bf16. v2 is the C++ default since 2026-05-22, so
+        # we don't need to set XDNA_ENABLE_GEMV_INT4_V2.
         "XDNA_ENABLE_GEMV":              "1",
         "XDNA_ENABLE_SWIGLU":            "1",
         "XDNA_ENABLE_QKV":               "1",
@@ -129,11 +131,11 @@ PRESETS: dict[str, dict[str, str]] = {
         # and correctness is byte-exact -- just opt-in until the inner
         # dequant loop is optimized.
     },
-    "npu_int4_v2": {
-        # Same as npu_int4 but with the v2 optimized INT4 GEMV kernel
-        # (PR #101 port: compile-time DIM_K/GROUP_SIZE + double-pump +
-        # AIE pipelining). Spike measured ~4x faster per-op on the
-        # dominant FFN shapes (565 us vs 2307 us for K=2048 N=8192).
+    "npu_int4_v1": {
+        # Regression-coverage preset that explicitly forces the old v1
+        # INT4 GEMV kernel via XDNA_DISABLE_GEMV_INT4_V2=1. Kept so we
+        # can A/B test future kernel changes against the documented v1
+        # baseline (3.4 t/s on Llama 3.2 1B Q4_0).
         "XDNA_ENABLE_GEMV":              "1",
         "XDNA_ENABLE_SWIGLU":            "1",
         "XDNA_ENABLE_QKV":               "1",
@@ -142,7 +144,19 @@ PRESETS: dict[str, dict[str, str]] = {
         "XDNA_ENABLE_FLOWKV_DECODE":     "1",
         "XDNA_ENABLE_RMS_NORM":          "0",
         "XDNA_ENABLE_GEMV_INT4":         "1",
-        "XDNA_ENABLE_GEMV_INT4_V2":      "1",
+        "XDNA_DISABLE_GEMV_INT4_V2":     "1",
+    },
+    "npu_int4_v2": {
+        # Alias of npu_int4 (v2 is the default since 2026-05-22). Kept
+        # for backward compatibility with existing test names.
+        "XDNA_ENABLE_GEMV":              "1",
+        "XDNA_ENABLE_SWIGLU":            "1",
+        "XDNA_ENABLE_QKV":               "1",
+        "XDNA_ENABLE_DECODE_BATCH":      "1",
+        "XDNA_ENABLE_TRANSFORMER_BLOCK": "1",
+        "XDNA_ENABLE_FLOWKV_DECODE":     "1",
+        "XDNA_ENABLE_RMS_NORM":          "0",
+        "XDNA_ENABLE_GEMV_INT4":         "1",
     },
     "npu_int4_swiglu": {
         # Same as npu_int4 but ALSO enables the chained INT4 SwiGLU
@@ -673,9 +687,9 @@ def build_bench_configs() -> list[BenchConfig]:
     return [
         BenchConfig(label="CPU Q4_0",          preset="cpu_baseline",     model=MODEL_Q4_0),
         BenchConfig(label="NPU bf16",          preset="npu_chat_safe",    model=MODEL),
-        BenchConfig(label="NPU INT4 (8.1)",    preset="npu_int4",         model=MODEL_Q4_0),
-        BenchConfig(label="NPU INT4 v2",       preset="npu_int4_v2",      model=MODEL_Q4_0),
-        BenchConfig(label="NPU INT4 (8.1+8.2)", preset="npu_int4_swiglu", model=MODEL_Q4_0),
+        BenchConfig(label="NPU INT4 v1",       preset="npu_int4_v1",      model=MODEL_Q4_0),
+        BenchConfig(label="NPU INT4 (default=v2)", preset="npu_int4",     model=MODEL_Q4_0),
+        BenchConfig(label="NPU INT4 +SwiGLU",  preset="npu_int4_swiglu",  model=MODEL_Q4_0),
     ]
 
 
