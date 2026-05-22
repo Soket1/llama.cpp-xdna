@@ -53,6 +53,9 @@ MODEL     = REPO_ROOT / "models" / "llama-3.2-1b-instruct-BF16.gguf"
 MODEL_Q4_0   = REPO_ROOT / "models" / "llama-3.2-1b-instruct-Q4_0.gguf"
 MODEL_Q4_K_M = REPO_ROOT / "models" / "llama-3.2-1b-instruct-Q4_K_M.gguf"
 MODEL_QWEN35_9B_Q4_0 = REPO_ROOT / "models" / "Qwen3.5-9B-Q4_0.gguf"
+# Llama 3.2 3B (head_dim=128, 28 layers, GQA 3:1). Used to validate the
+# Phase 8.5 head_dim parameterization end-to-end on a non-Llama-1B model.
+MODEL_LLAMA_3B_Q4_0 = REPO_ROOT / "models" / "llama-3.2-3b-q4_0.gguf"
 
 # Driver/SDK paths -- adjust if your install differs.
 BASE_ENV: dict[str, str] = {
@@ -442,6 +445,34 @@ TESTS: list[Test] = [
         variants=["npu_int4_v2"],
         min_prefix_match=1,
         description="V2 + FlowKV + chat-mode composition. Should match the v1 chat test byte-for-byte.",
+    ),
+    # ---- Llama 3.2 3B Q4_0 (head_dim=128) ------------------------------
+    # Validates the Phase 8.5 head_dim parameterization end-to-end on a
+    # model with head_dim != 64. First-touch run will trigger IRON compile
+    # of new xclbins with -DHEAD_DIM=128 (~5-15 min per shape); subsequent
+    # runs hit the npu_kernels_win_8col cache.
+    Test(
+        name="paris_short_3b_q4_0_int4_v2",
+        # 3B Q4_0 appears to be the base completion model (not Instruct);
+        # use a sentence-start prompt so greedy decoding emits text rather
+        # than immediately hitting EOS.
+        prompt="The capital of France is",
+        n_predict=24,
+        mode="single-turn",
+        model=MODEL_LLAMA_3B_Q4_0,
+        variants=["npu_int4_v2"],
+        min_prefix_match=5,
+        description="Phase 8.5 validation: Llama 3.2 3B Q4_0 (head_dim=128, 28 layers, GQA 3:1) through INT4 v2 + FlowKV decode. Triggers first-touch IRON compile of GEMV xclbins (K=3072 shapes) and the FlowKV kernel with -DHEAD_DIM=128.",
+    ),
+    Test(
+        name="paris_short_3b_q4_0_gemv_only",
+        prompt="The capital of France is",
+        n_predict=24,
+        mode="single-turn",
+        model=MODEL_LLAMA_3B_Q4_0,
+        variants=["npu_int4_gemv_only"],
+        min_prefix_match=5,
+        description="Phase 8.5 fallback path: matmul-only NPU dispatch (no FlowKV/attention) on 3B. Architecture-agnostic; confirms INT4 GEMV alone works at the 3B model's K=3072 shapes (head_dim is irrelevant for the GEMV path).",
     ),
     # ---- Qwen3.5-9B-Q4_0 -----------------------------------------------
     # Qwen3.5-9B uses head_dim=256, M-RoPE [11,11,10,0], and SWA with

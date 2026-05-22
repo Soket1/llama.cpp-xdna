@@ -12527,6 +12527,20 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
             continue;
         }
 
+        // Q4_0/Q4_K prefill guard: supports_op claims these for all M so
+        // the scheduler keeps the surrounding attention/FFN graph in the
+        // XDNA partition (otherwise decode-time M=1 matmuls would also
+        // fall back to CPU -- ggml's per-node decision is sticky once
+        // chosen at planning time). But there is no NPU GEMM kernel for
+        // Q4_0/Q4_K -- mul_mat_gemv_int4 only handles M=1. Accumulate
+        // these M>1 nodes into the CPU run instead of dispatching.
+        if (node->op == GGML_OP_MUL_MAT && node->src[1]->ne[1] != 1 &&
+            (node->src[0]->type == GGML_TYPE_Q4_0 ||
+             node->src[0]->type == GGML_TYPE_Q4_K)) {
+            if (cpu_run_start < 0) cpu_run_start = i;
+            continue;
+        }
+
         if (xdna_node_npu_dispatchable(node)) {
             // Batchable decode GEMV: collect in the batcher instead of
             // dispatching individually. The batcher will flush these as
@@ -13691,10 +13705,16 @@ static bool xdna_shape_dispatchable(int64_t M, int64_t K, int64_t N) {
 //   select_gemv_tiles, any per_col >= 8 with per_col a power-of-two multiple works.
 // Same vocab-proj N cap applies (BD-overflow territory).
 static bool xdna_shape_dispatchable_gemv(int64_t K, int64_t N) {
+    // Either bf16 GEMV (XDNA_ENABLE_GEMV) or INT4 GEMV (XDNA_ENABLE_GEMV_INT4)
+    // enables this code path. The bf16 path runs Q4_K-via-CPU-dequant + bf16
+    // matmul; the INT4 path runs Q4_0/Q4_K directly via mul_mat_gemv_int4.
+    // The `npu_int4_gemv_only` preset disables bf16 GEMV but enables INT4 --
+    // we must still accept the shape so the INT4 path can run.
     static const bool gemv_enabled = xdna_env_enabled("XDNA_ENABLE_GEMV");
+    static const bool int4_enabled = xdna_env_enabled("XDNA_ENABLE_GEMV_INT4");
     static const bool dbg = getenv("XDNA_DEBUG") != NULL;
 
-    if (!gemv_enabled) return false;
+    if (!gemv_enabled && !int4_enabled) return false;
     int num_cols = 4;
     const char * cols_env = getenv("GGML_XDNA_NUM_COLS");
     if (cols_env) num_cols = atoi(cols_env);
@@ -13775,20 +13795,18 @@ static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const s
             static const bool int4_ok = xdna_env_enabled("XDNA_ENABLE_GEMV_INT4");
             if (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_BF16 || src0->type == GGML_TYPE_F16) return true;
             if ((int8_ok || tblock_w8a16_ok) && src0->type == GGML_TYPE_Q8_0) return true;
-            // Q4_0 (Priority 8.1) and Q4_K (Priority 8.4): claimed only
-            // when the INT4 dispatch path env gate is enabled AND the
-            // matmul is M=1 (decode). Phase 8.1/8.4 only implement
-            // mul_mat_gemv_int4 (M=1); prefill M>1 has no Q4_0/Q4_K
-            // path in mul_mat_gemv_int4 nor mul_mat_gemm, so we must
-            // fall through to CPU here. Without this M=1 guard, prefill
-            // Q4_K matmuls (e.g. llama-perplexity's M=512 chunks) hit
-            // the bf16 GEMM path with Q4_K weights and either crash on
-            // compile failure or write garbage into dst tensor->data.
-            // QKV matcher rejects non-bf16 weights; SwiGLU matcher
-            // routes Q4_0 to mul_mat_swiglu_int4 (still M=1); decode
-            // batcher already skips Q4_0.
+            // Q4_0 (Priority 8.1) and Q4_K (Priority 8.4): claimed for ALL
+            // M when the INT4 dispatch path env gate is enabled. ggml's
+            // scheduler queries supports_op at planning time with
+            // src1->ne[1] = max_batch (typically n_ubatch=512 from prefill),
+            // and the decision is sticky across decode iterations. Claiming
+            // only for M=1 here therefore prevents Q4_0/Q4_K matmuls from
+            // ever reaching the NPU even for decode -- they go to CPU.
+            // The actual M=1 vs M>1 split happens INSIDE the dispatch fn
+            // (mul_mat_gemv_int4 for M=1; mul_mat_gemm falls back to CPU
+            // for Q4_0/Q4_K via xdna_delegate_range).
             // Q4_K additionally requires K % 256 == 0 (super-block size).
-            if (int4_ok && src1->ne[1] == 1 &&
+            if (int4_ok &&
                 (src0->type == GGML_TYPE_Q4_0 ||
                  (src0->type == GGML_TYPE_Q4_K && (src0->ne[0] % 256) == 0)))
                 return true;
