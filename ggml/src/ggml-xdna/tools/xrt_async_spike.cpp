@@ -227,9 +227,222 @@ void bench(dispatch_ctx & d, int N_iters) {
     fflush(stderr);
 }
 
+// ----------------------------------------------------------------------
+// Token-sequence mode (Phase 9 v2 re-spike).
+//
+// Models one Llama 3.2 1B decode token's worth of INT4 GEMV dispatches
+// using the v2 xclbins. Per-layer sequence (7 ops/layer × num_layers):
+//     2× attn_q/o   (K=2048 N=2048)
+//     2× attn_k/v   (K=2048 N=512)
+//     1× ffn_gate   (K=2048 N=8192)
+//     1× ffn_up     (K=2048 N=8192)
+//     1× ffn_down   (K=8192 N=2048)
+//
+// Three modes compared:
+//     SYNC          submit + wait per op   (current ggml-xdna behavior)
+//     ASYNC_LAYER   submit 7 ops, wait at end of layer, then busy_us CPU
+//                   work (mimics deferred bias compensation at a barrier)
+//     ASYNC_TOKEN   submit ALL N×7 ops, wait once on the final op
+//                   (upper bound -- ignores data deps + bias barriers)
+//
+// busy_us optionally injects a CPU busy-loop between dispatches to model
+// the host-side bias compensation step that mul_mat_gemv_int4 currently
+// does immediately after rl.wait(). Set ~700 us to mimic the worst-case
+// FFN-down bias work observed in earlier profiling.
+
+struct LayerOp {
+    const char * label;
+    const char * xclbin;
+    const char * insts;
+    int K;
+    int N;
+    int count_per_layer;
+};
+
+void busy_loop_us(long long us) {
+    if (us <= 0) return;
+    auto t0 = clk::now();
+    volatile unsigned x = 1;
+    while (us_since(t0) < us) {
+        for (int i = 0; i < 1000; i++) x = x * 1103515245u + 12345u;
+    }
+    (void)x;
+}
+
+void bench_token_sequence(const std::string & cache_dir,
+                          int num_layers,
+                          long long busy_us) {
+    static const LayerOp layer_ops[] = {
+        {"attn_q",  "gemv_int4_v2_K2048_N2048_8col_g32.xclbin",
+                    "gemv_int4_v2_K2048_N2048_8col_g32.insts", 2048, 2048, 1},
+        {"attn_o",  "gemv_int4_v2_K2048_N2048_8col_g32.xclbin",
+                    "gemv_int4_v2_K2048_N2048_8col_g32.insts", 2048, 2048, 1},
+        {"attn_k",  "gemv_int4_v2_K2048_N512_8col_g32.xclbin",
+                    "gemv_int4_v2_K2048_N512_8col_g32.insts",  2048,  512, 1},
+        {"attn_v",  "gemv_int4_v2_K2048_N512_8col_g32.xclbin",
+                    "gemv_int4_v2_K2048_N512_8col_g32.insts",  2048,  512, 1},
+        {"ffn_gate","gemv_int4_v2_K2048_N8192_8col_g32.xclbin",
+                    "gemv_int4_v2_K2048_N8192_8col_g32.insts", 2048, 8192, 1},
+        {"ffn_up",  "gemv_int4_v2_K2048_N8192_8col_g32.xclbin",
+                    "gemv_int4_v2_K2048_N8192_8col_g32.insts", 2048, 8192, 1},
+        {"ffn_down","gemv_int4_v2_K8192_N2048_8col_g32.xclbin",
+                    "gemv_int4_v2_K8192_N2048_8col_g32.insts", 8192, 2048, 1},
+    };
+    const int ops_per_layer = (int)(sizeof(layer_ops) / sizeof(layer_ops[0]));
+
+    // Deduplicate contexts by (xclbin path) so we only load each xclbin once.
+    fprintf(stderr, "\nspike: token-sequence mode num_layers=%d busy_us=%lld\n",
+            num_layers, busy_us);
+    std::vector<dispatch_ctx> ctxs;
+    std::vector<int> op_to_ctx(ops_per_layer);
+    for (int i = 0; i < ops_per_layer; i++) {
+        int found = -1;
+        for (int j = 0; j < (int)ctxs.size(); j++) {
+            if (ctxs[j].K == layer_ops[i].K && ctxs[j].N == layer_ops[i].N) {
+                found = j;
+                break;
+            }
+        }
+        if (found < 0) {
+            ctxs.push_back(make_dispatch_ctx(
+                cache_dir + "/" + layer_ops[i].xclbin,
+                cache_dir + "/" + layer_ops[i].insts,
+                layer_ops[i].K, layer_ops[i].N));
+            found = (int)ctxs.size() - 1;
+        }
+        op_to_ctx[i] = found;
+    }
+    fprintf(stderr, "spike: loaded %zu unique shapes for %d ops/layer\n",
+            ctxs.size(), ops_per_layer);
+
+    // Pre-build all dispatches for one token (num_layers * ops_per_layer).
+    const int total_ops = num_layers * ops_per_layer;
+    fprintf(stderr, "spike: building %d dispatches (one token's worth)...\n",
+            total_ops);
+    std::vector<dispatch> ds;
+    ds.reserve(total_ops);
+    std::vector<int> ds_ctx(total_ops);
+    auto t_build_s = clk::now();
+    for (int L = 0; L < num_layers; L++) {
+        for (int op = 0; op < ops_per_layer; op++) {
+            int cidx = op_to_ctx[op];
+            ds.push_back(make_dispatch(ctxs[cidx]));
+            ds_ctx[L * ops_per_layer + op] = cidx;
+        }
+    }
+    auto build_us = us_since(t_build_s);
+    fprintf(stderr, "spike: built in %lld us (%.0f us/dispatch)\n",
+            build_us, (double)build_us / total_ops);
+
+    // Warm-up: one full token sync to arm driver + hw_ctx for every shape.
+    for (int i = 0; i < total_ops; i++) {
+        ds[i].run.start();
+        ds[i].run.wait();
+    }
+
+    // ---- SYNC ----
+    long long sync_bias_us = 0;
+    auto t_sync_s = clk::now();
+    for (int i = 0; i < total_ops; i++) {
+        ds[i].run.start();
+        ds[i].run.wait();
+        if (busy_us > 0) {
+            auto t_b = clk::now();
+            busy_loop_us(busy_us);
+            sync_bias_us += us_since(t_b);
+        }
+    }
+    long long sync_us = us_since(t_sync_s);
+
+    // ---- ASYNC_LAYER: submit 7 ops/layer, wait barrier, busy work ----
+    long long async_layer_bias_us = 0;
+    auto t_al_s = clk::now();
+    for (int L = 0; L < num_layers; L++) {
+        const int base = L * ops_per_layer;
+        for (int op = 0; op < ops_per_layer; op++) ds[base + op].run.start();
+        for (int op = 0; op < ops_per_layer; op++) ds[base + op].run.wait();
+        if (busy_us > 0) {
+            auto t_b = clk::now();
+            // One bias compensation per op-with-bias. Approximation: do
+            // ops_per_layer busy steps at the layer barrier (real path
+            // would interleave them; this overestimates the cost slightly).
+            busy_loop_us(busy_us * ops_per_layer);
+            async_layer_bias_us += us_since(t_b);
+        }
+    }
+    long long async_layer_us = us_since(t_al_s);
+
+    // ---- ASYNC_TOKEN: submit everything, wait only at end ----
+    auto t_at_s = clk::now();
+    for (int i = 0; i < total_ops; i++) ds[i].run.start();
+    auto at_submit_done_us = us_since(t_at_s);
+    for (int i = 0; i < total_ops; i++) ds[i].run.wait();
+    long long async_token_us = us_since(t_at_s);
+
+    // ---- Report ----
+    fprintf(stderr, "\n=== token-sequence results (layers=%d, ops/layer=%d, total=%d) ===\n",
+            num_layers, ops_per_layer, total_ops);
+    fprintf(stderr, "  SYNC         total %8lld us  (%.0f us/op)",
+            sync_us, (double)sync_us / total_ops);
+    if (busy_us > 0)
+        fprintf(stderr, "  [bias %lld us]", sync_bias_us);
+    fprintf(stderr, "\n");
+    fprintf(stderr, "  ASYNC_LAYER  total %8lld us  (%.0f us/op)",
+            async_layer_us, (double)async_layer_us / total_ops);
+    if (busy_us > 0)
+        fprintf(stderr, "  [bias %lld us]", async_layer_bias_us);
+    fprintf(stderr, "\n");
+    fprintf(stderr, "  ASYNC_TOKEN  total %8lld us  (%.0f us/op)\n",
+            async_token_us, (double)async_token_us / total_ops);
+    fprintf(stderr, "                 submit-only %lld us\n",
+            at_submit_done_us);
+    fprintf(stderr, "  speedup ASYNC_LAYER / SYNC = %.3fx\n",
+            (double)sync_us / (double)async_layer_us);
+    fprintf(stderr, "  speedup ASYNC_TOKEN / SYNC = %.3fx\n",
+            (double)sync_us / (double)async_token_us);
+
+    // Translate to t/s projection assuming the per-token decode budget
+    // outside NPU work stays constant. Current measured baseline:
+    //   sync v2 INT4 decode = 5.6 t/s = 178 ms/token, of which the NPU
+    //   work is the sync_us above. So non-NPU overhead ≈ (178000 -
+    //   sync_us/1000) us. Async ROI is reflected in the new total:
+    //   new_token_us = async_X_us + non_NPU_overhead.
+    const long long non_npu_us = 178000LL - sync_us;
+    if (non_npu_us > 0) {
+        auto proj_ts = [non_npu_us](long long npu_us) -> double {
+            return 1e6 / (double)(npu_us + non_npu_us);
+        };
+        fprintf(stderr, "  projected end-to-end decode t/s "
+                "(non-NPU overhead = %lld us, assumed constant):\n",
+                non_npu_us);
+        fprintf(stderr, "    SYNC         %.2f t/s\n", proj_ts(sync_us));
+        fprintf(stderr, "    ASYNC_LAYER  %.2f t/s\n", proj_ts(async_layer_us));
+        fprintf(stderr, "    ASYNC_TOKEN  %.2f t/s\n", proj_ts(async_token_us));
+    }
+    fflush(stderr);
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
+    // Two modes:
+    //   1. Single-shape (default): one xclbin, N dispatches, sync/async/runlist.
+    //        argv: <xclbin> <insts> <K> <N> <N_iters>
+    //   2. Token-sequence (Phase 9 v2 re-spike): pass --token as argv[1].
+    //        argv: --token <cache_dir> <num_layers> <busy_us>
+    if (argc > 1 && std::string(argv[1]) == "--token") {
+        const char * cache_dir = (argc > 2) ? argv[2] : "npu_kernels_win_8col";
+        int num_layers = (argc > 3) ? std::atoi(argv[3]) : 16;
+        long long busy_us = (argc > 4) ? std::atoll(argv[4]) : 0;
+        try {
+            bench_token_sequence(cache_dir, num_layers, busy_us);
+        } catch (const std::exception & e) {
+            fprintf(stderr, "spike: exception: %s\n", e.what());
+            return 1;
+        }
+        return 0;
+    }
+
     const char * xclbin =
         (argc > 1) ? argv[1]
                    : "npu_kernels_win_8col/gemv_int4_K2048_N8192_8col_g32.xclbin";
