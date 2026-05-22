@@ -320,7 +320,24 @@ TESTS: list[Test] = [
         n_predict=16,
         mode="single-turn",
         model=MODEL_Q4_K_M,
-        description="Q4_K_M model sanity. Same CPU fallback story as paris_short_q4_0. Will become NPU dispatch test in Phase 8.4 (via re-quantize to W4A16).",
+        variants=["npu_int4"],
+        # Q4_K has more precision than Q4_0 (2-level scales, asymmetric).
+        # We dispatch through the same fused_dequant_gemv kernel via a
+        # host-side repack (xdna_repack_q4_K_to_fused_int4) that stores
+        # effective_scale + effective_min per group and uses min·S[g]
+        # bias compensation. Should match CPU baseline byte-exact.
+        min_prefix_match=1,
+        description="Phase 8.4: Q4_K_M model routed through INT4 NPU dispatch via lossless host repack (effective_scale + effective_min, min-based bias). First Q4_K NPU dispatch.",
+    ),
+    Test(
+        name="paris_drift_64_q4_k_m_int4",
+        prompt="What is the capital of France? Explain in detail.",
+        n_predict=64,
+        mode="single-turn",
+        model=MODEL_Q4_K_M,
+        variants=["npu_int4"],
+        min_prefix_match=10,
+        description="Long Q4_K_M generation through INT4 NPU. Stresses the new Q4_K repack across 16 layers x 7 matmuls x 64 tokens.",
     ),
     Test(
         name="multiquery_q4_0_chatsafe",

@@ -1116,7 +1116,169 @@ static void xdna_repack_q4_0_to_fused_int4(
     }
 }
 
-// Repack Q8_0 weights to per-tensor int8 in (K, N) row-major layout for GEMM.
+// Repack Q4_K weights into the same packed INT4 layout used by the v2
+// fused_dequant_gemv kernel. Q4_K uses asymmetric quantization with two
+// levels of scales (super-block fp16 d + per-sub-block 6-bit scale,
+// likewise for min). Dequant formula:
+//     y = d * sub_scale[g] * nibble - dmin * sub_min[g]
+//
+// Our kernel computes:
+//     kernel_out[i] = sum_k(uint4[i,k] * scale_g[i,g] * x[k])
+//
+// To make the kernel produce the correct Q4_K matvec result, we:
+//   * Use `effective_scale = d * sub_scale[g]` (bf16) as the per-group scale
+//     in the standard packed buffer position.
+//   * Store `effective_min = dmin * sub_min[g]` (bf16) in a SEPARATE flat
+//     section appended AFTER all per-tile weight+scale regions. CRITICAL:
+//     we cannot grow `packed_bytes_per_tile`, because the kernel's xclbin
+//     hard-codes the per-tile stride (m_input * K/2 + m_input * num_groups
+//     * 2) at compile time -- adding bytes to that would misalign every
+//     tile past the first. The kernel never touches the min section; only
+//     host-side bias compensation reads it via fixed offset.
+//
+// Packed buffer layout (bytes) under Q4_K:
+//   per tile (kernel sees these): [m_input * K / 2]               packed uint4
+//                                 [m_input * num_groups * 2]      bf16 scales
+//   end of buffer (host only):    [M * num_groups * 2]            bf16 mins, row-major
+static void xdna_repack_q4_K_to_fused_int4(
+        const uint8_t * q4_K,
+        int64_t M, int64_t K,
+        int m_input, int cols, int group_size,
+        uint8_t * packed_out) {
+    GGML_ASSERT(group_size == 32);   // Q4_K sub-blocks are fixed at 32 elements.
+    GGML_ASSERT(K % 256 == 0);        // Q4_K super-block = 256 elements per row.
+    GGML_ASSERT(K % group_size == 0);
+    GGML_ASSERT(M % cols == 0);
+
+    const int64_t rows_per_col = M / cols;
+    GGML_ASSERT(rows_per_col % m_input == 0);
+
+    // Q4_K block size: 2 + 2 + K_SCALE_SIZE + QK_K/2 = 2 + 2 + 12 + 128 = 144 bytes
+    constexpr size_t K_SCALE_SIZE = 12;
+    constexpr size_t QK_K = 256;
+    constexpr size_t Q4_K_BLOCK_BYTES = 2 + 2 + K_SCALE_SIZE + QK_K / 2;   // 144
+
+    const int64_t super_blocks_per_row = K / QK_K;          // QK_K = 256
+    const size_t  row_stride_q4K = (size_t)super_blocks_per_row * Q4_K_BLOCK_BYTES;
+    const int64_t num_groups_per_row = K / group_size;       // group_size = 32
+
+    const size_t weight_bytes_per_row = (size_t)K / 2;
+    const size_t scale_bytes_per_row  = (size_t)num_groups_per_row * 2;
+    // Per-tile size MUST match the Q4_0 layout (no min region inside) so
+    // the kernel's hard-coded per-tile stride still works.
+    const size_t packed_bytes_per_tile =
+        (size_t)m_input * weight_bytes_per_row
+      + (size_t)m_input * scale_bytes_per_row;
+    const int64_t tiles_per_col = rows_per_col / m_input;
+
+    // The min section sits after ALL the per-tile data. Flat layout:
+    //     mins[row, group] at offset min_section_start + (row*num_groups + group)*2
+    // where row is in 0..M-1 (the "global" weight row).
+    const size_t min_section_start = (size_t)cols * tiles_per_col * packed_bytes_per_tile;
+
+    auto f32_to_bf16_scalar = [](float f) -> uint16_t {
+        uint32_t bits;
+        memcpy(&bits, &f, sizeof(bits));
+        bits += (0x7FFF + ((bits >> 16) & 1));
+        return (uint16_t)(bits >> 16);
+    };
+
+    // Replicates ggml's get_scale_min_k4: extracts the 6-bit sub_scale and
+    // sub_min for sub-block sg in [0..7] from the 12-byte packed scales array.
+    auto get_scale_min_k4 = [](int sg, const uint8_t * q, uint8_t & d, uint8_t & m) {
+        if (sg < 4) {
+            d = q[sg]     & 63;
+            m = q[sg + 4] & 63;
+        } else {
+            d = (q[sg + 4] & 0xF) | ((q[sg - 4] >> 6) << 4);
+            m = (q[sg + 4] >>  4) | ((q[sg - 0] >> 6) << 4);
+        }
+    };
+
+    for (int col = 0; col < cols; col++) {
+        for (int64_t tile_idx = 0; tile_idx < tiles_per_col; tile_idx++) {
+            const int64_t row_start = (int64_t)col * rows_per_col + tile_idx * m_input;
+            const int64_t flat_tile = (int64_t)col * tiles_per_col + tile_idx;
+            const size_t tile_offset = (size_t)flat_tile * packed_bytes_per_tile;
+
+            const size_t scale_region_start =
+                tile_offset + (size_t)m_input * weight_bytes_per_row;
+
+            for (int r = 0; r < m_input; r++) {
+                const int64_t global_row = row_start + r;
+                const uint8_t * row_src = q4_K + (size_t)global_row * row_stride_q4K;
+                uint8_t * row_dst = packed_out + tile_offset
+                                  + (size_t)r * weight_bytes_per_row;
+                uint16_t * scale_dst = (uint16_t *)(packed_out + scale_region_start
+                                  + (size_t)r * scale_bytes_per_row);
+                // Mins live in the flat global section keyed by global_row.
+                uint16_t * min_dst = (uint16_t *)(packed_out + min_section_start
+                                  + (size_t)global_row * (size_t)num_groups_per_row * 2);
+
+                for (int64_t sb = 0; sb < super_blocks_per_row; sb++) {
+                    const uint8_t * blk = row_src + (size_t)sb * Q4_K_BLOCK_BYTES;
+                    uint16_t d_h16, dmin_h16;
+                    memcpy(&d_h16,    blk,     2);
+                    memcpy(&dmin_h16, blk + 2, 2);
+                    const float d    = ggml_fp16_to_fp32(d_h16);
+                    const float dmin = ggml_fp16_to_fp32(dmin_h16);
+                    const uint8_t * scales_qs = blk + 4;            // K_SCALE_SIZE bytes
+                    const uint8_t * qs        = blk + 4 + K_SCALE_SIZE;  // QK_K/2 = 128
+
+                    for (int sg = 0; sg < 8; sg++) {
+                        uint8_t sc6, mn6;
+                        get_scale_min_k4(sg, scales_qs, sc6, mn6);
+                        const float eff_scale = d    * (float)sc6;
+                        const float eff_min   = dmin * (float)mn6;
+
+                        // Extract the 32 uint4 nibbles for this sub-block.
+                        // qs layout per super-block (128 bytes = 4 chunks of 32):
+                        //   chunk c covers sub-blocks 2c (low nibble) and 2c+1 (high).
+                        const uint8_t * chunk = qs + (sg / 2) * 32;
+                        const bool high_nibble = (sg & 1) != 0;
+                        uint8_t e[32];
+                        if (!high_nibble) {
+                            for (int i = 0; i < 32; i++) e[i] =  chunk[i]       & 0x0F;
+                        } else {
+                            for (int i = 0; i < 32; i++) e[i] = (chunk[i] >> 4) & 0x0F;
+                        }
+
+                        // Pack into our linear byte format:
+                        //   byte[k] = e[2k] | (e[2k+1] << 4)
+                        const int64_t g_global = sb * 8 + sg;
+                        uint8_t * blk_dst = row_dst + (size_t)g_global * 16;
+                        for (int k = 0; k < 16; k++) {
+                            blk_dst[k] = (uint8_t)(e[2*k] | (e[2*k + 1] << 4));
+                        }
+
+                        scale_dst[g_global] = f32_to_bf16_scalar(eff_scale);
+                        min_dst  [g_global] = f32_to_bf16_scalar(eff_min);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Packed BO size for a Q4_K weight matrix repacked into our INT4 layout.
+// Per-tile size matches Q4_0 (kernel stride compatibility); a flat M-row
+// min section is appended at the end for host bias compensation.
+static size_t xdna_packed_int4_size_q4_K(int64_t M, int64_t K,
+                                          int m_input, int cols,
+                                          int group_size) {
+    GGML_ASSERT(group_size == 32);
+    const int64_t rows_per_col = M / cols;
+    const int64_t tiles_per_col = rows_per_col / m_input;
+    const int64_t num_groups_per_row = K / group_size;
+    const size_t packed_bytes_per_tile =
+        (size_t)m_input * (size_t)K / 2
+      + (size_t)m_input * (size_t)num_groups_per_row * 2;
+    const size_t per_tile_total = (size_t)cols * tiles_per_col * packed_bytes_per_tile;
+    const size_t min_section_bytes = (size_t)M * (size_t)num_groups_per_row * 2;
+    return per_tile_total + min_section_bytes;
+}
+
+
 // Returns the per-tensor scale factor.
 // Q8_0: each block = [fp16 scale][32 int8 values]. Per-block dequant: x_f = qs * d.
 // We compute a global scale = max(|qs[i] * d_block|) / 127 across ALL blocks,
@@ -1589,19 +1751,23 @@ static void ggml_backend_xdna_mul_mat_gemm(ggml_backend_xdna_context * ctx, stru
 // Matrix layout matches ggml src0 natively ([N,K] row-major), so no transpose.
 static void ggml_backend_xdna_mul_mat_gemv_int4(ggml_backend_xdna_context * ctx,
                                                  struct ggml_tensor * dst) {
-    // INT4 fused-dequant GEMV dispatch (Priority 8.1).
-    // Weights are Q4_0 (uint4 packed nibbles + fp16 per-block scale).
-    // The IRON kernel computes ((nibble) * scale_bf16) * activation_bf16
-    // — i.e. it treats nibbles as unsigned [0, 15]. GGML's Q4_0 nibbles
-    // represent signed [-8, 7] values (signed = nibble - 8), so we apply
-    // a per-row bias `8 * sum_g(scale[i,g] * S[g])` after the kernel
-    // (where S[g] = sum of activation over group g). This will move to
-    // a kernel-side `aie::sub(8)` once the IRON compile pipeline is
-    // available on this env (see NPU_PLAN_PRIORITY_8.md note N2).
-    const struct ggml_tensor * src0 = dst->src[0];  // Q4_0 weights [K, N]
+    // INT4 fused-dequant GEMV dispatch (Priority 8.1 + 8.4).
+    // Weights are either Q4_0 (symmetric uint4 + per-block fp16 scale) or
+    // Q4_K (asymmetric uint4 with two-level scales: per-super-block fp16
+    // d/dmin + 6-bit per-sub-block scale/min). The IRON kernel computes
+    // `output[i] = sum_k (uint4[i,k] * scale_bf16[i,g] * x[k])`. Q4_0 and
+    // Q4_K share that exact kernel; only host-side bias compensation and
+    // the repack layout differ:
+    //   Q4_0: bias[i] = 8 * sum_g (scale[i,g] * S[g])     (signed = uint - 8)
+    //   Q4_K: bias[i] = sum_g (min[i,g] * S[g])           (asymmetric)
+    //   where S[g] = sum_{k in g} x[k].
+    // For Q4_K the packed BO contains an extra `min` region after the
+    // scales, see xdna_repack_q4_K_to_fused_int4().
+    const struct ggml_tensor * src0 = dst->src[0];  // INT4 weights [K, N]
     const struct ggml_tensor * src1 = dst->src[1];  // bf16/f32 activation [K]
 
-    GGML_ASSERT(src0->type == GGML_TYPE_Q4_0);
+    const bool is_q4_K = (src0->type == GGML_TYPE_Q4_K);
+    GGML_ASSERT(src0->type == GGML_TYPE_Q4_0 || is_q4_K);
     const int64_t K = src0->ne[0];
     const int64_t N = src0->ne[1];
     const int group_size = 32;
@@ -1620,6 +1786,11 @@ static void ggml_backend_xdna_mul_mat_gemv_int4(ggml_backend_xdna_context * ctx,
     if (K % group_size != 0) {
         GGML_LOG_ERROR("ggml-xdna: int4 gemv K=%lld not divisible by group_size=%d\n",
                        (long long)K, group_size);
+        return;
+    }
+    if (is_q4_K && K % 256 != 0) {
+        GGML_LOG_ERROR("ggml-xdna: Q4_K mul_mat K=%lld not divisible by super-block size 256\n",
+                       (long long)K);
         return;
     }
 
@@ -1648,9 +1819,16 @@ static void ggml_backend_xdna_mul_mat_gemv_int4(ggml_backend_xdna_context * ctx,
         const int64_t rows_per_col = N / num_cols;
         const int64_t tiles_per_col = rows_per_col / m_input;
         const int64_t num_groups_per_row = K / group_size;
+        // Per-tile size = Q4_0 layout (kernel stride must match xclbin).
+        // For Q4_K we append a separate flat min section at the END of the
+        // buffer to preserve that stride.
         const size_t packed_bytes_per_tile =
-            (size_t)m_input * (size_t)K / 2 + (size_t)m_input * (size_t)num_groups_per_row * 2;
-        const size_t packed_total = (size_t)num_cols * tiles_per_col * packed_bytes_per_tile;
+            (size_t)m_input * (size_t)K / 2
+          + (size_t)m_input * (size_t)num_groups_per_row * 2;
+        const size_t per_tile_total = (size_t)num_cols * tiles_per_col * packed_bytes_per_tile;
+        const size_t min_section_bytes =
+            is_q4_K ? (size_t)N * (size_t)num_groups_per_row * 2 : 0;
+        const size_t packed_total = per_tile_total + min_section_bytes;
 
         // Lazy alloc input/output BOs (per AIEFusedDequantGEMV arg_spec:
         // group_id 3 = packed weights, 4 = bf16 vector, 5 = bf16 output).
@@ -1682,14 +1860,22 @@ static void ggml_backend_xdna_mul_mat_gemv_int4(ggml_backend_xdna_context * ctx,
             if (it == entry->b_bo_cache.end()) {
                 xrt::bo new_packed(ctx->device, packed_total, xrt::bo::flags::host_only,
                                    entry->kernel.group_id(3));
-                xdna_repack_q4_0_to_fused_int4(
-                    (const uint8_t *)src0->data, N, K, m_input, num_cols, group_size,
-                    (uint8_t *)new_packed.map<void*>());
+                if (is_q4_K) {
+                    xdna_repack_q4_K_to_fused_int4(
+                        (const uint8_t *)src0->data, N, K, m_input, num_cols, group_size,
+                        (uint8_t *)new_packed.map<void*>());
+                } else {
+                    xdna_repack_q4_0_to_fused_int4(
+                        (const uint8_t *)src0->data, N, K, m_input, num_cols, group_size,
+                        (uint8_t *)new_packed.map<void*>());
+                }
                 new_packed.sync(XCL_BO_SYNC_BO_TO_DEVICE);
                 auto [ins, _] = entry->b_bo_cache.emplace(src0->data, std::move(new_packed));
                 weight_bo_ptr = &ins->second;
-                fprintf(stderr, "ggml-xdna: warm int4 weight K=%lld N=%lld m_in=%d weight=%s (%zu cached)\n",
-                        (long long)K, (long long)N, m_input, src0->name, entry->b_bo_cache.size());
+                fprintf(stderr, "ggml-xdna: warm int4 weight K=%lld N=%lld m_in=%d type=%s weight=%s (%zu cached)\n",
+                        (long long)K, (long long)N, m_input,
+                        is_q4_K ? "Q4_K" : "Q4_0",
+                        src0->name, entry->b_bo_cache.size());
                 fflush(stderr);
             } else {
                 weight_bo_ptr = &it->second;
@@ -1737,13 +1923,30 @@ static void ggml_backend_xdna_mul_mat_gemv_int4(ggml_backend_xdna_context * ctx,
                     + (size_t)r_in_tile * (size_t)num_groups_per_row * 2);
 
             float bias = 0.0f;
-            for (int64_t g = 0; g < num_groups_per_row; g++) {
-                uint32_t bits = ((uint32_t)sf_row[g]) << 16;
-                float sf;
-                memcpy(&sf, &bits, sizeof(sf));
-                bias += sf * S[(size_t)g];
+            if (is_q4_K) {
+                // Q4_K: bias = sum_g (min[i,g] * S[g]).
+                // Mins live in a flat M-row section at the very end of
+                // the packed BO (per_tile_total). The per-row stride is
+                // num_groups_per_row * 2 bytes.
+                const uint16_t * mn_row =
+                    (const uint16_t *)(packed + per_tile_total
+                        + (size_t)i * (size_t)num_groups_per_row * 2);
+                for (int64_t g = 0; g < num_groups_per_row; g++) {
+                    uint32_t bits = ((uint32_t)mn_row[g]) << 16;
+                    float mn;
+                    memcpy(&mn, &bits, sizeof(mn));
+                    bias += mn * S[(size_t)g];
+                }
+            } else {
+                // Q4_0: bias = 8 * sum_g (scale[i,g] * S[g]).
+                for (int64_t g = 0; g < num_groups_per_row; g++) {
+                    uint32_t bits = ((uint32_t)sf_row[g]) << 16;
+                    float sf;
+                    memcpy(&sf, &bits, sizeof(sf));
+                    bias += sf * S[(size_t)g];
+                }
+                bias *= 8.0f;
             }
-            bias *= 8.0f;
 
             uint32_t out_bits = ((uint32_t)out_bf16[i]) << 16;
             float out_f;
@@ -1755,9 +1958,42 @@ static void ggml_backend_xdna_mul_mat_gemv_int4(ggml_backend_xdna_context * ctx,
         // dst, CPU reference) for the FIRST INT4 dispatch to help debug the
         // "GGGG" output bug. Gated on XDNA_DEBUG=1. Computes CPU reference
         // by dequantizing Q4_0 in-place and doing a scalar GEMV.
+        // Q4_K accuracy probe: first dispatch only, gated on XDNA_DEBUG=1.
+        // Dumps scale/min/output for the first 8 rows so we can spot
+        // inf/nan/sign mismatches that produce "GGGG" output. Kept around
+        // because Q4_K_M is a likely future regression target whenever
+        // we touch the repack or bias formula.
+        static bool q4k_probe_done = false;
+        static const bool q4k_probe_enabled = getenv("XDNA_DEBUG") != NULL;
+        if (is_q4_K && q4k_probe_enabled && !q4k_probe_done) {
+            q4k_probe_done = true;
+            fprintf(stderr, "\n=== Q4_K ACCURACY PROBE (first dispatch) ===\n");
+            fprintf(stderr, "  weight=%s shape K=%lld N=%lld cols=%d m_in=%d\n",
+                    src0->name, (long long)K, (long long)N, num_cols, m_input);
+            const uint8_t * pkd = (const uint8_t *)weight_bo_ptr->map<void*>();
+            const size_t scale_off0 = (size_t)m_input * (size_t)K / 2;  // tile 0 scales
+            const uint16_t * sf0 = (const uint16_t *)(pkd + scale_off0);
+            // Mins for row 0 live in the flat section at per_tile_total + 0.
+            const uint16_t * mn0 = (const uint16_t *)(pkd + per_tile_total);
+            for (int g = 0; g < 4 && g < num_groups_per_row; g++) {
+                uint32_t sb = ((uint32_t)sf0[g]) << 16;  float sf; memcpy(&sf, &sb, sizeof(sf));
+                uint32_t mb = ((uint32_t)mn0[g]) << 16;  float mn; memcpy(&mn, &mb, sizeof(mn));
+                fprintf(stderr, "  row0 g=%d scale=%g min=%g S=%g\n",
+                        g, sf, mn, S[(size_t)g]);
+            }
+            for (int i = 0; i < 8 && i < N; i++) {
+                uint32_t b = ((uint32_t)out_bf16[i]) << 16;
+                float raw; memcpy(&raw, &b, sizeof(float));
+                fprintf(stderr, "  i=%d raw_kernel=%g dst=%g\n",
+                        i, raw, dst_f32[i]);
+            }
+            fprintf(stderr, "=== END Q4_K PROBE ===\n\n");
+            fflush(stderr);
+        }
+
         static bool probe_done = false;
         static const bool probe_enabled = getenv("XDNA_DEBUG") != NULL;
-        if (probe_enabled && !probe_done) {
+        if (probe_enabled && !probe_done && !is_q4_K) {  // probe is Q4_0-specific
             probe_done = true;
             fprintf(stderr, "\n=== INT4 ACCURACY PROBE (first dispatch) ===\n");
             fprintf(stderr, "  weight=%s shape K=%lld N=%lld cols=%d\n",
@@ -1851,8 +2087,8 @@ static void ggml_backend_xdna_mul_mat_gemv(ggml_backend_xdna_context * ctx, stru
     const struct ggml_tensor * src0 = dst->src[0];  // weight (matrix), [N,K]
     const struct ggml_tensor * src1 = dst->src[1];  // activation (vector), [K]
 
-    // Route Q4_0 to the INT4 fused-dequant kernel.
-    if (src0->type == GGML_TYPE_Q4_0) {
+    // Route Q4_0 / Q4_K to the INT4 fused-dequant kernel (Phase 8.1 + 8.4).
+    if (src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q4_K) {
         ggml_backend_xdna_mul_mat_gemv_int4(ctx, dst);
         return;
     }
@@ -13231,6 +13467,13 @@ static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const s
             // does SwiGLU matcher; xdna_plan_decode_batch now also skips
             // Q4_0 -> bare mul_mat_gemv routes Q4_0 to mul_mat_gemv_int4.
             if (int4_ok && src0->type == GGML_TYPE_Q4_0) return true;
+            // Q4_K (Priority 8.4): same dispatch path as Q4_0 (lossless
+            // host repack to our packed layout with effective scales +
+            // mins; bias compensation uses min·S[g] instead of 8·scale·S[g]).
+            // Q4_K requires K % 256 == 0 (super-block); enforce that here
+            // so non-conforming shapes fall through to CPU cleanly.
+            if (int4_ok && src0->type == GGML_TYPE_Q4_K && (src0->ne[0] % 256) == 0)
+                return true;
             return false;
         }
 
