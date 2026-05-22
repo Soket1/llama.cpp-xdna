@@ -144,16 +144,18 @@ struct xdna_kernel_entry {
 };
 
 // Phase 9: backend-wide tracker of in-flight async dispatches. Each
-// entry holds the run that's executing on the NPU and a deferred lambda
-// that completes the operation host-side (e.g. INT4 GEMV's bias
+// entry holds a wait_fn that blocks until the underlying NPU work is
+// complete (this can wrap xrt::run::wait2() for single runs, or
+// xrt::runlist::wait() for chained dispatches like SwiGLU INT4), plus
+// a deferred lambda that completes the operation host-side (e.g. bias
 // compensation). The dispatch function returns immediately after
-// run.start() and pushes here; the next consumer of the output tensor
-// (or graph_compute end) waits + runs the deferred work.
+// submitting + pushing here; the next consumer of the output tensor
+// (or graph_compute end) drains.
 //
-// dst_data is the ggml tensor->data pointer the run writes to -- used
-// to match wait_for(consumer_input) requests.
+// dst_data is the ggml tensor->data pointer the work writes to -- used
+// to match wait_for(consumer_input) requests across the queue.
 struct xdna_inflight_entry {
-    xrt::run                       run;
+    std::function<void()>          wait_fn;   // wraps run.wait2() or runlist.wait()
     void *                         dst_data = nullptr;
     std::function<void()>          deferred;  // bias compensation, etc.
 };
@@ -164,12 +166,12 @@ struct xdna_inflight_tracker {
 
     // Wait until queue depth is below Q_max (pop+complete oldest if not),
     // then enqueue the new entry.
-    void submit(xrt::run && run, void * dst_data,
+    void submit(std::function<void()> wait_fn, void * dst_data,
                 std::function<void()> deferred) {
         while (q.size() >= Q_max) {
             pop_front_complete();
         }
-        q.push_back(xdna_inflight_entry{std::move(run), dst_data,
+        q.push_back(xdna_inflight_entry{std::move(wait_fn), dst_data,
                                          std::move(deferred)});
     }
 
@@ -181,7 +183,7 @@ struct xdna_inflight_tracker {
         // given pointer is the most recent producer in q. Walk forward.
         for (auto it = q.begin(); it != q.end(); ) {
             if (it->dst_data == data_ptr) {
-                it->run.wait2();
+                if (it->wait_fn) it->wait_fn();
                 if (it->deferred) it->deferred();
                 it = q.erase(it);
             } else {
@@ -198,7 +200,7 @@ struct xdna_inflight_tracker {
 private:
     void pop_front_complete() {
         auto & e = q.front();
-        e.run.wait2();
+        if (e.wait_fn) e.wait_fn();
         if (e.deferred) e.deferred();
         q.pop_front();
     }
@@ -309,6 +311,10 @@ struct xdna_swiglu_kernel_entry {
     // I/O BOs (lazy — allocated on first dispatch).
     // input_bo : embedding_dim * M bf16 (M=1 for decode)
     // output_bo: embedding_dim * M bf16
+    //
+    // These remain the canonical sync-path single-instance BOs (used by
+    // bf16/INT8 SwiGLU paths). The INT4 SwiGLU async path (Phase 9) uses
+    // the BO ring below instead.
     std::unique_ptr<xrt::bo> input_bo;
     std::unique_ptr<xrt::bo> output_bo;
 
@@ -317,6 +323,21 @@ struct xdna_swiglu_kernel_entry {
     std::unique_ptr<xrt::bo> right_bo;         // matmul_1(w_up,   input)
     std::unique_ptr<xrt::bo> left_swished_bo;  // silu(left)
     std::unique_ptr<xrt::bo> intermediate_bo;  // eltwise_mul(left_swished, right)
+
+    // Phase 9 INT4 SwiGLU async path: 3-BO ring per dispatch. The fused
+    // gate+up+silu+mul stage reads slot's input_bo and writes its
+    // intermediate_bo; the down GEMV stage reads intermediate_bo and
+    // writes output_bo. Bias compensation for the down stage runs in
+    // the deferred lambda. Ring back-pressure mirrors xdna_kernel_entry's
+    // slot_active/slot_dst_data: when the dispatch picks next_slot, if
+    // active, ctx->inflight.wait_for(slot_dst_data) runs the prior
+    // dispatch's deferred (writing to dst) before reusing the slot.
+    std::unique_ptr<xrt::bo> input_bo_ring[XDNA_PHASE9_RING_SIZE];
+    std::unique_ptr<xrt::bo> intermediate_bo_ring[XDNA_PHASE9_RING_SIZE];
+    std::unique_ptr<xrt::bo> output_bo_ring[XDNA_PHASE9_RING_SIZE];
+    bool                     slot_active_swiglu[XDNA_PHASE9_RING_SIZE] = {};
+    void *                   slot_dst_data_swiglu[XDNA_PHASE9_RING_SIZE] = {};
+    int                      next_slot_swiglu = 0;
 
     // Weight BO caches — one map per slot (gate, up, down), keyed by the
     // ggml weight tensor's data pointer. Multi-layer models share a kernel
@@ -2078,7 +2099,10 @@ static void ggml_backend_xdna_mul_mat_gemv_int4(ggml_backend_xdna_context * ctx,
                 }
                 entry->slot_active[slot] = false;
             };
-            ctx->inflight.submit(std::move(run), dst->data, std::move(deferred));
+            ctx->inflight.submit(
+                [run = std::move(run)]() mutable { run.wait2(); },
+                dst->data,
+                std::move(deferred));
             return;  // async path complete; bias work deferred
         }
 
@@ -3398,21 +3422,58 @@ static void ggml_backend_xdna_mul_mat_swiglu_int4(
         const int64_t down_tiles_per_col = per_col_down / down_tile_in;
         const size_t down_total = (size_t)num_cols * down_tiles_per_col * down_packed_tile_bytes;
 
-        // Lazy alloc persistent activation BOs.
-        if (!entry->input_bo) {
-            entry->input_bo = std::make_unique<xrt::bo>(
-                ctx->device, input_bytes, xrt::bo::flags::host_only,
-                entry->kernels[XDNA_SWIGLU_SLOT_0].group_id(4));
-        }
-        if (!entry->intermediate_bo) {
-            entry->intermediate_bo = std::make_unique<xrt::bo>(
-                ctx->device, intermediate_bytes, xrt::bo::flags::host_only,
-                entry->kernels[XDNA_SWIGLU_SLOT_0].group_id(5));
-        }
-        if (!entry->output_bo) {
-            entry->output_bo = std::make_unique<xrt::bo>(
-                ctx->device, output_bytes, xrt::bo::flags::host_only,
-                entry->kernels[XDNA_SWIGLU_SLOT_1].group_id(5));
+        // Phase 9: ring-buffered BOs for async dispatch. Picks next slot in
+        // round-robin; if active, completes the slot's previous deferred
+        // bias compensation (writes to OLD dst tensor data) before
+        // overwriting input. Sync path uses the legacy single-BO trio.
+        static const bool phase9_async_enabled = xdna_env_enabled("XDNA_ENABLE_PHASE9");
+        xrt::bo * input_bo_ptr        = nullptr;
+        xrt::bo * intermediate_bo_ptr = nullptr;
+        xrt::bo * output_bo_ptr       = nullptr;
+        int swiglu_slot = -1;
+        if (phase9_async_enabled) {
+            swiglu_slot = entry->next_slot_swiglu;
+            entry->next_slot_swiglu = (swiglu_slot + 1) % XDNA_PHASE9_RING_SIZE;
+            if (entry->slot_active_swiglu[swiglu_slot]) {
+                ctx->inflight.wait_for(entry->slot_dst_data_swiglu[swiglu_slot]);
+            }
+            if (!entry->input_bo_ring[swiglu_slot]) {
+                entry->input_bo_ring[swiglu_slot] = std::make_unique<xrt::bo>(
+                    ctx->device, input_bytes, xrt::bo::flags::host_only,
+                    entry->kernels[XDNA_SWIGLU_SLOT_0].group_id(4));
+            }
+            if (!entry->intermediate_bo_ring[swiglu_slot]) {
+                entry->intermediate_bo_ring[swiglu_slot] = std::make_unique<xrt::bo>(
+                    ctx->device, intermediate_bytes, xrt::bo::flags::host_only,
+                    entry->kernels[XDNA_SWIGLU_SLOT_0].group_id(5));
+            }
+            if (!entry->output_bo_ring[swiglu_slot]) {
+                entry->output_bo_ring[swiglu_slot] = std::make_unique<xrt::bo>(
+                    ctx->device, output_bytes, xrt::bo::flags::host_only,
+                    entry->kernels[XDNA_SWIGLU_SLOT_1].group_id(5));
+            }
+            input_bo_ptr        = entry->input_bo_ring[swiglu_slot].get();
+            intermediate_bo_ptr = entry->intermediate_bo_ring[swiglu_slot].get();
+            output_bo_ptr       = entry->output_bo_ring[swiglu_slot].get();
+        } else {
+            if (!entry->input_bo) {
+                entry->input_bo = std::make_unique<xrt::bo>(
+                    ctx->device, input_bytes, xrt::bo::flags::host_only,
+                    entry->kernels[XDNA_SWIGLU_SLOT_0].group_id(4));
+            }
+            if (!entry->intermediate_bo) {
+                entry->intermediate_bo = std::make_unique<xrt::bo>(
+                    ctx->device, intermediate_bytes, xrt::bo::flags::host_only,
+                    entry->kernels[XDNA_SWIGLU_SLOT_0].group_id(5));
+            }
+            if (!entry->output_bo) {
+                entry->output_bo = std::make_unique<xrt::bo>(
+                    ctx->device, output_bytes, xrt::bo::flags::host_only,
+                    entry->kernels[XDNA_SWIGLU_SLOT_1].group_id(5));
+            }
+            input_bo_ptr        = entry->input_bo.get();
+            intermediate_bo_ptr = entry->intermediate_bo.get();
+            output_bo_ptr       = entry->output_bo.get();
         }
 
         // Warm cached weight BOs keyed by ggml weight ptr pair (gate+up
@@ -3481,17 +3542,21 @@ static void ggml_backend_xdna_mul_mat_swiglu_int4(
             }
         }
 
+        // Phase 9: if src1_input was produced by an earlier async dispatch,
+        // wait for its deferred lambda to finalize tensor->data first.
+        ctx->inflight.wait_for(src1_input->data);
+
         // Write input activation.
         using clk = std::chrono::steady_clock;
         static const bool prof = getenv("XDNA_DEBUG") != NULL;
         auto t_in_s = clk::now();
         if (src1_input->type == GGML_TYPE_F32) {
             f32_to_bf16((const float *)src1_input->data,
-                        (uint16_t *)entry->input_bo->map<void*>(), (size_t)embedding_dim);
+                        (uint16_t *)input_bo_ptr->map<void*>(), (size_t)embedding_dim);
         } else {
-            memcpy(entry->input_bo->map<void*>(), src1_input->data, input_bytes);
+            memcpy(input_bo_ptr->map<void*>(), src1_input->data, input_bytes);
         }
-        entry->input_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        input_bo_ptr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
         auto t_in_e = clk::now();
 
         // Build runlist: 2 runs (fused + down).
@@ -3503,8 +3568,8 @@ static void ggml_backend_xdna_mul_mat_swiglu_int4(
             r.set_arg(1, entry->insts_bo[XDNA_SWIGLU_SLOT_0]);
             r.set_arg(2, (uint32_t)entry->insts_data[XDNA_SWIGLU_SLOT_0].size());
             r.set_arg(3, *w_fused_bo_ptr);
-            r.set_arg(4, *entry->input_bo);
-            r.set_arg(5, *entry->intermediate_bo);
+            r.set_arg(4, *input_bo_ptr);
+            r.set_arg(5, *intermediate_bo_ptr);
             rl.add(r);
         }
         {
@@ -3513,8 +3578,8 @@ static void ggml_backend_xdna_mul_mat_swiglu_int4(
             r.set_arg(1, entry->insts_bo[XDNA_SWIGLU_SLOT_1]);
             r.set_arg(2, (uint32_t)entry->insts_data[XDNA_SWIGLU_SLOT_1].size());
             r.set_arg(3, *w_down_bo_ptr);
-            r.set_arg(4, *entry->intermediate_bo);
-            r.set_arg(5, *entry->output_bo);
+            r.set_arg(4, *intermediate_bo_ptr);
+            r.set_arg(5, *output_bo_ptr);
             rl.add(r);
         }
         auto t_build_e = clk::now();
@@ -3522,65 +3587,84 @@ static void ggml_backend_xdna_mul_mat_swiglu_int4(
         rl.execute();
         auto t_exec_e = clk::now();
 
+        // Bias compensation body extracted so async + sync paths share it
+        // verbatim. dst_final->data is the ggml output tensor; w_down_bo_ptr
+        // remains valid for the lifetime of the entry (cached on first use).
+        auto bias_compensation = [
+            intermediate_bo_ptr, output_bo_ptr, w_down_bo_ptr,
+            embedding_dim, num_groups_hid, group_size, num_cols,
+            down_tile_in, down_tiles_per_col, down_packed_tile_bytes,
+            hidden_dim, dst_data = dst_final->data]() {
+            intermediate_bo_ptr->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+            output_bo_ptr->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+
+            const uint16_t * intermediate_bf16 =
+                (const uint16_t *)intermediate_bo_ptr->map<void*>();
+            std::vector<float> S((size_t)num_groups_hid, 0.0f);
+            for (int64_t g = 0; g < num_groups_hid; g++) {
+                float sum = 0.0f;
+                for (int k = 0; k < group_size; k++) {
+                    uint32_t bits = ((uint32_t)intermediate_bf16[g * group_size + k]) << 16;
+                    float v;
+                    memcpy(&v, &bits, sizeof(v));
+                    sum += v;
+                }
+                S[(size_t)g] = sum;
+            }
+
+            const uint8_t * down_packed = (const uint8_t *)w_down_bo_ptr->map<void*>();
+            const uint16_t * out_bf16 = (const uint16_t *)output_bo_ptr->map<void*>();
+            float * dst_f32 = (float *)dst_data;
+            const int64_t down_rows_per_col = embedding_dim / num_cols;
+            for (int64_t i = 0; i < embedding_dim; i++) {
+                const int64_t col       = i / down_rows_per_col;
+                const int64_t local_row = i % down_rows_per_col;
+                const int64_t tile_idx  = local_row / down_tile_in;
+                const int64_t r_in_tile = local_row % down_tile_in;
+                const int64_t flat_tile = col * down_tiles_per_col + tile_idx;
+                const size_t tile_offset = (size_t)flat_tile * down_packed_tile_bytes;
+                const size_t scale_region_start =
+                    tile_offset + (size_t)down_tile_in * (size_t)hidden_dim / 2;
+                const uint16_t * sf_row =
+                    (const uint16_t *)(down_packed + scale_region_start
+                        + (size_t)r_in_tile * (size_t)num_groups_hid * 2);
+                float bias = 0.0f;
+                for (int64_t g = 0; g < num_groups_hid; g++) {
+                    uint32_t bits = ((uint32_t)sf_row[g]) << 16;
+                    float sf;
+                    memcpy(&sf, &bits, sizeof(sf));
+                    bias += sf * S[(size_t)g];
+                }
+                bias *= 8.0f;
+                uint32_t out_bits = ((uint32_t)out_bf16[i]) << 16;
+                float out_f;
+                memcpy(&out_f, &out_bits, sizeof(out_f));
+                dst_f32[i] = out_f - bias;
+            }
+        };
+
+        if (phase9_async_enabled) {
+            // Async path: wrap runlist in a wait_fn, capture bias-comp lambda
+            // (which clears slot_active_swiglu) into deferred. Return without
+            // blocking; tracker drains at end of graph_compute or on consumer
+            // wait_for(dst_final->data).
+            entry->slot_active_swiglu[swiglu_slot] = true;
+            entry->slot_dst_data_swiglu[swiglu_slot] = dst_final->data;
+            ctx->inflight.submit(
+                [rl = std::move(rl)]() mutable { rl.wait(); },
+                dst_final->data,
+                [entry, swiglu_slot, bias_compensation = std::move(bias_compensation)]() {
+                    bias_compensation();
+                    entry->slot_active_swiglu[swiglu_slot] = false;
+                });
+            return;  // async path complete; bias work deferred
+        }
+
+        // Sync path (Phase 9 disabled).
         rl.wait();
         auto t_wait_e = clk::now();
 
-        // Sync intermediate (need it for down's bias compensation) and output.
-        auto t_si_s = clk::now();
-        entry->intermediate_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-        auto t_si_e = clk::now();
-        entry->output_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-        auto t_so_e = clk::now();
-
-        // Host-side bias compensation for the DOWN matmul only. The fused
-        // kernel already applied the -8 offset internally.
-        auto t_bias_s = clk::now();
-        const uint16_t * intermediate_bf16 =
-            (const uint16_t *)entry->intermediate_bo->map<void*>();
-        std::vector<float> S((size_t)num_groups_hid, 0.0f);
-        for (int64_t g = 0; g < num_groups_hid; g++) {
-            float sum = 0.0f;
-            for (int k = 0; k < group_size; k++) {
-                uint32_t bits = ((uint32_t)intermediate_bf16[g * group_size + k]) << 16;
-                float v;
-                memcpy(&v, &bits, sizeof(v));
-                sum += v;
-            }
-            S[(size_t)g] = sum;
-        }
-
-        const uint8_t * down_packed = (const uint8_t *)w_down_bo_ptr->map<void*>();
-        const uint16_t * out_bf16 = (const uint16_t *)entry->output_bo->map<void*>();
-        float * dst_f32 = (float *)dst_final->data;
-
-        const int64_t down_rows_per_col = embedding_dim / num_cols;
-        for (int64_t i = 0; i < embedding_dim; i++) {
-            const int64_t col       = i / down_rows_per_col;
-            const int64_t local_row = i % down_rows_per_col;
-            const int64_t tile_idx  = local_row / down_tile_in;
-            const int64_t r_in_tile = local_row % down_tile_in;
-            const int64_t flat_tile = col * down_tiles_per_col + tile_idx;
-            const size_t tile_offset = (size_t)flat_tile * down_packed_tile_bytes;
-            const size_t scale_region_start =
-                tile_offset + (size_t)down_tile_in * (size_t)hidden_dim / 2;
-            const uint16_t * sf_row =
-                (const uint16_t *)(down_packed + scale_region_start
-                    + (size_t)r_in_tile * (size_t)num_groups_hid * 2);
-
-            float bias = 0.0f;
-            for (int64_t g = 0; g < num_groups_hid; g++) {
-                uint32_t bits = ((uint32_t)sf_row[g]) << 16;
-                float sf;
-                memcpy(&sf, &bits, sizeof(sf));
-                bias += sf * S[(size_t)g];
-            }
-            bias *= 8.0f;
-
-            uint32_t out_bits = ((uint32_t)out_bf16[i]) << 16;
-            float out_f;
-            memcpy(&out_f, &out_bits, sizeof(out_f));
-            dst_f32[i] = out_f - bias;
-        }
+        bias_compensation();
         auto t_bias_e = clk::now();
 
         if (prof) {
@@ -3590,16 +3674,14 @@ static void ggml_backend_xdna_mul_mat_swiglu_int4(
             fprintf(stderr,
                 "ggml-xdna: swiglu_int4_prof K=%lld N=%lld f_tsi=%d d_tsi=%d "
                 "in=%lld rl_build=%lld rl_exec=%lld rl_wait=%lld "
-                "sync_inter=%lld sync_out=%lld bias=%lld total=%lld us\n",
+                "bias=%lld total=%lld us\n",
                 (long long)embedding_dim, (long long)hidden_dim,
                 fused_tile_in, down_tile_in,
                 us(t_in_s, t_in_e),
                 us(t_build_s, t_build_e),
                 us(t_build_e, t_exec_e),
                 us(t_exec_e, t_wait_e),
-                us(t_si_s, t_si_e),
-                us(t_si_e, t_so_e),
-                us(t_bias_s, t_bias_e),
+                us(t_wait_e, t_bias_e),
                 us(t_in_s, t_bias_e));
         }
 
