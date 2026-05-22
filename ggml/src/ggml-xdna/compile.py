@@ -895,6 +895,49 @@ def compile_fused_dequant_gemv(N: int, K: int, num_aie_columns: int,
     return output_path
 
 
+def compile_fused_dequant_gemv_v2(N: int, K: int, num_aie_columns: int,
+                                  group_size: int, output_path: str) -> str:
+    """Compile the v2 fused INT4-dequant GEMV (PR #101 optimized kernel).
+
+    Difference from v1 (compile_fused_dequant_gemv):
+      * Kernel object is compiled per-shape with -DDIM_K and
+        -DGROUP_SIZE so inner loop bounds are constexpr.
+      * Inner loop has AIE pipelining hints + double-pump for 2-group
+        instruction interleaving.
+
+    Args:
+        N: Matrix-row dimension (output length). Maps to IRON op's M.
+        K: Reduction dim (vector length). Must be divisible by group_size.
+        num_aie_columns: Number of AIE columns (must divide N).
+        group_size: Quantization group size (Q4_0 = 32).
+        output_path: Destination .xclbin path. The matching .insts is
+            written alongside.
+    """
+    from iron.operators.fused_dequant_gemv_v2.op import AIEFusedDequantGEMVv2
+
+    tile_in, tile_out = select_gemv_tiles(N, K, num_aie_columns)
+    op = AIEFusedDequantGEMVv2(
+        M=N,
+        K=K,
+        num_aie_columns=num_aie_columns,
+        tile_size_input=tile_in,
+        tile_size_output=tile_out,
+        group_size=group_size,
+    )
+    op.compile()
+
+    build_dir = op.context.build_dir
+    compiled_xclbin = build_dir / op.xclbin_artifact.filename
+    compiled_insts = build_dir / op.insts_artifact.filename
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    shutil.copy2(str(compiled_xclbin), output_path)
+    insts_output = output_path.replace(".xclbin", ".insts")
+    shutil.copy2(str(compiled_insts), insts_output)
+
+    return output_path
+
+
 def compile_swiglu_decode(embedding_dim: int, hidden_dim: int, dtype: str,
                           num_aie_columns: int, output_dir: str) -> str:
     """Compile an IRON SwiGLU decode operator and stage its artifacts into output_dir.
@@ -2373,6 +2416,19 @@ def main():
                             help="Weights per scale (default 32 = GGML Q4_0 block size)")
     fdg_parser.add_argument("--out", type=str, help="Output xclbin path (default: cache)")
 
+    # V2 of the same -- PR #101 optimized kernel (double-pump, compile-time
+    # DIM_K/GROUP_SIZE, AIE pipelining hints). ~4x faster on the dominant shapes.
+    fdg2_parser = subparsers.add_parser(
+        "fused-dequant-gemv-v2",
+        help="V2 optimized INT4 dequant+GEMV from amd/IRON PR #101",
+    )
+    fdg2_parser.add_argument("--N", type=int, required=True)
+    fdg2_parser.add_argument("--K", type=int, required=True)
+    fdg2_parser.add_argument("--num-aie-columns", type=int, default=8)
+    fdg2_parser.add_argument("--group-size", type=int, default=32)
+    fdg2_parser.add_argument("--out", type=str, required=True,
+                             help="Output xclbin path (no cache mode -- spike use)")
+
     # SwiGLU decode subcommand
     swd_parser = subparsers.add_parser(
         "swiglu-decode", help="Compile fused SwiGLU FFN (M=1 decode path)"
@@ -2666,6 +2722,13 @@ def main():
                 args.N, args.K,
                 args.num_aie_columns, args.group_size,
             )
+        if not args.quiet:
+            print(path)
+    elif args.op == "fused-dequant-gemv-v2":
+        path = compile_fused_dequant_gemv_v2(
+            args.N, args.K,
+            args.num_aie_columns, args.group_size, args.out,
+        )
         if not args.quiet:
             print(path)
     elif args.op == "swiglu-decode":
