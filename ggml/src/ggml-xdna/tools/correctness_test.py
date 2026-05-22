@@ -129,6 +129,21 @@ PRESETS: dict[str, dict[str, str]] = {
         # and correctness is byte-exact -- just opt-in until the inner
         # dequant loop is optimized.
     },
+    "npu_int4_v2": {
+        # Same as npu_int4 but with the v2 optimized INT4 GEMV kernel
+        # (PR #101 port: compile-time DIM_K/GROUP_SIZE + double-pump +
+        # AIE pipelining). Spike measured ~4x faster per-op on the
+        # dominant FFN shapes (565 us vs 2307 us for K=2048 N=8192).
+        "XDNA_ENABLE_GEMV":              "1",
+        "XDNA_ENABLE_SWIGLU":            "1",
+        "XDNA_ENABLE_QKV":               "1",
+        "XDNA_ENABLE_DECODE_BATCH":      "1",
+        "XDNA_ENABLE_TRANSFORMER_BLOCK": "1",
+        "XDNA_ENABLE_FLOWKV_DECODE":     "1",
+        "XDNA_ENABLE_RMS_NORM":          "0",
+        "XDNA_ENABLE_GEMV_INT4":         "1",
+        "XDNA_ENABLE_GEMV_INT4_V2":      "1",
+    },
     "npu_int4_swiglu": {
         # Same as npu_int4 but ALSO enables the chained INT4 SwiGLU
         # dispatch (Phase 8.2). Kept available for regression coverage
@@ -349,6 +364,36 @@ TESTS: list[Test] = [
         variants=["npu_int4_swiglu"],
         min_prefix_match=1,
         description="Phase 8.2 dispatch path: Q4_0 SwiGLU routed through the chained INT4 xclbin (dual_fused_dequant_gemv_silu_mul + fused_dequant_gemv).",
+    ),
+    Test(
+        name="paris_short_q4_0_int4_v2",
+        prompt="What is the capital of France?",
+        n_predict=12,
+        mode="single-turn",
+        model=MODEL_Q4_0,
+        variants=["npu_int4_v2"],
+        min_prefix_match=1,
+        description="V2 INT4 GEMV kernel (PR #101 optimized: compile-time DIM_K/G + double-pump + AIE pipelining). ~4x faster than v1 on the dominant FFN shapes per xrt_async_spike.",
+    ),
+    Test(
+        name="paris_drift_64_q4_0_int4_v2",
+        prompt="What is the capital of France? Explain in detail.",
+        n_predict=64,
+        mode="single-turn",
+        model=MODEL_Q4_0,
+        variants=["npu_int4_v2"],
+        min_prefix_match=10,
+        description="V2 long-generation drift check. Same workload as paris_drift_64_q4_0_int4 but through the optimized PR #101 kernel.",
+    ),
+    Test(
+        name="multiquery_q4_0_int4_v2",
+        prompt=["What is the capital of France?", "What is 2+2?"],
+        n_predict=24,
+        mode="chat",
+        model=MODEL_Q4_0,
+        variants=["npu_int4_v2"],
+        min_prefix_match=1,
+        description="V2 + FlowKV + chat-mode composition. Should match the v1 chat test byte-for-byte.",
     ),
 ]
 
@@ -629,6 +674,7 @@ def build_bench_configs() -> list[BenchConfig]:
         BenchConfig(label="CPU Q4_0",          preset="cpu_baseline",     model=MODEL_Q4_0),
         BenchConfig(label="NPU bf16",          preset="npu_chat_safe",    model=MODEL),
         BenchConfig(label="NPU INT4 (8.1)",    preset="npu_int4",         model=MODEL_Q4_0),
+        BenchConfig(label="NPU INT4 v2",       preset="npu_int4_v2",      model=MODEL_Q4_0),
         BenchConfig(label="NPU INT4 (8.1+8.2)", preset="npu_int4_swiglu", model=MODEL_Q4_0),
     ]
 
