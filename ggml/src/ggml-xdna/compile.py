@@ -185,9 +185,16 @@ def swiglu_decode_int4_cache_key(embedding_dim: int, hidden_dim: int,
     Q4_0 has fixed group_size=32 but we keep it in the key so future
     Q4_K (W4A16 re-quant) variants with different group sizes don't
     collide.
+
+    The ``version`` field forces a fresh xclbin set after kernel changes
+    that share the same shape parameters. Bumped to 2 on 2026-05-22
+    when the dual-fused-dequant-gemv-silu-mul kernel and the down GEMV
+    inside the SwiGLU chain were ported to the v2 (PR #101) optimizations
+    (compile-time DIM_K/GROUP_SIZE + AIE pipelining hints + double-pump).
     """
     key_data = {
         "op": "swiglu_decode_int4",
+        "version": 2,
         "embedding_dim": embedding_dim,
         "hidden_dim": hidden_dim,
         "num_aie_columns": num_aie_columns,

@@ -2234,9 +2234,12 @@ static std::string make_swiglu_cache_key(xdna_op_kind op_kind,
                  (long long)embedding_dim, (long long)hidden_dim, num_cols, group_size);
     } else if (op_kind == XDNA_OP_SWIGLU_DECODE_INT4) {
         // Phase 8.2 INT4 SwiGLU decode. group_size in the key for the same
-        // -DGROUP_SIZE reason; Q4_0 is fixed at 32 today.
+        // -DGROUP_SIZE reason; Q4_0 is fixed at 32 today. The "_v2" suffix
+        // (added 2026-05-22) forces a fresh xclbin after the v2 port of the
+        // dual fused-dequant-gemv-silu-mul kernel + the swap of the down
+        // stage to AIEFusedDequantGEMVv2.
         snprintf(buf, sizeof(buf),
-                 "swiglu_decode_int4_K%lld_N%lld_%dcol_g%d",
+                 "swiglu_decode_int4_v2_K%lld_N%lld_%dcol_g%d",
                  (long long)embedding_dim, (long long)hidden_dim, num_cols, group_size);
     } else if (op_kind == XDNA_OP_SWIGLU_PREFILL_INT8) {
         if (tile_n != 64) {
