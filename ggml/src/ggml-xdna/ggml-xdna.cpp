@@ -13754,17 +13754,22 @@ static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const s
             static const bool int4_ok = xdna_env_enabled("XDNA_ENABLE_GEMV_INT4");
             if (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_BF16 || src0->type == GGML_TYPE_F16) return true;
             if ((int8_ok || tblock_w8a16_ok) && src0->type == GGML_TYPE_Q8_0) return true;
-            // Q4_0 (Priority 8.1): claimed only when the INT4 dispatch path
-            // env gate is enabled. QKV matcher rejects non-bf16 weights, so
-            // does SwiGLU matcher; xdna_plan_decode_batch now also skips
-            // Q4_0 -> bare mul_mat_gemv routes Q4_0 to mul_mat_gemv_int4.
-            if (int4_ok && src0->type == GGML_TYPE_Q4_0) return true;
-            // Q4_K (Priority 8.4): same dispatch path as Q4_0 (lossless
-            // host repack to our packed layout with effective scales +
-            // mins; bias compensation uses min·S[g] instead of 8·scale·S[g]).
-            // Q4_K requires K % 256 == 0 (super-block); enforce that here
-            // so non-conforming shapes fall through to CPU cleanly.
-            if (int4_ok && src0->type == GGML_TYPE_Q4_K && (src0->ne[0] % 256) == 0)
+            // Q4_0 (Priority 8.1) and Q4_K (Priority 8.4): claimed only
+            // when the INT4 dispatch path env gate is enabled AND the
+            // matmul is M=1 (decode). Phase 8.1/8.4 only implement
+            // mul_mat_gemv_int4 (M=1); prefill M>1 has no Q4_0/Q4_K
+            // path in mul_mat_gemv_int4 nor mul_mat_gemm, so we must
+            // fall through to CPU here. Without this M=1 guard, prefill
+            // Q4_K matmuls (e.g. llama-perplexity's M=512 chunks) hit
+            // the bf16 GEMM path with Q4_K weights and either crash on
+            // compile failure or write garbage into dst tensor->data.
+            // QKV matcher rejects non-bf16 weights; SwiGLU matcher
+            // routes Q4_0 to mul_mat_swiglu_int4 (still M=1); decode
+            // batcher already skips Q4_0.
+            // Q4_K additionally requires K % 256 == 0 (super-block size).
+            if (int4_ok && src1->ne[1] == 1 &&
+                (src0->type == GGML_TYPE_Q4_0 ||
+                 (src0->type == GGML_TYPE_Q4_K && (src0->ne[0] % 256) == 0)))
                 return true;
             return false;
         }
