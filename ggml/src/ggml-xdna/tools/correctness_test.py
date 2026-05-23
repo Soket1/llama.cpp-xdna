@@ -56,6 +56,12 @@ MODEL_QWEN35_9B_Q4_0 = REPO_ROOT / "models" / "Qwen3.5-9B-Q4_0.gguf"
 # Llama 3.2 3B (head_dim=128, 28 layers, GQA 3:1). Used to validate the
 # Phase 8.5 head_dim parameterization end-to-end on a non-Llama-1B model.
 MODEL_LLAMA_3B_Q4_0 = REPO_ROOT / "models" / "llama-3.2-3b-q4_0.gguf"
+# Gemma 3 1B Q4_K_M. Architecture: head_dim=256, GQA 4:1, embedding=1152,
+# 26 blocks. Mixed quantization -- only attn_output is Q4_K (the only
+# weight type our supports_op claims), so only that op dispatches to NPU.
+# Stresses Q4_K + head_dim=256 dispatch path even when FlowKV/attention
+# matchers don't fire (different arch from Llama).
+MODEL_GEMMA_3_1B_Q4_K_M = REPO_ROOT / "models" / "gemma-3-1b-it-Q4_K_M.gguf"
 
 # Driver/SDK paths -- adjust if your install differs.
 BASE_ENV: dict[str, str] = {
@@ -473,6 +479,18 @@ TESTS: list[Test] = [
         variants=["npu_int4_gemv_only"],
         min_prefix_match=5,
         description="Phase 8.5 fallback path: matmul-only NPU dispatch (no FlowKV/attention) on 3B. Architecture-agnostic; confirms INT4 GEMV alone works at the 3B model's K=3072 shapes (head_dim is irrelevant for the GEMV path).",
+    ),
+    Test(
+        name="paris_short_gemma3_1b_q4_k_m_gemv_only",
+        # Gemma 3 1B is instruct-tuned but uses ChatML-style tokens.
+        # A sentence-start prompt avoids the immediate <|im_end|> issue.
+        prompt="The capital of France is",
+        n_predict=24,
+        mode="single-turn",
+        model=MODEL_GEMMA_3_1B_Q4_K_M,
+        variants=["npu_int4_gemv_only"],
+        min_prefix_match=5,
+        description="Phase 8.5 head_dim=256 sanity: Gemma 3 1B Q4_K_M dispatches only its 26 attn_output Q4_K matmuls through NPU (other weights are Q5_0/Q6_K -- not claimed). Architecture-agnostic path; SWA + non-1D RoPE blockers on attention/FlowKV are irrelevant here. Validates Q4_K bias compensation works with the Gemma weight layout.",
     ),
     # ---- Qwen3.5-9B-Q4_0 -----------------------------------------------
     # Qwen3.5-9B uses head_dim=256, M-RoPE [11,11,10,0], and SWA with
