@@ -184,6 +184,18 @@ PRESETS: dict[str, dict[str, str]] = {
         "XDNA_ENABLE_RMS_NORM":          "0",
         "XDNA_ENABLE_GEMV_INT4":         "1",
     },
+    "npu_int4_v2_no_flowkv": {
+        # Same as npu_int4_v2 but FlowKV decode disabled. For 3B/Gemma
+        # debug: isolates INT4 dispatch correctness from FlowKV POC.
+        "XDNA_ENABLE_GEMV":              "1",
+        "XDNA_ENABLE_SWIGLU":            "1",
+        "XDNA_ENABLE_QKV":               "1",
+        "XDNA_ENABLE_DECODE_BATCH":      "1",
+        "XDNA_ENABLE_TRANSFORMER_BLOCK": "1",
+        "XDNA_ENABLE_FLOWKV_DECODE":     "0",
+        "XDNA_ENABLE_RMS_NORM":          "0",
+        "XDNA_ENABLE_GEMV_INT4":         "1",
+    },
     "npu_int4_swiglu": {
         # Same as npu_int4 but ALSO enables the chained INT4 SwiGLU
         # dispatch (Phase 8.2). Kept available for regression coverage

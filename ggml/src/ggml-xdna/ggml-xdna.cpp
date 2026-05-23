@@ -5155,8 +5155,22 @@ static bool xdna_validate_qkv_triple(const struct ggml_tensor * w_q,
                                       const struct ggml_tensor * w_v,
                                       const struct ggml_tensor * input,
                                       int * out_num_cols) {
+    // Phase 8.3 INT4 QKV: accept Q4_0/Q4_K weights in addition to bf16/f16/f32.
+    // The fused-bf16 QKV xclbin can't dispatch Q4_0/Q4_K -- graph_compute
+    // routes those triples to 3 individual mul_mat_gemv_int4 calls instead.
+    // Either way the matcher must fire so the FlowKV detector (which lives
+    // inside the same graph_compute QKV branch) can find Q/K/V perm tensors.
+    // All three weights must share the same type to keep dispatch simple.
+    const enum ggml_type qkv_t = w_q->type;
+    if (w_k->type != qkv_t || w_v->type != qkv_t) return false;
+    const bool is_bf16_family =
+        qkv_t == GGML_TYPE_F32 || qkv_t == GGML_TYPE_BF16 || qkv_t == GGML_TYPE_F16;
+    const bool is_int4_family =
+        qkv_t == GGML_TYPE_Q4_0 ||
+        (qkv_t == GGML_TYPE_Q4_K &&
+         (w_q->ne[0] % 256 == 0) && (w_k->ne[0] % 256 == 0) && (w_v->ne[0] % 256 == 0));
+    if (!is_bf16_family && !is_int4_family) return false;
     for (const auto * w : {w_q, w_k, w_v}) {
-        if (w->type != GGML_TYPE_F32 && w->type != GGML_TYPE_BF16 && w->type != GGML_TYPE_F16) return false;
         if (!ggml_is_contiguous(w)) return false;
         if (w->ne[2] != 1 || w->ne[3] != 1) return false;
     }
@@ -11700,10 +11714,23 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                 struct ggml_tensor * q_mm = cgraph->nodes[trip[0]];
                 struct ggml_tensor * k_mm = cgraph->nodes[trip[1]];
                 struct ggml_tensor * v_mm = cgraph->nodes[trip[2]];
-                ggml_backend_xdna_mul_mat_qkv(
-                    ctx, q_mm, k_mm, v_mm,
-                    q_mm->src[0], k_mm->src[0], v_mm->src[0],
-                    q_mm->src[1]);
+                // Phase 8.3 INT4 QKV: bf16/f16/f32 weights → fused QKV xclbin.
+                // Q4_0/Q4_K weights → 3 individual mul_mat_gemv_int4 calls,
+                // since the fused QKV bf16 xclbin can't dispatch quantized
+                // weights. Both branches share the FlowKV detector below.
+                const enum ggml_type qkv_t = q_mm->src[0]->type;
+                const bool qkv_int4 =
+                    (qkv_t == GGML_TYPE_Q4_0 || qkv_t == GGML_TYPE_Q4_K);
+                if (qkv_int4) {
+                    ggml_backend_xdna_mul_mat_gemv_int4(ctx, q_mm);
+                    ggml_backend_xdna_mul_mat_gemv_int4(ctx, k_mm);
+                    ggml_backend_xdna_mul_mat_gemv_int4(ctx, v_mm);
+                } else {
+                    ggml_backend_xdna_mul_mat_qkv(
+                        ctx, q_mm, k_mm, v_mm,
+                        q_mm->src[0], k_mm->src[0], v_mm->src[0],
+                        q_mm->src[1]);
+                }
                 // ── FlowKV diagnostic: log QKV tensors and surrounding nodes ──
                 // Gated by XDNA_DEBUG=1 (was unconditionally on when
                 // XDNA_ENABLE_FLOWKV_DECODE=1, which spammed stderr with
