@@ -11763,7 +11763,26 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                 //   K cache perm: ne = [head_dim, seq_len, kv_heads] — ne[1] == seq_len, ne[2] > 1
                 //   V cache perm: ne = [seq_len, head_dim, kv_heads] — ne[0] > head_dim, ne[2] > 1
                 //   Q rotated:    ne = [head_dim, 1, q_heads]       — ne[1] == 1
+                //
+                // The FlowKV POC OVERWRITES kqv_out after CPU has already
+                // computed attention -- so when both CPU and NPU run the
+                // attention math, we pay 2x compute. That was a net win on
+                // the bf16 path historically (NPU attention is faster than
+                // CPU bf16 attention). On Q4_0/Q4_K weights post-Phase 8.3,
+                // CPU attention runs on dequantized fp32 (fast), and the
+                // NPU overwrite is net-negative -- measured ~10% decode
+                // regression on 1B Q4_0. Default-gate FlowKV-POC to bf16
+                // models for now; XDNA_FLOWKV_ON_INT4=1 forces opt-in for
+                // INT4 correctness experiments. When FlowKV graduates from
+                // "POC overwrite" to "NPU replaces CPU attention", this
+                // gate goes away.
                 if (flowkv_decode_enabled && q_mm->src[1]->ne[1] == 1) {  // M=1 decode only
+                    static const bool flowkv_on_int4 = xdna_env_enabled("XDNA_FLOWKV_ON_INT4");
+                    if (qkv_int4 && !flowkv_on_int4) {
+                        // FlowKV POC gated off on Q4_0/Q4_K (see comment above).
+                        // Skip permute scan -- flowkv_poc_valid stays false.
+                        continue;
+                    }
                     // Find Q perm first to derive head_dim from its ne[0],
                     // then match K/V perms by that hd. Q perm is unique:
                     // ne[1] == 1 (decode batch) AND ne[2] > 1 (heads).

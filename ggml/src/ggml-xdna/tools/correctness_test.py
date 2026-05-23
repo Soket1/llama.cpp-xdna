@@ -816,6 +816,36 @@ def build_bench_configs() -> list[BenchConfig]:
     ]
 
 
+def build_bench_configs_llama3b() -> list[BenchConfig]:
+    """Bench configs for Llama 3.2 3B Q4_0 (head_dim=128).
+
+    Phase 8.3 + 8.5 result: FlowKV NPU dispatch now fires on Q4_0 models.
+    The 'NPU INT4 v2' config exercises the full stack including FlowKV
+    on head_dim=128. The 'no-flowkv' variant isolates the GEMV+QKV-INT4
+    path -- useful to see whether FlowKV POC overwrite of kqv_out helps
+    or hurts perf in practice.
+    """
+    return [
+        BenchConfig(label="3B CPU Q4_0",                 preset="cpu_baseline",          model=MODEL_LLAMA_3B_Q4_0),
+        BenchConfig(label="3B NPU INT4 v2",              preset="npu_int4_v2",           model=MODEL_LLAMA_3B_Q4_0),
+        BenchConfig(label="3B NPU INT4 v2 no-FlowKV",    preset="npu_int4_v2_no_flowkv", model=MODEL_LLAMA_3B_Q4_0),
+        BenchConfig(label="3B NPU INT4 GEMV-only",       preset="npu_int4_gemv_only",    model=MODEL_LLAMA_3B_Q4_0),
+    ]
+
+
+def build_bench_configs_gemma() -> list[BenchConfig]:
+    """Bench configs for Gemma 3 1B Q4_K_M (head_dim=256).
+
+    Only npu_int4_gemv_only fires (SWA + non-1D RoPE block other paths).
+    Q4_K attn_output dispatches through the INT4 path; ffn_down too after
+    ggml's CPU_REPACK Q6_K → Q4_K conversion.
+    """
+    return [
+        BenchConfig(label="Gemma 3 1B CPU Q4_K_M",       preset="cpu_baseline",       model=MODEL_GEMMA_3_1B_Q4_K_M),
+        BenchConfig(label="Gemma 3 1B NPU INT4 GEMV",    preset="npu_int4_gemv_only", model=MODEL_GEMMA_3_1B_Q4_K_M),
+    ]
+
+
 def build_bench_configs_qwen() -> list[BenchConfig]:
     """Bench configs for Qwen3.5-9B-Q4_0.
 
@@ -886,7 +916,14 @@ def run_bench(mode: str, model: str = "llama") -> int:
         rc2 = run_bench("chat",   model)
         return rc1 or rc2
 
-    configs = build_bench_configs_qwen() if model == "qwen" else build_bench_configs()
+    if model == "qwen":
+        configs = build_bench_configs_qwen()
+    elif model == "llama3b":
+        configs = build_bench_configs_llama3b()
+    elif model == "gemma":
+        configs = build_bench_configs_gemma()
+    else:
+        configs = build_bench_configs()
     missing = [c.model for c in configs if not c.model.exists()]
     if missing:
         for m in missing:
@@ -940,8 +977,8 @@ def main():
                     help="Run perf benchmark across CPU/NPU bf16/NPU INT4 presets")
     ap.add_argument("--bench-mode", choices=["single", "chat", "both"], default="single",
                     help="Bench mode: single-turn, chat (-cnv), or both (default: single)")
-    ap.add_argument("--model", choices=["llama", "qwen"], default="llama",
-                    help="Bench model: llama (1B Q4_0, default) or qwen (3.5-9B Q4_0)")
+    ap.add_argument("--model", choices=["llama", "qwen", "llama3b", "gemma"], default="llama",
+                    help="Bench model: llama (1B Q4_0, default), qwen (3.5-9B), llama3b (3.2 3B Q4_0), or gemma (3 1B Q4_K_M)")
     args = ap.parse_args()
 
     if args.list:
