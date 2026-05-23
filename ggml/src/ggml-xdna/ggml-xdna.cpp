@@ -823,10 +823,35 @@ struct ggml_backend_xdna_context {
             fprintf(stderr, "ggml-xdna: failed to initialize XRT device: %s\n", e.what());
         }
 
+        // Probe BO alignment via test allocations.
+        // Gated behind XDNA_PROBE_BO=1 because a failed carveout probe
+        // appears to leave the XRT/MCDM driver state inconsistent and
+        // breaks subsequent host_only weight-BO allocations (segfault
+        // in dispatch path). Use only for one-off alignment inspection.
+        if (xdna_env_enabled("XDNA_PROBE_BO")) {
+            for (int probe_i = 0; probe_i < 4; probe_i++) {
+                try {
+                    size_t probe_sz = (probe_i < 2) ? 65536 : (64 * 65536);
+                    xrt::bo::flags probe_flags = (probe_i % 2 == 0)
+                        ? xrt::bo::flags::host_only
+                        : xrt::bo::flags::carveout;
+                    xrt::bo probe(device, probe_sz, probe_flags, 0);
+                    uint64_t addr = probe.address();
+                    fprintf(stderr, "ggml-xdna: BO probe %s sz=%zuK addr=0x%llx mod4K=0x%llx mod64K=0x%llx\n",
+                            (probe_flags == xrt::bo::flags::carveout) ? "carveout" : "host_only",
+                            probe_sz / 1024,
+                            (unsigned long long)addr,
+                            (unsigned long long)(addr % 4096),
+                            (unsigned long long)(addr % 65536));
+                } catch (const std::exception & e) {
+                    fprintf(stderr, "ggml-xdna: BO probe failed: %s\n", e.what());
+                }
+            }
+        }
+
         // CPU backend for fallback. Our buffers are plain host RAM so CPU
         // can operate on them directly — no copies needed.
         cpu_backend = ggml_backend_cpu_init();
-
         // Number of AIE columns to use
         num_cols = 4;
         const char * cols_env = getenv("GGML_XDNA_NUM_COLS");
@@ -2020,12 +2045,16 @@ static void ggml_backend_xdna_mul_mat_gemv_int4(ggml_backend_xdna_context * ctx,
                         (uint8_t *)new_packed.map<void*>());
                 }
                 new_packed.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                const uint64_t bo_addr = new_packed.address();
                 auto [ins, _] = entry->b_bo_cache.emplace(src0->data, std::move(new_packed));
                 weight_bo_ptr = &ins->second;
-                fprintf(stderr, "ggml-xdna: warm int4 weight K=%lld N=%lld m_in=%d type=%s weight=%s (%zu cached)\n",
+                fprintf(stderr, "ggml-xdna: warm int4 weight K=%lld N=%lld m_in=%d type=%s weight=%s addr=0x%llx mod64K=0x%llx (%zu cached)\n",
                         (long long)K, (long long)N, m_input,
                         is_q4_K ? "Q4_K" : "Q4_0",
-                        src0->name, entry->b_bo_cache.size());
+                        src0->name,
+                        (unsigned long long)bo_addr,
+                        (unsigned long long)(bo_addr % 65536),
+                        entry->b_bo_cache.size());
                 fflush(stderr);
             } else {
                 weight_bo_ptr = &it->second;
@@ -2386,10 +2415,14 @@ static void ggml_backend_xdna_mul_mat_gemv(ggml_backend_xdna_context * ctx, stru
                     memcpy(new_mat.map<void*>(), src0->data, mat_bytes);
                 }
                 new_mat.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                const uint64_t mat_addr = new_mat.address();
                 auto [ins, _] = entry->b_bo_cache.emplace(src0->data, std::move(new_mat));
                 mat_bo_ptr = &ins->second;
-                fprintf(stderr, "ggml-xdna: warm gemv matrix K=%lld N=%lld weight=%s (%zu cached)\n",
-                        (long long)K, (long long)N, src0->name, entry->b_bo_cache.size());
+                fprintf(stderr, "ggml-xdna: warm gemv matrix K=%lld N=%lld weight=%s addr=0x%llx mod64K=0x%llx (%zu cached)\n",
+                        (long long)K, (long long)N, src0->name,
+                        (unsigned long long)mat_addr,
+                        (unsigned long long)(mat_addr % 65536),
+                        entry->b_bo_cache.size());
                 fflush(stderr);
             } else {
                 mat_bo_ptr = &it->second;
