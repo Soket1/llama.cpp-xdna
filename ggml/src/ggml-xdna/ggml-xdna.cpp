@@ -2027,6 +2027,56 @@ static void ggml_backend_xdna_mul_mat_gemv_int4(ggml_backend_xdna_context * ctx,
         }
         a_bo_ptr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
+        // [P9 carveout full probe] Run once after kernel/hw_context is
+        // available. Iterates device-ctor vs hw_context-ctor, all
+        // kernel.group_id(arg) values, and small/large sizes. Gated
+        // by XDNA_PROBE_BO=1.
+        static std::once_flag carveout_probe_flag;
+        if (xdna_env_enabled("XDNA_PROBE_BO")) {
+            std::call_once(carveout_probe_flag, [&]() {
+                fprintf(stderr, "ggml-xdna: [P9-carveout] full probe begin (cache_key=%s)\n",
+                        cache_key.c_str());
+                const size_t sizes[] = { 65536, 4u * 1024u * 1024u };
+                // Collect group_ids exposed by the loaded kernel
+                std::vector<int> grps;
+                for (int a = 0; a < 8; a++) {
+                    try { grps.push_back((int)entry->kernel.group_id(a)); }
+                    catch (...) { break; }
+                }
+                // Also try small literal group_ids (0, 1, 2, 3) -- those
+                // are what the old XRT examples used.
+                for (int g : {0, 1, 2, 3}) grps.push_back(g);
+                for (size_t sz : sizes) {
+                    for (int grp : grps) {
+                        // device-ctor variant
+                        try {
+                            xrt::bo b(ctx->device, sz, xrt::bo::flags::carveout, grp);
+                            fprintf(stderr, "ggml-xdna: [P9-carveout] device sz=%zuK grp=%d OK addr=0x%llx mod64K=0x%llx\n",
+                                    sz / 1024, grp,
+                                    (unsigned long long)b.address(),
+                                    (unsigned long long)(b.address() % 65536));
+                        } catch (const std::exception & e) {
+                            fprintf(stderr, "ggml-xdna: [P9-carveout] device sz=%zuK grp=%d FAIL %s\n",
+                                    sz / 1024, grp, e.what());
+                        }
+                        // hw_context-ctor variant
+                        try {
+                            xrt::bo b(entry->hw_ctx, sz, xrt::bo::flags::carveout, grp);
+                            fprintf(stderr, "ggml-xdna: [P9-carveout] hwctx  sz=%zuK grp=%d OK addr=0x%llx mod64K=0x%llx\n",
+                                    sz / 1024, grp,
+                                    (unsigned long long)b.address(),
+                                    (unsigned long long)(b.address() % 65536));
+                        } catch (const std::exception & e) {
+                            fprintf(stderr, "ggml-xdna: [P9-carveout] hwctx  sz=%zuK grp=%d FAIL %s\n",
+                                    sz / 1024, grp, e.what());
+                        }
+                    }
+                }
+                fprintf(stderr, "ggml-xdna: [P9-carveout] full probe end\n");
+                fflush(stderr);
+            });
+        }
+
         // Cached packed weight (keyed by src0->data, immutable after model load).
         xrt::bo * weight_bo_ptr = nullptr;
         {
