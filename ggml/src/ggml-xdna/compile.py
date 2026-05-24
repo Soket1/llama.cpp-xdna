@@ -32,6 +32,11 @@ if os.name == 'nt':
     if os.path.exists(xrt_sdk_dlls):
         os.add_dll_directory(xrt_sdk_dlls)
 
+    # Add xclbinutil directory to PATH so aiecc can find it for xclbin packaging.
+    xclbinutil_dir = r'C:\Users\Kuhnya\Downloads\xrt_windows_sdk\xrt_sdk\xrt'
+    if os.path.exists(xclbinutil_dir):
+        os.environ['PATH'] = xclbinutil_dir + os.pathsep + os.environ.get('PATH', '')
+
     # Patch Peano path for Windows
     import aie.utils.config as aie_config
     peano_dir = r'C:\ProgramData\miniforge3\envs\ryzen-ai-1.7.1\Lib\site-packages\win64.o\tools\peano'
@@ -893,6 +898,56 @@ def compile_fused_dequant_gemv(N: int, K: int, num_aie_columns: int,
     build_dir = op.context.build_dir
     compiled_xclbin = build_dir / op.xclbin_artifact.filename
     compiled_insts = build_dir / op.insts_artifact.filename
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    shutil.copy2(str(compiled_xclbin), output_path)
+    insts_output = output_path.replace(".xclbin", ".insts")
+    shutil.copy2(str(compiled_insts), insts_output)
+
+    return output_path
+
+
+def compile_fused_dequant_gemv_v3(N: int, K: int, m_batch: int,
+                                  num_aie_columns: int,
+                                  group_size: int, output_path: str) -> str:
+    """Compile the v3 fused INT4-dequant batched GEMV for spec-dec verification.
+
+    Extends v2 with an M_BATCH dimension: the 'vector' buffer holds
+    M_BATCH × K bf16 activations, and the 'output' buffer returns
+    N × M_BATCH bf16 scalars. The weight dequant cost is amortised
+    across the batch.
+
+    Args:
+        N:               Matrix-row dimension (output rows). Maps to IRON op M.
+        K:               Reduction dim. Must be divisible by group_size.
+        m_batch:         Number of activation rows (M_BATCH). 4 or 8.
+        num_aie_columns: Number of AIE columns (must divide N).
+        group_size:      Quantization group size (Q4_0 = 32).
+        output_path:     Destination .xclbin path.
+    """
+    from iron.operators.fused_dequant_gemv_v3.op import AIEFusedDequantGEMVv3
+
+    tile_in, tile_out = select_gemv_tiles(N, K, num_aie_columns)
+    # For v3, use tile_size_output = tile_size_input to keep L1 budget safe:
+    # L1_C_ty = m_out × M_BATCH × 2 bytes × depth=2. If we use the same
+    # tile_out as v2, for large N (N=8192, tile_out=1024) this becomes
+    # 1024 × 8 × 2 × 2 = 32KB which combined with the activation buffer
+    # (M_BATCH × K × 2 = up to 32KB) exceeds the 64KB AIE L1 budget.
+    # Using tile_in (typically 4) keeps C to only 128 bytes × depth=2 = trivial.
+    op = AIEFusedDequantGEMVv3(
+        M=N,
+        K=K,
+        m_batch=m_batch,
+        num_aie_columns=num_aie_columns,
+        tile_size_input=tile_in,
+        tile_size_output=tile_in,  # conservative: same as input to fit in L1
+        group_size=group_size,
+    )
+    op.compile()
+
+    build_dir = op.context.build_dir
+    compiled_xclbin = build_dir / op.xclbin_artifact.filename
+    compiled_insts  = build_dir / op.insts_artifact.filename
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     shutil.copy2(str(compiled_xclbin), output_path)
@@ -2436,6 +2491,21 @@ def main():
     fdg2_parser.add_argument("--out", type=str, required=True,
                              help="Output xclbin path (no cache mode -- spike use)")
 
+    # V3 -- batched GEMV for spec-dec verification (M_BATCH activation rows).
+    fdg3_parser = subparsers.add_parser(
+        "fused-dequant-gemv-v3",
+        help="V3 batched INT4 dequant+GEMV for spec-dec (M_BATCH=4 or 8)",
+    )
+    fdg3_parser.add_argument("--N", type=int, required=True)
+    fdg3_parser.add_argument("--K", type=int, required=True)
+    fdg3_parser.add_argument("--m-batch", type=int, default=4,
+                             choices=[2, 4, 8],
+                             help="Activation batch size (default 4)")
+    fdg3_parser.add_argument("--num-aie-columns", type=int, default=8)
+    fdg3_parser.add_argument("--group-size", type=int, default=32)
+    fdg3_parser.add_argument("--out", type=str, required=True,
+                             help="Output xclbin path (no cache mode -- spike use)")
+
     # SwiGLU decode subcommand
     swd_parser = subparsers.add_parser(
         "swiglu-decode", help="Compile fused SwiGLU FFN (M=1 decode path)"
@@ -2734,6 +2804,13 @@ def main():
     elif args.op == "fused-dequant-gemv-v2":
         path = compile_fused_dequant_gemv_v2(
             args.N, args.K,
+            args.num_aie_columns, args.group_size, args.out,
+        )
+        if not args.quiet:
+            print(path)
+    elif args.op == "fused-dequant-gemv-v3":
+        path = compile_fused_dequant_gemv_v3(
+            args.N, args.K, args.m_batch,
             args.num_aie_columns, args.group_size, args.out,
         )
         if not args.quiet:

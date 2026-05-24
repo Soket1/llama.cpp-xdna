@@ -101,8 +101,9 @@ enum xdna_op_kind : int {
     XDNA_OP_QKV = 7,  // M==1 fused Q/K/V (single GEMV with concatenated weights)
     XDNA_OP_RMS_NORM            = 8,  // standalone RMSNorm (bf16, eps=1e-5 baked-in)
     XDNA_OP_ATTENTION_PREFILL   = 9,  // chained attention block (RMSNorm+QKV+RoPE+MHA+O+residual)
-    XDNA_OP_GEMV_INT4           = 10, // M==1 fused INT4-dequant + GEMV (Q4_0 weights, bf16 acts)
-    XDNA_OP_SWIGLU_DECODE_INT4  = 11, // M==1 W4A16 fused SwiGLU FFN (Q4_0 weights, bf16 acts; Phase 8.2)
+    XDNA_OP_GEMV_INT4           = 10, // M==1  fused INT4-dequant + GEMV (Q4_0 weights, bf16 acts)
+    XDNA_OP_SWIGLU_DECODE_INT4  = 11, // M==1  W4A16 fused SwiGLU FFN (Q4_0 weights, bf16 acts; Phase 8.2)
+    XDNA_OP_GEMV_INT4_BATCH     = 12, // M=2..8 fused INT4-dequant + batched GEMV (spec-dec verify)
 };
 
 // Phase 9: per-entry input/output BO ring for async dispatch. Each call
@@ -914,6 +915,10 @@ static std::string make_cache_key(xdna_op_kind op_kind,
             snprintf(buf, sizeof(buf), "gemv_int4_K%lld_N%lld_%dcol_g32",
                      (long long)K, (long long)N, num_cols);
         }
+    } else if (op_kind == XDNA_OP_GEMV_INT4_BATCH) {
+        // v3 batched GEMV: M encodes M_BATCH (2/4/8).
+        snprintf(buf, sizeof(buf), "gemv_int4_v3_K%lld_N%lld_mb%lld_%dcol_g32",
+                 (long long)K, (long long)N, (long long)M, num_cols);
     } else {
         snprintf(buf, sizeof(buf), "gemm_%lldx%lldx%lld_%s_%dcol",
                  (long long)M, (long long)K, (long long)N, dtype_in, num_cols);
@@ -1600,6 +1605,17 @@ static bool ensure_compiled(ggml_backend_xdna_context * ctx,
                  xclbin_path.c_str(), xdna_null_redirect());
         fprintf(stderr, "ggml-xdna: compiling INT4 GEMV %s K=%lld N=%lld (first run, will be cached)...\n",
                       v2_disabled ? "v1" : "v2", (long long)K, (long long)N);
+    } else if (op_kind == XDNA_OP_GEMV_INT4_BATCH) {
+        // V3 batched GEMV: M encodes M_BATCH.
+        snprintf(cmd, sizeof(cmd),
+                 "%s \"%s\" --quiet fused-dequant-gemv-v3 --N %lld --K %lld "
+                 "--m-batch %lld --num-aie-columns %d --group-size 32 --out \"%s\"%s",
+                 xdna_python_cmd(), ctx->compile_script.c_str(),
+                 (long long)N, (long long)K, (long long)M,
+                 num_cols,
+                 xclbin_path.c_str(), xdna_null_redirect());
+        fprintf(stderr, "ggml-xdna: compiling INT4 GEMV v3 K=%lld N=%lld M_BATCH=%lld (first run, will be cached)...\n",
+                      (long long)K, (long long)N, (long long)M);
     } else {
         // [INT8 GEMM] Use separate dtype_out when provided (e.g. "i32" for i8 input).
         const char * out_dtype = dtype_out ? dtype_out : dtype_in;
@@ -2414,6 +2430,322 @@ static void ggml_backend_xdna_mul_mat_gemv_int4(ggml_backend_xdna_context * ctx,
     }
 }
 
+// =============================================================================
+// V3: Batched INT4 GEMV for spec-decoding verification (M=2..8).
+// Dequant each weight tile ONCE, accumulate dot products for M_BATCH
+// independent activation rows. Same packed-weight layout as v2 -- we reuse
+// the existing xdna_repack_q4_*_to_fused_int4 helpers.
+//
+// Notes:
+//   * src1 layout: [K, M] row-major -> M contiguous rows of K bf16/f32.
+//   * dst  layout: [N, M] row-major -> we transpose from kernel output
+//     (which is [N, M_BATCH] interleaved).
+//   * M_BATCH is rounded up to {2, 4, 8} (smallest matching tier).
+//     Activation rows >= M are zero-padded so they don't poison the dot
+//     product (kernel doesn't know about padding).
+//   * Bias compensation per batch row (Q4_0 -8 offset).
+//   * No Phase 9 async path yet -- spec-dec verify is on the critical path
+//     so sync wait is fine.
+// =============================================================================
+static void ggml_backend_xdna_mul_mat_gemv_int4_batched(
+        ggml_backend_xdna_context * ctx, struct ggml_tensor * dst) {
+    const struct ggml_tensor * src0 = dst->src[0];  // weight, [K,N], Q4_0/Q4_K
+    const struct ggml_tensor * src1 = dst->src[1];  // activations, [K,M]
+
+    if (!ctx->device_valid) return;
+
+    const int64_t K = src0->ne[0];
+    const int64_t N = src0->ne[1];
+    const int64_t M = src1->ne[1];
+    if (M < 2 || M > 8) return;  // outside our supported range
+
+    const bool is_q4_K = (src0->type == GGML_TYPE_Q4_K);
+    const int num_cols = ctx->num_cols;
+    const int group_size = 32;
+
+    // Round M_BATCH up to {2, 4, 8}. L1 budget limits:
+    //   K=2048: mb ∈ {2, 4, 8} (activation ≤ 32KB → total ≤ 41KB < 64KB)
+    //   K=8192: mb=2 only (activation 2×8192×2=32KB; mb=4 pushes total ~73KB > 64KB)
+    // The graph_compute Q4 guard already rejects M > max_batch so we don't
+    // reach here in that case.
+    const int64_t max_batch = (K > 4096) ? 2 : 8;
+    const int64_t m_batch   = (M <= 2) ? 2 : (M <= 4) ? std::min((int64_t)4, max_batch)
+                                             : max_batch;
+
+    if (N % num_cols != 0) return;  // need clean column split
+    if (K % group_size != 0) return;
+
+    // Cache key encodes M_BATCH (via the M field).
+    const std::string cache_key = make_cache_key(
+        XDNA_OP_GEMV_INT4_BATCH, m_batch, K, N, "uint4", num_cols);
+
+    if (!ensure_compiled(ctx, cache_key, XDNA_OP_GEMV_INT4_BATCH,
+                         m_batch, K, N, "uint4", num_cols)) {
+        GGML_LOG_ERROR("ggml-xdna: INT4 GEMV v3 compile failed K=%lld N=%lld MB=%lld, "
+                       "zeroing dst (graceful degradation -- pre-compile this shape)\n",
+                       (long long)K, (long long)N, (long long)m_batch);
+        // Zero dst so downstream computation doesn't get garbage.
+        // The result is numerically wrong for this layer, but at least won't crash.
+        const size_t dst_bytes = (size_t)N * (size_t)M * sizeof(float);
+        memset(dst->data, 0, dst_bytes);
+        return;
+    }
+
+    xdna_kernel_entry * entry = get_or_load_kernel(
+        ctx, cache_key, XDNA_OP_GEMV_INT4_BATCH, m_batch, K, N);
+    if (!entry) return;
+
+    try {
+        // Packed weight buffer -- same layout as v2.
+        const auto [tile_in, tile_out] = xdna_select_gemv_tiles_int4(N, K, num_cols);
+        const int m_input = tile_in;
+        (void)tile_out;
+        const int64_t rows_per_col = N / num_cols;
+        const int64_t tiles_per_col = rows_per_col / m_input;
+        const int64_t num_groups_per_row = K / group_size;
+        const size_t packed_bytes_per_tile =
+            (size_t)m_input * (size_t)K / 2
+          + (size_t)m_input * (size_t)num_groups_per_row * 2;
+        const size_t per_tile_total = (size_t)num_cols * tiles_per_col * packed_bytes_per_tile;
+        const size_t min_section_bytes =
+            is_q4_K ? (size_t)N * (size_t)num_groups_per_row * 2 : 0;
+        const size_t packed_total = per_tile_total + min_section_bytes;
+
+        const size_t vec_total_bytes = (size_t)m_batch * (size_t)K * sizeof(uint16_t);
+        const size_t out_total_bytes = (size_t)N * (size_t)m_batch * sizeof(uint16_t);
+
+        // Allocate per-call BOs (legacy single-slot, no Phase 9 yet for v3).
+        if (!entry->a_bo) {
+            entry->a_bo = std::make_unique<xrt::bo>(
+                ctx->device, vec_total_bytes, xrt::bo::flags::host_only,
+                entry->kernel.group_id(4));
+        }
+        if (!entry->c_bo) {
+            entry->c_bo = std::make_unique<xrt::bo>(
+                ctx->device, out_total_bytes, xrt::bo::flags::host_only,
+                entry->kernel.group_id(5));
+        }
+        xrt::bo * a_bo_ptr = entry->a_bo.get();
+        xrt::bo * c_bo_ptr = entry->c_bo.get();
+
+        // Phase 9 inflight wait (if upstream produced src1 async).
+        ctx->inflight.wait_for(src1->data);
+
+        // Pack M activation rows into a_bo (M_BATCH × K layout, zero-pad above M).
+        // Use nb[1] for row stride -- src1 may be a non-contiguous view.
+        uint16_t * a_dst = (uint16_t *)a_bo_ptr->map<void*>();
+        const size_t row_bytes = (size_t)K * sizeof(uint16_t);
+        if (src1->type == GGML_TYPE_F32) {
+            for (int64_t m = 0; m < M; m++) {
+                const float * src_row = (const float *)((const char *)src1->data
+                                        + m * src1->nb[1]);
+                f32_to_bf16(src_row, a_dst + m * K, (size_t)K);
+            }
+        } else {
+            for (int64_t m = 0; m < M; m++) {
+                const void * src_row = (const char *)src1->data + m * src1->nb[1];
+                memcpy(a_dst + m * K, src_row, row_bytes);
+            }
+        }
+        // Zero-pad rows M..m_batch-1 (padding doesn't contribute to accepted output)
+        for (int64_t m = M; m < m_batch; m++) {
+            memset(a_dst + m * K, 0, row_bytes);
+        }
+        a_bo_ptr->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+        // Cached weight BO (own cache, keyed by src0->data; same layout as v2).
+        xrt::bo * weight_bo_ptr = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(*entry->b_bo_mutex);
+            auto it = entry->b_bo_cache.find(src0->data);
+            if (it == entry->b_bo_cache.end()) {
+                xrt::bo new_packed(ctx->device, packed_total,
+                                   xrt::bo::flags::host_only,
+                                   entry->kernel.group_id(3));
+                if (is_q4_K) {
+                    xdna_repack_q4_K_to_fused_int4(
+                        (const uint8_t *)src0->data, N, K, m_input, num_cols, group_size,
+                        (uint8_t *)new_packed.map<void*>());
+                } else {
+                    xdna_repack_q4_0_to_fused_int4(
+                        (const uint8_t *)src0->data, N, K, m_input, num_cols, group_size,
+                        (uint8_t *)new_packed.map<void*>());
+                }
+                new_packed.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                const uint64_t bo_addr = new_packed.address();
+                auto [ins, _] = entry->b_bo_cache.emplace(src0->data, std::move(new_packed));
+                weight_bo_ptr = &ins->second;
+                fprintf(stderr, "ggml-xdna: warm int4 v3 K=%lld N=%lld MB=%lld m_in=%d "
+                        "type=%s weight=%s addr=0x%llx (%zu cached)\n",
+                        (long long)K, (long long)N, (long long)m_batch, m_input,
+                        is_q4_K ? "Q4_K" : "Q4_0",
+                        src0->name, (unsigned long long)bo_addr,
+                        entry->b_bo_cache.size());
+                fflush(stderr);
+            } else {
+                weight_bo_ptr = &it->second;
+            }
+        }
+
+        // Dispatch.
+        // XDNA_V3_REF=1 skips NPU and uses host-side reference (for correctness isolation).
+        static const bool v3_ref = xdna_env_enabled("XDNA_V3_REF");
+        static int v3_cmp_probe = 0;
+        if (!v3_ref) {
+            auto run = entry->kernel(3, entry->insts_bo, (uint32_t)entry->insts.size(),
+                                      *weight_bo_ptr, *a_bo_ptr, *c_bo_ptr);
+            run.wait();
+            c_bo_ptr->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+            // Dump first 8 raw bf16 output values for diagnosis.
+            if (xdna_env_enabled("XDNA_DEBUG_SPECDEC") && v3_cmp_probe < 2) {
+                const uint16_t * raw = (const uint16_t *)c_bo_ptr->map<void*>();
+                fprintf(stderr, "ggml-xdna: [v3-npu-raw] K=%lld N=%lld MB=%lld first8:",
+                        (long long)K, (long long)N, (long long)m_batch);
+                for (int ii = 0; ii < 8; ii++) {
+                    uint32_t b = ((uint32_t)raw[ii]) << 16; float f; memcpy(&f, &b, 4);
+                    fprintf(stderr, " %.4f", f);
+                }
+                fprintf(stderr, "\n"); fflush(stderr); v3_cmp_probe++;
+            }
+        } else {
+            // Reference: compute using packed weights + activations on host.
+            // output[i * m_batch + mb] = dot(w_unsigned_row_i, act_mb)
+            uint16_t * ref_out = (uint16_t *)c_bo_ptr->map<void*>();
+            memset(ref_out, 0, (size_t)N * (size_t)m_batch * sizeof(uint16_t));
+            const uint8_t  * w   = (const uint8_t  *)weight_bo_ptr->map<void*>();
+            const uint16_t * act = (const uint16_t *)a_bo_ptr->map<void*>();
+            for (int64_t col = 0; col < num_cols; col++) {
+                int64_t col_rows = N / num_cols;
+                for (int64_t lt = 0; lt < tiles_per_col; lt++) {
+                    size_t t = (size_t)(col * tiles_per_col + lt);
+                    const uint8_t  * wt = w + t * packed_bytes_per_tile;
+                    const uint16_t * sc = (const uint16_t *)(wt + (size_t)m_input * (size_t)K / 2);
+                    for (int64_t r = 0; r < m_input; r++) {
+                        int64_t global_row = col * col_rows + lt * m_input + r;
+                        for (int64_t mb = 0; mb < m_batch; mb++) {
+                            float acc = 0;
+                            for (int64_t g = 0; g < num_groups_per_row; g++) {
+                                uint32_t sb = ((uint32_t)sc[r * num_groups_per_row + g]) << 16;
+                                float sf; memcpy(&sf, &sb, 4);
+                                for (int64_t k = 0; k < group_size; k++) {
+                                    int64_t ki = g * group_size + k;
+                                    uint8_t nibble = (ki % 2 == 0)
+                                        ? (wt[r * K/2 + ki/2] & 0xF)
+                                        : (wt[r * K/2 + ki/2] >> 4);
+                                    float w_val = nibble * sf;
+                                    uint32_t ab = ((uint32_t)act[mb * K + ki]) << 16;
+                                    float a_val; memcpy(&a_val, &ab, 4);
+                                    acc += w_val * a_val;
+                                }
+                            }
+                            // Write to output (same layout as kernel: row * m_batch + mb)
+                            float ref_f = acc;
+                            uint16_t ref_bf16; uint32_t bits; memcpy(&bits, &ref_f, 4);
+                            bits += (0x7FFF + ((bits >> 16) & 1));
+                            ref_bf16 = (uint16_t)(bits >> 16);
+                            ref_out[global_row * m_batch + mb] = ref_bf16;
+                        }
+                    }
+                }
+            }
+            if (xdna_env_enabled("XDNA_DEBUG_SPECDEC") && v3_cmp_probe < 2) {
+                const uint16_t * raw = (const uint16_t *)c_bo_ptr->map<void*>();
+                fprintf(stderr, "ggml-xdna: [v3-ref-raw] K=%lld N=%lld MB=%lld first8:",
+                        (long long)K, (long long)N, (long long)m_batch);
+                for (int ii = 0; ii < 8; ii++) {
+                    uint32_t b = ((uint32_t)raw[ii]) << 16; float f; memcpy(&f, &b, 4);
+                    fprintf(stderr, " %.4f", f);
+                }
+                fprintf(stderr, "\n"); fflush(stderr); v3_cmp_probe++;
+            }
+        }
+
+        // ── Host-side post-processing: bias compensation + transpose ──
+        // Kernel output layout: c_out[row * m_batch + mb] (bf16)
+        // ggml dst layout:      dst_f32[mb * N + row]    (float32)
+        const uint16_t * out_bf16 = (const uint16_t *)c_bo_ptr->map<void*>();
+        const uint16_t * x_bf16   = (const uint16_t *)a_bo_ptr->map<void*>();
+
+        // Precompute S_mb[g] = sum over each group of activation values, per batch row.
+        // Shape: [m_batch][num_groups_per_row]. For M < m_batch, padding rows yield
+        // S=0 -> bias=0 -> output also 0 (correct since output not read).
+        std::vector<float> S_all((size_t)m_batch * (size_t)num_groups_per_row, 0.0f);
+        for (int64_t mb = 0; mb < m_batch; mb++) {
+            for (int64_t g = 0; g < num_groups_per_row; g++) {
+                float sum = 0.0f;
+                for (int k = 0; k < group_size; k++) {
+                    uint32_t bits = ((uint32_t)x_bf16[mb * K + g * group_size + k]) << 16;
+                    float v;
+                    memcpy(&v, &bits, sizeof(v));
+                    sum += v;
+                }
+                S_all[mb * num_groups_per_row + g] = sum;
+            }
+        }
+
+        const size_t packed_bytes_per_tile_local = (size_t)m_input * (size_t)K / 2
+                                                 + (size_t)m_input * (size_t)num_groups_per_row * 2;
+
+        // Per output row: walk packed buffer to find scales, apply bias to each mb.
+        const uint8_t * packed = (const uint8_t *)weight_bo_ptr->map<void*>();
+        float * dst_f32 = (float *)dst->data;
+
+        for (int64_t i = 0; i < N; i++) {
+            const int64_t col = i / rows_per_col;
+            const int64_t local_row = i % rows_per_col;
+            const int64_t tile_idx = local_row / m_input;
+            const int64_t r_in_tile = local_row % m_input;
+            const int64_t flat_tile = col * tiles_per_col + tile_idx;
+            const size_t tile_offset = (size_t)flat_tile * packed_bytes_per_tile_local;
+            const size_t scale_region_start =
+                tile_offset + (size_t)m_input * (size_t)K / 2;
+            const uint16_t * sf_row = (const uint16_t *)(packed + scale_region_start
+                                       + (size_t)r_in_tile * (size_t)num_groups_per_row * 2);
+
+            // For Q4_K, also pull per-row min from the appended min section.
+            const uint16_t * min_row = nullptr;
+            if (is_q4_K) {
+                min_row = (const uint16_t *)(packed + per_tile_total
+                                              + (size_t)i * (size_t)num_groups_per_row * 2);
+            }
+
+            for (int64_t mb = 0; mb < m_batch; mb++) {
+                // Raw kernel output for (row i, batch mb).
+                uint32_t b = ((uint32_t)out_bf16[i * m_batch + mb]) << 16;
+                float raw;
+                memcpy(&raw, &b, sizeof(raw));
+
+                // Bias = sum_g(scale[g] * S_mb[g] * (-8)) [Q4_0]
+                //        or sum_g(scale[g] * S_mb[g] * 0 + min[g] * S_mb[g]) [Q4_K]
+                // For Q4_0 the kernel does unsigned dequant; host adds the -8 correction.
+                // For Q4_K the kernel does unsigned dequant + min adjustment is host-side.
+                float bias = 0.0f;
+                for (int64_t g = 0; g < num_groups_per_row; g++) {
+                    uint32_t sb = ((uint32_t)sf_row[g]) << 16;
+                    float sf; memcpy(&sf, &sb, sizeof(sf));
+                    const float S = S_all[mb * num_groups_per_row + g];
+                    if (is_q4_K) {
+                        // Q4_K: bias = sum_g(min[g] * S_mb[g])
+                        uint32_t mnb = ((uint32_t)min_row[g]) << 16;
+                        float mn; memcpy(&mn, &mnb, sizeof(mn));
+                        bias += mn * S;
+                    } else {
+                        // Q4_0: bias = -8 * sum_g(scale[g] * S_mb[g])
+                        bias += (-8.0f) * sf * S;
+                    }
+                }
+
+                // Write to dst (mb stays within M -- skip padded rows).
+                if (mb < M) {
+                    dst_f32[mb * N + i] = raw + bias;
+                }
+            }
+        }
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("ggml-xdna: INT4 GEMV v3 dispatch failed (%s)\n", e.what());
+    }
+}
+
 static void ggml_backend_xdna_mul_mat_gemv(ggml_backend_xdna_context * ctx, struct ggml_tensor * dst) {
     const struct ggml_tensor * src0 = dst->src[0];  // weight (matrix), [N,K]
     const struct ggml_tensor * src1 = dst->src[1];  // activation (vector), [K]
@@ -2512,11 +2844,28 @@ static void ggml_backend_xdna_mul_mat_gemv(ggml_backend_xdna_context * ctx, stru
     }
 }
 
-// Dispatch MUL_MAT to GEMM (M>=32 prefill) or GEMV (M==1 decode) kernel.
+// Dispatch MUL_MAT to GEMM (M>=32 prefill), v3 batched INT4 GEMV (M=2..8 INT4
+// spec-dec verify), or GEMV (M==1 decode) kernel.
 static void ggml_backend_xdna_mul_mat(ggml_backend_xdna_context * ctx, struct ggml_tensor * dst) {
     const int64_t M = dst->src[1]->ne[1];
+    const struct ggml_tensor * src0 = dst->src[1] ? dst->src[0] : nullptr;
+    static const bool batched_int4 = xdna_env_enabled("XDNA_ENABLE_GEMV_INT4_BATCH");
+
     if (M == 1) {
         ggml_backend_xdna_mul_mat_gemv(ctx, dst);
+    } else if (batched_int4 && src0 && M >= 2 && M <= 8 &&
+               (src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q4_K)) {
+        // Spec-dec verify batch path. Opt-in via XDNA_ENABLE_GEMV_INT4_BATCH=1
+        // to avoid changing dispatch semantics for non-spec-dec runs.
+        static int v3_route_probe = 0;
+        if (v3_route_probe < 5) {
+            fprintf(stderr, "ggml-xdna: [v3-route] M=%lld K=%lld N=%lld type=%s -> batched dispatch\n",
+                    (long long)M, (long long)dst->src[0]->ne[0], (long long)dst->src[0]->ne[1],
+                    src0->type == GGML_TYPE_Q4_K ? "Q4_K" : "Q4_0");
+            fflush(stderr);
+            v3_route_probe++;
+        }
+        ggml_backend_xdna_mul_mat_gemv_int4_batched(ctx, dst);
     } else {
         ggml_backend_xdna_mul_mat_gemm(ctx, dst);
     }
@@ -11539,6 +11888,21 @@ static bool xdna_node_npu_dispatchable(const struct ggml_tensor * node) {
     const int64_t N = s0->ne[1];
     const int64_t M = s1->ne[1];
     if (M == 1) return xdna_shape_dispatchable_gemv(K, N);
+    // Spec-dec verify path: M=2..8 INT4 batched GEMV (opt-in).
+    static const bool batched_int4 = xdna_env_enabled("XDNA_ENABLE_GEMV_INT4_BATCH");
+    if (batched_int4 && M >= 2 && M <= 8 &&
+        (s0->type == GGML_TYPE_Q4_0 || s0->type == GGML_TYPE_Q4_K)) {
+        bool shape_ok = xdna_shape_dispatchable_gemv(K, N);
+        static int dbg_count = 0;
+        if (xdna_env_enabled("XDNA_DEBUG_SPECDEC") && dbg_count < 8) {
+            fprintf(stderr, "ggml-xdna: [batched-disp] M=%lld K=%lld N=%lld type=%s shape_ok=%d\n",
+                    (long long)M, (long long)K, (long long)N,
+                    s0->type == GGML_TYPE_Q4_K ? "Q4_K" : "Q4_0", (int)shape_ok);
+            fflush(stderr);
+            dbg_count++;
+        }
+        if (shape_ok) return true;
+    }
     return xdna_shape_dispatchable(M, K, N);
 }
 
@@ -11579,6 +11943,42 @@ static ggml_status xdna_delegate_range(ggml_backend_xdna_context * ctx,
 // Matches the pattern: MUL_MAT(Q@K^T) [SCALE] [ADD mask] SOFT_MAX MUL_MAT(scores@V)
 
 static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
+    // [spec-dec probe] aggregate M histograms across many calls.
+    {
+        static const bool dbg = xdna_env_enabled("XDNA_DEBUG_SPECDEC");
+        static int call_count = 0;
+        static int total_m_hist[10] = {0};  // M in [0..8], index 9 = M>=9
+        static int total_int4_m_hist[10] = {0};
+        if (dbg) {
+            call_count++;
+            for (int i = 0; i < cgraph->n_nodes; i++) {
+                struct ggml_tensor * node = cgraph->nodes[i];
+                if (node->op != GGML_OP_MUL_MAT) continue;
+                int64_t M = node->src[1]->ne[1];
+                int idx = (M < 0) ? 0 : (M >= 9) ? 9 : (int)M;
+                total_m_hist[idx]++;
+                if (node->src[0]->type == GGML_TYPE_Q4_0 ||
+                    node->src[0]->type == GGML_TYPE_Q4_K) {
+                    total_int4_m_hist[idx]++;
+                }
+            }
+            // Print cumulative every 50 calls and at end of long run.
+            if (call_count % 50 == 0 || call_count == 1) {
+                fprintf(stderr,
+                    "ggml-xdna: [specdec-cum %d calls] all mul_mat M{1:%d 2:%d 3:%d 4:%d 5:%d 6:%d 7:%d 8:%d >=9:%d}\n",
+                    call_count, total_m_hist[1], total_m_hist[2], total_m_hist[3],
+                    total_m_hist[4], total_m_hist[5], total_m_hist[6], total_m_hist[7],
+                    total_m_hist[8], total_m_hist[9]);
+                fprintf(stderr,
+                    "ggml-xdna: [specdec-cum %d calls] INT4    M{1:%d 2:%d 3:%d 4:%d 5:%d 6:%d 7:%d 8:%d >=9:%d}\n",
+                    call_count, total_int4_m_hist[1], total_int4_m_hist[2], total_int4_m_hist[3],
+                    total_int4_m_hist[4], total_int4_m_hist[5], total_int4_m_hist[6], total_int4_m_hist[7],
+                    total_int4_m_hist[8], total_int4_m_hist[9]);
+                fflush(stderr);
+            }
+        }
+    }
+
     ggml_backend_xdna_context * ctx = (ggml_backend_xdna_context *)backend->context;
     int n = cgraph->n_nodes;
 
@@ -12684,13 +13084,23 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
         // XDNA partition (otherwise decode-time M=1 matmuls would also
         // fall back to CPU -- ggml's per-node decision is sticky once
         // chosen at planning time). But there is no NPU GEMM kernel for
-        // Q4_0/Q4_K -- mul_mat_gemv_int4 only handles M=1. Accumulate
-        // these M>1 nodes into the CPU run instead of dispatching.
+        // Q4_0/Q4_K at large M. Exception: M=2..8 batched GEMV (v3 kernel)
+        // is available when XDNA_ENABLE_GEMV_INT4_BATCH=1.
         if (node->op == GGML_OP_MUL_MAT && node->src[1]->ne[1] != 1 &&
             (node->src[0]->type == GGML_TYPE_Q4_0 ||
              node->src[0]->type == GGML_TYPE_Q4_K)) {
-            if (cpu_run_start < 0) cpu_run_start = i;
-            continue;
+            static const bool batched_int4_guard =
+                xdna_env_enabled("XDNA_ENABLE_GEMV_INT4_BATCH");
+            const int64_t M_guard = node->src[1]->ne[1];
+            const int64_t K_guard = node->src[0]->ne[0];
+            // max_batch = 2 for K>4096 (L1 budget), 8 otherwise.
+            const int64_t max_batch_guard = (K_guard > 4096) ? 2 : 8;
+            if (batched_int4_guard && M_guard >= 2 && M_guard <= max_batch_guard) {
+                // Fall through to xdna_node_npu_dispatchable check below.
+            } else {
+                if (cpu_run_start < 0) cpu_run_start = i;
+                continue;
+            }
         }
 
         if (xdna_node_npu_dispatchable(node)) {
@@ -14141,6 +14551,14 @@ static bool ggml_backend_xdna_device_offload_op(ggml_backend_dev_t dev, const st
     const int64_t N = op->src[0]->ne[1];
     const int64_t M = op->src[1]->ne[1];
     if (M == 1) return xdna_shape_dispatchable_gemv(K, N);
+    // Spec-dec verify path: M=2..8 INT4 batched GEMV (opt-in).
+    static const bool batched_int4 = xdna_env_enabled("XDNA_ENABLE_GEMV_INT4_BATCH");
+    if (batched_int4 && M >= 2 && M <= 8 &&
+        (op->src[0]->type == GGML_TYPE_Q4_0 ||
+         op->src[0]->type == GGML_TYPE_Q4_K) &&
+        xdna_shape_dispatchable_gemv(K, N)) {
+        return true;
+    }
     return xdna_shape_dispatchable(M, K, N);
     GGML_UNUSED(dev);
 }
