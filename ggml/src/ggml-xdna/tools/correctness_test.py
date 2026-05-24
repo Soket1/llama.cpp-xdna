@@ -41,7 +41,8 @@ from typing import Iterable
 # =============================================================================
 
 REPO_ROOT = Path("C:/llama.cpp-xdna")
-LLAMA_CLI = REPO_ROOT / "build" / "bin" / "Release" / "llama-cli.exe"
+LLAMA_CLI    = REPO_ROOT / "build" / "bin" / "Release" / "llama-cli.exe"
+LLAMA_LOOKUP = REPO_ROOT / "build" / "bin" / "Release" / "llama-lookup.exe"
 MODEL     = REPO_ROOT / "models" / "llama-3.2-1b-instruct-BF16.gguf"
 
 # Quantized variants of the same model, generated via llama-quantize.exe.
@@ -967,6 +968,68 @@ def run_bench_one(cfg: BenchConfig, mode: str) -> tuple[float, float]:
     return decode_tps, prompt_tps
 
 
+def run_bench_lookup(preset: str, model: Path, draft_max: int = 8,
+                     prompt: str = None) -> tuple[float, float, float]:
+    """Run llama-lookup.exe and return (decode_tps, accept_pct, n_drafted).
+
+    llama-lookup uses in-context n-gram speculation -- no draft model
+    needed. Best with repetitive/structured text; acceptance varies from
+    ~50% (creative) to ~100% (repetitive). Stats come from stderr.
+    """
+    env = build_env(preset)
+    test_prompt = prompt or (
+        # Repetitive text gives high n-gram hit rate for benchmark stability
+        "The quick brown fox jumps over the lazy dog. "
+        "The quick brown fox jumps over the lazy dog. "
+        "The quick brown fox jumps over the lazy dog. Continue: "
+    )
+    args = [
+        str(LLAMA_LOOKUP),
+        "-m",   str(model),
+        "-n",   str(BENCH_N_PREDICT),
+        "-c",   "512",
+        "-ngl", "100",
+        "--no-mmap",
+        "--temp", "0",
+        "-s",   "42",
+        "--draft-max", str(draft_max),
+        "--draft-min", "1",
+        "-p", test_prompt,
+    ]
+    timeout = 300 + BENCH_N_PREDICT * 8
+    result = subprocess.run(
+        args, env=env, capture_output=True, text=True,
+        timeout=timeout, errors="replace",
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"llama-lookup exit {result.returncode}\n"
+            f"stderr tail:\n{result.stderr[-1000:]}"
+        )
+    # Parse speed from stderr: "decoded N tokens in T s, speed: S t/s"
+    import re
+    speed_m = re.search(r"decoded\s+\d+\s+tokens.*?,\s+speed:\s+([\d.]+)\s+t/s",
+                        result.stderr)
+    accept_m = re.search(r"accept\s*=\s*([\d.]+)%", result.stderr)
+    drafted_m = re.search(r"n_drafted\s*=\s*(\d+)", result.stderr)
+    decode_tps  = float(speed_m.group(1))  if speed_m   else 0.0
+    accept_pct  = float(accept_m.group(1)) if accept_m  else 0.0
+    n_drafted   = int(drafted_m.group(1))  if drafted_m else 0
+    return decode_tps, accept_pct, n_drafted
+
+
+def build_bench_configs_lookup() -> list[tuple[str, str, Path, int]]:
+    """Lookup (n-gram) spec-dec bench configs.
+
+    Returns list of (label, preset, model, draft_max).
+    """
+    return [
+        ("1B NPU INT4, n-gram d=4",  "npu_int4", MODEL_Q4_0, 4),
+        ("1B NPU INT4, n-gram d=8",  "npu_int4", MODEL_Q4_0, 8),
+        ("1B NPU INT4, n-gram d=16", "npu_int4", MODEL_Q4_0, 16),
+    ]
+
+
 def run_bench(mode: str, model: str = "llama") -> int:
     if mode == "both":
         rc1 = run_bench("single", model)
@@ -1016,6 +1079,21 @@ def run_bench(mode: str, model: str = "llama") -> int:
     print(f"  {'-'*24}  {'-'*11}  {'-'*11}")
     for label, decodes, prompts in rows:
         print(f"  {label:24s}  {median(decodes):11.2f}  {median(prompts):11.2f}")
+
+    # N-gram lookup bench: shows spec-dec speedup without draft model.
+    if model == "llama" and mode == "single":
+        lookup_configs = build_bench_configs_lookup()
+        baseline_tps = median([d for _, decodes, _ in rows[:1] for d in decodes]) or 0
+        print(f"\n--- n-gram lookup spec-dec (repetitive prompt, baseline~{baseline_tps:.1f} t/s) ---")
+        print(f"  {'config':30s}  {'decode t/s':>11s}  {'accept%':>8s}  {'speedup':>8s}")
+        print(f"  {'-'*30}  {'-'*11}  {'-'*8}  {'-'*8}")
+        for label, preset, lmodel, dmax in lookup_configs:
+            try:
+                tps, accept, ndrafted = run_bench_lookup(preset, lmodel, dmax)
+                speedup = tps / baseline_tps if baseline_tps > 0 else 0
+                print(f"  {label:30s}  {tps:11.2f}  {accept:8.1f}%  {speedup:7.1f}x")
+            except Exception as e:
+                print(f"  {label:30s}  ERROR: {e}")
     print()
     return 0
 
