@@ -196,6 +196,31 @@ PRESETS: dict[str, dict[str, str]] = {
         "XDNA_ENABLE_RMS_NORM":          "0",
         "XDNA_ENABLE_GEMV_INT4":         "1",
     },
+    "npu_int4_specdec": {
+        # v3 batched INT4 GEMV for spec-dec verify batches (M=2..8).
+        # Output from this preset should match cpu_baseline at temp=0.
+        "XDNA_ENABLE_GEMV":              "1",
+        "XDNA_ENABLE_SWIGLU":            "1",
+        "XDNA_ENABLE_QKV":               "1",
+        "XDNA_ENABLE_DECODE_BATCH":      "1",
+        "XDNA_ENABLE_TRANSFORMER_BLOCK": "1",
+        "XDNA_ENABLE_FLOWKV_DECODE":     "1",
+        "XDNA_ENABLE_RMS_NORM":          "0",
+        "XDNA_ENABLE_GEMV_INT4":         "1",
+        "XDNA_ENABLE_GEMV_INT4_BATCH":   "1",
+    },
+    "npu_int4_specdec_cpu_verify": {
+        # Same as npu_int4 but spec-dec verify uses CPU (M>1 fallback).
+        # This is the correct/baseline for spec-dec correctness validation.
+        "XDNA_ENABLE_GEMV":              "1",
+        "XDNA_ENABLE_SWIGLU":            "1",
+        "XDNA_ENABLE_QKV":               "1",
+        "XDNA_ENABLE_DECODE_BATCH":      "1",
+        "XDNA_ENABLE_TRANSFORMER_BLOCK": "1",
+        "XDNA_ENABLE_FLOWKV_DECODE":     "1",
+        "XDNA_ENABLE_RMS_NORM":          "0",
+        "XDNA_ENABLE_GEMV_INT4":         "1",
+    },
     "npu_int4_swiglu": {
         # Same as npu_int4 but ALSO enables the chained INT4 SwiGLU
         # dispatch (Phase 8.2). Kept available for regression coverage
@@ -242,6 +267,9 @@ class Test:
     # as info. A `min_prefix_match` of None means "require full match"
     # (same as 0). Use a positive int to allow drift past that point.
     min_prefix_match: int | None = None
+    # Optional draft model for spec-dec tests.
+    draft_model: Path | None = None
+    draft_max: int = 4
 
 
 TESTS: list[Test] = [
@@ -445,6 +473,30 @@ TESTS: list[Test] = [
         description="V2 INT4 GEMV kernel (PR #101 optimized: compile-time DIM_K/G + double-pump + AIE pipelining). ~4x faster than v1 on the dominant FFN shapes per xrt_async_spike.",
     ),
     Test(
+        name="paris_short_specdec_cpu_verify",
+        prompt="What is the capital of France?",
+        n_predict=12,
+        mode="single-turn",
+        model=MODEL_Q4_0,
+        draft_model=MODEL_Q4_0,
+        draft_max=4,
+        variants=["npu_int4_specdec_cpu_verify"],
+        min_prefix_match=1,
+        description="Spec-dec with CPU verify (M>1 falls back to CPU). Validates spec-dec correctness baseline: same model as draft so acceptance ~100%. Output must match cpu_baseline.",
+    ),
+    Test(
+        name="paris_short_specdec_v3_npu",
+        prompt="What is the capital of France?",
+        n_predict=12,
+        mode="single-turn",
+        model=MODEL_Q4_0,
+        draft_model=MODEL_Q4_0,
+        draft_max=4,
+        variants=["npu_int4_specdec"],
+        min_prefix_match=1,
+        description="Spec-dec with v3 NPU batched GEMV verify (XDNA_ENABLE_GEMV_INT4_BATCH=1). Output must match cpu_baseline. Fails if v3 bias compensation is wrong.",
+    ),
+    Test(
         name="paris_drift_64_q4_0_int4_v2",
         prompt="What is the capital of France? Explain in detail.",
         n_predict=64,
@@ -567,6 +619,11 @@ def run_llama(preset: str, test: Test) -> tuple[str, str]:
         "--temp", "0",
         "-s",   str(test.seed),
     ]
+    # Spec-dec args: add draft model if specified.
+    if test.draft_model is not None:
+        args.extend(["--model-draft", str(test.draft_model),
+                     "--draft-max", str(test.draft_max),
+                     "--draft-min", "1"])
 
     timeout = 60 + test.n_predict * 2  # generous: bf16 NPU runs at ~5-10 t/s
     if test.mode == "single-turn":
