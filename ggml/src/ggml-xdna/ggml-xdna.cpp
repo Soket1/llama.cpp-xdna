@@ -6021,15 +6021,25 @@ struct xdna_qkv_plan {
     // K and V node indices — skipped during main loop (already dispatched at Q).
     std::unordered_set<int> skip_indices;
     // Q node idx -> (Q_rope node, K_rope node) if RoPE is found downstream.
-    // Allows fused QKV+RoPE dispatch: matmul + rotation in one host-side call,
-    // consuming the ROPE ggml ops before the CPU runs them.
     struct RopeInfo {
-        struct ggml_tensor * q_rope = nullptr;  // ROPE(Q) ggml node
-        struct ggml_tensor * k_rope = nullptr;  // ROPE(K) ggml node
+        struct ggml_tensor * q_rope = nullptr;
+        struct ggml_tensor * k_rope = nullptr;
         int q_rope_idx = -1;
         int k_rope_idx = -1;
     };
     std::unordered_map<int, RopeInfo> rope_at;  // keyed by Q node idx
+
+    // Q node idx -> pre-attention RMSNorm node (the norm that normalises the
+    // residual just before QKV projection).  When found and
+    // XDNA_ENABLE_QKV_NORM_FUSED=1, the QKV dispatch applies the norm inline
+    // on CPU and consumes the ggml node — eliminating the CPU sub-graph for
+    // pre-attention normalisation and the 1-col hw_context that causes the
+    // multi-query chat-mode garbage bug.
+    struct AttnNormInfo {
+        struct ggml_tensor * norm = nullptr;   // RMS_NORM ggml node
+        int norm_idx = -1;                     // cgraph index
+    };
+    std::unordered_map<int, AttnNormInfo> attn_norm_at;  // keyed by Q node idx
 };
 
 // Scan cgraph for QKV triples: MUL_MAT nodes grouped by src[1] that form
@@ -6158,6 +6168,42 @@ static void xdna_plan_qkv(const struct ggml_cgraph * cgraph, xdna_qkv_plan * out
             }
             if (ri.q_rope_idx >= 0 && ri.k_rope_idx >= 0) {
                 out->rope_at[i_q] = ri;
+            }
+        }
+
+        // Scan backward from Q's input (src[1] of q_mm) to find the
+        // pre-attention RMSNorm that normalises the residual before QKV.
+        // Pattern: residual → RMS_NORM → [MUL(gain)] → gate/up matmuls.
+        // We find the RMS_NORM itself; the gain MUL (if any) stays on CPU
+        // and correctly reads our inline-normalised output tensor.
+        {
+            xdna_qkv_plan::AttnNormInfo ani;
+            const struct ggml_tensor * qkv_input = n_q->src[1];
+            // Walk the src[0] chain to find an ancestor RMS_NORM.
+            const struct ggml_tensor * anc = qkv_input;
+            for (int s = 0; anc && s < 6; s++) {
+                if (anc->op == GGML_OP_RMS_NORM) {
+                    // Map back to cgraph index.
+                    for (int j = std::max(0, i_q - 12); j < i_q; j++) {
+                        if (cgraph->nodes[j] == anc) {
+                            ani.norm = cgraph->nodes[j];
+                            ani.norm_idx = j;
+                            break;
+                        }
+                    }
+                    break;
+                }
+                if (!anc->src[0]) break;
+                if (anc->op == GGML_OP_VIEW || anc->op == GGML_OP_RESHAPE ||
+                    anc->op == GGML_OP_PERMUTE || anc->op == GGML_OP_CONT ||
+                    anc->op == GGML_OP_MUL /* gain after norm */) {
+                    anc = xdna_strip_view(anc->src[0]);
+                } else {
+                    break;
+                }
+            }
+            if (ani.norm_idx >= 0) {
+                out->attn_norm_at[i_q] = ani;
             }
         }
     }
@@ -12673,6 +12719,31 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                     static const bool qkv_fused_enabled =
                         xdna_env_enabled("XDNA_ENABLE_QKV_INT4_FUSED");
                     if (qkv_fused_enabled && qkv_t == GGML_TYPE_Q4_0) {
+                        // Fused pre-attn RMSNorm: apply inline and consume node.
+                        // This eliminates the 1-col hw_context that causes the
+                        // multi-query chat-mode garbage bug (1-col RMSNorm
+                        // hw_context conflicts with 8-col QKV hw_context).
+                        static const bool attn_norm_fused =
+                            xdna_env_enabled("XDNA_ENABLE_QKV_NORM_FUSED");
+                        if (attn_norm_fused) {
+                            auto nit = qkv_plan.attn_norm_at.find(i);
+                            if (nit != qkv_plan.attn_norm_at.end() &&
+                                nit->second.norm != nullptr) {
+                                struct ggml_tensor * norm_node = nit->second.norm;
+                                // Apply norm in-place: write to norm_node->data
+                                // so downstream gain-MUL reads our result.
+                                if (norm_node->type == GGML_TYPE_F32 &&
+                                    norm_node->src[0] &&
+                                    norm_node->src[0]->type == GGML_TYPE_F32) {
+                                    const int64_t row_len = norm_node->ne[0];
+                                    xdna_apply_rms_norm_f32(norm_node,
+                                        (float *)norm_node->data,
+                                        (const float *)norm_node->src[0]->data,
+                                        row_len);
+                                    qkv_plan.skip_indices.insert(nit->second.norm_idx);
+                                }
+                            }
+                        }
                         // Fused QKV+RoPE: if ROPE nodes found, apply inline.
                         struct ggml_tensor * q_rope_node = nullptr;
                         struct ggml_tensor * k_rope_node = nullptr;
@@ -12683,8 +12754,6 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                             if (rit != qkv_plan.rope_at.end()) {
                                 q_rope_node = rit->second.q_rope;
                                 k_rope_node = rit->second.k_rope;
-                                // Mark ROPE nodes as consumed so CPU doesn't
-                                // re-execute them.
                                 if (rit->second.q_rope_idx >= 0)
                                     qkv_plan.skip_indices.insert(rit->second.q_rope_idx);
                                 if (rit->second.k_rope_idx >= 0)
