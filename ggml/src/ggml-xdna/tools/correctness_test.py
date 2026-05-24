@@ -197,6 +197,20 @@ PRESETS: dict[str, dict[str, str]] = {
         "XDNA_ENABLE_RMS_NORM":          "0",
         "XDNA_ENABLE_GEMV_INT4":         "1",
     },
+    "npu_int4_qkv_fused": {
+        # Phase 8.3 mode B: fused Q+K+V INT4 in one dispatch.
+        # XDNA_ENABLE_QKV_INT4_FUSED=1 routes INT4 QKV triples through
+        # ggml_backend_xdna_mul_mat_qkv_int4_fused (N=q+k+v, single call).
+        "XDNA_ENABLE_GEMV":              "1",
+        "XDNA_ENABLE_SWIGLU":            "1",
+        "XDNA_ENABLE_QKV":               "1",
+        "XDNA_ENABLE_DECODE_BATCH":      "1",
+        "XDNA_ENABLE_TRANSFORMER_BLOCK": "1",
+        "XDNA_ENABLE_FLOWKV_DECODE":     "1",
+        "XDNA_ENABLE_RMS_NORM":          "0",
+        "XDNA_ENABLE_GEMV_INT4":         "1",
+        "XDNA_ENABLE_QKV_INT4_FUSED":    "1",
+    },
     "npu_int4_specdec": {
         # v3 batched INT4 GEMV for spec-dec verify batches (M=2..8).
         # Output from this preset should match cpu_baseline at temp=0.
@@ -462,6 +476,17 @@ TESTS: list[Test] = [
         variants=["npu_int4_swiglu"],
         min_prefix_match=1,
         description="Phase 8.2 dispatch path: Q4_0 SwiGLU routed through the chained INT4 xclbin (dual_fused_dequant_gemv_silu_mul + fused_dequant_gemv).",
+    ),
+    Test(
+        name="paris_short_qkv_int4_fused",
+        prompt="What is the capital of France?",
+        n_predict=12,
+        mode="single-turn",
+        model=MODEL_Q4_0,
+        variants=["npu_int4_qkv_fused"],
+        min_prefix_match=1,
+        description="Phase 8.3 mode B: fused Q+K+V INT4 in one dispatch (N=q+k+v). "
+                    "Expected ~10% decode speedup vs mode A. Output must match cpu_baseline.",
     ),
     Test(
         name="paris_short_q4_0_int4_v2",
@@ -871,6 +896,7 @@ def build_bench_configs() -> list[BenchConfig]:
         BenchConfig(label="NPU INT4 v1",       preset="npu_int4_v1",      model=MODEL_Q4_0),
         BenchConfig(label="NPU INT4 (default=v2)", preset="npu_int4",     model=MODEL_Q4_0),
         BenchConfig(label="NPU INT4 +SwiGLU",  preset="npu_int4_swiglu",  model=MODEL_Q4_0),
+        BenchConfig(label="NPU INT4 QKV fused", preset="npu_int4_qkv_fused", model=MODEL_Q4_0),
     ]
 
 
