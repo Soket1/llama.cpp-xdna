@@ -2112,8 +2112,14 @@ static void ggml_backend_xdna_mul_mat_gemv_int4(ggml_backend_xdna_context * ctx,
         }
 
         // Dispatch — same arg order as bf16 GEMV (opcode, insts, n_insts, mat, vec, out).
+        // [Phase 0 spec-dec probe] XDNA_DEBUG_TIMING=1 prints submit/wait split
+        // (kernel(...) returns after XRT submit, run.wait() blocks for NPU done).
+        static const bool dbg_timing = xdna_env_enabled("XDNA_DEBUG_TIMING");
+        const auto t0 = dbg_timing ? std::chrono::steady_clock::now()
+                                   : std::chrono::steady_clock::time_point{};
         auto run = entry->kernel(3, entry->insts_bo, (uint32_t)entry->insts.size(),
                                   *weight_bo_ptr, *a_bo_ptr, *c_bo_ptr);
+        const auto t1 = dbg_timing ? std::chrono::steady_clock::now() : t0;
 
         // Phase 9 async path: opt-in via XDNA_ENABLE_PHASE9=1. Capture all
         // state needed for bias compensation into a deferred lambda + push
@@ -2196,6 +2202,21 @@ static void ggml_backend_xdna_mul_mat_gemv_int4(ggml_backend_xdna_context * ctx,
 
         // Sync path (Phase 9 disabled). Same as Step 2: wait + inline bias.
         run.wait();
+        const auto t2 = dbg_timing ? std::chrono::steady_clock::now() : t1;
+        if (dbg_timing) {
+            const auto submit_us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+            const auto wait_us   = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
+            const auto total_us  = submit_us + wait_us;
+            static int timing_probe = 0;
+            if (timing_probe < 16) {
+                fprintf(stderr, "ggml-xdna: [P0-timing] INT4 K=%lld N=%lld submit=%lldus wait=%lldus total=%lldus (submit_pct=%d%%)\n",
+                        (long long)K, (long long)N,
+                        (long long)submit_us, (long long)wait_us, (long long)total_us,
+                        total_us > 0 ? (int)((submit_us * 100) / total_us) : -1);
+                fflush(stderr);
+                timing_probe++;
+            }
+        }
         c_bo_ptr->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
 
         // ---- Host-side bias compensation -----------------------------------
@@ -3445,7 +3466,9 @@ static void ggml_backend_xdna_mul_mat_swiglu_int4(
     const int64_t embedding_dim = src1_input->ne[0];
     const int64_t hidden_dim    = src0_gate_w->ne[1];
     const int group_size = 32;
-    GGML_ASSERT(M == 1 && "SwiGLU INT4 only supports M=1 decode");
+    // M=1 only for now (spec-dec M>1 handled via Phase 3 kernel).
+    // Return silently so caller gets CPU fallback instead of crashing.
+    if (M != 1) return;
 
     const xdna_op_kind op_kind = XDNA_OP_SWIGLU_DECODE_INT4;
     const std::string cache_key = make_swiglu_cache_key(
