@@ -175,6 +175,7 @@ PRESETS: dict[str, dict[str, str]] = {
         "XDNA_ENABLE_QKV_INT4_FUSED":    "1",
         "XDNA_ENABLE_PHASE9":            "1",
         "XDNA_ENABLE_QKV_ROPE_FUSED":    "1",
+        "XDNA_ENABLE_SWIGLU_NORM_FUSED": "1",
     },
     "npu_int4_gemv_only": {
         # INT4 GEMV-only preset for models with NON-Llama attention

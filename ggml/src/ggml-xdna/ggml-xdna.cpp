@@ -2759,6 +2759,41 @@ static void ggml_backend_xdna_mul_mat_gemv_int4_batched(
 // each consecutive head_dim-length block is one attention head.
 // =============================================================================
 static void xdna_apply_rope_f32(float * data, int64_t num_heads, int64_t head_dim,
+                                 const struct ggml_tensor * rope_node);
+
+// =============================================================================
+// Host-side RMSNorm helper (for fused SwiGLU+RMSNorm decode dispatch).
+//
+// Applies RMSNorm in-place: x_i' = x_i / sqrt(mean(x^2) + eps)
+// then multiplies by the elementwise gain weight from rms_norm_node->src[1]
+// (if present — ggml emits a separate MUL for the gain; we handle the pure
+// RMS_NORM case here and let the MUL run on CPU if it's not absorbed).
+//
+// dst and src may alias (in-place when in->data == out->data).
+// =============================================================================
+static void xdna_apply_rms_norm_f32(const struct ggml_tensor * rms_norm_node,
+                                     float * dst, const float * src, int64_t n) {
+    if (!rms_norm_node || n <= 0) return;
+    // Extract eps from op_params[0] (stored as float in op_params memory).
+    float eps = 1e-5f;
+    if (rms_norm_node->op_params[0]) {
+        memcpy(&eps, &rms_norm_node->op_params[0], sizeof(float));
+    }
+    // Compute mean of squares.
+    float ss = 0.0f;
+    for (int64_t i = 0; i < n; i++) ss += src[i] * src[i];
+    const float scale = 1.0f / std::sqrt(ss / (float)n + eps);
+    for (int64_t i = 0; i < n; i++) dst[i] = src[i] * scale;
+    // Apply gain weight if present (src[1] of the RMS_NORM node holds it).
+    const struct ggml_tensor * gain = rms_norm_node->src[1];
+    if (gain && gain->type == GGML_TYPE_F32 && gain->ne[0] == n) {
+        const float * gw = (const float *)gain->data;
+        for (int64_t i = 0; i < n; i++) dst[i] *= gw[i];
+    }
+}
+
+// Full definition of xdna_apply_rope_f32 (forward-declared above).
+static void xdna_apply_rope_f32(float * data, int64_t num_heads, int64_t head_dim,
                                  const struct ggml_tensor * rope_node) {
     if (!data || !rope_node || head_dim < 2 || head_dim % 2 != 0) return;
 
@@ -7342,6 +7377,12 @@ struct xdna_swiglu_match {
     // Number of AIE columns to use. Prefer 8 (full NPU2), fall back to 4
     // when hidden_dim/embedding_dim don't tile at 8 cols.
     int num_cols;
+    // Optional: pre-FFN RMSNorm node that normalises the residual before
+    // the gate/up projections. When found by the matcher (scanning backward
+    // from gate_mm->src[1]) and XDNA_ENABLE_SWIGLU_NORM_FUSED=1, the
+    // SwiGLU dispatch applies the norm inline and consumes this node.
+    struct ggml_tensor * ffn_norm = nullptr;  // RMS_NORM node
+    int ffn_norm_idx = -1;                    // cgraph index
 };
 
 // Attempt to match a 4-node SwiGLU pattern starting at cgraph->nodes[i].
@@ -7559,6 +7600,38 @@ static bool xdna_try_match_swiglu(const struct ggml_cgraph * cgraph, int i,
     out->is_int8 = allow_int8;
     out->is_int4 = allow_int4;
     out->num_cols = num_cols;
+
+    // Optional: scan backward from gate_mm to find the pre-FFN RMS_NORM.
+    // In Llama decode, the norm feeds directly into gate/up via:
+    //   input → RMS_NORM → [MUL(gain)?] → gate_mm / up_mm
+    // We look back up to 8 nodes from gate_mm's position.
+    {
+        const struct ggml_tensor * ffn_input = out->input;
+        // Walk src chain of input to find a RMS_NORM ancestor.
+        const struct ggml_tensor * anc = ffn_input;
+        for (int s = 0; anc && s < 4; s++) {
+            if (anc->op == GGML_OP_RMS_NORM) {
+                // Found a RMS_NORM. Map back to cgraph index.
+                for (int j = std::max(0, i - 8); j < i; j++) {
+                    if (cgraph->nodes[j] == anc) {
+                        out->ffn_norm     = cgraph->nodes[j];
+                        out->ffn_norm_idx = j;
+                        break;
+                    }
+                }
+                break;
+            }
+            if (!anc->src[0]) break;
+            // Skip view / reshape / permute / cont wrappers.
+            if (anc->op == GGML_OP_VIEW || anc->op == GGML_OP_RESHAPE ||
+                anc->op == GGML_OP_PERMUTE || anc->op == GGML_OP_CONT ||
+                anc->op == GGML_OP_MUL /* RMSNorm gain */) {
+                anc = xdna_strip_view(anc->src[0]);
+            } else {
+                break;
+            }
+        }
+    }
     return true;
 }
 
@@ -13417,6 +13490,32 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                     if (s != GGML_STATUS_SUCCESS) return s;
                     cpu_run_start = -1;
                 }
+
+                // Fused pre-FFN RMSNorm: if the matcher found a RMS_NORM
+                // immediately preceding gate/up and XDNA_ENABLE_SWIGLU_NORM_FUSED=1,
+                // apply the norm on CPU inline here and consume the ggml node
+                // so it doesn't run again as a separate CPU sub-graph.
+                static const bool norm_fused_enabled =
+                    xdna_env_enabled("XDNA_ENABLE_SWIGLU_NORM_FUSED");
+                if (norm_fused_enabled && m.ffn_norm && m.ffn_norm_idx >= 0) {
+                    // The RMS_NORM output tensor must be valid and f32.
+                    struct ggml_tensor * norm_out = m.ffn_norm;
+                    const struct ggml_tensor * norm_in = norm_out->src[0];
+                    if (norm_out->type == GGML_TYPE_F32 && norm_in &&
+                        norm_in->type == GGML_TYPE_F32 &&
+                        norm_out->ne[0] == norm_in->ne[0]) {
+                        const int64_t row_len = norm_out->ne[0];
+                        xdna_apply_rms_norm_f32(norm_out,
+                            (float *)norm_out->data,
+                            (const float *)norm_in->data, row_len);
+                        // Mark as consumed — add to skip set so the main loop
+                        // doesn't re-execute it via xdna_delegate_range.
+                        // We insert it into qkv_plan.skip_indices reusing the
+                        // already-present set (it covers all "already done" nodes).
+                        qkv_plan.skip_indices.insert(m.ffn_norm_idx);
+                    }
+                }
+
                 if (m.is_int8) {
                     // INT8 SwiGLU not available in IRON-windows build —
                     // compile.py raises NotImplementedError for INT8 kernels.
