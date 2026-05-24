@@ -160,6 +160,8 @@ PRESETS: dict[str, dict[str, str]] = {
     "npu_int4_v2": {
         # Alias of npu_int4 (v2 is the default since 2026-05-22). Kept
         # for backward compatibility with existing test names.
+        # QKV fused mode B enabled: single INT4 dispatch for Q+K+V
+        # (+10.5% decode vs mode A; correctness validated with 64-token drift).
         "XDNA_ENABLE_GEMV":              "1",
         "XDNA_ENABLE_SWIGLU":            "1",
         "XDNA_ENABLE_QKV":               "1",
@@ -168,6 +170,7 @@ PRESETS: dict[str, dict[str, str]] = {
         "XDNA_ENABLE_FLOWKV_DECODE":     "1",
         "XDNA_ENABLE_RMS_NORM":          "0",
         "XDNA_ENABLE_GEMV_INT4":         "1",
+        "XDNA_ENABLE_QKV_INT4_FUSED":    "1",
     },
     "npu_int4_gemv_only": {
         # INT4 GEMV-only preset for models with NON-Llama attention
@@ -531,6 +534,16 @@ TESTS: list[Test] = [
         variants=["npu_int4_v2"],
         min_prefix_match=10,
         description="V2 long-generation drift check. Same workload as paris_drift_64_q4_0_int4 but through the optimized PR #101 kernel.",
+    ),
+    Test(
+        name="paris_drift_64_qkv_fused",
+        prompt="What is the capital of France? Explain in detail.",
+        n_predict=64,
+        mode="single-turn",
+        model=MODEL_Q4_0,
+        variants=["npu_int4_qkv_fused"],
+        min_prefix_match=10,
+        description="Phase 8.3 mode B long-generation drift check. Output must match cpu_baseline to min 10 chars (validates bias compensation doesn't drift on 64 tokens).",
     ),
     Test(
         name="multiquery_q4_0_int4_v2",
