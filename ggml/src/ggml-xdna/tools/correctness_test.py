@@ -160,8 +160,8 @@ PRESETS: dict[str, dict[str, str]] = {
     "npu_int4_v2": {
         # Alias of npu_int4 (v2 is the default since 2026-05-22). Kept
         # for backward compatibility with existing test names.
-        # QKV fused mode B enabled: single INT4 dispatch for Q+K+V
-        # (+10.5% decode vs mode A; correctness validated with 64-token drift).
+        # QKV fused mode B: single INT4 dispatch for Q+K+V (+10.5%).
+        # Phase 9 async: overlaps INT4 GEMV with CPU bias compensation (+5%).
         "XDNA_ENABLE_GEMV":              "1",
         "XDNA_ENABLE_SWIGLU":            "1",
         "XDNA_ENABLE_QKV":               "1",
@@ -171,6 +171,7 @@ PRESETS: dict[str, dict[str, str]] = {
         "XDNA_ENABLE_RMS_NORM":          "0",
         "XDNA_ENABLE_GEMV_INT4":         "1",
         "XDNA_ENABLE_QKV_INT4_FUSED":    "1",
+        "XDNA_ENABLE_PHASE9":            "1",
     },
     "npu_int4_gemv_only": {
         # INT4 GEMV-only preset for models with NON-Llama attention
