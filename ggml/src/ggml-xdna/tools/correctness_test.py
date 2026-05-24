@@ -162,6 +162,8 @@ PRESETS: dict[str, dict[str, str]] = {
         # for backward compatibility with existing test names.
         # QKV fused mode B: single INT4 dispatch for Q+K+V (+10.5%).
         # Phase 9 async: overlaps INT4 GEMV with CPU bias compensation (+5%).
+        # QKV RoPE fused: apply RoPE inline inside QKV dispatch, eliminating
+        # the separate CPU ROPE step between QKV and FlowKV (+~5%).
         "XDNA_ENABLE_GEMV":              "1",
         "XDNA_ENABLE_SWIGLU":            "1",
         "XDNA_ENABLE_QKV":               "1",
@@ -172,6 +174,7 @@ PRESETS: dict[str, dict[str, str]] = {
         "XDNA_ENABLE_GEMV_INT4":         "1",
         "XDNA_ENABLE_QKV_INT4_FUSED":    "1",
         "XDNA_ENABLE_PHASE9":            "1",
+        "XDNA_ENABLE_QKV_ROPE_FUSED":    "1",
     },
     "npu_int4_gemv_only": {
         # INT4 GEMV-only preset for models with NON-Llama attention

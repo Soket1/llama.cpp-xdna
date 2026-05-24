@@ -2747,6 +2747,73 @@ static void ggml_backend_xdna_mul_mat_gemv_int4_batched(
 }
 
 // =============================================================================
+// RoPE host-side application helper (for fused QKV+RoPE decode dispatch).
+//
+// Applies rotary position embedding to a float32 vector in-place.
+// The rotation is the standard Llama RoPE:
+//   x'[2i]   = x[2i]   * cos(θ_i) - x[2i+1] * sin(θ_i)
+//   x'[2i+1] = x[2i]   * sin(θ_i) + x[2i+1] * cos(θ_i)
+//   θ_i = pos * freq_base^(-2i/head_dim)
+//
+// Works on a flat array of (num_heads * head_dim) float32 values, where
+// each consecutive head_dim-length block is one attention head.
+// =============================================================================
+static void xdna_apply_rope_f32(float * data, int64_t num_heads, int64_t head_dim,
+                                 const struct ggml_tensor * rope_node) {
+    if (!data || !rope_node || head_dim < 2 || head_dim % 2 != 0) return;
+
+    // Extract RoPE parameters from the ggml op_params.
+    const int32_t * p = (const int32_t *)rope_node->op_params;
+    const int   n_dims   = p[1];
+    float freq_base      = 10000.0f;
+    float freq_scale     = 1.0f;
+    float ext_factor     = 0.0f;
+    float attn_factor    = 1.0f;
+    memcpy(&freq_base,   p + 5, sizeof(float));
+    memcpy(&freq_scale,  p + 6, sizeof(float));
+    memcpy(&ext_factor,  p + 7, sizeof(float));
+    memcpy(&attn_factor, p + 8, sizeof(float));
+
+    // Skip unsupported variants (YaRN, freq_scale ≠ 1, partial dims).
+    if (n_dims != (int)head_dim) return;
+    if (ext_factor != 0.0f) return;
+    if (std::fabs(freq_scale - 1.0f) > 1e-6f) return;
+
+    // Resolve current token position from src[1] (inp_pos i32 tensor).
+    int32_t pos = 0;
+    const struct ggml_tensor * pos_tensor = rope_node->src[1];
+    if (pos_tensor && pos_tensor->type == GGML_TYPE_I32 && pos_tensor->ne[0] >= 1) {
+        pos = ((const int32_t *)pos_tensor->data)[0];
+    }
+
+    // Optional per-dimension frequency factors (src[2]).
+    const float * freq_factors = nullptr;
+    const struct ggml_tensor * ff_tensor = rope_node->src[2];
+    if (ff_tensor && ff_tensor->type == GGML_TYPE_F32 && ff_tensor->ne[0] >= head_dim/2) {
+        freq_factors = (const float *)ff_tensor->data;
+    }
+
+    const int64_t half = head_dim / 2;
+    const float theta_scale = std::pow(freq_base, -2.0f / (float)head_dim);
+
+    for (int64_t h = 0; h < num_heads; h++) {
+        float * head_data = data + h * head_dim;
+        float theta_i = 1.0f;
+        for (int64_t i = 0; i < half; i++) {
+            const float ff  = freq_factors ? freq_factors[i] : 1.0f;
+            const float ang = (float)pos * (theta_i / ff);
+            const float c   = std::cos(ang);
+            const float s   = std::sin(ang);
+            const float x0  = head_data[2*i];
+            const float x1  = head_data[2*i + 1];
+            head_data[2*i]     = x0 * c - x1 * s;
+            head_data[2*i + 1] = x0 * s + x1 * c;
+            theta_i *= theta_scale;
+        }
+    }
+}
+
+// =============================================================================
 // Phase 8.3 mode B: fused QKV INT4 dispatch.
 //
 // Instead of 3 sequential dispatches (Q, K, V each on 8 cols), treat the
@@ -2791,7 +2858,9 @@ static void ggml_backend_xdna_mul_mat_qkv_int4_fused(
         ggml_backend_xdna_context * ctx,
         struct ggml_tensor * q_dst,
         struct ggml_tensor * k_dst,
-        struct ggml_tensor * v_dst)
+        struct ggml_tensor * v_dst,
+        struct ggml_tensor * q_rope_dst = nullptr,   // ROPE(Q) node — if set, apply RoPE inline
+        struct ggml_tensor * k_rope_dst = nullptr)   // ROPE(K) node — if set, apply RoPE inline
 {
     if (!ctx->device_valid) return;
 
@@ -2960,6 +3029,36 @@ static void ggml_backend_xdna_mul_mat_qkv_int4_fused(
                 uint32_t ob = ((uint32_t)out_bf16[i]) << 16;
                 float out_f; memcpy(&out_f, &ob, sizeof(out_f));
                 dst_f32[local_i] = out_f - bias;
+            }
+
+            // Fused RoPE: apply rotation inline to Q (d=0) and K (d=1)
+            // using the pre-parsed ROPE ggml node. This writes directly into
+            // q_rope_dst->data / k_rope_dst->data (the tensors downstream
+            // FlowKV expects), eliminating the separate CPU RoPE step.
+            if (d == 0 && q_rope_dst) {
+                // Q: reshape as [num_q_heads, head_dim] and rotate.
+                const int64_t head_dim  = q_rope_dst->src[0]->ne[0];
+                const int64_t num_heads = q_N / head_dim;
+                if (num_heads > 0 && head_dim > 0) {
+                    // Copy rotated floats into q_rope_dst->data (same layout).
+                    // dst_f32 already holds q_N floats; rotate in place then copy.
+                    xdna_apply_rope_f32(dst_f32, num_heads, head_dim, q_rope_dst);
+                    // q_rope_dst->data == q_dst->data (they share the buffer
+                    // after ggml_cont ops) in the common Llama decode path.
+                    // If they differ, copy:
+                    if (q_rope_dst->data != q_dst->data) {
+                        memcpy(q_rope_dst->data, dst_f32, (size_t)q_N * sizeof(float));
+                    }
+                }
+            } else if (d == 1 && k_rope_dst) {
+                const int64_t head_dim  = k_rope_dst->src[0]->ne[0];
+                const int64_t num_heads = k_N / head_dim;
+                if (num_heads > 0 && head_dim > 0) {
+                    xdna_apply_rope_f32(dst_f32, num_heads, head_dim, k_rope_dst);
+                    if (k_rope_dst->data != k_dst->data) {
+                        memcpy(k_rope_dst->data, dst_f32, (size_t)k_N * sizeof(float));
+                    }
+                }
             }
         }
     } catch (const std::exception & e) {
@@ -5827,6 +5926,9 @@ static bool xdna_shape_dispatchable_swiglu_decode_int8(int64_t K_emb, int64_t N_
     return true;
 }
 
+// Forward declare: defined later after FlowKV section.
+static struct ggml_tensor * xdna_strip_view(struct ggml_tensor * t);
+
 // Validate that (w_q, w_k, w_v, input) form a dispatchable QKV triple.
 // Checks types, contiguity, 2D, K-dim consistency, M=1, shape tileability.
 // Shared between the cgraph pre-scan (xdna_plan_qkv) and any future callers.
@@ -5883,6 +5985,16 @@ struct xdna_qkv_plan {
     std::unordered_map<int, std::array<int,3>> triple_at;
     // K and V node indices — skipped during main loop (already dispatched at Q).
     std::unordered_set<int> skip_indices;
+    // Q node idx -> (Q_rope node, K_rope node) if RoPE is found downstream.
+    // Allows fused QKV+RoPE dispatch: matmul + rotation in one host-side call,
+    // consuming the ROPE ggml ops before the CPU runs them.
+    struct RopeInfo {
+        struct ggml_tensor * q_rope = nullptr;  // ROPE(Q) ggml node
+        struct ggml_tensor * k_rope = nullptr;  // ROPE(K) ggml node
+        int q_rope_idx = -1;
+        int k_rope_idx = -1;
+    };
+    std::unordered_map<int, RopeInfo> rope_at;  // keyed by Q node idx
 };
 
 // Scan cgraph for QKV triples: MUL_MAT nodes grouped by src[1] that form
@@ -5985,6 +6097,34 @@ static void xdna_plan_qkv(const struct ggml_cgraph * cgraph, xdna_qkv_plan * out
         out->skip_indices.insert(i_k);
         out->skip_indices.insert(i_v);
         n_triples_validated++;
+
+        // Scan forward for ROPE(Q) and ROPE(K) within a short window.
+        // If found, store them in rope_at[i_q] so fused QKV+RoPE dispatch
+        // can apply rotation inline and consume the ROPE nodes.
+        {
+            xdna_qkv_plan::RopeInfo ri;
+            int scan_end = std::min(i_q + 60, cgraph->n_nodes);
+            for (int j = i_q + 1; j < scan_end; j++) {
+                struct ggml_tensor * rn = cgraph->nodes[j];
+                if (rn->op != GGML_OP_ROPE) continue;
+                if (!rn->src[0]) continue;
+                struct ggml_tensor * anc = xdna_strip_view(rn->src[0]);
+                for (int s = 0; anc && s < 6; s++) {
+                    if (anc == n_q || anc == n_k) break;
+                    if (!anc->src[0]) break;
+                    anc = xdna_strip_view(anc->src[0]);
+                }
+                if (anc == n_q && ri.q_rope_idx < 0) {
+                    ri.q_rope = rn; ri.q_rope_idx = j;
+                } else if (anc == n_k && ri.k_rope_idx < 0) {
+                    ri.k_rope = rn; ri.k_rope_idx = j;
+                }
+                if (ri.q_rope_idx >= 0 && ri.k_rope_idx >= 0) break;
+            }
+            if (ri.q_rope_idx >= 0 && ri.k_rope_idx >= 0) {
+                out->rope_at[i_q] = ri;
+            }
+        }
     }
 
     if (dbg) {
@@ -12460,7 +12600,26 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                     static const bool qkv_fused_enabled =
                         xdna_env_enabled("XDNA_ENABLE_QKV_INT4_FUSED");
                     if (qkv_fused_enabled && qkv_t == GGML_TYPE_Q4_0) {
-                        ggml_backend_xdna_mul_mat_qkv_int4_fused(ctx, q_mm, k_mm, v_mm);
+                        // Fused QKV+RoPE: if ROPE nodes found, apply inline.
+                        struct ggml_tensor * q_rope_node = nullptr;
+                        struct ggml_tensor * k_rope_node = nullptr;
+                        static const bool rope_fused =
+                            xdna_env_enabled("XDNA_ENABLE_QKV_ROPE_FUSED");
+                        if (rope_fused) {
+                            auto rit = qkv_plan.rope_at.find(i);
+                            if (rit != qkv_plan.rope_at.end()) {
+                                q_rope_node = rit->second.q_rope;
+                                k_rope_node = rit->second.k_rope;
+                                // Mark ROPE nodes as consumed so CPU doesn't
+                                // re-execute them.
+                                if (rit->second.q_rope_idx >= 0)
+                                    qkv_plan.skip_indices.insert(rit->second.q_rope_idx);
+                                if (rit->second.k_rope_idx >= 0)
+                                    qkv_plan.skip_indices.insert(rit->second.k_rope_idx);
+                            }
+                        }
+                        ggml_backend_xdna_mul_mat_qkv_int4_fused(
+                            ctx, q_mm, k_mm, v_mm, q_rope_node, k_rope_node);
                     } else {
                         ggml_backend_xdna_mul_mat_gemv_int4(ctx, q_mm);
                         ggml_backend_xdna_mul_mat_gemv_int4(ctx, k_mm);
