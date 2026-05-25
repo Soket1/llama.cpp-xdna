@@ -680,6 +680,27 @@ struct xdna_rms_norm_entry {
 };
 
 // ============================================================================
+// Elementwise 1D BF16 kernel entry (ADD or MUL, size=2048)
+// Used in the Phase A fused post-attention runlist:
+//   O_proj → ADD(attn_res) → NORM → MUL(gain) → SwiGLU → ADD(ffn_res)
+// ============================================================================
+
+struct xdna_elem1d_entry {
+    xrt::xclbin      xclbin;
+    xrt::hw_context  hw_ctx;
+    xrt::kernel      kernel;
+    std::vector<char> insts;
+    xrt::bo          insts_bo;
+    std::string      cache_key;
+    std::string      insts_filename;  // "elem_add_main.insts" or "elem_mul_main.insts"
+    int64_t          size;
+    // BOs: in_a (group 3), in_b (group 4), out (group 5)
+    std::unique_ptr<xrt::bo> in_a_bo;
+    std::unique_ptr<xrt::bo> in_b_bo;
+    std::unique_ptr<xrt::bo> out_bo;
+};
+
+// ============================================================================
 // Backend context — holds XRT device and kernel cache
 // ============================================================================
 
@@ -735,6 +756,34 @@ struct ggml_backend_xdna_context {
     std::unordered_map<std::string, xdna_qkv_entry> qkv_cache;
     std::unordered_set<std::string> qkv_compile_failed;
     std::unordered_map<std::string, xdna_rms_norm_entry> rms_norm_cache;
+    // Phase A: fused post-attention layer dispatch (O_proj+ADD+NORM+MUL+SwiGLU in one runlist)
+    std::unordered_map<std::string, xdna_elem1d_entry> elem_add_cache;
+    std::unordered_map<std::string, xdna_elem1d_entry> elem_mul_cache;
+    // Intermediate BOs for the fused layer runlist (allocated once, reused per token)
+    struct xdna_fused_layer_bos_t {
+        int64_t embed_dim = 0;
+        std::unique_ptr<xrt::bo> inpL_bo;       // BF16 converted inpL (attn input)
+        std::unique_ptr<xrt::bo> gain_bo;        // BF16 converted gain weights
+        std::unique_ptr<xrt::bo> o_proj_bo;      // O_proj output (BF16)
+        std::unique_ptr<xrt::bo> inpFF_bo;       // ADD(O_proj, inpL) = attn residual
+        std::unique_ptr<xrt::bo> normed_bo;      // RMS_NORM output
+        std::unique_ptr<xrt::bo> ffn_input_bo;  // MUL(normed, gain) = FFN input
+        std::unique_ptr<xrt::bo> outL_bo;        // ADD(ffn_out, inpFF) = layer output
+    };
+    std::unordered_map<int64_t, xdna_fused_layer_bos_t> fused_layer_bos_cache;
+    // Fused layer skip set — nodes to skip in graph_compute when fused dispatch fires
+    std::unordered_set<int> fused_layer_skip;
+    // Pending fused layer dispatch info (set when o_proj is deferred within a layer)
+    struct xdna_fused_layer_pending_t {
+        const struct ggml_tensor * o_proj_weight = nullptr;
+        const struct ggml_tensor * kqv_out       = nullptr;   // O_proj input (attn output)
+        const struct ggml_tensor * inpL           = nullptr;   // attn residual input
+        const struct ggml_tensor * gain_weight    = nullptr;   // pre-FFN gain
+        const struct ggml_tensor * add_ffn_out    = nullptr;   // ADD_ffn output tensor
+        int64_t embed_dim = 0;
+        int layer_idx = -1;
+    };
+    std::vector<xdna_fused_layer_pending_t> fused_layer_pending;  // one per layer per token
     std::unordered_map<std::string, xdna_attention_prefill_entry> attention_prefill_cache;
     std::unordered_map<std::string, xdna_transformer_block_prefill_entry> transformer_block_prefill_cache;
     std::unordered_map<std::string, struct xdna_tblock_fused_entry> tblock_fused_cache;
@@ -4138,6 +4187,20 @@ static void ggml_backend_xdna_mul_mat_swiglu(ggml_backend_xdna_context * ctx,
     }
 }
 
+// Phase A: Fused post-attention layer dispatch (STUB / NYI).
+//
+// Intent: build a single xrt::runlist per layer covering O_proj + ADD + NORM +
+// MUL_gain + SwiGLU in one xrt::execute(), reducing from 4 dispatches/layer to 3.
+//
+// Blocker: xrt::runlist requires all runs to share the same hw_context (same
+// xclbin). The 7 kernel types needed here come from different xclbins → different
+// hw_ctxs → cannot be combined. A fused single-xclbin IRON design is required
+// (Phase B).
+//
+// FUSED_LAYER=1 currently provides: merged graph_compute calls (all 16 layers in
+// one call). The skip-node infrastructure is in place for when Phase B lands.
+// NOTE: Forward declaration only — definition follows xdna_swiglu_match below.
+
 // Phase 8.2: SwiGLU decode with INT4 weights (W4A16).
 // Mirror of the bf16 decode path in ggml_backend_xdna_mul_mat_swiglu, but
 // weights are Q4_0 (uint4 nibbles + per-group bf16 scales) and dispatched
@@ -7412,23 +7475,28 @@ struct xdna_swiglu_match {
     const struct ggml_tensor * up_w;
     const struct ggml_tensor * down_w;
     const struct ggml_tensor * input;
-    // When true the three weights are Q8_0 and the int8 dispatch path
-    // (ggml_backend_xdna_mul_mat_swiglu_int8) should be used. Bf16 matches
-    // leave this false for the existing bf16 dispatcher.
     bool is_int8;
-    // When true the three weights are Q4_0 and the int4 dispatch path
-    // (ggml_backend_xdna_mul_mat_swiglu_int4, Phase 8.2) should be used.
-    // Mutually exclusive with is_int8.
     bool is_int4;
-    // Number of AIE columns to use. Prefer 8 (full NPU2), fall back to 4
-    // when hidden_dim/embedding_dim don't tile at 8 cols.
     int num_cols;
-    // Optional: pre-FFN RMSNorm node that normalises the residual before
-    // the gate/up projections. When found by the matcher (scanning backward
-    // from gate_mm->src[1]) and XDNA_ENABLE_SWIGLU_NORM_FUSED=1, the
-    // SwiGLU dispatch applies the norm inline and consumes this node.
-    struct ggml_tensor * ffn_norm = nullptr;  // RMS_NORM node
-    int ffn_norm_idx = -1;                    // cgraph index
+    struct ggml_tensor * ffn_norm = nullptr;
+    int ffn_norm_idx = -1;
+
+    // Phase A fused layer fields — populated by xdna_try_match_swiglu when
+    // XDNA_ENABLE_FUSED_LAYER=1 AND the preceding O_proj+ADD+NORM+MUL and
+    // the following ADD_ffn are found in the same graph segment.
+    struct ggml_tensor * o_proj_mm  = nullptr;  // O_proj MUL_MAT
+    int   o_proj_idx  = -1;
+    struct ggml_tensor * add_attn   = nullptr;  // ADD(O_proj_out, inpL) = inpFF
+    int   add_attn_idx = -1;
+    const struct ggml_tensor * inpL = nullptr;  // pre-attention residual
+    struct ggml_tensor * norm_ffn   = nullptr;  // RMS_NORM(inpFF) (same as ffn_norm above)
+    int   norm_ffn_idx = -1;
+    struct ggml_tensor * mul_gain   = nullptr;  // MUL(normed, gain_weight)
+    int   mul_gain_idx = -1;
+    const struct ggml_tensor * gain_weight = nullptr;
+    struct ggml_tensor * add_ffn    = nullptr;  // ADD(down_out, inpFF) = outL
+    int   add_ffn_idx  = -1;
+    bool  fused_layer  = false;     // true when all fields above are valid
 };
 
 // Attempt to match a 4-node SwiGLU pattern starting at cgraph->nodes[i].
@@ -7678,7 +7746,166 @@ static bool xdna_try_match_swiglu(const struct ggml_cgraph * cgraph, int i,
             }
         }
     }
+
+    // Phase A fused layer: when XDNA_ENABLE_FUSED_LAYER=1, also scan for
+    // O_proj → ADD_attn → NORM_ffn chain before gate_mm, and ADD_ffn after down_mm.
+    // These are the nodes that will be replaced by the 7-run runlist.
+    {
+        static const bool fused_layer = xdna_env_enabled("XDNA_ENABLE_FUSED_LAYER");
+        if (fused_layer && out->is_int4) {
+            // Walk the src chain from gate_mm input to find:
+            //   input (= MUL_gain output) → gain_src (= RMS_NORM output)
+            //     → norm_src (= inpFF = ADD_attn output)
+            //       → o_proj_out = one of ADD_attn's srcs (the other is inpL)
+
+            const struct ggml_tensor * gain_out = out->input;  // = MUL_gain output
+            // Find mul_gain node: gate_mm->src[1] is mul_gain output
+            // Scan backward a few positions to find the MUL node
+            struct ggml_tensor * mul_gain_node = nullptr;
+            int mul_gain_idx = -1;
+            for (int j = std::max(0, i - 4); j < i; j++) {
+                struct ggml_tensor * nj = cgraph->nodes[j];
+                if (nj->op == GGML_OP_MUL && nj == gain_out) {
+                    mul_gain_node = nj;
+                    mul_gain_idx = j;
+                    break;
+                }
+            }
+            if (!mul_gain_node) goto fused_layer_done;
+
+            // Find gain_weight from mul_gain: src[0] or src[1] that is a weight
+            const struct ggml_tensor * gain_weight_ptr = nullptr;
+            const struct ggml_tensor * norm_out_ptr = nullptr;
+            {
+                struct ggml_tensor * s0 = xdna_strip_view(mul_gain_node->src[0]);
+                struct ggml_tensor * s1 = xdna_strip_view(mul_gain_node->src[1]);
+                // norm output is RMS_NORM output; gain weight is the other src
+                if (s0 && s0->op == GGML_OP_RMS_NORM) {
+                    norm_out_ptr = s0;
+                    gain_weight_ptr = s1;
+                } else if (s1 && s1->op == GGML_OP_RMS_NORM) {
+                    norm_out_ptr = s1;
+                    gain_weight_ptr = s0;
+                } else {
+                    // Check if norm_out is referenced indirectly (e.g., via src chain)
+                    if (out->ffn_norm) {
+                        // We already found ffn_norm above; use it
+                        norm_out_ptr = out->ffn_norm;
+                        gain_weight_ptr = (s0->op == GGML_OP_RMS_NORM) ? s1 : s0;
+                    } else {
+                        goto fused_layer_done;
+                    }
+                }
+            }
+            if (!norm_out_ptr || !gain_weight_ptr) goto fused_layer_done;
+
+            // Find RMS_NORM (norm_ffn) node in cgraph
+            struct ggml_tensor * norm_ffn_node = nullptr;
+            int norm_ffn_idx = -1;
+            for (int j = std::max(0, mul_gain_idx - 6); j < mul_gain_idx; j++) {
+                if (cgraph->nodes[j] == norm_out_ptr) {
+                    norm_ffn_node = cgraph->nodes[j];
+                    norm_ffn_idx = j;
+                    break;
+                }
+            }
+            if (!norm_ffn_node || norm_ffn_node->op != GGML_OP_RMS_NORM)
+                goto fused_layer_done;
+
+            // inpFF = RMS_NORM input = ADD_attn output
+            const struct ggml_tensor * inpFF = xdna_strip_view(norm_ffn_node->src[0]);
+            if (!inpFF) goto fused_layer_done;
+
+            // Find ADD_attn node in cgraph
+            struct ggml_tensor * add_attn_node = nullptr;
+            int add_attn_idx = -1;
+            for (int j = std::max(0, norm_ffn_idx - 8); j < norm_ffn_idx; j++) {
+                if (cgraph->nodes[j] == inpFF) {
+                    add_attn_node = cgraph->nodes[j];
+                    add_attn_idx = j;
+                    break;
+                }
+            }
+            if (!add_attn_node || add_attn_node->op != GGML_OP_ADD)
+                goto fused_layer_done;
+
+            // Find O_proj (MUL_MAT) and inpL from ADD_attn srcs
+            struct ggml_tensor * o_proj_node = nullptr;
+            int o_proj_idx = -1;
+            const struct ggml_tensor * inpL_ptr = nullptr;
+            {
+                struct ggml_tensor * s0 = xdna_strip_view(add_attn_node->src[0]);
+                struct ggml_tensor * s1 = xdna_strip_view(add_attn_node->src[1]);
+                if (s0 && s0->op == GGML_OP_MUL_MAT) {
+                    o_proj_node = s0; inpL_ptr = s1;
+                } else if (s1 && s1->op == GGML_OP_MUL_MAT) {
+                    o_proj_node = s1; inpL_ptr = s0;
+                } else goto fused_layer_done;
+            }
+            // Verify O_proj is M=1 INT4 with correct K=embed
+            if (!o_proj_node) goto fused_layer_done;
+            if (!(o_proj_node->src[0]->type == GGML_TYPE_Q4_0 ||
+                  o_proj_node->src[0]->type == GGML_TYPE_Q4_K))
+                goto fused_layer_done;
+
+            // Find O_proj in cgraph
+            for (int j = std::max(0, add_attn_idx - 10); j < add_attn_idx; j++) {
+                if (cgraph->nodes[j] == o_proj_node) {
+                    o_proj_idx = j;
+                    break;
+                }
+            }
+            if (o_proj_idx < 0) goto fused_layer_done;
+
+            // Find ADD_ffn after down_mm (i+3)
+            int add_ffn_idx = -1;
+            struct ggml_tensor * add_ffn_node = nullptr;
+            for (int j = i + 4; j <= i + 6 && j < cgraph->n_nodes; j++) {
+                if (cgraph->nodes[j]->op == GGML_OP_ADD) {
+                    add_ffn_node = cgraph->nodes[j];
+                    add_ffn_idx = j;
+                    break;
+                }
+            }
+            if (!add_ffn_node) goto fused_layer_done;
+
+            // Verify ADD_ffn uses down_mm output
+            {
+                struct ggml_tensor * s0 = xdna_strip_view(add_ffn_node->src[0]);
+                struct ggml_tensor * s1 = xdna_strip_view(add_ffn_node->src[1]);
+                if (s0 != out->down_mm && s1 != out->down_mm)
+                    goto fused_layer_done;
+            }
+
+            // All found! Store in the match struct.
+            out->o_proj_mm   = o_proj_node;
+            out->o_proj_idx  = o_proj_idx;
+            out->add_attn    = add_attn_node;
+            out->add_attn_idx = add_attn_idx;
+            out->inpL        = inpL_ptr;
+            out->norm_ffn    = norm_ffn_node;
+            out->norm_ffn_idx = norm_ffn_idx;
+            out->mul_gain    = mul_gain_node;
+            out->mul_gain_idx = mul_gain_idx;
+            out->gain_weight = gain_weight_ptr;
+            out->add_ffn     = add_ffn_node;
+            out->add_ffn_idx = add_ffn_idx;
+            out->fused_layer = true;
+        }
+        fused_layer_done:;
+    }
+
     return true;
+}
+
+// Phase A stub: fused post-attention layer dispatch (NYI).
+// When XDNA_ENABLE_FUSED_LAYER=1 and the SwiGLU matcher sets m.fused_layer=true,
+// this is called. Currently a no-op: the 7-run runlist requires a single fused
+// xclbin (Phase B). The skip-node fields in the match struct are for future use.
+static void ggml_backend_xdna_fused_layer_dispatch(
+        ggml_backend_xdna_context * /*ctx*/,
+        const xdna_swiglu_match & /*m*/) {
+    // NYI: individual dispatches (O_proj + SwiGLU) handle this normally.
 }
 
 // ============================================================================
@@ -12199,6 +12426,122 @@ static xdna_rms_norm_entry * get_or_load_rms_norm_kernel(
     }
 }
 
+// ============================================================================
+// Elementwise 1D BF16 kernel loading (Phase A fused layer runlist)
+// ============================================================================
+
+static xdna_elem1d_entry * get_or_load_elem1d_kernel(
+        ggml_backend_xdna_context * ctx,
+        std::unordered_map<std::string, xdna_elem1d_entry> & cache,
+        const std::string & cache_key,
+        const std::string & insts_filename,
+        int64_t size) {
+    std::lock_guard<std::mutex> lock(ctx->cache_mutex);
+
+    auto it = cache.find(cache_key);
+    if (it != cache.end()) return &it->second;
+
+    const std::string bundle_dir  = ctx->cache_dir + "\\" + cache_key;
+    const std::string xclbin_path = bundle_dir + "/combined.xclbin";
+    const std::string insts_path  = bundle_dir + "/" + insts_filename;
+
+    try {
+        xdna_elem1d_entry entry;
+        entry.cache_key       = cache_key;
+        entry.insts_filename  = insts_filename;
+        entry.size            = size;
+
+        entry.xclbin = xrt::xclbin(xclbin_path);
+        ctx->device.register_xclbin(entry.xclbin);
+        entry.hw_ctx = xrt::hw_context(ctx->device, entry.xclbin.get_uuid());
+        entry.kernel = xrt::kernel(entry.hw_ctx, "MLIR_AIE");
+
+        entry.insts = read_binary_file(insts_path);
+        if (entry.insts.empty()) {
+            GGML_LOG_ERROR("ggml-xdna: failed to read elem1d insts %s\n",
+                           insts_path.c_str());
+            return nullptr;
+        }
+        entry.insts_bo = xrt::bo(ctx->device, entry.insts.size(),
+                                 xrt::bo::flags::cacheable,
+                                 entry.kernel.group_id(1));
+        entry.insts_bo.write(entry.insts.data());
+        entry.insts_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+        auto [ins, _] = cache.emplace(cache_key, std::move(entry));
+        fprintf(stderr, "ggml-xdna: loaded elem1d kernel %s\n", cache_key.c_str());
+        return &ins->second;
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("ggml-xdna: failed to load elem1d kernel %s: %s\n",
+                       cache_key.c_str(), e.what());
+        return nullptr;
+    }
+}
+
+// Returns or lazily allocates a BF16 host_only BO of `elem_count` elements
+// using the given kernel's group_id.
+static xrt::bo * get_or_alloc_bo(ggml_backend_xdna_context * ctx,
+                                  std::unique_ptr<xrt::bo> & bo_ptr,
+                                  int64_t elem_count,
+                                  xrt::kernel & kernel, int group_id) {
+    if (!bo_ptr) {
+        bo_ptr = std::make_unique<xrt::bo>(
+            ctx->device,
+            (size_t)elem_count * sizeof(uint16_t),
+            xrt::bo::flags::host_only,
+            kernel.group_id(group_id));
+    }
+    return bo_ptr.get();
+}
+
+// Dispatch a single elem1d run (ADD or MUL) as part of an xrt::runlist.
+// Writes to an existing runlist `rl` rather than executing immediately.
+static bool add_elem1d_run_to_runlist(
+        xrt::runlist & rl,
+        xdna_elem1d_entry * entry,
+        xrt::bo & in_a_bo, xrt::bo & in_b_bo, xrt::bo & out_bo) {
+    xrt::run r(entry->kernel);
+    r.set_arg(0, 3u);
+    r.set_arg(1, entry->insts_bo);
+    r.set_arg(2, (uint32_t)entry->insts.size());
+    r.set_arg(3, in_a_bo);
+    r.set_arg(4, in_b_bo);
+    r.set_arg(5, out_bo);
+    rl.add(r);
+    return true;
+}
+
+// Dispatch a single rms_norm run to an xrt::runlist.
+static bool add_rms_norm_run_to_runlist(
+        xrt::runlist & rl,
+        xdna_rms_norm_entry * entry,
+        xrt::bo & in_bo, xrt::bo & out_bo) {
+    xrt::run r(entry->kernel);
+    r.set_arg(0, 3u);
+    r.set_arg(1, entry->insts_bo);
+    r.set_arg(2, (uint32_t)entry->insts.size());
+    r.set_arg(3, in_bo);
+    r.set_arg(4, out_bo);
+    rl.add(r);
+    return true;
+}
+
+// Dispatch a single GEMV run (for O_proj) to an xrt::runlist.
+static bool add_gemv_run_to_runlist(
+        xrt::runlist & rl,
+        xdna_kernel_entry * entry,
+        xrt::bo & weight_bo, xrt::bo & input_bo, xrt::bo & output_bo) {
+    xrt::run r(entry->kernel);
+    r.set_arg(0, 3u);
+    r.set_arg(1, entry->insts_bo);
+    r.set_arg(2, (uint32_t)entry->insts.size());
+    r.set_arg(3, weight_bo);
+    r.set_arg(4, input_bo);
+    r.set_arg(5, output_bo);
+    rl.add(r);
+    return true;
+}
+
 // Dispatch a single GGML_OP_RMS_NORM node to the NPU. Returns true on success,
 // false on any fallback condition (gate off, unsupported shape/dtype, eps
 // mismatch, XRT failure). Caller must fall the node into the CPU accumulator
@@ -14976,8 +15319,11 @@ static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const s
         // Normalization.
         case GGML_OP_RMS_NORM:
         case GGML_OP_NORM:
-        case GGML_OP_GROUP_NORM:
-            return rms_norm_enabled;
+        case GGML_OP_GROUP_NORM: {
+            static const bool fused_layer_enabled =
+                xdna_env_enabled("XDNA_ENABLE_FUSED_LAYER");
+            return rms_norm_enabled || fused_layer_enabled;
+        }
 
         // Scaling.
         case GGML_OP_SCALE:
