@@ -707,22 +707,22 @@ struct xdna_post_attn_fused_entry {
 
 // Per-layer state for the fused dispatch. Keyed by the o_proj weight tensor
 // pointer (unique per layer, stable across tokens). Weights are packed once
-// on first dispatch; activations BOs are reused on every token.
+// on first dispatch; bundle BOs are reused on every token.
+//
+// Bundled-args layout (XRT MLIR_AIE caps kernels at 8 group_ids):
+//   input_bundle: 3 * embed_dim bf16 = [kqv | inpL | gain]
+//   io_bundle:    2*embed_dim + hidden_dim bf16 = [scratch | silu_buf | ffn_out]
+// On every token the host writes kqv at offset 0 and inpL at offset embed_bytes
+// of input_bundle; gain is pre-baked once. After dispatch, ffn_out lives at
+// io_bundle offset (embed+hidden)*sizeof(bf16); scratch (= inpFF) at offset 0.
 struct xdna_post_attn_fused_layer_t {
     // INT4 packed weight BOs (synced once on first dispatch).
     std::unique_ptr<xrt::bo> w_o_bo;
     std::unique_ptr<xrt::bo> w_gu_bo;
     std::unique_ptr<xrt::bo> w_d_bo;
-    // bf16 gain weight BO (synced once on first dispatch).
-    std::unique_ptr<xrt::bo> gain_bo;
-    // Per-token activation BOs.
-    std::unique_ptr<xrt::bo> kqv_bo;     // O_proj input (attention output)
-    std::unique_ptr<xrt::bo> inpL_bo;    // residual input
-    // On-chip intermediates exposed in DDR (scratch holds inpFF after dispatch,
-    // needed by host post-FFN residual ADD).
-    std::unique_ptr<xrt::bo> scratch_bo;
-    std::unique_ptr<xrt::bo> silu_buf_bo;
-    std::unique_ptr<xrt::bo> ffn_out_bo;
+    // Per-token bundled activation/intermediate BOs.
+    std::unique_ptr<xrt::bo> input_bundle_bo;   // [kqv | inpL | gain]  3*embed bf16
+    std::unique_ptr<xrt::bo> io_bundle_bo;      // [scratch | silu | ffn_out]
 };
 
 // ============================================================================
@@ -8212,9 +8212,19 @@ static bool ggml_backend_xdna_fused_layer_dispatch(
     const size_t embed_bytes  = (size_t)embed_dim  * sizeof(uint16_t);
     const size_t hidden_bytes = (size_t)hidden_dim * sizeof(uint16_t);
 
+    // Bundle layout (host-side memory):
+    //   input_bundle: kqv (E bf16) | inpL (E bf16) | gain (E bf16)   = 3*E
+    //   io_bundle:    scratch (E)  | silu_buf (H)  | ffn_out (E)     = 2E+H
+    const size_t input_bundle_bytes = 3 * embed_bytes;
+    const size_t io_bundle_bytes    = 2 * embed_bytes + hidden_bytes;
+    const size_t kqv_off  = 0;
+    const size_t inpL_off = (size_t)embed_dim;          // in uint16_t units
+    const size_t gain_off = (size_t)2 * embed_dim;
+    const size_t scratch_off_u16 = 0;
+    const size_t ffn_out_off_u16 = (size_t)(embed_dim + hidden_dim);
+
     if (!lb.w_o_bo) {
-        // First dispatch for this layer: allocate all BOs and pack weights.
-        // Allocate one at a time so a failing group_id(N) call is identifiable.
+        // First dispatch for this layer: allocate 5 BOs and pack weights+gain.
         auto alloc_bo = [&](const char * name, size_t bytes, int gid)
                             -> std::unique_ptr<xrt::bo> {
             try {
@@ -8228,18 +8238,15 @@ static bool ggml_backend_xdna_fused_layer_dispatch(
                 return nullptr;
             }
         };
-        lb.w_o_bo      = alloc_bo("w_o",      entry->w_o_bytes, 3);
-        lb.kqv_bo      = alloc_bo("kqv",      embed_bytes,      4);
-        lb.inpL_bo     = alloc_bo("inpL",     embed_bytes,      5);
-        lb.gain_bo     = alloc_bo("gain",     embed_bytes,      6);
-        lb.w_gu_bo     = alloc_bo("w_gu",     entry->w_gu_bytes, 7);
-        lb.w_d_bo      = alloc_bo("w_d",      entry->w_d_bytes,  8);
-        lb.scratch_bo  = alloc_bo("scratch",  embed_bytes,      9);
-        lb.silu_buf_bo = alloc_bo("silu_buf", hidden_bytes,     10);
-        lb.ffn_out_bo  = alloc_bo("ffn_out",  embed_bytes,      11);
-        if (!lb.w_o_bo || !lb.kqv_bo || !lb.inpL_bo || !lb.gain_bo
-                || !lb.w_gu_bo || !lb.w_d_bo
-                || !lb.scratch_bo || !lb.silu_buf_bo || !lb.ffn_out_bo) {
+        // group_id indices match design.py rt.sequence order:
+        //   3 = w_o, 4 = w_gu, 5 = w_d, 6 = input_bundle, 7 = io_bundle
+        lb.w_o_bo           = alloc_bo("w_o",          entry->w_o_bytes,  3);
+        lb.w_gu_bo          = alloc_bo("w_gu",         entry->w_gu_bytes, 4);
+        lb.w_d_bo           = alloc_bo("w_d",          entry->w_d_bytes,  5);
+        lb.input_bundle_bo  = alloc_bo("input_bundle", input_bundle_bytes, 6);
+        lb.io_bundle_bo     = alloc_bo("io_bundle",    io_bundle_bytes,    7);
+        if (!lb.w_o_bo || !lb.w_gu_bo || !lb.w_d_bo
+                || !lb.input_bundle_bo || !lb.io_bundle_bo) {
             ctx->post_attn_fused_layer_cache.erase(o_proj_w);
             return false;
         }
@@ -8259,9 +8266,12 @@ static bool ggml_backend_xdna_fused_layer_dispatch(
         lb.w_gu_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
         lb.w_d_bo ->sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
-        // bf16 gain weight (per-layer, static after model load).
+        // bf16 gain weight (per-layer, static after model load) — pre-bake into
+        // input_bundle at the gain offset; kqv/inpL get refreshed every token.
+        uint16_t * bundle = (uint16_t *)lb.input_bundle_bo->map<void *>();
+        std::memset(bundle, 0, input_bundle_bytes);
         const struct ggml_tensor * gw = m.gain_weight;
-        uint16_t * gain_dst = (uint16_t *)lb.gain_bo->map<void *>();
+        uint16_t * gain_dst = bundle + gain_off;
         if (gw->type == GGML_TYPE_F32) {
             f32_to_bf16((const float *)gw->data, gain_dst, (size_t)embed_dim);
         } else if (gw->type == GGML_TYPE_BF16) {
@@ -8272,30 +8282,27 @@ static bool ggml_backend_xdna_fused_layer_dispatch(
             ctx->post_attn_fused_layer_cache.erase(o_proj_w);
             return false;
         }
-        lb.gain_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
     }
 
-    // Per-token: write kqv (attn output = O_proj input) and inpL into their BOs.
+    // Per-token: pack kqv + inpL into input_bundle (gain stays cached).
     const struct ggml_tensor * kqv  = m.o_proj_mm->src[1];   // attn output
     const struct ggml_tensor * inpL = m.inpL;                // residual
-    uint16_t * kqv_dst = (uint16_t *)lb.kqv_bo->map<void *>();
-    uint16_t * inpL_dst = (uint16_t *)lb.inpL_bo->map<void *>();
+    uint16_t * bundle = (uint16_t *)lb.input_bundle_bo->map<void *>();
     if (kqv->type == GGML_TYPE_F32) {
-        f32_to_bf16((const float *)kqv->data, kqv_dst, (size_t)embed_dim);
+        f32_to_bf16((const float *)kqv->data, bundle + kqv_off, (size_t)embed_dim);
     } else if (kqv->type == GGML_TYPE_BF16) {
-        memcpy(kqv_dst, kqv->data, embed_bytes);
+        memcpy(bundle + kqv_off, kqv->data, embed_bytes);
     } else {
         return false;
     }
     if (inpL->type == GGML_TYPE_F32) {
-        f32_to_bf16((const float *)inpL->data, inpL_dst, (size_t)embed_dim);
+        f32_to_bf16((const float *)inpL->data, bundle + inpL_off, (size_t)embed_dim);
     } else if (inpL->type == GGML_TYPE_BF16) {
-        memcpy(inpL_dst, inpL->data, embed_bytes);
+        memcpy(bundle + inpL_off, inpL->data, embed_bytes);
     } else {
         return false;
     }
-    lb.kqv_bo ->sync(XCL_BO_SYNC_BO_TO_DEVICE);
-    lb.inpL_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    lb.input_bundle_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
     // Run the fused layer (one xrt::execute for O_proj+ADD+NORM+MUL+SwiGLU).
     try {
@@ -8304,16 +8311,12 @@ static bool ggml_backend_xdna_fused_layer_dispatch(
         r.set_arg(1, entry->insts_bo);
         r.set_arg(2, (uint32_t)entry->insts.size());
         // Sequence args match design.py rt.sequence order:
-        //   w_o, kqv, inpL, gain, w_gu, w_d, scratch, silu_buf, ffn_out
-        r.set_arg(3,  *lb.w_o_bo);
-        r.set_arg(4,  *lb.kqv_bo);
-        r.set_arg(5,  *lb.inpL_bo);
-        r.set_arg(6,  *lb.gain_bo);
-        r.set_arg(7,  *lb.w_gu_bo);
-        r.set_arg(8,  *lb.w_d_bo);
-        r.set_arg(9,  *lb.scratch_bo);
-        r.set_arg(10, *lb.silu_buf_bo);
-        r.set_arg(11, *lb.ffn_out_bo);
+        //   w_o, w_gu, w_d, input_bundle, io_bundle
+        r.set_arg(3, *lb.w_o_bo);
+        r.set_arg(4, *lb.w_gu_bo);
+        r.set_arg(5, *lb.w_d_bo);
+        r.set_arg(6, *lb.input_bundle_bo);
+        r.set_arg(7, *lb.io_bundle_bo);
         r.start();
         r.wait();
     } catch (const std::exception & e) {
@@ -8321,13 +8324,12 @@ static bool ggml_backend_xdna_fused_layer_dispatch(
         return false;
     }
 
-    // Sync outputs needed for the post-FFN residual.
-    // scratch holds inpFF (= o_proj_out + inpL, written by ANM and untouched
-    // since SwiGLU consumes it as an input). ffn_out holds down_proj output.
-    lb.ffn_out_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-    lb.scratch_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-    const uint16_t * ffn_out_bf = (const uint16_t *)lb.ffn_out_bo->map<void *>();
-    const uint16_t * inpFF_bf   = (const uint16_t *)lb.scratch_bo->map<void *>();
+    // io_bundle now holds: [scratch (= inpFF) | silu_buf | ffn_out]. Sync
+    // back, then the post-FFN residual ADD pulls scratch + ffn_out for outL.
+    lb.io_bundle_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+    const uint16_t * io = (const uint16_t *)lb.io_bundle_bo->map<void *>();
+    const uint16_t * inpFF_bf   = io + scratch_off_u16;
+    const uint16_t * ffn_out_bf = io + ffn_out_off_u16;
 
     // outL = ffn_out + inpFF.  Write to m.add_ffn (the ADD_ffn output tensor).
     struct ggml_tensor * dst = m.add_ffn;
@@ -12886,7 +12888,9 @@ static xdna_rms_norm_entry * get_or_load_rms_norm_kernel(
 static std::string make_post_attn_fused_cache_key(
         int64_t embed_dim, int64_t hidden_dim, int cols, int group_size) {
     char buf[128];
-    snprintf(buf, sizeof(buf), "post_attn_fused_e%lld_h%lld_c%d_g%d",
+    // _v2_ matches IRON-windows op.py: bundled 5-arg layout (kqv/inpL/gain
+    // -> input_bundle, scratch/silu_buf/ffn_out -> io_bundle).
+    snprintf(buf, sizeof(buf), "post_attn_fused_v2_e%lld_h%lld_c%d_g%d",
              (long long)embed_dim, (long long)hidden_dim, cols, group_size);
     return std::string(buf);
 }
