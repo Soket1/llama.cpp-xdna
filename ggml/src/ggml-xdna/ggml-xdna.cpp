@@ -13724,7 +13724,7 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
             int64_t num_q_heads = flowkv_poc_num_q_heads;
             int64_t q_heads_per_kv = num_q_heads / num_kv_heads;
             int chunk_size = 32;
-            int num_cols = 4;  // batch 4 KV heads per dispatch (XDNA 2 max 4 cols per XRT context)
+            int num_cols = 4;  // batch 4 KV heads per dispatch (uses all 8 physical tiles: 4 score+4 value workers)
 
             if (poc_dbg) {
                 fprintf(stderr, "ggml-xdna: [FlowKV-POC] CONT(kqv_out) @%d: "
@@ -13740,8 +13740,10 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
             }
 
             // Ensure FlowKV kernel is compiled and loaded.
+            // Pass ALL num_kv_heads to the kernel (IRON design loops
+            // num_kv_heads/num_cols batches internally → ONE dispatch instead of two).
             xdna_flowkv_entry * fk_entry = get_or_load_flowkv_kernel(
-                ctx, q_heads_per_kv * num_cols, /*num_kv_heads=*/num_cols, head_dim, seq_len, chunk_size, num_cols);
+                ctx, q_heads_per_kv * num_kv_heads, /*num_kv_heads=*/num_kv_heads, head_dim, seq_len, chunk_size, num_cols);
 
             if (fk_entry) {
                 try {
@@ -13759,8 +13761,8 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                     size_t raw_head_bytes = seq_len * row_bytes;
                     size_t aligned_head_stride_bytes = (raw_head_bytes + 63) & ~63;
                     size_t aligned_head_stride_elems = aligned_head_stride_bytes / dtype_size;
-                    size_t kv_region_elems = num_cols * aligned_head_stride_elems;
-                    size_t total_k_region_bytes = num_cols * aligned_head_stride_bytes;
+                    size_t kv_region_elems = num_kv_heads * aligned_head_stride_elems;
+                    size_t total_k_region_bytes = num_kv_heads * aligned_head_stride_bytes;
                     size_t aligned_v_region_offset_bytes = (total_k_region_bytes + 63) & ~63;
                     size_t aligned_v_region_offset_elems = aligned_v_region_offset_bytes / dtype_size;
 
@@ -13779,7 +13781,7 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                     size_t q_group_stride_bytes = (q_heads_per_kv * head_dim + head_dim + 2) * dtype_size;
                     size_t aligned_q_group_stride_bytes = (q_group_stride_bytes + 63) & ~63;
                     size_t aligned_q_group_stride_elems = aligned_q_group_stride_bytes / dtype_size;
-                    size_t q_size = num_cols * aligned_q_group_stride_elems * dtype_size;
+                    size_t q_size = num_kv_heads * aligned_q_group_stride_elems * dtype_size;
                     if (!fk_entry->bo_q) {
                         fk_entry->bo_q = std::make_unique<xrt::bo>(
                             xrt::bo(ctx->device, q_size, xrt::bo::flags::host_only,
@@ -13788,7 +13790,7 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                     size_t raw_out_bytes = q_heads_per_kv * row_bytes;
                     size_t aligned_out_stride_bytes = (raw_out_bytes + 63) & ~63;
                     size_t aligned_out_stride_elems = aligned_out_stride_bytes / dtype_size;
-                    size_t out_size = num_cols * aligned_out_stride_elems * dtype_size;
+                    size_t out_size = num_kv_heads * aligned_out_stride_elems * dtype_size;
                     if (!fk_entry->bo_out) {
                         fk_entry->bo_out = std::make_unique<xrt::bo>(
                             xrt::bo(ctx->device, out_size, xrt::bo::flags::host_only,
@@ -14014,21 +14016,22 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                 (long long)actual_seq_len, (long long)seq_len);
                     }
 
-                    // Batch num_cols KV heads per dispatch with 64-byte aligned strides.
-                    // Shim DMA requires 64-byte alignment for parallel channels.
-                    // (aligned stride variables defined in BO allocation section above)
-
-                    for (int64_t kv_h = 0; kv_h < num_kv_heads; kv_h += num_cols) {
+                    // Process ALL num_kv_heads in ONE dispatch.
+                    // The IRON design loops num_kv_heads/num_cols batches internally
+                    // via its rt.sequence, so ONE xrt::execute() covers everything.
+                    // kv_h is always 0 here (no outer loop needed).
+                    {
+                        const int64_t kv_h = 0;  // one shot: all KV heads
                         // Zero entire bo_v before writing K and V for all columns.
                         {
                             auto bo_v_ptr = fk_entry->bo_v->map<char *>();
-                            memset(bo_v_ptr, 0, (aligned_v_region_offset_elems + num_cols * aligned_head_stride_elems) * dtype_size);
+                            memset(bo_v_ptr, 0, (aligned_v_region_offset_elems + num_kv_heads * aligned_head_stride_elems) * dtype_size);
                         }
-                        // --- Write K and V data for each column ---
+                        // --- Write K and V data for all KV heads ---
                         {
                             auto bo_v_ptr = fk_entry->bo_v->map<char *>();
-                            for (int64_t col = 0; col < num_cols && (kv_h + col) < num_kv_heads; col++) {
-                                int64_t cur_kv_h = kv_h + col;
+                            for (int64_t col = 0; col < num_kv_heads; col++) {
+                                int64_t cur_kv_h = col;
                                 // K at aligned stride offset
                                 char * k_col_ptr = bo_v_ptr + col * aligned_head_stride_bytes;
                                 for (int64_t pos = 0; pos < actual_seq_len; pos++) {
@@ -14100,11 +14103,11 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                 }
                             } // end col loop
                         }
-                        // Mirror K data into bo_k (arg0)
+                        // Mirror K data into bo_k (arg0) — copy all num_kv_heads
                         {
                             auto k_dst = fk_entry->bo_k->map<char *>();
                             auto k_src = fk_entry->bo_v->map<char *>();
-                            memcpy(k_dst, k_src, num_cols * aligned_head_stride_bytes);
+                            memcpy(k_dst, k_src, num_kv_heads * aligned_head_stride_bytes);
                             fk_entry->bo_k->sync(XCL_BO_SYNC_BO_TO_DEVICE);
                         }
                         // Sync V buffer to device
@@ -14117,8 +14120,8 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                             size_t q_group_stride_bytes = (q_heads_per_kv * head_dim + head_dim + 2) * dtype_size;
                             size_t aligned_q_group_stride_bytes = (q_group_stride_bytes + 63) & ~63;
                             const bool q_is_f16 = (flowkv_poc_q_perm->type == GGML_TYPE_F16);
-                            for (int64_t col = 0; col < num_cols && (kv_h + col) < num_kv_heads; col++) {
-                            int64_t cur_kv_h = kv_h + col;
+                            for (int64_t col = 0; col < num_kv_heads; col++) {
+                            int64_t cur_kv_h = col;
                             char * q_col_ptr = q_ptr + col * aligned_q_group_stride_bytes;
                             for (int64_t g = 0; g < q_heads_per_kv; g++) {
                                 int64_t q_head = cur_kv_h * q_heads_per_kv + g;
@@ -14404,8 +14407,8 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                             size_t out_head_bytes = head_dim * sizeof(uint16_t);
                             size_t raw_out_bytes = q_heads_per_kv * out_head_bytes;
                             size_t aligned_out_stride_bytes = (raw_out_bytes + 63) & ~63;
-                            for (int64_t col = 0; col < num_cols && (kv_h + col) < num_kv_heads; col++) {
-                                int64_t cur_kv_h = kv_h + col;
+                            for (int64_t col = 0; col < num_kv_heads; col++) {
+                                int64_t cur_kv_h = col;
                                 const char * col_out = out_ptr + col * aligned_out_stride_bytes;
                                 for (int64_t g = 0; g < q_heads_per_kv; g++) {
                                     int64_t q_head = cur_kv_h * q_heads_per_kv + g;
@@ -14476,7 +14479,7 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                             }
                         }
                         // === END V11 MATH DIAG ===
-                    } // for kv_h
+                    } // single dispatch block
 
                     if (poc_dbg) {
                         fprintf(stderr, "ggml-xdna: [FlowKV-POC] completed, overwrote kqv_out @%d\n", i);
