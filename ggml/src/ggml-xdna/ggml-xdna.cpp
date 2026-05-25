@@ -1423,8 +1423,10 @@ static void xdna_pack_post_attn_fused_weights(
                                     m_input_o, cols, group_size,
                                     w_o_out);
 
-    // w_gu: pack gate and up separately, then interleave per col.
-    //   bytes_col_gu = tiles_per_col_gu * packed_tile_gu
+    // w_gu (v7 monolithic): tile-interleaved per col so the worker can
+    // alternate gate/up phases on each Agu.acquire(1). Layout:
+    //   [col0_g0|col0_u0|col0_g1|col0_u1|...|col0_gN|col0_uN|col1_g0|col1_u0|...]
+    // where each gN/uN is packed_tile_gu bytes.
     const int64_t groups_embed     = embed_dim / group_size;
     const size_t  packed_tile_gu   = (size_t)m_input_gu * (size_t)embed_dim / 2
                                     + (size_t)m_input_gu * (size_t)groups_embed * 2;
@@ -1442,12 +1444,15 @@ static void xdna_pack_post_attn_fused_weights(
                                     m_input_gu, cols, group_size,
                                     up_tmp.data());
     for (int col = 0; col < cols; col++) {
-        memcpy(w_gu_out + (size_t)(2 * col) * bytes_col_gu,
-               gate_tmp.data() + (size_t)col * bytes_col_gu,
-               bytes_col_gu);
-        memcpy(w_gu_out + (size_t)(2 * col + 1) * bytes_col_gu,
-               up_tmp.data()   + (size_t)col * bytes_col_gu,
-               bytes_col_gu);
+        const size_t col_base_dst = (size_t)col * 2 * bytes_col_gu;
+        const size_t col_base_src = (size_t)col * bytes_col_gu;
+        for (int64_t t = 0; t < tiles_per_col_gu; t++) {
+            const size_t src_off = col_base_src + (size_t)t * packed_tile_gu;
+            const size_t dst_g   = col_base_dst + (size_t)t * 2 * packed_tile_gu;
+            const size_t dst_u   = dst_g + packed_tile_gu;
+            memcpy(w_gu_out + dst_g, gate_tmp.data() + src_off, packed_tile_gu);
+            memcpy(w_gu_out + dst_u, up_tmp.data()   + src_off, packed_tile_gu);
+        }
     }
 
     // w_d: Down weights — M = embed_dim, K = hidden_dim.
@@ -8182,7 +8187,7 @@ static bool ggml_backend_xdna_fused_layer_dispatch(
     // Shape extraction. o_proj_w is [E,E], gate/up are [E,H], down is [H,E].
     const int64_t embed_dim  = o_proj_w->ne[0];
     const int64_t hidden_dim = gate_w  ->ne[1];
-    const int cols       = 2;   // matches design.py and the compiled xclbin
+    const int cols       = 4;   // v7 MemTile redesign — was 2 in v3..v6
     const int group_size = 32;
     const int m_input_o  = 2;
     const int m_input_gu = 8;
@@ -12897,7 +12902,7 @@ static std::string make_post_attn_fused_cache_key(
     // _v5_ matches IRON-windows op.py: also broadcasts ffn_input (ANM output)
     // via MemTile to all SwiGLU workers across all cols, removing per-col
     // Bgu shim fills.
-    snprintf(buf, sizeof(buf), "post_attn_fused_v6_e%lld_h%lld_c%d_g%d",
+    snprintf(buf, sizeof(buf), "post_attn_fused_v7_e%lld_h%lld_c%d_g%d",
              (long long)embed_dim, (long long)hidden_dim, cols, group_size);
     return std::string(buf);
 }
