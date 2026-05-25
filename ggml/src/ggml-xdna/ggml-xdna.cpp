@@ -8213,15 +8213,18 @@ static bool ggml_backend_xdna_fused_layer_dispatch(
     const size_t hidden_bytes = (size_t)hidden_dim * sizeof(uint16_t);
 
     // Bundle layout (host-side memory):
-    //   input_bundle: kqv (E bf16) | inpL (E bf16) | gain (E bf16)   = 3*E
-    //   io_bundle:    scratch (E)  | silu_buf (H)  | ffn_out (E)     = 2E+H
+    //   input_bundle: kqv (E bf16) | inpL (E bf16) | gain (E bf16)            = 3*E
+    //   io_bundle:    scratch (E)  | silu_buf (H)  | ffn_out (E) | inpff (E)  = 3E+H
+    // inpff is the residual saved by ANM before it overwrites scratch with
+    // ffn_input; host reads it for the post-FFN ADD.
     const size_t input_bundle_bytes = 3 * embed_bytes;
-    const size_t io_bundle_bytes    = 2 * embed_bytes + hidden_bytes;
+    const size_t io_bundle_bytes    = 3 * embed_bytes + hidden_bytes;
     const size_t kqv_off  = 0;
     const size_t inpL_off = (size_t)embed_dim;          // in uint16_t units
     const size_t gain_off = (size_t)2 * embed_dim;
-    const size_t scratch_off_u16 = 0;
-    const size_t ffn_out_off_u16 = (size_t)(embed_dim + hidden_dim);
+    const size_t scratch_off_u16    = 0;
+    const size_t ffn_out_off_u16    = (size_t)(embed_dim + hidden_dim);
+    const size_t inpff_save_off_u16 = (size_t)(2 * embed_dim + hidden_dim);
 
     if (!lb.w_o_bo) {
         // First dispatch for this layer: allocate 5 BOs and pack weights+gain.
@@ -8324,12 +8327,15 @@ static bool ggml_backend_xdna_fused_layer_dispatch(
         return false;
     }
 
-    // io_bundle now holds: [scratch (= inpFF) | silu_buf | ffn_out]. Sync
-    // back, then the post-FFN residual ADD pulls scratch + ffn_out for outL.
+    // io_bundle now holds: [scratch (= ffn_input) | silu_buf | ffn_out | inpff_save].
+    // The host reads inpff_save (= O_proj_out + inpL written by ANM before it
+    // overwrote scratch with ffn_input) and ffn_out for the post-FFN ADD.
     lb.io_bundle_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
     const uint16_t * io = (const uint16_t *)lb.io_bundle_bo->map<void *>();
-    const uint16_t * inpFF_bf   = io + scratch_off_u16;
+    const uint16_t * inpFF_bf   = io + inpff_save_off_u16;
+    const uint16_t * silu_bf    = io + (size_t)embed_dim;            // silu region
     const uint16_t * ffn_out_bf = io + ffn_out_off_u16;
+    (void)silu_bf;   // kept for future debug, e.g., XDNA_DEBUG_PHASE_B_DUMP=1
 
     // outL = ffn_out + inpFF.  Write to m.add_ffn (the ADD_ffn output tensor).
     struct ggml_tensor * dst = m.add_ffn;
@@ -12888,9 +12894,10 @@ static xdna_rms_norm_entry * get_or_load_rms_norm_kernel(
 static std::string make_post_attn_fused_cache_key(
         int64_t embed_dim, int64_t hidden_dim, int cols, int group_size) {
     char buf[128];
-    // _v2_ matches IRON-windows op.py: bundled 5-arg layout (kqv/inpL/gain
-    // -> input_bundle, scratch/silu_buf/ffn_out -> io_bundle).
-    snprintf(buf, sizeof(buf), "post_attn_fused_v2_e%lld_h%lld_c%d_g%d",
+    // _v3_ matches IRON-windows op.py: io_bundle now carries an extra
+    // inpff_save region so the host gets the residual back (v2 returned
+    // ffn_input by mistake, breaking the post-FFN ADD).
+    snprintf(buf, sizeof(buf), "post_attn_fused_v3_e%lld_h%lld_c%d_g%d",
              (long long)embed_dim, (long long)hidden_dim, cols, group_size);
     return std::string(buf);
 }
