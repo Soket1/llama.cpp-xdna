@@ -12894,10 +12894,10 @@ static xdna_rms_norm_entry * get_or_load_rms_norm_kernel(
 static std::string make_post_attn_fused_cache_key(
         int64_t embed_dim, int64_t hidden_dim, int cols, int group_size) {
     char buf[128];
-    // _v4_ matches IRON-windows op.py: kqv now broadcasts via MemTile
-    // (one shim S2MM fans out to all cols' o_proj workers) -- foundation
-    // for cols=4+ designs that fit within the 16-shim cap.
-    snprintf(buf, sizeof(buf), "post_attn_fused_v4_e%lld_h%lld_c%d_g%d",
+    // _v5_ matches IRON-windows op.py: also broadcasts ffn_input (ANM output)
+    // via MemTile to all SwiGLU workers across all cols, removing per-col
+    // Bgu shim fills.
+    snprintf(buf, sizeof(buf), "post_attn_fused_v5_e%lld_h%lld_c%d_g%d",
              (long long)embed_dim, (long long)hidden_dim, cols, group_size);
     return std::string(buf);
 }
