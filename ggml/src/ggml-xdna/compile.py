@@ -1878,6 +1878,68 @@ def compile_rms_norm_cached(size: int, dtype: str = "bf16",
 
 
 # ---------------------------------------------------------------------------
+# Post-attention fused layer (Phase B: O_proj+ADD+NORM+MUL+SwiGLU in 1 xclbin)
+# ---------------------------------------------------------------------------
+
+POST_ATTN_FUSED_KERNELS = ("main",)
+
+
+def post_attn_fused_cache_key(embed_dim: int, hidden_dim: int,
+                               num_aie_columns: int, group_size: int) -> str:
+    key_data = {"op": "post_attn_fused", "embed_dim": embed_dim,
+                "hidden_dim": hidden_dim, "num_aie_columns": num_aie_columns,
+                "group_size": group_size}
+    key_json = json.dumps(key_data, sort_keys=True)
+    return hashlib.sha256(key_json.encode()).hexdigest()[:16]
+
+
+def _stage_post_attn_fused_artifacts(op, output_dir: str) -> None:
+    os.makedirs(output_dir, exist_ok=True)
+    build_dir = op.context.build_dir
+    shutil.copy2(str(build_dir / op.xclbin_artifact.filename),
+                 os.path.join(output_dir, "combined.xclbin"))
+    shutil.copy2(str(build_dir / op.insts_artifact.filename),
+                 os.path.join(output_dir, "post_attn_fused_main.insts"))
+
+
+def compile_post_attn_fused(embed_dim: int, hidden_dim: int,
+                             num_aie_columns: int, group_size: int,
+                             output_dir: str) -> str:
+    """Compile the Phase B fused post-attention layer operator."""
+    actual_cols = get_device_cols(num_aie_columns)
+    if actual_cols < num_aie_columns:
+        raise ValueError(
+            f"Device column mismatch: requested {num_aie_columns}, "
+            f"device has {actual_cols}"
+        )
+    from iron.operators.post_attn_fused.op import PostAttnFused
+    op = PostAttnFused(
+        embed_dim=embed_dim,
+        hidden_dim=hidden_dim,
+        num_aie_columns=num_aie_columns,
+        group_size=group_size,
+    )
+    op.compile()
+    _stage_post_attn_fused_artifacts(op, output_dir)
+    return output_dir
+
+
+def compile_post_attn_fused_cached(embed_dim: int = 2048,
+                                   hidden_dim: int = 8192,
+                                   num_aie_columns: int = 8,
+                                   group_size: int = 32) -> Path:
+    key = post_attn_fused_cache_key(embed_dim, hidden_dim, num_aie_columns, group_size)
+    cached = get_cached_chained_dir(key, POST_ATTN_FUSED_KERNELS,
+                                    prefix="post_attn_fused")
+    if cached is not None:
+        return cached
+    output_dir = str(get_cache_dir() / key)
+    compile_post_attn_fused(embed_dim, hidden_dim, num_aie_columns,
+                            group_size, output_dir)
+    return Path(output_dir)
+
+
+# ---------------------------------------------------------------------------
 # Elementwise ADD / MUL 1D (bf16, for post-attention fused runlist)
 # ---------------------------------------------------------------------------
 
@@ -2715,6 +2777,17 @@ def main():
     mul1d_parser.add_argument("--tile-size", type=int, default=512)
     mul1d_parser.add_argument("--out", type=str, required=True)
 
+    # Phase B: Post-attention fused layer (O_proj+ADD+NORM+MUL+SwiGLU in one xclbin)
+    paf_parser = subparsers.add_parser(
+        "post-attn-fused",
+        help="[Phase B] Fused O_proj+ADD+RMSNorm+MUL+SwiGLU (1 dispatch/layer)",
+    )
+    paf_parser.add_argument("--embed-dim",      type=int, default=2048)
+    paf_parser.add_argument("--hidden-dim",     type=int, default=8192)
+    paf_parser.add_argument("--num-aie-columns",type=int, default=8)
+    paf_parser.add_argument("--group-size",     type=int, default=32)
+    paf_parser.add_argument("--out", type=str, required=True)
+
     # FlowKV Decode Attention subcommand (streaming decode attention with online softmax)
     fkvd_parser = subparsers.add_parser(
         "flowkv-decode",
@@ -3038,6 +3111,12 @@ def main():
             print(path)
     elif args.op == "elem-mul-1d":
         path = compile_elem_mul_1d(args.size, args.num_aie_columns, args.tile_size, args.out)
+        if not args.quiet:
+            print(path)
+    elif args.op == "post-attn-fused":
+        path = compile_post_attn_fused(args.embed_dim, args.hidden_dim,
+                                        args.num_aie_columns, args.group_size,
+                                        args.out)
         if not args.quiet:
             print(path)
     elif args.op == "flowkv-decode":
