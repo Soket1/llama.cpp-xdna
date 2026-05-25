@@ -1327,6 +1327,121 @@ static void xdna_repack_q4_0_to_fused_int4(
     }
 }
 
+// Pack the four Q4_0 weight tensors (o_proj, gate, up, down) into the three
+// DDR buffers consumed by the post_attn_fused IRON design (Phase B). Mirrors
+// IRON-windows/iron/operators/post_attn_fused/pack_weights.py.
+//
+// Per-col layouts (col index i = 0..cols-1):
+//   w_o  : [col0 tiles ... col_{C-1} tiles]
+//   w_gu : [col0_gate, col0_up, col1_gate, col1_up, ...]   (col-interleaved phases)
+//   w_d  : [col0 tiles ... col_{C-1} tiles]
+// Each tile inside is m_input * K/2 weight bytes followed by m_input * groups * 2
+// bf16 scale bytes, with weight nibbles packed pairwise:
+//   byte k of a row = elem[2k] | (elem[2k+1] << 4)   (unsigned uint4 in [0,15])
+// The kernel applies the -8 bias internally (aie::sub(8)) inside _gemv_swiglu,
+// so the host packer leaves nibbles unsigned -- no per-row bias compensation
+// is needed (in contrast to the production v2 GEMV dispatch path).
+//
+// Buffer sizes (cols=2, embed=2048, hidden=8192, group_size=32):
+//   w_o  =        2,359,296 B  (cols * tiles_per_col_o  * packed_tile_o)
+//   w_gu =       18,874,368 B  (cols * 2 * tiles_per_col_gu * packed_tile_gu)
+//   w_d  =        9,437,184 B  (cols * tiles_per_col_d  * packed_tile_d)
+//
+// All output buffers must be pre-allocated by the caller.
+static void xdna_pack_post_attn_fused_weights(
+        const uint8_t * o_proj_q4_0,
+        const uint8_t * gate_q4_0,
+        const uint8_t * up_q4_0,
+        const uint8_t * down_q4_0,
+        int64_t embed_dim, int64_t hidden_dim,
+        int cols, int group_size,
+        int m_input_o, int m_input_gu, int m_input_d,
+        uint8_t * w_o_out,
+        uint8_t * w_gu_out,
+        uint8_t * w_d_out) {
+    GGML_ASSERT(group_size == 32);
+    GGML_ASSERT(embed_dim  % cols == 0);
+    GGML_ASSERT(hidden_dim % cols == 0);
+    GGML_ASSERT((embed_dim  / cols) % m_input_o  == 0);
+    GGML_ASSERT((hidden_dim / cols) % m_input_gu == 0);
+    GGML_ASSERT((embed_dim  / cols) % m_input_d  == 0);
+
+    // w_o: O_proj weights — M = embed_dim, K = embed_dim.
+    xdna_repack_q4_0_to_fused_int4(o_proj_q4_0,
+                                    embed_dim, embed_dim,
+                                    m_input_o, cols, group_size,
+                                    w_o_out);
+
+    // w_gu: pack gate and up separately, then interleave per col.
+    //   bytes_col_gu = tiles_per_col_gu * packed_tile_gu
+    const int64_t groups_embed     = embed_dim / group_size;
+    const size_t  packed_tile_gu   = (size_t)m_input_gu * (size_t)embed_dim / 2
+                                    + (size_t)m_input_gu * (size_t)groups_embed * 2;
+    const int64_t tiles_per_col_gu = (hidden_dim / cols) / m_input_gu;
+    const size_t  bytes_col_gu     = (size_t)tiles_per_col_gu * packed_tile_gu;
+
+    std::vector<uint8_t> gate_tmp((size_t)cols * bytes_col_gu);
+    std::vector<uint8_t> up_tmp  ((size_t)cols * bytes_col_gu);
+    xdna_repack_q4_0_to_fused_int4(gate_q4_0,
+                                    hidden_dim, embed_dim,
+                                    m_input_gu, cols, group_size,
+                                    gate_tmp.data());
+    xdna_repack_q4_0_to_fused_int4(up_q4_0,
+                                    hidden_dim, embed_dim,
+                                    m_input_gu, cols, group_size,
+                                    up_tmp.data());
+    for (int col = 0; col < cols; col++) {
+        memcpy(w_gu_out + (size_t)(2 * col) * bytes_col_gu,
+               gate_tmp.data() + (size_t)col * bytes_col_gu,
+               bytes_col_gu);
+        memcpy(w_gu_out + (size_t)(2 * col + 1) * bytes_col_gu,
+               up_tmp.data()   + (size_t)col * bytes_col_gu,
+               bytes_col_gu);
+    }
+
+    // w_d: Down weights — M = embed_dim, K = hidden_dim.
+    xdna_repack_q4_0_to_fused_int4(down_q4_0,
+                                    embed_dim, hidden_dim,
+                                    m_input_d, cols, group_size,
+                                    w_d_out);
+}
+
+// Compute the DDR byte sizes for the three post_attn_fused weight buffers.
+// Useful for sizing the XRT BOs before calling xdna_pack_post_attn_fused_weights.
+struct xdna_post_attn_fused_sizes {
+    size_t w_o_bytes;
+    size_t w_gu_bytes;
+    size_t w_d_bytes;
+    size_t packed_tile_o;
+    size_t packed_tile_gu;
+    size_t packed_tile_d;
+    int64_t tiles_per_col_o;
+    int64_t tiles_per_col_gu;
+    int64_t tiles_per_col_d;
+};
+
+static xdna_post_attn_fused_sizes xdna_post_attn_fused_buffer_sizes(
+        int64_t embed_dim, int64_t hidden_dim,
+        int cols, int group_size,
+        int m_input_o, int m_input_gu, int m_input_d) {
+    xdna_post_attn_fused_sizes s{};
+    const int64_t g_embed  = embed_dim  / group_size;
+    const int64_t g_hidden = hidden_dim / group_size;
+    s.packed_tile_o  = (size_t)m_input_o  * (size_t)embed_dim  / 2
+                     + (size_t)m_input_o  * (size_t)g_embed   * 2;
+    s.packed_tile_gu = (size_t)m_input_gu * (size_t)embed_dim  / 2
+                     + (size_t)m_input_gu * (size_t)g_embed   * 2;
+    s.packed_tile_d  = (size_t)m_input_d  * (size_t)hidden_dim / 2
+                     + (size_t)m_input_d  * (size_t)g_hidden  * 2;
+    s.tiles_per_col_o  = (embed_dim  / cols) / m_input_o;
+    s.tiles_per_col_gu = (hidden_dim / cols) / m_input_gu;
+    s.tiles_per_col_d  = (embed_dim  / cols) / m_input_d;
+    s.w_o_bytes  = (size_t)cols     * (size_t)s.tiles_per_col_o  * s.packed_tile_o;
+    s.w_gu_bytes = (size_t)cols * 2 * (size_t)s.tiles_per_col_gu * s.packed_tile_gu;
+    s.w_d_bytes  = (size_t)cols     * (size_t)s.tiles_per_col_d  * s.packed_tile_d;
+    return s;
+}
+
 // Repack Q4_K weights into the same packed INT4 layout used by the v2
 // fused_dequant_gemv kernel. Q4_K uses asymmetric quantization with two
 // levels of scales (super-block fp16 d + per-sub-block 6-bit scale,
