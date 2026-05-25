@@ -1878,6 +1878,86 @@ def compile_rms_norm_cached(size: int, dtype: str = "bf16",
 
 
 # ---------------------------------------------------------------------------
+# Elementwise ADD / MUL 1D (bf16, for post-attention fused runlist)
+# ---------------------------------------------------------------------------
+
+ELEM_ADD_1D_KERNELS = ("main",)
+ELEM_MUL_1D_KERNELS = ("main",)
+
+
+def elem_add_1d_cache_key(size: int, num_aie_columns: int, tile_size: int) -> str:
+    key_data = {"op": "elem_add_1d", "size": size,
+                "num_aie_columns": num_aie_columns, "tile_size": tile_size}
+    return json.dumps(key_data, sort_keys=True)
+
+
+def elem_mul_1d_cache_key(size: int, num_aie_columns: int, tile_size: int) -> str:
+    key_data = {"op": "elem_mul_1d", "size": size,
+                "num_aie_columns": num_aie_columns, "tile_size": tile_size}
+    return json.dumps(key_data, sort_keys=True)
+
+
+def _stage_elem_add_artifacts(op, output_dir: str) -> None:
+    os.makedirs(output_dir, exist_ok=True)
+    build_dir = op.context.build_dir
+    shutil.copy2(str(build_dir / op.xclbin_artifact.filename),
+                 os.path.join(output_dir, "combined.xclbin"))
+    shutil.copy2(str(build_dir / op.insts_artifact.filename),
+                 os.path.join(output_dir, "elem_add_main.insts"))
+
+
+def _stage_elem_mul_artifacts(op, output_dir: str) -> None:
+    os.makedirs(output_dir, exist_ok=True)
+    build_dir = op.context.build_dir
+    shutil.copy2(str(build_dir / op.xclbin_artifact.filename),
+                 os.path.join(output_dir, "combined.xclbin"))
+    shutil.copy2(str(build_dir / op.insts_artifact.filename),
+                 os.path.join(output_dir, "elem_mul_main.insts"))
+
+
+def compile_elem_add_1d(size: int, num_aie_columns: int, tile_size: int,
+                        output_dir: str) -> str:
+    """Compile ElementwiseAdd for bf16 1D vectors (used in post-attention runlist)."""
+    from iron.operators.elementwise_add.op import ElementwiseAdd
+    op = ElementwiseAdd(size=size, tile_size=tile_size, num_aie_columns=num_aie_columns)
+    op.compile()
+    _stage_elem_add_artifacts(op, output_dir)
+    return output_dir
+
+
+def compile_elem_add_1d_cached(size: int = 2048, num_aie_columns: int = 4,
+                               tile_size: int = 512) -> Path:
+    key = elem_add_1d_cache_key(size, num_aie_columns, tile_size)
+    cached = get_cached_chained_dir(key, ELEM_ADD_1D_KERNELS, prefix="elem_add")
+    if cached is not None:
+        return cached
+    output_dir = str(get_cache_dir() / key)
+    compile_elem_add_1d(size, num_aie_columns, tile_size, output_dir)
+    return Path(output_dir)
+
+
+def compile_elem_mul_1d(size: int, num_aie_columns: int, tile_size: int,
+                        output_dir: str) -> str:
+    """Compile ElementwiseMul for bf16 1D vectors (used in post-attention runlist)."""
+    from iron.operators.elementwise_mul.op import ElementwiseMul
+    op = ElementwiseMul(size=size, tile_size=tile_size, num_aie_columns=num_aie_columns)
+    op.compile()
+    _stage_elem_mul_artifacts(op, output_dir)
+    return output_dir
+
+
+def compile_elem_mul_1d_cached(size: int = 2048, num_aie_columns: int = 4,
+                               tile_size: int = 512) -> Path:
+    key = elem_mul_1d_cache_key(size, num_aie_columns, tile_size)
+    cached = get_cached_chained_dir(key, ELEM_MUL_1D_KERNELS, prefix="elem_mul")
+    if cached is not None:
+        return cached
+    output_dir = str(get_cache_dir() / key)
+    compile_elem_mul_1d(size, num_aie_columns, tile_size, output_dir)
+    return Path(output_dir)
+
+
+# ---------------------------------------------------------------------------
 # AttentionBlockPrefill (chained 11-kernel composite)
 # ---------------------------------------------------------------------------
 
@@ -2615,6 +2695,26 @@ def main():
     rms_parser.add_argument("--out", type=str,
                             help="Output directory (default: cache)")
 
+    # Elementwise ADD 1D (bf16, 2048 elements — post-attention fused runlist)
+    add1d_parser = subparsers.add_parser(
+        "elem-add-1d",
+        help="Compile elementwise bf16 ADD for 1D vectors (post-attention runlist)",
+    )
+    add1d_parser.add_argument("--size", type=int, default=2048)
+    add1d_parser.add_argument("--num-aie-columns", type=int, default=4)
+    add1d_parser.add_argument("--tile-size", type=int, default=512)
+    add1d_parser.add_argument("--out", type=str, required=True)
+
+    # Elementwise MUL 1D (bf16, 2048 elements — post-attention fused runlist)
+    mul1d_parser = subparsers.add_parser(
+        "elem-mul-1d",
+        help="Compile elementwise bf16 MUL for 1D vectors (post-attention runlist)",
+    )
+    mul1d_parser.add_argument("--size", type=int, default=2048)
+    mul1d_parser.add_argument("--num-aie-columns", type=int, default=4)
+    mul1d_parser.add_argument("--tile-size", type=int, default=512)
+    mul1d_parser.add_argument("--out", type=str, required=True)
+
     # FlowKV Decode Attention subcommand (streaming decode attention with online softmax)
     fkvd_parser = subparsers.add_parser(
         "flowkv-decode",
@@ -2930,6 +3030,14 @@ def main():
                 args.size, args.dtype, args.num_aie_columns,
                 args.num_channels, args.tile_size, args.weighted,
             )
+        if not args.quiet:
+            print(path)
+    elif args.op == "elem-add-1d":
+        path = compile_elem_add_1d(args.size, args.num_aie_columns, args.tile_size, args.out)
+        if not args.quiet:
+            print(path)
+    elif args.op == "elem-mul-1d":
+        path = compile_elem_mul_1d(args.size, args.num_aie_columns, args.tile_size, args.out)
         if not args.quiet:
             print(path)
     elif args.op == "flowkv-decode":
