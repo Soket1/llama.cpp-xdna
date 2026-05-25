@@ -7920,7 +7920,14 @@ static bool xdna_try_match_swiglu(const struct ggml_cgraph * cgraph, int i,
         static const bool fused_layer = xdna_env_enabled("XDNA_ENABLE_FUSED_LAYER");
         static const bool fused_dbg   = getenv("XDNA_DEBUG_FUSED") != NULL;
         static int fused_log_count = 0;
+        static int gate_check_count = 0;
         const int log_cap = 4;   // bound log volume per session
+        if (fused_dbg && gate_check_count < 2) {
+            fprintf(stderr,
+                    "fused_layer: gate check (fused_layer_env=%d is_int4=%d) @gate_mm=%p\n",
+                    (int)fused_layer, (int)out->is_int4, (void *)out->gate_mm);
+            gate_check_count++;
+        }
         if (fused_layer && out->is_int4) {
             if (fused_dbg && fused_log_count < log_cap) {
                 fprintf(stderr, "fused_layer: scan ENTER (gate_mm=%p)\n",
@@ -8081,6 +8088,63 @@ static bool xdna_try_match_swiglu(const struct ggml_cgraph * cgraph, int i,
     return true;
 }
 
+// Phase B cgraph pre-scan: find every fused post-attention pattern and
+// insert the indices of all PRECEDING ops (O_proj MUL_MAT, ADD_attn,
+// RMS_NORM_ffn, MUL_gain) plus the trailing ADD_ffn into the qkv-plan
+// skip set, so the per-node dispatch loop does NOT dispatch them via
+// the legacy paths. The SwiGLU dispatch site re-runs xdna_try_match_swiglu
+// at the gate position and, finding m.fused_layer still true, fires
+// ggml_backend_xdna_fused_layer_dispatch.
+//
+// Without this pass the per-node loop dispatches O_proj as a standalone
+// INT4 GEMV before the matcher ever sees the SwiGLU position, leaving
+// Phase B unreachable.
+static void xdna_plan_fused_layer(const struct ggml_cgraph * cgraph,
+                                   xdna_qkv_plan * qkv_plan) {
+    if (!xdna_env_enabled("XDNA_ENABLE_FUSED_LAYER")) return;
+    static const bool dbg = getenv("XDNA_DEBUG_FUSED") != NULL;
+    static std::atomic<int> dbg_budget{dbg ? 8 : 0};
+    int matches = 0, swiglu_hits = 0, no_fused = 0, no_int4 = 0;
+    int mulmat_count = 0, glu_count = 0;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT) mulmat_count++;
+        if (cgraph->nodes[i]->op == GGML_OP_GLU)     glu_count++;
+    }
+    if (dbg) {
+        fprintf(stderr,
+                "xdna_plan_fused_layer: cgraph n_nodes=%d mulmat=%d glu=%d\n",
+                cgraph->n_nodes, mulmat_count, glu_count);
+    }
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        if (cgraph->nodes[i]->op != GGML_OP_MUL_MAT) continue;
+        xdna_swiglu_match m{};
+        if (!xdna_try_match_swiglu(cgraph, i, &m)) continue;
+        swiglu_hits++;
+        const bool budget_ok = dbg && dbg_budget.fetch_sub(1) > 0;
+        if (budget_ok) {
+            fprintf(stderr,
+                    "xdna_plan_fused_layer: swiglu match @gate=%d "
+                    "is_int4=%d fused_layer=%d o_proj_idx=%d add_ffn_idx=%d\n",
+                    i, (int)m.is_int4, (int)m.fused_layer,
+                    m.o_proj_idx, m.add_ffn_idx);
+        }
+        if (!m.fused_layer) { no_fused++; continue; }
+        if (!m.is_int4)    { no_int4++;  continue; }
+        qkv_plan->skip_indices.insert(m.o_proj_idx);
+        qkv_plan->skip_indices.insert(m.add_attn_idx);
+        if (m.norm_ffn_idx  >= 0) qkv_plan->skip_indices.insert(m.norm_ffn_idx);
+        if (m.mul_gain_idx  >= 0) qkv_plan->skip_indices.insert(m.mul_gain_idx);
+        qkv_plan->skip_indices.insert(m.add_ffn_idx);
+        matches++;
+    }
+    if (dbg) {
+        fprintf(stderr,
+                "xdna_plan_fused_layer: %d patterns found "
+                "(swiglu_hits=%d no_fused=%d no_int4=%d)\n",
+                matches, swiglu_hits, no_fused, no_int4);
+    }
+}
+
 // Phase A stub: fused post-attention layer dispatch (NYI).
 // When XDNA_ENABLE_FUSED_LAYER=1 and the SwiGLU matcher sets m.fused_layer=true,
 // this is called. Currently a no-op: the 7-run runlist requires a single fused
@@ -8150,38 +8214,32 @@ static bool ggml_backend_xdna_fused_layer_dispatch(
 
     if (!lb.w_o_bo) {
         // First dispatch for this layer: allocate all BOs and pack weights.
-        try {
-            lb.w_o_bo      = std::make_unique<xrt::bo>(ctx->device, entry->w_o_bytes,
-                                                       xrt::bo::flags::host_only,
-                                                       entry->kernel.group_id(3));
-            lb.kqv_bo      = std::make_unique<xrt::bo>(ctx->device, embed_bytes,
-                                                       xrt::bo::flags::host_only,
-                                                       entry->kernel.group_id(4));
-            lb.inpL_bo     = std::make_unique<xrt::bo>(ctx->device, embed_bytes,
-                                                       xrt::bo::flags::host_only,
-                                                       entry->kernel.group_id(5));
-            lb.gain_bo     = std::make_unique<xrt::bo>(ctx->device, embed_bytes,
-                                                       xrt::bo::flags::host_only,
-                                                       entry->kernel.group_id(6));
-            lb.w_gu_bo     = std::make_unique<xrt::bo>(ctx->device, entry->w_gu_bytes,
-                                                       xrt::bo::flags::host_only,
-                                                       entry->kernel.group_id(7));
-            lb.w_d_bo      = std::make_unique<xrt::bo>(ctx->device, entry->w_d_bytes,
-                                                       xrt::bo::flags::host_only,
-                                                       entry->kernel.group_id(8));
-            lb.scratch_bo  = std::make_unique<xrt::bo>(ctx->device, embed_bytes,
-                                                       xrt::bo::flags::host_only,
-                                                       entry->kernel.group_id(9));
-            lb.silu_buf_bo = std::make_unique<xrt::bo>(ctx->device, hidden_bytes,
-                                                       xrt::bo::flags::host_only,
-                                                       entry->kernel.group_id(10));
-            lb.ffn_out_bo  = std::make_unique<xrt::bo>(ctx->device, embed_bytes,
-                                                       xrt::bo::flags::host_only,
-                                                       entry->kernel.group_id(11));
-        } catch (const std::exception & e) {
-            GGML_LOG_ERROR("ggml-xdna: failed to allocate post_attn_fused BOs "
-                           "for layer (E=%lld H=%lld): %s\n",
-                           (long long)embed_dim, (long long)hidden_dim, e.what());
+        // Allocate one at a time so a failing group_id(N) call is identifiable.
+        auto alloc_bo = [&](const char * name, size_t bytes, int gid)
+                            -> std::unique_ptr<xrt::bo> {
+            try {
+                return std::make_unique<xrt::bo>(
+                    ctx->device, bytes, xrt::bo::flags::host_only,
+                    entry->kernel.group_id(gid));
+            } catch (const std::exception & e) {
+                GGML_LOG_ERROR("ggml-xdna: failed to allocate post_attn_fused %s "
+                               "(group_id=%d size=%zu): %s\n",
+                               name, gid, bytes, e.what());
+                return nullptr;
+            }
+        };
+        lb.w_o_bo      = alloc_bo("w_o",      entry->w_o_bytes, 3);
+        lb.kqv_bo      = alloc_bo("kqv",      embed_bytes,      4);
+        lb.inpL_bo     = alloc_bo("inpL",     embed_bytes,      5);
+        lb.gain_bo     = alloc_bo("gain",     embed_bytes,      6);
+        lb.w_gu_bo     = alloc_bo("w_gu",     entry->w_gu_bytes, 7);
+        lb.w_d_bo      = alloc_bo("w_d",      entry->w_d_bytes,  8);
+        lb.scratch_bo  = alloc_bo("scratch",  embed_bytes,      9);
+        lb.silu_buf_bo = alloc_bo("silu_buf", hidden_bytes,     10);
+        lb.ffn_out_bo  = alloc_bo("ffn_out",  embed_bytes,      11);
+        if (!lb.w_o_bo || !lb.kqv_bo || !lb.inpL_bo || !lb.gain_bo
+                || !lb.w_gu_bo || !lb.w_d_bo
+                || !lb.scratch_bo || !lb.silu_buf_bo || !lb.ffn_out_bo) {
             ctx->post_attn_fused_layer_cache.erase(o_proj_w);
             return false;
         }
@@ -13434,6 +13492,11 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
     xdna_qkv_plan qkv_plan;
     if (qkv_enabled) {
         xdna_plan_qkv(cgraph, &qkv_plan);
+        // Phase B: extend the skip set with any nodes that the fused
+        // post-attention dispatch will subsume. Runs after QKV planning so
+        // skip sets compose; runs BEFORE the per-node dispatch loop so the
+        // legacy O_proj GEMV doesn't fire and leave Phase B dormant.
+        xdna_plan_fused_layer(cgraph, &qkv_plan);
         static const bool qkv_dbg = getenv("XDNA_DEBUG") != NULL;
         if (qkv_dbg) {
             fprintf(stderr, "ggml-xdna: QKV plan: %zu triples (%zu skip nodes)\n",

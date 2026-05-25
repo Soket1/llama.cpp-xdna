@@ -159,6 +159,10 @@ PRESETS: dict[str, dict[str, str]] = {
         "XDNA_ENABLE_FLOWKV_DECODE":     "1",
         "XDNA_ENABLE_RMS_NORM":          "0",
         "XDNA_ENABLE_GEMV_INT4":         "1",
+        # Phase B requires the matcher to flag is_int4=true so the
+        # fused-layer scan block enters. The legacy chained INT4 SwiGLU
+        # dispatch (which we override) is gated by this same flag.
+        "XDNA_ENABLE_SWIGLU_INT4":       "1",
         "XDNA_ENABLE_FUSED_LAYER":       "1",
     },
     "npu_int4_v1": {
