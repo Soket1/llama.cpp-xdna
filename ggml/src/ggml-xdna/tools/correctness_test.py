@@ -142,6 +142,25 @@ PRESETS: dict[str, dict[str, str]] = {
         # and correctness is byte-exact -- just opt-in until the inner
         # dequant loop is optimized.
     },
+    "npu_phase_b": {
+        # Phase B: single-xclbin fused dispatch for the entire post-attention
+        # layer (O_proj + ADD + RMSNorm + MUL + SwiGLU + ADD_ffn). Drops
+        # layer dispatches from 3 (Phase A target) to 2 (QKV + post_attn_fused).
+        # Layered on top of npu_int4: Q4_0 weights, INT4 GEMV path, etc.
+        # XDNA_ENABLE_FUSED_LAYER=1 tells the matcher to populate the
+        # fused-layer fields in xdna_swiglu_match and the graph_compute
+        # SwiGLU dispatch site to try ggml_backend_xdna_fused_layer_dispatch
+        # BEFORE the legacy chained-INT4 SwiGLU fallback.
+        "XDNA_ENABLE_GEMV":              "1",
+        "XDNA_ENABLE_SWIGLU":            "1",
+        "XDNA_ENABLE_QKV":               "1",
+        "XDNA_ENABLE_DECODE_BATCH":      "1",
+        "XDNA_ENABLE_TRANSFORMER_BLOCK": "1",
+        "XDNA_ENABLE_FLOWKV_DECODE":     "1",
+        "XDNA_ENABLE_RMS_NORM":          "0",
+        "XDNA_ENABLE_GEMV_INT4":         "1",
+        "XDNA_ENABLE_FUSED_LAYER":       "1",
+    },
     "npu_int4_v1": {
         # Regression-coverage preset that explicitly forces the old v1
         # INT4 GEMV kernel via XDNA_DISABLE_GEMV_INT4_V2=1. Kept so we
@@ -506,6 +525,32 @@ TESTS: list[Test] = [
         variants=["npu_int4_v2"],
         min_prefix_match=1,
         description="V2 INT4 GEMV kernel (PR #101 optimized: compile-time DIM_K/G + double-pump + AIE pipelining). ~4x faster than v1 on the dominant FFN shapes per xrt_async_spike.",
+    ),
+    Test(
+        name="paris_short_q4_0_phase_b",
+        prompt="What is the capital of France?",
+        n_predict=12,
+        mode="single-turn",
+        model=MODEL_Q4_0,
+        variants=["npu_phase_b"],
+        min_prefix_match=1,
+        description="Phase B fused post-attention layer: one xrt::execute() per "
+                    "layer covering O_proj + ADD + RMSNorm + MUL + SwiGLU + ADD_ffn. "
+                    "Drops layer dispatch count from 3 (Phase A) to 2. Output must "
+                    "match cpu_baseline byte-for-byte on the first ~12 tokens.",
+    ),
+    Test(
+        name="paris_drift_64_q4_0_phase_b",
+        prompt="What is the capital of France? Explain in detail.",
+        n_predict=64,
+        mode="single-turn",
+        model=MODEL_Q4_0,
+        variants=["npu_phase_b"],
+        min_prefix_match=12,
+        description="Phase B long-generation drift check. The post-attention "
+                    "fused kernel sub-8 dequant + tanh-approx SiLU should match "
+                    "the production v2 GEMV + SwiGLU outputs to within bf16 noise; "
+                    "drift past 12 chars reported as info only.",
     ),
     Test(
         name="paris_short_specdec_cpu_verify",
@@ -916,6 +961,7 @@ def build_bench_configs() -> list[BenchConfig]:
         BenchConfig(label="NPU INT4 (default=v2)", preset="npu_int4",     model=MODEL_Q4_0),
         BenchConfig(label="NPU INT4 +SwiGLU",  preset="npu_int4_swiglu",  model=MODEL_Q4_0),
         BenchConfig(label="NPU INT4 QKV fused", preset="npu_int4_qkv_fused", model=MODEL_Q4_0),
+        BenchConfig(label="NPU Phase B fused", preset="npu_phase_b",      model=MODEL_Q4_0),
     ]
 
 
