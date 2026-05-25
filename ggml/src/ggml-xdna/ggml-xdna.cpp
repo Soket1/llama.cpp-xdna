@@ -12848,7 +12848,10 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                             if (!k_perm && nd->ne[0] == hd && nd->ne[1] > hd && nd->ne[2] > 1) {
                                 k_perm = nd;          // [hd, seq_len, kv_heads]
                             } else if (!v_perm && nd->ne[0] > hd && nd->ne[1] == hd && nd->ne[2] > 1) {
-                                v_perm = nd;          // [seq_len, hd, kv_heads]
+                                v_perm = nd;          // old [seq_len, hd, kv_heads]
+                            } else if (!v_perm && k_perm &&
+                                       nd->ne[0] == hd && nd->ne[1] > hd && nd->ne[2] > 1) {
+                                v_perm = nd;          // new [hd, seq_len, kv_heads] — same shape as K
                             }
                         }
                     }
@@ -12861,6 +12864,19 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                         flowkv_poc_num_kv_heads = k_perm->ne[2];
                         flowkv_poc_num_q_heads = q_perm->ne[2];
                         flowkv_poc_valid = true;
+                        if (flowkv_diag_enabled) {
+                            fprintf(stderr, "ggml-xdna: [FlowKV-SCAN] perm found: q=%s ne=[%lld,%lld,%lld] k=%s ne=[%lld,%lld,%lld] v=%s ne=[%lld,%lld,%lld]\n",
+                                q_perm->name, (long long)q_perm->ne[0], (long long)q_perm->ne[1], (long long)q_perm->ne[2],
+                                k_perm->name, (long long)k_perm->ne[0], (long long)k_perm->ne[1], (long long)k_perm->ne[2],
+                                v_perm->name, (long long)v_perm->ne[0], (long long)v_perm->ne[1], (long long)v_perm->ne[2]);
+                            fflush(stderr);
+                        }
+                    } else if (flowkv_diag_enabled) {
+                        fprintf(stderr, "ggml-xdna: [FlowKV-SCAN] perm NOT found (q=%s k=%s v=%s) — flowkv_poc_valid stays false\n",
+                            q_perm ? q_perm->name : "null",
+                            k_perm ? k_perm->name : "null",
+                            v_perm ? v_perm->name : "null");
+                        fflush(stderr);
                     }
                 }
                 continue;  // natural ++i; intermediate CPU nodes still run via accumulator
@@ -13713,7 +13729,7 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
         // We dispatch FlowKV on NPU and OVERWRITE kqv_out with the
         // NPU result. If output matches → FlowKV computes correctly.
         if (flowkv_decode_enabled && flowkv_poc_valid &&
-            node->op == GGML_OP_CONT &&
+            (node->op == GGML_OP_CONT || node->op == GGML_OP_RESHAPE) &&
             node->name && strstr(node->name, "kqv_out")) {
 
             struct ggml_tensor * kqv_out = node->src[0];
@@ -14063,6 +14079,11 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                     if (v_is_f32) {
                                         uint16_t * dst_bf16 = (uint16_t *)(v_col_ptr + dst);
                                         if (v_nb0 == (size_t)head_dim * 4) {
+                                            // old [seq, hd, kv] f32 contiguous rows
+                                            const float * src = (const float *)(v_data + pos * v_nb1 + cur_kv_h * v_nb2);
+                                            f32_to_bf16(src, dst_bf16, (size_t)head_dim);
+                                        } else if (v_nb0 == 4) {
+                                            // new [hd, seq, kv] f32 — same layout as K
                                             const float * src = (const float *)(v_data + pos * v_nb1 + cur_kv_h * v_nb2);
                                             f32_to_bf16(src, dst_bf16, (size_t)head_dim);
                                         } else {
@@ -14091,6 +14112,11 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                         }
                                     } else {
                                         if (v_nb0 == (size_t)head_dim * 2) {
+                                            // old [seq, hd, kv] bf16 contiguous rows
+                                            size_t src_v = pos * v_nb1 + cur_kv_h * v_nb2;
+                                            memcpy(v_col_ptr + dst, v_data + src_v, row_bytes);
+                                        } else if (v_nb0 == 2) {
+                                            // new [hd, seq, kv] bf16 — same layout as K
                                             size_t src_v = pos * v_nb1 + cur_kv_h * v_nb2;
                                             memcpy(v_col_ptr + dst, v_data + src_v, row_bytes);
                                         } else {
