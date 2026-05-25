@@ -7918,7 +7918,14 @@ static bool xdna_try_match_swiglu(const struct ggml_cgraph * cgraph, int i,
     // These are the nodes that will be replaced by the 7-run runlist.
     {
         static const bool fused_layer = xdna_env_enabled("XDNA_ENABLE_FUSED_LAYER");
+        static const bool fused_dbg   = getenv("XDNA_DEBUG_FUSED") != NULL;
+        static int fused_log_count = 0;
+        const int log_cap = 4;   // bound log volume per session
         if (fused_layer && out->is_int4) {
+            if (fused_dbg && fused_log_count < log_cap) {
+                fprintf(stderr, "fused_layer: scan ENTER (gate_mm=%p)\n",
+                        (void *)out->gate_mm);
+            }
             // Walk the src chain from gate_mm input to find:
             //   input (= MUL_gain output) → gain_src (= RMS_NORM output)
             //     → norm_src (= inpFF = ADD_attn output)
@@ -8057,8 +8064,18 @@ static bool xdna_try_match_swiglu(const struct ggml_cgraph * cgraph, int i,
             out->add_ffn     = add_ffn_node;
             out->add_ffn_idx = add_ffn_idx;
             out->fused_layer = true;
+            if (fused_dbg && fused_log_count < log_cap) {
+                fprintf(stderr, "fused_layer: scan SUCCESS (o_proj_idx=%d add_attn_idx=%d add_ffn_idx=%d)\n",
+                        out->o_proj_idx, out->add_attn_idx, out->add_ffn_idx);
+                fused_log_count++;
+            }
         }
         fused_layer_done:;
+        if (fused_dbg && fused_layer && out->is_int4
+                && !out->fused_layer && fused_log_count < log_cap) {
+            fprintf(stderr, "fused_layer: scan BAIL (no success path taken)\n");
+            fused_log_count++;
+        }
     }
 
     return true;
