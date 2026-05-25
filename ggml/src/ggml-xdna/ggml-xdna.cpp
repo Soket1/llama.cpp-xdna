@@ -679,6 +679,52 @@ struct xdna_rms_norm_entry {
     std::unique_ptr<xrt::bo> out_bo;
 };
 
+// Phase B fused post-attention layer entry: single xclbin doing
+// O_proj GEMV + ADD(attn_res) + RMSNorm + MUL(gain) + SwiGLU gate+up + silu_mul + down.
+// Shared across all transformer layers of a model — only weights/activation BOs
+// differ per layer, see xdna_post_attn_fused_layer_t below.
+struct xdna_post_attn_fused_entry {
+    xrt::xclbin     xclbin;
+    xrt::hw_context hw_ctx;
+    xrt::kernel     kernel;
+    std::vector<char> insts;
+    xrt::bo         insts_bo;
+
+    std::string cache_key;
+    int64_t embed_dim;
+    int64_t hidden_dim;
+    int cols;
+    int group_size;
+    int m_input_o;
+    int m_input_gu;
+    int m_input_d;
+    // Pre-computed byte sizes for the three packed weight buffers + per-tile
+    // sizes (from xdna_post_attn_fused_buffer_sizes).
+    size_t w_o_bytes;
+    size_t w_gu_bytes;
+    size_t w_d_bytes;
+};
+
+// Per-layer state for the fused dispatch. Keyed by the o_proj weight tensor
+// pointer (unique per layer, stable across tokens). Weights are packed once
+// on first dispatch; activations BOs are reused on every token.
+struct xdna_post_attn_fused_layer_t {
+    // INT4 packed weight BOs (synced once on first dispatch).
+    std::unique_ptr<xrt::bo> w_o_bo;
+    std::unique_ptr<xrt::bo> w_gu_bo;
+    std::unique_ptr<xrt::bo> w_d_bo;
+    // bf16 gain weight BO (synced once on first dispatch).
+    std::unique_ptr<xrt::bo> gain_bo;
+    // Per-token activation BOs.
+    std::unique_ptr<xrt::bo> kqv_bo;     // O_proj input (attention output)
+    std::unique_ptr<xrt::bo> inpL_bo;    // residual input
+    // On-chip intermediates exposed in DDR (scratch holds inpFF after dispatch,
+    // needed by host post-FFN residual ADD).
+    std::unique_ptr<xrt::bo> scratch_bo;
+    std::unique_ptr<xrt::bo> silu_buf_bo;
+    std::unique_ptr<xrt::bo> ffn_out_bo;
+};
+
 // ============================================================================
 // Elementwise 1D BF16 kernel entry (ADD or MUL, size=2048)
 // Used in the Phase A fused post-attention runlist:
@@ -756,6 +802,11 @@ struct ggml_backend_xdna_context {
     std::unordered_map<std::string, xdna_qkv_entry> qkv_cache;
     std::unordered_set<std::string> qkv_compile_failed;
     std::unordered_map<std::string, xdna_rms_norm_entry> rms_norm_cache;
+    // Phase B fused post-attention layer caches.
+    // Kernel cache (xclbin+insts) keyed by (E,H,C,G).
+    // Per-layer weight/activation BOs keyed by the o_proj weight tensor pointer.
+    std::unordered_map<std::string, xdna_post_attn_fused_entry> post_attn_fused_cache;
+    std::unordered_map<const void *, xdna_post_attn_fused_layer_t> post_attn_fused_layer_cache;
     // Phase A: fused post-attention layer dispatch (O_proj+ADD+NORM+MUL+SwiGLU in one runlist)
     std::unordered_map<std::string, xdna_elem1d_entry> elem_add_cache;
     std::unordered_map<std::string, xdna_elem1d_entry> elem_mul_cache;
@@ -8017,10 +8068,222 @@ static bool xdna_try_match_swiglu(const struct ggml_cgraph * cgraph, int i,
 // When XDNA_ENABLE_FUSED_LAYER=1 and the SwiGLU matcher sets m.fused_layer=true,
 // this is called. Currently a no-op: the 7-run runlist requires a single fused
 // xclbin (Phase B). The skip-node fields in the match struct are for future use.
-static void ggml_backend_xdna_fused_layer_dispatch(
-        ggml_backend_xdna_context * /*ctx*/,
-        const xdna_swiglu_match & /*m*/) {
-    // NYI: individual dispatches (O_proj + SwiGLU) handle this normally.
+// Forward declarations for the post_attn_fused helpers (defined further below
+// alongside the rms_norm / elem1d cache loaders).
+static std::string make_post_attn_fused_cache_key(
+        int64_t embed_dim, int64_t hidden_dim, int cols, int group_size);
+static bool ensure_post_attn_fused_compiled(
+        ggml_backend_xdna_context * ctx, const std::string & cache_key,
+        int64_t embed_dim, int64_t hidden_dim, int cols, int group_size);
+static xdna_post_attn_fused_entry * get_or_load_post_attn_fused_kernel(
+        ggml_backend_xdna_context * ctx, const std::string & cache_key,
+        int64_t embed_dim, int64_t hidden_dim, int cols, int group_size,
+        int m_input_o, int m_input_gu, int m_input_d);
+
+static bool ggml_backend_xdna_fused_layer_dispatch(
+        ggml_backend_xdna_context * ctx,
+        const xdna_swiglu_match & m) {
+    if (!ctx->device_valid) return false;
+    if (!m.fused_layer)     return false;
+
+    // All four weights MUST be Q4_0 with K=embed_dim or K=hidden_dim as
+    // appropriate; the IRON design hard-codes group_size=32 and the kernel
+    // expects the exact packed-tile shape from xdna_pack_post_attn_fused_weights.
+    const struct ggml_tensor * o_proj_w = m.o_proj_mm->src[0];
+    const struct ggml_tensor * gate_w   = m.gate_w;
+    const struct ggml_tensor * up_w     = m.up_w;
+    const struct ggml_tensor * down_w   = m.down_w;
+    if (o_proj_w->type != GGML_TYPE_Q4_0) return false;
+    if (gate_w  ->type != GGML_TYPE_Q4_0) return false;
+    if (up_w    ->type != GGML_TYPE_Q4_0) return false;
+    if (down_w  ->type != GGML_TYPE_Q4_0) return false;
+
+    // Shape extraction. o_proj_w is [E,E], gate/up are [E,H], down is [H,E].
+    const int64_t embed_dim  = o_proj_w->ne[0];
+    const int64_t hidden_dim = gate_w  ->ne[1];
+    const int cols       = 2;   // matches design.py and the compiled xclbin
+    const int group_size = 32;
+    const int m_input_o  = 2;
+    const int m_input_gu = 8;
+    const int m_input_d  = 2;
+
+    // Divisibility — also asserted inside the packer.
+    if ((embed_dim  / cols) % m_input_o  != 0) return false;
+    if ((hidden_dim / cols) % m_input_gu != 0) return false;
+    if ((embed_dim  / cols) % m_input_d  != 0) return false;
+    if (embed_dim  % group_size != 0) return false;
+    if (hidden_dim % group_size != 0) return false;
+
+    // Compile + load the xclbin (cached per (E,H,C,G)).
+    const std::string cache_key = make_post_attn_fused_cache_key(
+        embed_dim, hidden_dim, cols, group_size);
+    if (!ensure_post_attn_fused_compiled(ctx, cache_key,
+                                          embed_dim, hidden_dim, cols, group_size)) {
+        return false;
+    }
+    xdna_post_attn_fused_entry * entry = get_or_load_post_attn_fused_kernel(
+        ctx, cache_key, embed_dim, hidden_dim, cols, group_size,
+        m_input_o, m_input_gu, m_input_d);
+    if (!entry) return false;
+
+    // Per-layer BOs (weights packed + sync'd on first dispatch for this layer).
+    xdna_post_attn_fused_layer_t & lb = ctx->post_attn_fused_layer_cache[o_proj_w];
+    const size_t embed_bytes  = (size_t)embed_dim  * sizeof(uint16_t);
+    const size_t hidden_bytes = (size_t)hidden_dim * sizeof(uint16_t);
+
+    if (!lb.w_o_bo) {
+        // First dispatch for this layer: allocate all BOs and pack weights.
+        try {
+            lb.w_o_bo      = std::make_unique<xrt::bo>(ctx->device, entry->w_o_bytes,
+                                                       xrt::bo::flags::host_only,
+                                                       entry->kernel.group_id(3));
+            lb.kqv_bo      = std::make_unique<xrt::bo>(ctx->device, embed_bytes,
+                                                       xrt::bo::flags::host_only,
+                                                       entry->kernel.group_id(4));
+            lb.inpL_bo     = std::make_unique<xrt::bo>(ctx->device, embed_bytes,
+                                                       xrt::bo::flags::host_only,
+                                                       entry->kernel.group_id(5));
+            lb.gain_bo     = std::make_unique<xrt::bo>(ctx->device, embed_bytes,
+                                                       xrt::bo::flags::host_only,
+                                                       entry->kernel.group_id(6));
+            lb.w_gu_bo     = std::make_unique<xrt::bo>(ctx->device, entry->w_gu_bytes,
+                                                       xrt::bo::flags::host_only,
+                                                       entry->kernel.group_id(7));
+            lb.w_d_bo      = std::make_unique<xrt::bo>(ctx->device, entry->w_d_bytes,
+                                                       xrt::bo::flags::host_only,
+                                                       entry->kernel.group_id(8));
+            lb.scratch_bo  = std::make_unique<xrt::bo>(ctx->device, embed_bytes,
+                                                       xrt::bo::flags::host_only,
+                                                       entry->kernel.group_id(9));
+            lb.silu_buf_bo = std::make_unique<xrt::bo>(ctx->device, hidden_bytes,
+                                                       xrt::bo::flags::host_only,
+                                                       entry->kernel.group_id(10));
+            lb.ffn_out_bo  = std::make_unique<xrt::bo>(ctx->device, embed_bytes,
+                                                       xrt::bo::flags::host_only,
+                                                       entry->kernel.group_id(11));
+        } catch (const std::exception & e) {
+            GGML_LOG_ERROR("ggml-xdna: failed to allocate post_attn_fused BOs "
+                           "for layer (E=%lld H=%lld): %s\n",
+                           (long long)embed_dim, (long long)hidden_dim, e.what());
+            ctx->post_attn_fused_layer_cache.erase(o_proj_w);
+            return false;
+        }
+
+        // Pack the three INT4 weight buffers into their BOs.
+        xdna_pack_post_attn_fused_weights(
+            (const uint8_t *)o_proj_w->data,
+            (const uint8_t *)gate_w  ->data,
+            (const uint8_t *)up_w    ->data,
+            (const uint8_t *)down_w  ->data,
+            embed_dim, hidden_dim, cols, group_size,
+            m_input_o, m_input_gu, m_input_d,
+            (uint8_t *)lb.w_o_bo ->map<void *>(),
+            (uint8_t *)lb.w_gu_bo->map<void *>(),
+            (uint8_t *)lb.w_d_bo ->map<void *>());
+        lb.w_o_bo ->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        lb.w_gu_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        lb.w_d_bo ->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+        // bf16 gain weight (per-layer, static after model load).
+        const struct ggml_tensor * gw = m.gain_weight;
+        uint16_t * gain_dst = (uint16_t *)lb.gain_bo->map<void *>();
+        if (gw->type == GGML_TYPE_F32) {
+            f32_to_bf16((const float *)gw->data, gain_dst, (size_t)embed_dim);
+        } else if (gw->type == GGML_TYPE_BF16) {
+            memcpy(gain_dst, gw->data, embed_bytes);
+        } else {
+            GGML_LOG_ERROR("ggml-xdna: post_attn_fused gain weight has unsupported "
+                           "dtype %d\n", (int)gw->type);
+            ctx->post_attn_fused_layer_cache.erase(o_proj_w);
+            return false;
+        }
+        lb.gain_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    }
+
+    // Per-token: write kqv (attn output = O_proj input) and inpL into their BOs.
+    const struct ggml_tensor * kqv  = m.o_proj_mm->src[1];   // attn output
+    const struct ggml_tensor * inpL = m.inpL;                // residual
+    uint16_t * kqv_dst = (uint16_t *)lb.kqv_bo->map<void *>();
+    uint16_t * inpL_dst = (uint16_t *)lb.inpL_bo->map<void *>();
+    if (kqv->type == GGML_TYPE_F32) {
+        f32_to_bf16((const float *)kqv->data, kqv_dst, (size_t)embed_dim);
+    } else if (kqv->type == GGML_TYPE_BF16) {
+        memcpy(kqv_dst, kqv->data, embed_bytes);
+    } else {
+        return false;
+    }
+    if (inpL->type == GGML_TYPE_F32) {
+        f32_to_bf16((const float *)inpL->data, inpL_dst, (size_t)embed_dim);
+    } else if (inpL->type == GGML_TYPE_BF16) {
+        memcpy(inpL_dst, inpL->data, embed_bytes);
+    } else {
+        return false;
+    }
+    lb.kqv_bo ->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    lb.inpL_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+    // Run the fused layer (one xrt::execute for O_proj+ADD+NORM+MUL+SwiGLU).
+    try {
+        xrt::run r(entry->kernel);
+        r.set_arg(0, 3u);
+        r.set_arg(1, entry->insts_bo);
+        r.set_arg(2, (uint32_t)entry->insts.size());
+        // Sequence args match design.py rt.sequence order:
+        //   w_o, kqv, inpL, gain, w_gu, w_d, scratch, silu_buf, ffn_out
+        r.set_arg(3,  *lb.w_o_bo);
+        r.set_arg(4,  *lb.kqv_bo);
+        r.set_arg(5,  *lb.inpL_bo);
+        r.set_arg(6,  *lb.gain_bo);
+        r.set_arg(7,  *lb.w_gu_bo);
+        r.set_arg(8,  *lb.w_d_bo);
+        r.set_arg(9,  *lb.scratch_bo);
+        r.set_arg(10, *lb.silu_buf_bo);
+        r.set_arg(11, *lb.ffn_out_bo);
+        r.start();
+        r.wait();
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("ggml-xdna: post_attn_fused dispatch failed: %s\n", e.what());
+        return false;
+    }
+
+    // Sync outputs needed for the post-FFN residual.
+    // scratch holds inpFF (= o_proj_out + inpL, written by ANM and untouched
+    // since SwiGLU consumes it as an input). ffn_out holds down_proj output.
+    lb.ffn_out_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+    lb.scratch_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+    const uint16_t * ffn_out_bf = (const uint16_t *)lb.ffn_out_bo->map<void *>();
+    const uint16_t * inpFF_bf   = (const uint16_t *)lb.scratch_bo->map<void *>();
+
+    // outL = ffn_out + inpFF.  Write to m.add_ffn (the ADD_ffn output tensor).
+    struct ggml_tensor * dst = m.add_ffn;
+    if (dst->type == GGML_TYPE_F32) {
+        float * out_f32 = (float *)dst->data;
+        for (int64_t i = 0; i < embed_dim; i++) {
+            // bf16 -> f32: zero-extend low 16 bits.
+            uint32_t a_bits = ((uint32_t)ffn_out_bf[i]) << 16;
+            uint32_t b_bits = ((uint32_t)inpFF_bf  [i]) << 16;
+            float af; std::memcpy(&af, &a_bits, sizeof(float));
+            float bf; std::memcpy(&bf, &b_bits, sizeof(float));
+            out_f32[i] = af + bf;
+        }
+    } else if (dst->type == GGML_TYPE_BF16) {
+        uint16_t * out_bf = (uint16_t *)dst->data;
+        for (int64_t i = 0; i < embed_dim; i++) {
+            uint32_t a_bits = ((uint32_t)ffn_out_bf[i]) << 16;
+            uint32_t b_bits = ((uint32_t)inpFF_bf  [i]) << 16;
+            float af; std::memcpy(&af, &a_bits, sizeof(float));
+            float bf; std::memcpy(&bf, &b_bits, sizeof(float));
+            const float s = af + bf;
+            uint32_t sbits; std::memcpy(&sbits, &s, sizeof(uint32_t));
+            sbits += (0x7FFF + ((sbits >> 16) & 1));
+            out_bf[i] = (uint16_t)(sbits >> 16);
+        }
+    } else {
+        GGML_LOG_ERROR("ggml-xdna: post_attn_fused output tensor has unsupported "
+                       "dtype %d\n", (int)dst->type);
+        return false;
+    }
+    return true;
 }
 
 // ============================================================================
@@ -12542,6 +12805,122 @@ static xdna_rms_norm_entry * get_or_load_rms_norm_kernel(
 }
 
 // ============================================================================
+// Phase B post_attn_fused: compile + load helpers
+// ============================================================================
+
+static std::string make_post_attn_fused_cache_key(
+        int64_t embed_dim, int64_t hidden_dim, int cols, int group_size) {
+    char buf[128];
+    snprintf(buf, sizeof(buf), "post_attn_fused_e%lld_h%lld_c%d_g%d",
+             (long long)embed_dim, (long long)hidden_dim, cols, group_size);
+    return std::string(buf);
+}
+
+static bool post_attn_fused_bundle_present(const std::string & bundle_dir) {
+    const std::string xclbin = bundle_dir + "/combined.xclbin";
+    const std::string insts  = bundle_dir + "/post_attn_fused_main.insts";
+    struct stat st;
+    return ::stat(xclbin.c_str(), &st) == 0 && ::stat(insts.c_str(), &st) == 0;
+}
+
+static bool ensure_post_attn_fused_compiled(
+        ggml_backend_xdna_context * ctx,
+        const std::string & cache_key,
+        int64_t embed_dim, int64_t hidden_dim,
+        int cols, int group_size) {
+    const std::string bundle_dir = ctx->cache_dir + "\\" + cache_key;
+    if (post_attn_fused_bundle_present(bundle_dir)) return true;
+
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd),
+             "%s \"%s\" --quiet post-attn-fused "
+             "--embed-dim %lld --hidden-dim %lld "
+             "--num-aie-columns %d --group-size %d "
+             "--out \"%s\"%s",
+             xdna_python_cmd(),
+             ctx->compile_script.c_str(),
+             (long long)embed_dim, (long long)hidden_dim,
+             cols, group_size,
+             bundle_dir.c_str(), xdna_null_redirect());
+    fprintf(stderr, "ggml-xdna: compiling post_attn_fused E=%lld H=%lld cols=%d g=%d "
+                    "(first run, will be cached)...\n",
+                    (long long)embed_dim, (long long)hidden_dim, cols, group_size);
+    int ret = system(cmd);
+    if (ret != 0) {
+        GGML_LOG_ERROR("ggml-xdna: post_attn_fused compilation failed (exit %d)\n", ret);
+        return false;
+    }
+    if (!post_attn_fused_bundle_present(bundle_dir)) {
+        GGML_LOG_ERROR("ggml-xdna: post_attn_fused build succeeded but bundle "
+                       "files missing in %s\n", bundle_dir.c_str());
+        return false;
+    }
+    fprintf(stderr, "ggml-xdna: post_attn_fused cached at %s\n", bundle_dir.c_str());
+    return true;
+}
+
+static xdna_post_attn_fused_entry * get_or_load_post_attn_fused_kernel(
+        ggml_backend_xdna_context * ctx,
+        const std::string & cache_key,
+        int64_t embed_dim, int64_t hidden_dim,
+        int cols, int group_size,
+        int m_input_o, int m_input_gu, int m_input_d) {
+    std::lock_guard<std::mutex> lock(ctx->cache_mutex);
+    auto it = ctx->post_attn_fused_cache.find(cache_key);
+    if (it != ctx->post_attn_fused_cache.end()) return &it->second;
+
+    const std::string bundle_dir  = ctx->cache_dir + "\\" + cache_key;
+    const std::string xclbin_path = bundle_dir + "/combined.xclbin";
+    const std::string insts_path  = bundle_dir + "/post_attn_fused_main.insts";
+
+    try {
+        xdna_post_attn_fused_entry entry;
+        entry.cache_key   = cache_key;
+        entry.embed_dim   = embed_dim;
+        entry.hidden_dim  = hidden_dim;
+        entry.cols        = cols;
+        entry.group_size  = group_size;
+        entry.m_input_o   = m_input_o;
+        entry.m_input_gu  = m_input_gu;
+        entry.m_input_d   = m_input_d;
+        const auto sizes = xdna_post_attn_fused_buffer_sizes(
+            embed_dim, hidden_dim, cols, group_size,
+            m_input_o, m_input_gu, m_input_d);
+        entry.w_o_bytes  = sizes.w_o_bytes;
+        entry.w_gu_bytes = sizes.w_gu_bytes;
+        entry.w_d_bytes  = sizes.w_d_bytes;
+
+        entry.xclbin = xrt::xclbin(xclbin_path);
+        ctx->device.register_xclbin(entry.xclbin);
+        entry.hw_ctx = xrt::hw_context(ctx->device, entry.xclbin.get_uuid());
+        entry.kernel = xrt::kernel(entry.hw_ctx, "MLIR_AIE");
+
+        entry.insts = read_binary_file(insts_path);
+        if (entry.insts.empty()) {
+            GGML_LOG_ERROR("ggml-xdna: failed to read post_attn_fused insts %s\n",
+                           insts_path.c_str());
+            return nullptr;
+        }
+        entry.insts_bo = xrt::bo(ctx->device, entry.insts.size(),
+                                  xrt::bo::flags::cacheable,
+                                  entry.kernel.group_id(1));
+        entry.insts_bo.write(entry.insts.data());
+        entry.insts_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+        auto [ins, _] = ctx->post_attn_fused_cache.emplace(cache_key, std::move(entry));
+        fprintf(stderr, "ggml-xdna: loaded post_attn_fused kernel %s "
+                        "(w_o=%zu, w_gu=%zu, w_d=%zu bytes per layer)\n",
+                        cache_key.c_str(), sizes.w_o_bytes,
+                        sizes.w_gu_bytes, sizes.w_d_bytes);
+        return &ins->second;
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("ggml-xdna: failed to load post_attn_fused kernel %s: %s\n",
+                       cache_key.c_str(), e.what());
+        return nullptr;
+    }
+}
+
+// ============================================================================
 // Elementwise 1D BF16 kernel loading (Phase A fused layer runlist)
 // ============================================================================
 
@@ -14065,7 +14444,16 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                     // Fall through to the bf16 path instead of crashing.
                     fprintf(stderr, "ggml-xdna: INT8 SwiGLU not available in IRON-windows build, using bf16 fallback\n");
                 }
-                if (m.is_int4) {
+                // Phase B: if the matcher set fused_layer=true, try the single
+                // xclbin dispatch covering O_proj + ADD + RMSNorm + MUL + SwiGLU
+                // + ADD_ffn. On success the skip set already covered the o_proj /
+                // add_attn / rms_norm / mul_gain nodes; the SwiGLU 4-node range
+                // is skipped by the `i += 3; continue;` below.
+                bool fused_layer_done = false;
+                if (m.fused_layer && m.is_int4) {
+                    fused_layer_done = ggml_backend_xdna_fused_layer_dispatch(ctx, m);
+                }
+                if (!fused_layer_done && m.is_int4) {
                     // Phase 8.2: dispatch through the chained INT4 SwiGLU
                     // (fused dual-GEMV + silu + mul + down GEMV all in one
                     // xrt::runlist). The matcher already verified all three
@@ -14075,12 +14463,18 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                         m.gate_mm, m.up_mm, m.glu, m.down_mm,
                         m.gate_w, m.up_w, m.down_w, m.input,
                         ctx->num_cols);
-                } else {
+                } else if (!fused_layer_done) {
                     ggml_backend_xdna_mul_mat_swiglu(
                         ctx,
                         m.gate_mm, m.up_mm, m.glu, m.down_mm,
                         m.gate_w, m.up_w, m.down_w, m.input,
                         ctx->num_cols);
+                }
+                if (fused_layer_done) {
+                    // The fused dispatch wrote outL into m.add_ffn->data.
+                    // Skip the SwiGLU 4-node range AND the ADD_ffn node so the
+                    // main loop doesn't re-execute them on CPU.
+                    qkv_plan.skip_indices.insert(m.add_ffn_idx);
                 }
                 i += 3;  // for-loop ++i then lands on the node after down_mm
                 continue;
