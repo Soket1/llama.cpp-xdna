@@ -698,6 +698,17 @@ struct xdna_post_attn_fused_entry {
     std::vector<char> insts;
     xrt::bo         insts_bo;
 
+    // Phase β step 2c: optional aiebu-backed kernel that uses xrt::module
+    // instead of an xclbin instr-buffer arg. Populated lazily when env
+    // XDNA_AIEBU_DISPATCH=1 — the dispatch site picks this kernel if it's
+    // non-empty. xclbin path stays as fallback.
+    //   aiebu_kernel(hw_ctx, module, "MLIR_AIE") — 3-arg ext::kernel
+    //   matches FFLM (see FFLM_REVERSE_ENGINEERING.md).
+    xrt::elf        aiebu_elf;
+    xrt::module     aiebu_module;
+    xrt::kernel     aiebu_kernel;
+    bool            aiebu_ready = false;
+
     std::string cache_key;
     int64_t embed_dim;
     int64_t hidden_dim;
@@ -8321,20 +8332,41 @@ static bool ggml_backend_xdna_fused_layer_dispatch(
     lb.input_bundle_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
     // Run the fused layer (one xrt::execute for O_proj+ADD+NORM+MUL+SwiGLU).
+    // Phase β step 2c: when aiebu_ready is set (XDNA_AIEBU_DISPATCH=1 at
+    // load time), route through the xrt::module-backed kernel and drop the
+    // opcode/instr/ninstr arg triple — the module carries those itself.
+    // FFLM-style 5-arg dispatch (w_o, w_gu, w_d, input_bundle, io_bundle).
     try {
-        xrt::run r(entry->kernel);
-        r.set_arg(0, 3u);
-        r.set_arg(1, entry->insts_bo);
-        r.set_arg(2, (uint32_t)entry->insts.size());
-        // Sequence args match design.py rt.sequence order:
-        //   w_o, w_gu, w_d, input_bundle, io_bundle
-        r.set_arg(3, *lb.w_o_bo);
-        r.set_arg(4, *lb.w_gu_bo);
-        r.set_arg(5, *lb.w_d_bo);
-        r.set_arg(6, *lb.input_bundle_bo);
-        r.set_arg(7, *lb.io_bundle_bo);
-        r.start();
-        r.wait();
+#ifdef GGML_XDNA_USE_AIEBU
+        if (entry->aiebu_ready) {
+            // FFLM module-path keeps the opcode at arg 0 but drops the
+            // instr/ninstr pair (module supplies those). BOs shift to 1..5.
+            xrt::run r(entry->aiebu_kernel);
+            r.set_arg(0, 3u);
+            r.set_arg(1, *lb.w_o_bo);
+            r.set_arg(2, *lb.w_gu_bo);
+            r.set_arg(3, *lb.w_d_bo);
+            r.set_arg(4, *lb.input_bundle_bo);
+            r.set_arg(5, *lb.io_bundle_bo);
+            r.start();
+            r.wait();
+        } else
+#endif
+        {
+            xrt::run r(entry->kernel);
+            r.set_arg(0, 3u);
+            r.set_arg(1, entry->insts_bo);
+            r.set_arg(2, (uint32_t)entry->insts.size());
+            // Sequence args match design.py rt.sequence order:
+            //   w_o, w_gu, w_d, input_bundle, io_bundle
+            r.set_arg(3, *lb.w_o_bo);
+            r.set_arg(4, *lb.w_gu_bo);
+            r.set_arg(5, *lb.w_d_bo);
+            r.set_arg(6, *lb.input_bundle_bo);
+            r.set_arg(7, *lb.io_bundle_bo);
+            r.start();
+            r.wait();
+        }
     } catch (const std::exception & e) {
         GGML_LOG_ERROR("ggml-xdna: post_attn_fused dispatch failed: %s\n", e.what());
         return false;
@@ -13001,19 +13033,24 @@ static xdna_post_attn_fused_entry * get_or_load_post_attn_fused_kernel(
             return nullptr;
         }
 #ifdef GGML_XDNA_USE_AIEBU
-        // Phase β step 2a smoke-test: round-trip the IRON transaction binary
-        // through aiebu's low-level assembler (same path FFLM uses). All
-        // heavy headers are isolated in aiebu_wrapper.cpp.
-        //   XDNA_AIEBU_ROUND_TRIP=1: assemble + log ELF size only.
-        //   XDNA_AIEBU_ELF_LOAD=1   : also probe XRT can load the ELF
-        //                             (xrt::elf + hw_context + ext::kernel).
-        // Neither flag changes dispatch — both are validation-only.
+        // Phase β aiebu integration. Three env-gated levels:
+        //   XDNA_AIEBU_ROUND_TRIP=1 : assemble + log ELF size only.
+        //   XDNA_AIEBU_ELF_LOAD=1   : also probe XRT can ingest the ELF
+        //                             (transient, no struct state).
+        //   XDNA_AIEBU_DISPATCH=1   : persist xrt::elf+module+ext::kernel
+        //                             on the entry; dispatch site switches
+        //                             to this kernel and drops opcode/instr/
+        //                             ninstr args (module supplies them).
+        //                             This is the FFLM dispatch path.
+        // Each level subsumes the previous.
         {
             const char * rt   = std::getenv("XDNA_AIEBU_ROUND_TRIP");
             const char * load = std::getenv("XDNA_AIEBU_ELF_LOAD");
+            const char * disp = std::getenv("XDNA_AIEBU_DISPATCH");
             const bool do_rt   = rt   && *rt   && *rt   != '0';
             const bool do_load = load && *load && *load != '0';
-            if (do_rt || do_load) {
+            const bool do_disp = disp && *disp && *disp != '0';
+            if (do_rt || do_load || do_disp) {
                 void * elf_buf = nullptr;
                 size_t elf_size = 0;
                 const int rc = aiebu_assemble_transaction(
@@ -13028,18 +13065,8 @@ static xdna_post_attn_fused_entry * get_or_load_post_attn_fused_kernel(
                                         "insts=%zu bytes -> ELF=%zu bytes\n",
                                 cache_key.c_str(), entry.insts.size(), elf_size);
                     }
-                    if (do_load) {
-                        // Step 2b-lite v2: validate XRT can ingest aiebu's
-                        // ELF using FFLM's flow (verified by symbol scan of
-                        // llama_npu.dll):
-                        //   xrt::elf e(buf, size);
-                        //   xrt::module m(e);
-                        //   xrt::ext::kernel(hw_ctx, m, "MLIR_AIE");
-                        // We reuse the xclbin-derived hw_ctx (entry.hw_ctx)
-                        // for memory topology + kernel signature; the module
-                        // provides the actual transaction-binary instructions.
-                        // The kernel is constructed then discarded — dispatch
-                        // path unchanged.
+                    if (do_load && !do_disp) {
+                        // Transient probe: build, log, discard.
                         try {
                             xrt::elf probe_elf(elf_buf, elf_size);
                             xrt::module probe_mod(probe_elf);
@@ -13054,6 +13081,28 @@ static xdna_post_attn_fused_entry * get_or_load_post_attn_fused_kernel(
                         } catch (const std::exception & e) {
                             GGML_LOG_ERROR(
                                 "ggml-xdna: aiebu ELF load FAIL %s: %s\n",
+                                cache_key.c_str(), e.what());
+                        }
+                    }
+                    if (do_disp) {
+                        // Step 2c: persist aiebu artifacts on the entry so
+                        // the dispatch site can route through them. xclbin
+                        // path stays in place as fallback.
+                        try {
+                            entry.aiebu_elf    = xrt::elf(elf_buf, elf_size);
+                            entry.aiebu_module = xrt::module(entry.aiebu_elf);
+                            entry.aiebu_kernel = xrt::ext::kernel(
+                                entry.hw_ctx, entry.aiebu_module, "MLIR_AIE");
+                            entry.aiebu_ready  = true;
+                            fprintf(stderr,
+                                "ggml-xdna: aiebu DISPATCH ready key=%s "
+                                "(dispatch will route through xrt::module)\n",
+                                cache_key.c_str());
+                        } catch (const std::exception & e) {
+                            entry.aiebu_ready = false;
+                            GGML_LOG_ERROR(
+                                "ggml-xdna: aiebu DISPATCH setup FAIL %s: %s "
+                                "— falling back to xclbin path\n",
                                 cache_key.c_str(), e.what());
                         }
                     }
