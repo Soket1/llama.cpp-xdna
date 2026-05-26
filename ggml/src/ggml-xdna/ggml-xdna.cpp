@@ -13029,39 +13029,28 @@ static xdna_post_attn_fused_entry * get_or_load_post_attn_fused_kernel(
                                 cache_key.c_str(), entry.insts.size(), elf_size);
                     }
                     if (do_load) {
-                        // Step 2b-lite: validate XRT can ingest aiebu's ELF
-                        // and resolve a kernel by name. Probe common names
-                        // (the xclbin meta uses "MLIR_AIE"; tblock uses
-                        // "main:sequence"). We discard the artifacts at
-                        // scope exit; dispatch path is unchanged.
+                        // Step 2b-lite v2: validate XRT can ingest aiebu's
+                        // ELF using FFLM's flow (verified by symbol scan of
+                        // llama_npu.dll):
+                        //   xrt::elf e(buf, size);
+                        //   xrt::module m(e);
+                        //   xrt::ext::kernel(hw_ctx, m, "MLIR_AIE");
+                        // We reuse the xclbin-derived hw_ctx (entry.hw_ctx)
+                        // for memory topology + kernel signature; the module
+                        // provides the actual transaction-binary instructions.
+                        // The kernel is constructed then discarded — dispatch
+                        // path unchanged.
                         try {
-                            // Use the void*+size ctor (string_view ctor is
-                            // declared in the SDK headers but NOT exported
-                            // by the production xrt_coreutil.dll on Windows).
                             xrt::elf probe_elf(elf_buf, elf_size);
-                            xrt::hw_context probe_ctx(ctx->device, probe_elf);
-                            const char * candidates[] = {
-                                "MLIR_AIE", "main:sequence",
-                                "MLIR_AIE:MLIRAIE"};
-                            bool ok = false;
-                            for (const char * name : candidates) {
-                                try {
-                                    xrt::kernel k = xrt::ext::kernel(probe_ctx, name);
-                                    (void)k;
-                                    fprintf(stderr,
-                                        "ggml-xdna: aiebu ELF load OK key=%s "
-                                        "kernel=\"%s\"\n",
-                                        cache_key.c_str(), name);
-                                    ok = true;
-                                    break;
-                                } catch (const std::exception &) {}
-                            }
-                            if (!ok) {
-                                GGML_LOG_ERROR(
-                                    "ggml-xdna: aiebu ELF loaded but no "
-                                    "kernel name resolved for %s\n",
-                                    cache_key.c_str());
-                            }
+                            xrt::module probe_mod(probe_elf);
+                            xrt::ext::kernel probe_k(
+                                entry.hw_ctx, probe_mod, "MLIR_AIE");
+                            (void)probe_k;
+                            fprintf(stderr,
+                                "ggml-xdna: aiebu ELF load OK key=%s "
+                                "via xrt::module+ext::kernel(hw_ctx, mod, "
+                                "\"MLIR_AIE\")\n",
+                                cache_key.c_str());
                         } catch (const std::exception & e) {
                             GGML_LOG_ERROR(
                                 "ggml-xdna: aiebu ELF load FAIL %s: %s\n",
