@@ -13003,24 +13003,72 @@ static xdna_post_attn_fused_entry * get_or_load_post_attn_fused_kernel(
 #ifdef GGML_XDNA_USE_AIEBU
         // Phase β step 2a smoke-test: round-trip the IRON transaction binary
         // through aiebu's low-level assembler (same path FFLM uses). All
-        // heavy headers are isolated in aiebu_wrapper.cpp. XDNA_AIEBU_ROUND_TRIP=1:
-        // log ELF size only, no dispatch change.
+        // heavy headers are isolated in aiebu_wrapper.cpp.
+        //   XDNA_AIEBU_ROUND_TRIP=1: assemble + log ELF size only.
+        //   XDNA_AIEBU_ELF_LOAD=1   : also probe XRT can load the ELF
+        //                             (xrt::elf + hw_context + ext::kernel).
+        // Neither flag changes dispatch — both are validation-only.
         {
-            const char * rt = std::getenv("XDNA_AIEBU_ROUND_TRIP");
-            if (rt && *rt && *rt != '0') {
+            const char * rt   = std::getenv("XDNA_AIEBU_ROUND_TRIP");
+            const char * load = std::getenv("XDNA_AIEBU_ELF_LOAD");
+            const bool do_rt   = rt   && *rt   && *rt   != '0';
+            const bool do_load = load && *load && *load != '0';
+            if (do_rt || do_load) {
                 void * elf_buf = nullptr;
                 size_t elf_size = 0;
                 const int rc = aiebu_assemble_transaction(
                     entry.insts.data(), entry.insts.size(),
                     &elf_buf, &elf_size);
-                if (rc == 0) {
-                    fprintf(stderr, "ggml-xdna: aiebu round-trip OK key=%s "
-                                    "insts=%zu bytes -> ELF=%zu bytes\n",
-                            cache_key.c_str(), entry.insts.size(), elf_size);
-                    aiebu_free_buffer(elf_buf);
-                } else {
+                if (rc != 0) {
                     GGML_LOG_ERROR("ggml-xdna: aiebu round-trip FAIL %s rc=%d\n",
                                    cache_key.c_str(), rc);
+                } else {
+                    if (do_rt) {
+                        fprintf(stderr, "ggml-xdna: aiebu round-trip OK key=%s "
+                                        "insts=%zu bytes -> ELF=%zu bytes\n",
+                                cache_key.c_str(), entry.insts.size(), elf_size);
+                    }
+                    if (do_load) {
+                        // Step 2b-lite: validate XRT can ingest aiebu's ELF
+                        // and resolve a kernel by name. Probe common names
+                        // (the xclbin meta uses "MLIR_AIE"; tblock uses
+                        // "main:sequence"). We discard the artifacts at
+                        // scope exit; dispatch path is unchanged.
+                        try {
+                            // Use the void*+size ctor (string_view ctor is
+                            // declared in the SDK headers but NOT exported
+                            // by the production xrt_coreutil.dll on Windows).
+                            xrt::elf probe_elf(elf_buf, elf_size);
+                            xrt::hw_context probe_ctx(ctx->device, probe_elf);
+                            const char * candidates[] = {
+                                "MLIR_AIE", "main:sequence",
+                                "MLIR_AIE:MLIRAIE"};
+                            bool ok = false;
+                            for (const char * name : candidates) {
+                                try {
+                                    xrt::kernel k = xrt::ext::kernel(probe_ctx, name);
+                                    (void)k;
+                                    fprintf(stderr,
+                                        "ggml-xdna: aiebu ELF load OK key=%s "
+                                        "kernel=\"%s\"\n",
+                                        cache_key.c_str(), name);
+                                    ok = true;
+                                    break;
+                                } catch (const std::exception &) {}
+                            }
+                            if (!ok) {
+                                GGML_LOG_ERROR(
+                                    "ggml-xdna: aiebu ELF loaded but no "
+                                    "kernel name resolved for %s\n",
+                                    cache_key.c_str());
+                            }
+                        } catch (const std::exception & e) {
+                            GGML_LOG_ERROR(
+                                "ggml-xdna: aiebu ELF load FAIL %s: %s\n",
+                                cache_key.c_str(), e.what());
+                        }
+                    }
+                    aiebu_free_buffer(elf_buf);
                 }
             }
         }
