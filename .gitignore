@@ -150,3 +150,14 @@ poetry.toml
 /.windsurf/
 # emscripten
 a.out.*
+
+# Claude Code local-only settings (may contain secrets like PATs).
+# The tracked .claude/settings.json (if any) can carry team-wide config;
+# .local.json never gets committed.
+/.claude/settings.local.json
+
+# Local-only reverse-engineering notes about third-party closed binaries.
+/FFLM_REVERSE_ENGINEERING.md
+
+# Vendored third-party sources/builds (aiebu, boost, etc.).
+/third_party/

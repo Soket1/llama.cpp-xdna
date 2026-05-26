@@ -86,6 +86,14 @@ static std::atomic<size_t> g_cpy_tensor_calls{0};
 #include "xrt/experimental/xrt_elf.h"     // xrt::elf — fused tblock single-ELF loader
 #include "xrt/experimental/xrt_ext.h"     // xrt::ext::kernel(ctx, "main:sequence")
 
+#ifdef GGML_XDNA_USE_AIEBU
+// All aiebu internals live in aiebu_wrapper.cpp; here we only see a tiny
+// C-style API. The public aiebu_assembler wrapper crashes on static-init
+// when loaded from a DLL on MSVC; we bypass it via lower-level
+// aiebu::assembler::process in the isolated TU (same approach as FFLM).
+#include "aiebu_wrapper.h"
+#endif
+
 // ============================================================================
 // Cached kernel entry — one per unique (op, shape, dtype) tuple
 // ============================================================================
@@ -12992,6 +13000,31 @@ static xdna_post_attn_fused_entry * get_or_load_post_attn_fused_kernel(
                            insts_path.c_str());
             return nullptr;
         }
+#ifdef GGML_XDNA_USE_AIEBU
+        // Phase β step 2a smoke-test: round-trip the IRON transaction binary
+        // through aiebu's low-level assembler (same path FFLM uses). All
+        // heavy headers are isolated in aiebu_wrapper.cpp. XDNA_AIEBU_ROUND_TRIP=1:
+        // log ELF size only, no dispatch change.
+        {
+            const char * rt = std::getenv("XDNA_AIEBU_ROUND_TRIP");
+            if (rt && *rt && *rt != '0') {
+                void * elf_buf = nullptr;
+                size_t elf_size = 0;
+                const int rc = aiebu_assemble_transaction(
+                    entry.insts.data(), entry.insts.size(),
+                    &elf_buf, &elf_size);
+                if (rc == 0) {
+                    fprintf(stderr, "ggml-xdna: aiebu round-trip OK key=%s "
+                                    "insts=%zu bytes -> ELF=%zu bytes\n",
+                            cache_key.c_str(), entry.insts.size(), elf_size);
+                    aiebu_free_buffer(elf_buf);
+                } else {
+                    GGML_LOG_ERROR("ggml-xdna: aiebu round-trip FAIL %s rc=%d\n",
+                                   cache_key.c_str(), rc);
+                }
+            }
+        }
+#endif
         entry.insts_bo = xrt::bo(ctx->device, entry.insts.size(),
                                   xrt::bo::flags::cacheable,
                                   entry.kernel.group_id(1));
