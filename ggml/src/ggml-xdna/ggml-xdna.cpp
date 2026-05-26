@@ -8339,15 +8339,19 @@ static bool ggml_backend_xdna_fused_layer_dispatch(
     try {
 #ifdef GGML_XDNA_USE_AIEBU
         if (entry->aiebu_ready) {
-            // FFLM module-path keeps the opcode at arg 0 but drops the
-            // instr/ninstr pair (module supplies those). BOs shift to 1..5.
+            // group_id probe shows aiebu_kernel has the SAME 8-arg signature
+            // (0..7) as the xclbin kernel with identical group_ids per slot.
+            // The module provides the kernel CODE; args still need the full
+            // opcode/instr/ninstr/BO triple. Match xclbin path exactly.
             xrt::run r(entry->aiebu_kernel);
             r.set_arg(0, 3u);
-            r.set_arg(1, *lb.w_o_bo);
-            r.set_arg(2, *lb.w_gu_bo);
-            r.set_arg(3, *lb.w_d_bo);
-            r.set_arg(4, *lb.input_bundle_bo);
-            r.set_arg(5, *lb.io_bundle_bo);
+            r.set_arg(1, entry->insts_bo);
+            r.set_arg(2, (uint32_t)entry->insts.size());
+            r.set_arg(3, *lb.w_o_bo);
+            r.set_arg(4, *lb.w_gu_bo);
+            r.set_arg(5, *lb.w_d_bo);
+            r.set_arg(6, *lb.input_bundle_bo);
+            r.set_arg(7, *lb.io_bundle_bo);
             r.start();
             r.wait();
         } else
@@ -13098,6 +13102,28 @@ static xdna_post_attn_fused_entry * get_or_load_post_attn_fused_kernel(
                                 "ggml-xdna: aiebu DISPATCH ready key=%s "
                                 "(dispatch will route through xrt::module)\n",
                                 cache_key.c_str());
+                            // Diagnostic: compare group_ids between
+                            // xclbin-kernel (used for BO allocation) and
+                            // aiebu-kernel (used for dispatch). Mismatch
+                            // would explain drift via SMMU bank divergence.
+                            fprintf(stderr,
+                                "ggml-xdna: aiebu DISPATCH group_id check:\n");
+                            int xclbin_max_arg = -1, aiebu_max_arg = -1;
+                            for (int a = 0; a < 16; a++) {
+                                int xclbin_gid = -1, aiebu_gid = -1;
+                                try { xclbin_gid = (int)entry.kernel.group_id(a);       xclbin_max_arg = a; } catch (...) {}
+                                try { aiebu_gid  = (int)entry.aiebu_kernel.group_id(a); aiebu_max_arg  = a; } catch (...) {}
+                                if (xclbin_gid < 0 && aiebu_gid < 0) break;
+                                const char * mark =
+                                    (xclbin_gid == aiebu_gid) ? "" : "  <-- MISMATCH";
+                                fprintf(stderr,
+                                    "  arg[%d]: xclbin_gid=%d aiebu_gid=%d%s\n",
+                                    a, xclbin_gid, aiebu_gid, mark);
+                            }
+                            fprintf(stderr,
+                                "  -> xclbin_max_arg=%d aiebu_max_arg=%d\n",
+                                xclbin_max_arg, aiebu_max_arg);
+                            fflush(stderr);
                         } catch (const std::exception & e) {
                             entry.aiebu_ready = false;
                             GGML_LOG_ERROR(
