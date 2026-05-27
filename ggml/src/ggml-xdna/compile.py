@@ -1902,6 +1902,56 @@ def _stage_post_attn_fused_artifacts(op, output_dir: str) -> None:
                  os.path.join(output_dir, "post_attn_fused_main.insts"))
 
 
+def compile_post_attn_fused_fullelf(embed_dim: int, hidden_dim: int,
+                                    num_aie_columns: int, group_size: int,
+                                    output_dir: str) -> str:
+    """Compile Phase B post-attention layer via FusedMLIROperator pipeline.
+
+    Produces a FullElfArtifact .elf with FFLM-style 5-arg naked kernel
+    signature (no opcode/instr/ninstr prefix). Loaded at runtime via
+    xrt::elf + xrt::module + xrt::ext::kernel (ggml-xdna.cpp aiebu path).
+    """
+    actual_cols = get_device_cols(num_aie_columns)
+    if actual_cols < num_aie_columns:
+        raise ValueError(
+            f"Device column mismatch: requested {num_aie_columns}, "
+            f"device has {actual_cols}"
+        )
+    from iron.common.context import AIEContext
+    from iron.common.fusion import FusedMLIROperator
+    from iron.operators.post_attn_fused.op_mlir import PostAttnFusedMLIR
+
+    ctx = AIEContext()
+    ctx.build_dir.mkdir(parents=True, exist_ok=True)
+    op = PostAttnFusedMLIR(
+        embed_dim=embed_dim, hidden_dim=hidden_dim,
+        num_aie_columns=num_aie_columns, group_size=group_size,
+        context=ctx,
+    )
+    # Single-entry FusedMLIROperator wrapping our MLIROperator. Gives us
+    # the FullElfArtifact path without needing to split post_attn_fused
+    # into multiple child operators.
+    fused_name = (
+        f"post_attn_fused_fullelf_e{embed_dim}_h{hidden_dim}"
+        f"_c{num_aie_columns}_g{group_size}"
+    )
+    fused = FusedMLIROperator(
+        fused_name,
+        [(op, "w_o", "w_gu", "w_d", "input_bundle", "io_bundle")],
+        input_args=["w_o", "w_gu", "w_d", "input_bundle"],
+        output_args=["io_bundle"],
+        context=ctx,
+    )
+    fused.compile()
+
+    # Stage the ELF into the output directory.
+    os.makedirs(output_dir, exist_ok=True)
+    elf_filename = fused.artifacts[0].filename
+    shutil.copy2(str(ctx.build_dir / elf_filename),
+                 os.path.join(output_dir, "post_attn_fused_main.elf"))
+    return output_dir
+
+
 def compile_post_attn_fused(embed_dim: int, hidden_dim: int,
                              num_aie_columns: int, group_size: int,
                              output_dir: str) -> str:
@@ -2788,6 +2838,18 @@ def main():
     paf_parser.add_argument("--group-size",     type=int, default=32)
     paf_parser.add_argument("--out", type=str, required=True)
 
+    # Phase β step 2d: same op, but compiled via FusedMLIROperator pipeline
+    # → FullElfArtifact .elf with naked 5-arg kernel signature (FFLM-style).
+    paf_full_parser = subparsers.add_parser(
+        "post-attn-fused-fullelf",
+        help="[Phase β 2d] post-attn-fused via FullElfArtifact (5-arg ELF)",
+    )
+    paf_full_parser.add_argument("--embed-dim",      type=int, default=2048)
+    paf_full_parser.add_argument("--hidden-dim",     type=int, default=8192)
+    paf_full_parser.add_argument("--num-aie-columns",type=int, default=4)
+    paf_full_parser.add_argument("--group-size",     type=int, default=32)
+    paf_full_parser.add_argument("--out", type=str, required=True)
+
     # FlowKV Decode Attention subcommand (streaming decode attention with online softmax)
     fkvd_parser = subparsers.add_parser(
         "flowkv-decode",
@@ -3117,6 +3179,12 @@ def main():
         path = compile_post_attn_fused(args.embed_dim, args.hidden_dim,
                                         args.num_aie_columns, args.group_size,
                                         args.out)
+        if not args.quiet:
+            print(path)
+    elif args.op == "post-attn-fused-fullelf":
+        path = compile_post_attn_fused_fullelf(args.embed_dim, args.hidden_dim,
+                                               args.num_aie_columns, args.group_size,
+                                               args.out)
         if not args.quiet:
             print(path)
     elif args.op == "flowkv-decode":

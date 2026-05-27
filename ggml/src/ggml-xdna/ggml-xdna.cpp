@@ -161,6 +161,211 @@ struct xdna_kernel_entry {
     std::unique_ptr<std::mutex> b_bo_mutex = std::make_unique<std::mutex>();
 };
 
+// ---------------------------------------------------------------------------
+// Step 2d-δ profiling spike — per-dispatch / per-token timing sink.
+// Gate: XDNA_PROFILE_DISPATCHES=1.  Output: CSV at XDNA_PROFILE_DISPATCHES_PATH
+// (default xdna_profile_<pid>.csv). Token cap: XDNA_PROFILE_MAX_TOKENS=32.
+// Defined here (early in TU) so the RAII timer is visible at all dispatch
+// sites that consume it (the earliest one is around line 2370).
+// ---------------------------------------------------------------------------
+
+struct xdna_profile_row {
+    int64_t      token_idx;
+    int          layer_idx;
+    const char * kernel;
+    int64_t      submit_us;
+    int64_t      wait_us;
+    int64_t      sync_pre_us;
+    int64_t      sync_post_us;
+    int64_t      host_pre_us;
+    int64_t      host_post_us;
+};
+
+struct xdna_profile_sink {
+    bool                          enabled       = false;
+    std::mutex                    mu;
+    std::vector<xdna_profile_row> rows;
+    int64_t                       token_idx     = 0;
+    int64_t                       max_tokens    = 32;
+    std::string                   path;
+    std::chrono::steady_clock::time_point  token_start;
+    int                                    token_dispatch_count = 0;
+    int64_t                                token_npu_us         = 0;
+    int64_t                                token_sync_us        = 0;
+    int64_t                                token_host_us        = 0;
+    bool                                   flushed              = false;
+
+    static xdna_profile_sink & get() {
+        static xdna_profile_sink inst;
+        static std::once_flag init_flag;
+        std::call_once(init_flag, [] {
+            xdna_profile_sink & s = inst;
+            s.enabled = xdna_env_enabled("XDNA_PROFILE_DISPATCHES");
+            const char * mt = getenv("XDNA_PROFILE_MAX_TOKENS");
+            if (mt && *mt) {
+                s.max_tokens = strtoll(mt, NULL, 10);
+                if (s.max_tokens <= 0) s.max_tokens = 32;
+            }
+            const char * p = getenv("XDNA_PROFILE_DISPATCHES_PATH");
+            if (p && *p) {
+                s.path = p;
+            } else {
+                char buf[64];
+                snprintf(buf, sizeof(buf), "xdna_profile_%u.csv",
+                         (unsigned)GetCurrentProcessId());
+                s.path = buf;
+            }
+            if (s.enabled) {
+                fprintf(stderr,
+                    "ggml-xdna: [PROFILE] dispatches enabled, "
+                    "max_tokens=%lld path=%s\n",
+                    (long long)s.max_tokens, s.path.c_str());
+            }
+        });
+        return inst;
+    }
+
+    void push(const xdna_profile_row & r) {
+        if (!enabled) return;
+        std::lock_guard<std::mutex> lk(mu);
+        if ((int64_t)rows.size() > max_tokens * 256) return;
+        rows.push_back(r);
+        token_dispatch_count++;
+        token_npu_us  += r.submit_us + r.wait_us;
+        token_sync_us += r.sync_pre_us + r.sync_post_us;
+        token_host_us += r.host_pre_us + r.host_post_us;
+    }
+
+    void note_token_start() {
+        if (!enabled) return;
+        std::lock_guard<std::mutex> lk(mu);
+        token_start          = std::chrono::steady_clock::now();
+        token_dispatch_count = 0;
+        token_npu_us         = 0;
+        token_sync_us        = 0;
+        token_host_us        = 0;
+    }
+
+    void note_token_end() {
+        if (!enabled) return;
+        std::lock_guard<std::mutex> lk(mu);
+        const auto now = std::chrono::steady_clock::now();
+        const int64_t total_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            now - token_start).count();
+        xdna_profile_row tk;
+        tk.token_idx    = token_idx;
+        tk.layer_idx    = -1;
+        tk.kernel       = "_TOKEN";
+        tk.submit_us    = total_us;
+        tk.wait_us      = token_dispatch_count;
+        tk.sync_pre_us  = token_npu_us;
+        tk.sync_post_us = token_sync_us;
+        tk.host_pre_us  = token_host_us;
+        tk.host_post_us = 0;
+        rows.push_back(tk);
+        token_idx++;
+        if (token_idx >= max_tokens && !flushed) {
+            flush_csv_unlocked();
+            flushed = true;
+            fprintf(stderr,
+                "ggml-xdna: [PROFILE] flushed %lld tokens to %s\n",
+                (long long)token_idx, path.c_str());
+        }
+    }
+
+    ~xdna_profile_sink() {
+        if (enabled && !flushed && !rows.empty()) {
+            flush_csv_unlocked();
+            fprintf(stderr,
+                "ggml-xdna: [PROFILE] flushed at exit (%lld tokens) to %s\n",
+                (long long)token_idx, path.c_str());
+        }
+    }
+
+    void flush_csv_unlocked() {
+        FILE * f = fopen(path.c_str(), "w");
+        if (!f) {
+            fprintf(stderr,
+                "ggml-xdna: [PROFILE] could not open %s for writing\n",
+                path.c_str());
+            return;
+        }
+        fprintf(f, "# _TOKEN row schema: submit_us=total_us "
+                   "wait_us=dispatch_count sync_pre_us=npu_us "
+                   "sync_post_us=sync_us host_pre_us=host_us host_post_us=0\n");
+        fprintf(f, "token_idx,layer_idx,kernel,submit_us,wait_us,"
+                   "sync_pre_us,sync_post_us,host_pre_us,host_post_us\n");
+        for (const auto & r : rows) {
+            fprintf(f, "%lld,%d,%s,%lld,%lld,%lld,%lld,%lld,%lld\n",
+                    (long long)r.token_idx, r.layer_idx, r.kernel,
+                    (long long)r.submit_us,    (long long)r.wait_us,
+                    (long long)r.sync_pre_us,  (long long)r.sync_post_us,
+                    (long long)r.host_pre_us,  (long long)r.host_post_us);
+        }
+        fclose(f);
+    }
+};
+
+struct xdna_dispatch_timer {
+    bool         enabled;
+    const char * kernel;
+    int          layer_idx;
+    using clk = std::chrono::steady_clock;
+    clk::time_point t0, t_sync_pre, t_submit, t_wait, t_sync_post;
+    int64_t host_pre_us  = 0;
+    int64_t host_post_us = 0;
+    bool finalized = false;
+
+    explicit xdna_dispatch_timer(const char * k, int layer = -1)
+        : enabled(xdna_profile_sink::get().enabled),
+          kernel(k), layer_idx(layer) {
+        if (!enabled) return;
+        t0 = t_sync_pre = t_submit = t_wait = t_sync_post = clk::now();
+    }
+
+    void mark_sync_pre_done() {
+        if (!enabled) return;
+        t_sync_pre = clk::now();
+    }
+    void mark_submit_done() {
+        if (!enabled) return;
+        t_submit = clk::now();
+    }
+    void mark_wait_done() {
+        if (!enabled) return;
+        t_wait = clk::now();
+    }
+    void mark_sync_post_done() {
+        if (!enabled) return;
+        t_sync_post = clk::now();
+    }
+    void add_host_pre_us(int64_t us) { host_pre_us  += us; }
+    void add_host_post_us(int64_t us) { host_post_us += us; }
+
+    ~xdna_dispatch_timer() {
+        if (!enabled || finalized) return;
+        finalized = true;
+        if (t_sync_post.time_since_epoch().count() <
+                t_wait.time_since_epoch().count()) {
+            t_sync_post = t_wait;
+        }
+        auto us = [](clk::time_point a, clk::time_point b) {
+            return std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
+        };
+        xdna_profile_row r;
+        r.token_idx     = xdna_profile_sink::get().token_idx;
+        r.layer_idx     = layer_idx;
+        r.kernel        = kernel;
+        r.sync_pre_us   = us(t0,         t_sync_pre);
+        r.submit_us     = us(t_sync_pre, t_submit);
+        r.wait_us       = us(t_submit,   t_wait);
+        r.sync_post_us  = us(t_wait,     t_sync_post);
+        r.host_pre_us   = host_pre_us;
+        r.host_post_us  = host_post_us;
+        xdna_profile_sink::get().push(r);
+    }
+};
+
 // Phase 9: backend-wide tracker of in-flight async dispatches. Each
 // entry holds a wait_fn that blocks until the underlying NPU work is
 // complete (this can wrap xrt::run::wait2() for single runs, or
@@ -2369,12 +2574,15 @@ static void ggml_backend_xdna_mul_mat_gemv_int4(ggml_backend_xdna_context * ctx,
         // Dispatch — same arg order as bf16 GEMV (opcode, insts, n_insts, mat, vec, out).
         // [Phase 0 spec-dec probe] XDNA_DEBUG_TIMING=1 prints submit/wait split
         // (kernel(...) returns after XRT submit, run.wait() blocks for NPU done).
+        xdna_dispatch_timer _g4_t("int4_gemv", -1);
+        _g4_t.mark_sync_pre_done();
         static const bool dbg_timing = xdna_env_enabled("XDNA_DEBUG_TIMING");
         const auto t0 = dbg_timing ? std::chrono::steady_clock::now()
                                    : std::chrono::steady_clock::time_point{};
         auto run = entry->kernel(3, entry->insts_bo, (uint32_t)entry->insts.size(),
                                   *weight_bo_ptr, *a_bo_ptr, *c_bo_ptr);
         const auto t1 = dbg_timing ? std::chrono::steady_clock::now() : t0;
+        _g4_t.mark_submit_done();
 
         // Phase 9 async path: opt-in via XDNA_ENABLE_PHASE9=1. Capture all
         // state needed for bias compensation into a deferred lambda + push
@@ -2457,6 +2665,7 @@ static void ggml_backend_xdna_mul_mat_gemv_int4(ggml_backend_xdna_context * ctx,
 
         // Sync path (Phase 9 disabled). Same as Step 2: wait + inline bias.
         run.wait();
+        _g4_t.mark_wait_done();
         const auto t2 = dbg_timing ? std::chrono::steady_clock::now() : t1;
         if (dbg_timing) {
             const auto submit_us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
@@ -2473,6 +2682,7 @@ static void ggml_backend_xdna_mul_mat_gemv_int4(ggml_backend_xdna_context * ctx,
             }
         }
         c_bo_ptr->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        _g4_t.mark_sync_post_done();
 
         // ---- Host-side bias compensation -----------------------------------
         // S[g] = sum_{k in group g}(x[k])  — one pass over input.
@@ -3214,7 +3424,9 @@ static void ggml_backend_xdna_mul_mat_qkv_int4_fused(
         } else {
             memcpy(entry->a_bo->map<void*>(), input->data, vec_bytes);
         }
+        xdna_dispatch_timer _qkv_t("qkv_int4_fused", -1);
         entry->a_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        _qkv_t.mark_sync_pre_done();
 
         // Cached fused packed weight buffer (keyed by q weight pointer).
         // Since Q, K, V come from the same layer, keying on w_q->data is stable.
@@ -3250,8 +3462,11 @@ static void ggml_backend_xdna_mul_mat_qkv_int4_fused(
         // Single dispatch for all 3 projections.
         auto run = entry->kernel(3, entry->insts_bo, (uint32_t)entry->insts.size(),
                                   *weight_bo_ptr, *entry->a_bo, *entry->c_bo);
+        _qkv_t.mark_submit_done();
         run.wait();
+        _qkv_t.mark_wait_done();
         entry->c_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        _qkv_t.mark_sync_post_done();
 
         // Bias compensation: S[g] = sum_k(x[k]) in group g.
         const uint16_t * x_bf16  = (const uint16_t *)entry->a_bo->map<void*>();
@@ -7228,6 +7443,8 @@ static bool ggml_backend_xdna_flowkv_per_head(
                 entry->bo_q->sync(XCL_BO_SYNC_BO_TO_DEVICE);
             }
 
+            xdna_dispatch_timer _fkv_t("flowkv_per_head", (int)kv_h);
+            _fkv_t.mark_sync_pre_done();
 
             // --- Dispatch ---
             auto run = entry->kernel(
@@ -7239,7 +7456,9 @@ static bool ggml_backend_xdna_flowkv_per_head(
                 std::lock_guard<std::mutex> lock(*entry->mu);
                 auto t0 = std::chrono::steady_clock::now();
                 run.start();
+                _fkv_t.mark_submit_done();
                 auto state = run.wait(30000);
+                _fkv_t.mark_wait_done();
                 auto t1 = std::chrono::steady_clock::now();
 
                 if (state != ERT_CMD_STATE_COMPLETED) {
@@ -7272,6 +7491,7 @@ static bool ggml_backend_xdna_flowkv_per_head(
 
             // --- Read back output and scatter ---
             entry->bo_out->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+            _fkv_t.mark_sync_post_done();
 
             {
                 auto out_ptr = entry->bo_out->map<char *>();
@@ -8252,12 +8472,35 @@ static bool ggml_backend_xdna_fused_layer_dispatch(
 
     if (!lb.w_o_bo) {
         // First dispatch for this layer: allocate 5 BOs and pack weights+gain.
+        //
+        // The xclbin MLIR_AIE kernel uses the 8-arg signature (opcode/instr/
+        // ninstr + 5 BOs at indices 3..7), the fullelf main:sequence kernel
+        // uses the 5-arg naked signature (5 BOs at indices 0..4).  BOs must
+        // be allocated against the group_ids of whichever kernel will end
+        // up dispatching.
+#ifdef GGML_XDNA_USE_AIEBU
+        const bool use_aiebu = entry->aiebu_ready;
+        const int  gid_w_o      = use_aiebu ? 0 : 3;
+        const int  gid_w_gu     = use_aiebu ? 1 : 4;
+        const int  gid_w_d      = use_aiebu ? 2 : 5;
+        const int  gid_inp_bnd  = use_aiebu ? 3 : 6;
+        const int  gid_io_bnd   = use_aiebu ? 4 : 7;
+        const xrt::kernel & gid_kernel = use_aiebu ? entry->aiebu_kernel
+                                                   : entry->kernel;
+#else
+        const int  gid_w_o      = 3;
+        const int  gid_w_gu     = 4;
+        const int  gid_w_d      = 5;
+        const int  gid_inp_bnd  = 6;
+        const int  gid_io_bnd   = 7;
+        const xrt::kernel & gid_kernel = entry->kernel;
+#endif
         auto alloc_bo = [&](const char * name, size_t bytes, int gid)
                             -> std::unique_ptr<xrt::bo> {
             try {
                 return std::make_unique<xrt::bo>(
                     ctx->device, bytes, xrt::bo::flags::host_only,
-                    entry->kernel.group_id(gid));
+                    gid_kernel.group_id(gid));
             } catch (const std::exception & e) {
                 GGML_LOG_ERROR("ggml-xdna: failed to allocate post_attn_fused %s "
                                "(group_id=%d size=%zu): %s\n",
@@ -8265,13 +8508,11 @@ static bool ggml_backend_xdna_fused_layer_dispatch(
                 return nullptr;
             }
         };
-        // group_id indices match design.py rt.sequence order:
-        //   3 = w_o, 4 = w_gu, 5 = w_d, 6 = input_bundle, 7 = io_bundle
-        lb.w_o_bo           = alloc_bo("w_o",          entry->w_o_bytes,  3);
-        lb.w_gu_bo          = alloc_bo("w_gu",         entry->w_gu_bytes, 4);
-        lb.w_d_bo           = alloc_bo("w_d",          entry->w_d_bytes,  5);
-        lb.input_bundle_bo  = alloc_bo("input_bundle", input_bundle_bytes, 6);
-        lb.io_bundle_bo     = alloc_bo("io_bundle",    io_bundle_bytes,    7);
+        lb.w_o_bo           = alloc_bo("w_o",          entry->w_o_bytes,  gid_w_o);
+        lb.w_gu_bo          = alloc_bo("w_gu",         entry->w_gu_bytes, gid_w_gu);
+        lb.w_d_bo           = alloc_bo("w_d",          entry->w_d_bytes,  gid_w_d);
+        lb.input_bundle_bo  = alloc_bo("input_bundle", input_bundle_bytes, gid_inp_bnd);
+        lb.io_bundle_bo     = alloc_bo("io_bundle",    io_bundle_bytes,    gid_io_bnd);
         if (!lb.w_o_bo || !lb.w_gu_bo || !lb.w_d_bo
                 || !lb.input_bundle_bo || !lb.io_bundle_bo) {
             ctx->post_attn_fused_layer_cache.erase(o_proj_w);
@@ -8329,31 +8570,40 @@ static bool ggml_backend_xdna_fused_layer_dispatch(
     } else {
         return false;
     }
+    xdna_dispatch_timer _pt("post_attn_fused", -1);
     lb.input_bundle_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    _pt.mark_sync_pre_done();
 
     // Run the fused layer (one xrt::execute for O_proj+ADD+NORM+MUL+SwiGLU).
-    // Phase β step 2c: when aiebu_ready is set (XDNA_AIEBU_DISPATCH=1 at
-    // load time), route through the xrt::module-backed kernel and drop the
-    // opcode/instr/ninstr arg triple — the module carries those itself.
-    // FFLM-style 5-arg dispatch (w_o, w_gu, w_d, input_bundle, io_bundle).
+    // Phase β step 2d-γ: when aiebu_ready is set (XDNA_AIEBU_DISPATCH=1
+    // and a precompiled FullElfArtifact ELF exists), route through the
+    // xrt::module-backed kernel with a FFLM-style 5-arg naked signature
+    // (just the 5 BOs; no opcode/instr/ninstr prefix — those are baked
+    // into the module's instruction stream).
     try {
 #ifdef GGML_XDNA_USE_AIEBU
         if (entry->aiebu_ready) {
-            // group_id probe shows aiebu_kernel has the SAME 8-arg signature
-            // (0..7) as the xclbin kernel with identical group_ids per slot.
-            // The module provides the kernel CODE; args still need the full
-            // opcode/instr/ninstr/BO triple. Match xclbin path exactly.
+            // FullElfArtifact's main:sequence kernel takes a naked 5-arg BO
+            // list (matches PostAttnFusedMLIR.get_arg_spec ordering: w_o,
+            // w_gu, w_d, input_bundle, io_bundle).  No opcode/instr/ninstr
+            // prefix — the transaction is baked into the ELF.
             xrt::run r(entry->aiebu_kernel);
-            r.set_arg(0, 3u);
-            r.set_arg(1, entry->insts_bo);
-            r.set_arg(2, (uint32_t)entry->insts.size());
-            r.set_arg(3, *lb.w_o_bo);
-            r.set_arg(4, *lb.w_gu_bo);
-            r.set_arg(5, *lb.w_d_bo);
-            r.set_arg(6, *lb.input_bundle_bo);
-            r.set_arg(7, *lb.io_bundle_bo);
+            r.set_arg(0, *lb.w_o_bo);
+            r.set_arg(1, *lb.w_gu_bo);
+            r.set_arg(2, *lb.w_d_bo);
+            r.set_arg(3, *lb.input_bundle_bo);
+            r.set_arg(4, *lb.io_bundle_bo);
             r.start();
-            r.wait();
+            _pt.mark_submit_done();
+            auto state = r.wait(std::chrono::milliseconds(5000));
+            _pt.mark_wait_done();
+            if (state != ERT_CMD_STATE_COMPLETED) {
+                GGML_LOG_ERROR("ggml-xdna: aiebu fullelf dispatch did not "
+                               "complete (state=%d) — disabling aiebu path\n",
+                               (int)state);
+                entry->aiebu_ready = false;
+                return false;
+            }
         } else
 #endif
         {
@@ -8369,7 +8619,9 @@ static bool ggml_backend_xdna_fused_layer_dispatch(
             r.set_arg(6, *lb.input_bundle_bo);
             r.set_arg(7, *lb.io_bundle_bo);
             r.start();
+            _pt.mark_submit_done();
             r.wait();
+            _pt.mark_wait_done();
         }
     } catch (const std::exception & e) {
         GGML_LOG_ERROR("ggml-xdna: post_attn_fused dispatch failed: %s\n", e.what());
@@ -8380,6 +8632,7 @@ static bool ggml_backend_xdna_fused_layer_dispatch(
     // The host reads inpff_save (= O_proj_out + inpL written by ANM before it
     // overwrote scratch with ffn_input) and ffn_out for the post-FFN ADD.
     lb.io_bundle_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+    _pt.mark_sync_post_done();
     const uint16_t * io = (const uint16_t *)lb.io_bundle_bo->map<void *>();
     const uint16_t * inpFF_bf   = io + inpff_save_off_u16;
     const uint16_t * silu_bf    = io + (size_t)embed_dim;            // silu region
@@ -12831,6 +13084,9 @@ static bool xdna_env_enabled(const char * name) {
     return val != NULL && strcmp(val, "0") != 0 && strcmp(val, "OFF") != 0 && strcmp(val, "off") != 0;
 }
 
+// (xdna_profile_sink / xdna_dispatch_timer moved up to ~line 165
+//  so they're visible at all dispatch sites that consume them.)
+
 static bool ensure_rms_norm_compiled(ggml_backend_xdna_context * ctx,
                                      const std::string & cache_key,
                                      int64_t size, int num_cols,
@@ -13007,6 +13263,7 @@ static xdna_post_attn_fused_entry * get_or_load_post_attn_fused_kernel(
     const std::string bundle_dir  = ctx->cache_dir + "\\" + cache_key;
     const std::string xclbin_path = bundle_dir + "/combined.xclbin";
     const std::string insts_path  = bundle_dir + "/post_attn_fused_main.insts";
+    const std::string elf_path    = bundle_dir + "/post_attn_fused_main.elf";
 
     try {
         xdna_post_attn_fused_entry entry;
@@ -13037,16 +13294,18 @@ static xdna_post_attn_fused_entry * get_or_load_post_attn_fused_kernel(
             return nullptr;
         }
 #ifdef GGML_XDNA_USE_AIEBU
-        // Phase β aiebu integration. Three env-gated levels:
-        //   XDNA_AIEBU_ROUND_TRIP=1 : assemble + log ELF size only.
-        //   XDNA_AIEBU_ELF_LOAD=1   : also probe XRT can ingest the ELF
-        //                             (transient, no struct state).
-        //   XDNA_AIEBU_DISPATCH=1   : persist xrt::elf+module+ext::kernel
-        //                             on the entry; dispatch site switches
-        //                             to this kernel and drops opcode/instr/
-        //                             ninstr args (module supplies them).
-        //                             This is the FFLM dispatch path.
-        // Each level subsumes the previous.
+        // Phase β step 2d-γ: prefer the precompiled FullElfArtifact ELF
+        // (`post_attn_fused_main.elf`) when it exists on disk AND
+        // XDNA_AIEBU_DISPATCH=1 is set. That ELF carries a 5-arg naked
+        // kernel signature (no opcode/instr/ninstr) and is loaded directly
+        // via xrt::elf + xrt::module + xrt::ext::kernel (FFLM path).
+        //
+        // Legacy aiebu_wrapper round-trip / ELF-load probes (env flags
+        // XDNA_AIEBU_ROUND_TRIP=1, XDNA_AIEBU_ELF_LOAD=1) are still useful
+        // for diagnostics on the IRON .insts.bin, but they produce an
+        // 8-arg-aware module that requires the xclbin instr-buffer pass-
+        // through to compute correctly — i.e. they don't actually replace
+        // the dispatch path. Only DISPATCH=1 with a precompiled .elf does.
         {
             const char * rt   = std::getenv("XDNA_AIEBU_ROUND_TRIP");
             const char * load = std::getenv("XDNA_AIEBU_ELF_LOAD");
@@ -13054,7 +13313,90 @@ static xdna_post_attn_fused_entry * get_or_load_post_attn_fused_kernel(
             const bool do_rt   = rt   && *rt   && *rt   != '0';
             const bool do_load = load && *load && *load != '0';
             const bool do_disp = disp && *disp && *disp != '0';
-            if (do_rt || do_load || do_disp) {
+
+            // Try the precompiled ELF first when DISPATCH is requested.
+            bool used_precompiled_elf = false;
+            if (do_disp) {
+                std::vector<char> elf_bytes = read_binary_file(elf_path);
+                if (!elf_bytes.empty()) {
+                    try {
+                        entry.aiebu_elf    = xrt::elf(elf_bytes.data(), elf_bytes.size());
+                        entry.aiebu_module = xrt::module(entry.aiebu_elf);
+                        // llvm-nm of the fullelf shows two functions:
+                        //   _Z21op0_PostAttnFusedMLIRPcPcPcPcPc  (5 char* args)
+                        //   _Z4mainPcPcPc                       (3 char* args, consolidated)
+                        // FusedFullELFCallable dispatches via "main:sequence"
+                        // with the 3 consolidated BOs.  Probe a handful of
+                        // candidate names to find what xrt::ext::kernel
+                        // accepts on this XRT build.
+                        // 2026-05-27 finding: our Windows XRT C++ ABI does
+                        // NOT recognise the new "device:sequence" / per-fn
+                        // symbol lookup that pyxrt accepts.  FullElfArtifact
+                        // ELFs contain both a 3-arg consolidated `main` entry
+                        // and a 5-arg `op0_*` entry — but on this XRT only
+                        // the legacy "MLIR_AIE" 8-arg compat symbol resolves,
+                        // which can't dispatch the consolidated transaction
+                        // baked into the ELF (it hangs the NPU).  Probe to
+                        // log which symbols are accessible, then mark NOT
+                        // ready so the xclbin fallback runs.
+                        const char * candidates[] = {
+                            "main:sequence",
+                            "main",
+                            "op0_PostAttnFusedMLIR",
+                            "MLIR_AIE",
+                        };
+                        std::string picked;
+                        for (const char * cand : candidates) {
+                            try {
+                                entry.aiebu_kernel = xrt::ext::kernel(
+                                    entry.hw_ctx, entry.aiebu_module, cand);
+                                picked = cand;
+                                break;
+                            } catch (const std::exception & ke) {
+                                fprintf(stderr,
+                                    "ggml-xdna:   kernel name '%s' rejected: %s\n",
+                                    cand, ke.what());
+                            }
+                        }
+                        if (picked == "main:sequence" || picked == "main"
+                                || picked == "op0_PostAttnFusedMLIR") {
+                            entry.aiebu_ready  = true;
+                            used_precompiled_elf = true;
+                            fprintf(stderr,
+                                "ggml-xdna: aiebu DISPATCH (fullelf) ready "
+                                "key=%s elf=%zu bytes kernel='%s'\n",
+                                cache_key.c_str(), elf_bytes.size(),
+                                picked.c_str());
+                        } else {
+                            entry.aiebu_ready = false;
+                            fprintf(stderr,
+                                "ggml-xdna: aiebu DISPATCH (fullelf) "
+                                "unavailable on this XRT — only the legacy "
+                                "'MLIR_AIE' compat symbol resolves, and the "
+                                "8-arg signature it exposes hangs the NPU "
+                                "when fed against a consolidated ELF.  "
+                                "Falling back to the xclbin path.\n");
+                        }
+                    } catch (const std::exception & e) {
+                        entry.aiebu_ready = false;
+                        GGML_LOG_ERROR(
+                            "ggml-xdna: aiebu DISPATCH (fullelf) setup FAIL "
+                            "%s: %s — falling back to xclbin path\n",
+                            cache_key.c_str(), e.what());
+                    }
+                } else if (!do_rt && !do_load) {
+                    GGML_LOG_ERROR(
+                        "ggml-xdna: XDNA_AIEBU_DISPATCH=1 but %s missing; "
+                        "run `compile.py post-attn-fused-fullelf` first or "
+                        "fall back to xclbin path by unsetting the env.\n",
+                        elf_path.c_str());
+                }
+            }
+
+            // Legacy roundtrip-via-aiebu_wrapper paths (diagnostics only,
+            // dispatch unaffected unless precompiled ELF is absent and
+            // we somehow want to retry the in-process build).
+            if (!used_precompiled_elf && (do_rt || do_load)) {
                 void * elf_buf = nullptr;
                 size_t elf_size = 0;
                 const int rc = aiebu_assemble_transaction(
@@ -13069,8 +13411,7 @@ static xdna_post_attn_fused_entry * get_or_load_post_attn_fused_kernel(
                                         "insts=%zu bytes -> ELF=%zu bytes\n",
                                 cache_key.c_str(), entry.insts.size(), elf_size);
                     }
-                    if (do_load && !do_disp) {
-                        // Transient probe: build, log, discard.
+                    if (do_load) {
                         try {
                             xrt::elf probe_elf(elf_buf, elf_size);
                             xrt::module probe_mod(probe_elf);
@@ -13079,56 +13420,11 @@ static xdna_post_attn_fused_entry * get_or_load_post_attn_fused_kernel(
                             (void)probe_k;
                             fprintf(stderr,
                                 "ggml-xdna: aiebu ELF load OK key=%s "
-                                "via xrt::module+ext::kernel(hw_ctx, mod, "
-                                "\"MLIR_AIE\")\n",
+                                "(roundtrip diagnostic)\n",
                                 cache_key.c_str());
                         } catch (const std::exception & e) {
                             GGML_LOG_ERROR(
                                 "ggml-xdna: aiebu ELF load FAIL %s: %s\n",
-                                cache_key.c_str(), e.what());
-                        }
-                    }
-                    if (do_disp) {
-                        // Step 2c: persist aiebu artifacts on the entry so
-                        // the dispatch site can route through them. xclbin
-                        // path stays in place as fallback.
-                        try {
-                            entry.aiebu_elf    = xrt::elf(elf_buf, elf_size);
-                            entry.aiebu_module = xrt::module(entry.aiebu_elf);
-                            entry.aiebu_kernel = xrt::ext::kernel(
-                                entry.hw_ctx, entry.aiebu_module, "MLIR_AIE");
-                            entry.aiebu_ready  = true;
-                            fprintf(stderr,
-                                "ggml-xdna: aiebu DISPATCH ready key=%s "
-                                "(dispatch will route through xrt::module)\n",
-                                cache_key.c_str());
-                            // Diagnostic: compare group_ids between
-                            // xclbin-kernel (used for BO allocation) and
-                            // aiebu-kernel (used for dispatch). Mismatch
-                            // would explain drift via SMMU bank divergence.
-                            fprintf(stderr,
-                                "ggml-xdna: aiebu DISPATCH group_id check:\n");
-                            int xclbin_max_arg = -1, aiebu_max_arg = -1;
-                            for (int a = 0; a < 16; a++) {
-                                int xclbin_gid = -1, aiebu_gid = -1;
-                                try { xclbin_gid = (int)entry.kernel.group_id(a);       xclbin_max_arg = a; } catch (...) {}
-                                try { aiebu_gid  = (int)entry.aiebu_kernel.group_id(a); aiebu_max_arg  = a; } catch (...) {}
-                                if (xclbin_gid < 0 && aiebu_gid < 0) break;
-                                const char * mark =
-                                    (xclbin_gid == aiebu_gid) ? "" : "  <-- MISMATCH";
-                                fprintf(stderr,
-                                    "  arg[%d]: xclbin_gid=%d aiebu_gid=%d%s\n",
-                                    a, xclbin_gid, aiebu_gid, mark);
-                            }
-                            fprintf(stderr,
-                                "  -> xclbin_max_arg=%d aiebu_max_arg=%d\n",
-                                xclbin_max_arg, aiebu_max_arg);
-                            fflush(stderr);
-                        } catch (const std::exception & e) {
-                            entry.aiebu_ready = false;
-                            GGML_LOG_ERROR(
-                                "ggml-xdna: aiebu DISPATCH setup FAIL %s: %s "
-                                "— falling back to xclbin path\n",
                                 cache_key.c_str(), e.what());
                         }
                     }
@@ -13500,6 +13796,7 @@ static ggml_status xdna_delegate_range(ggml_backend_xdna_context * ctx,
 // Matches the pattern: MUL_MAT(Q@K^T) [SCALE] [ADD mask] SOFT_MAX MUL_MAT(scores@V)
 
 static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
+    xdna_profile_sink::get().note_token_start();
     // [spec-dec probe] aggregate M histograms across many calls.
     {
         static const bool dbg = xdna_env_enabled("XDNA_DEBUG_SPECDEC");
@@ -15677,6 +15974,7 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
     // are valid when the caller reads them. No-op when XDNA_ENABLE_PHASE9=0.
     ctx->inflight.drain();
 
+    xdna_profile_sink::get().note_token_end();
     return GGML_STATUS_SUCCESS;
 
     GGML_UNUSED(backend);
