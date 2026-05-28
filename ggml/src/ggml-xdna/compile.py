@@ -1974,6 +1974,120 @@ def compile_post_attn_fused(embed_dim: int, hidden_dim: int,
     return output_dir
 
 
+# ---------------------------------------------------------------------------
+# LayerFused (Phase A1.3 monolithic full-layer fusion)
+# ---------------------------------------------------------------------------
+
+LAYER_FUSED_KERNELS = ("main",)
+
+
+def layer_fused_cache_key(embed_dim: int, hidden_dim: int,
+                           num_heads: int, num_kv_heads: int,
+                           head_dim: int, max_seq_len: int,
+                           num_aie_columns: int, group_size: int) -> str:
+    key_data = {
+        "op": "layer_fused",
+        "embed_dim": embed_dim, "hidden_dim": hidden_dim,
+        "num_heads": num_heads, "num_kv_heads": num_kv_heads,
+        "head_dim": head_dim, "max_seq_len": max_seq_len,
+        "num_aie_columns": num_aie_columns, "group_size": group_size,
+    }
+    return hashlib.sha256(
+        json.dumps(key_data, sort_keys=True).encode()
+    ).hexdigest()[:16]
+
+
+def _stage_layer_fused_artifacts(fused, output_dir: str) -> None:
+    os.makedirs(output_dir, exist_ok=True)
+    build_dir = fused.context.build_dir
+    xclbin_name = None
+    insts_name = None
+    for art in fused.artifacts:
+        fn = getattr(art, "filename", "")
+        if fn.endswith(".xclbin"):
+            xclbin_name = fn
+        elif fn.endswith(".insts"):
+            insts_name = fn
+    if xclbin_name is None or insts_name is None:
+        raise RuntimeError(
+            "Expected XclbinArtifact + InstsBinArtifact in fused.artifacts; "
+            f"got {[type(a).__name__ for a in fused.artifacts]}"
+        )
+    shutil.copy2(str(build_dir / xclbin_name),
+                 os.path.join(output_dir, "combined.xclbin"))
+    shutil.copy2(str(build_dir / insts_name),
+                 os.path.join(output_dir, "layer_fused_main.insts"))
+
+
+def compile_layer_fused(embed_dim: int, hidden_dim: int,
+                         num_heads: int, num_kv_heads: int,
+                         head_dim: int, max_seq_len: int,
+                         num_aie_columns: int, group_size: int,
+                         output_dir: str) -> str:
+    """Compile the Phase A1.3 monolithic LayerFused operator.
+
+    Produces a legacy-xclbin pair (xclbin + insts) loadable via the
+    standard MLIR_AIE 8-arg kernel signature. C++ runtime patches BO
+    addresses per layer via DDR_PATCH ops baked into the .insts.
+    """
+    actual_cols = get_device_cols(num_aie_columns)
+    if actual_cols < num_aie_columns:
+        raise ValueError(
+            f"Device column mismatch: requested {num_aie_columns}, "
+            f"device has {actual_cols}"
+        )
+    from iron.common.context import AIEContext
+    from iron.common.fusion import FusedMLIROperator
+    from iron.operators.layer_fused.op_mlir import LayerFusedMLIR
+
+    ctx = AIEContext()
+    ctx.build_dir.mkdir(parents=True, exist_ok=True)
+    op = LayerFusedMLIR(
+        embed_dim=embed_dim, hidden_dim=hidden_dim,
+        num_heads=num_heads, num_kv_heads=num_kv_heads,
+        head_dim=head_dim, max_seq_len=max_seq_len,
+        num_aie_columns=num_aie_columns, group_size=group_size,
+        context=ctx,
+    )
+    fused_name = (
+        f"layer_fused_e{embed_dim}_h{hidden_dim}"
+        f"_c{num_aie_columns}_g{group_size}"
+    )
+    fused = FusedMLIROperator(
+        fused_name,
+        [(op, "w_qkv", "w_o", "w_ffn", "kv_pair", "activations")],
+        input_args=["w_qkv", "w_o", "w_ffn"],
+        output_args=["kv_pair", "activations"],
+        legacy_xclbin=True,
+        xclbin_kernel_name="MLIR_AIE",
+        xclbin_instance_name="MLIRAIE",
+        xclbin_kernel_id="0x901",
+        context=ctx,
+    )
+    fused.compile()
+    _stage_layer_fused_artifacts(fused, output_dir)
+    return output_dir
+
+
+def compile_layer_fused_cached(embed_dim: int = 2048, hidden_dim: int = 8192,
+                                num_heads: int = 32, num_kv_heads: int = 8,
+                                head_dim: int = 64, max_seq_len: int = 2048,
+                                num_aie_columns: int = 8,
+                                group_size: int = 32) -> Path:
+    key = layer_fused_cache_key(embed_dim, hidden_dim, num_heads,
+                                 num_kv_heads, head_dim, max_seq_len,
+                                 num_aie_columns, group_size)
+    cached = get_cached_chained_dir(key, LAYER_FUSED_KERNELS,
+                                    prefix="layer_fused")
+    if cached is not None:
+        return cached
+    output_dir = str(get_cache_dir() / key)
+    compile_layer_fused(embed_dim, hidden_dim, num_heads, num_kv_heads,
+                         head_dim, max_seq_len, num_aie_columns,
+                         group_size, output_dir)
+    return Path(output_dir)
+
+
 def compile_post_attn_fused_cached(embed_dim: int = 2048,
                                    hidden_dim: int = 8192,
                                    num_aie_columns: int = 8,
@@ -2850,6 +2964,22 @@ def main():
     paf_full_parser.add_argument("--group-size",     type=int, default=32)
     paf_full_parser.add_argument("--out", type=str, required=True)
 
+    # Phase A1.3 monolithic full-layer fusion (one xclbin per layer, reused
+    # across all 16 layers via DDR_PATCH).
+    lf_parser = subparsers.add_parser(
+        "layer-fused",
+        help="[Phase A1.3] Monolithic LayerFused (1 dispatch per layer)",
+    )
+    lf_parser.add_argument("--embed-dim",      type=int, default=2048)
+    lf_parser.add_argument("--hidden-dim",     type=int, default=8192)
+    lf_parser.add_argument("--num-heads",      type=int, default=32)
+    lf_parser.add_argument("--num-kv-heads",   type=int, default=8)
+    lf_parser.add_argument("--head-dim",       type=int, default=64)
+    lf_parser.add_argument("--max-seq-len",    type=int, default=2048)
+    lf_parser.add_argument("--num-aie-columns",type=int, default=8)
+    lf_parser.add_argument("--group-size",     type=int, default=32)
+    lf_parser.add_argument("--out", type=str, required=True)
+
     # FlowKV Decode Attention subcommand (streaming decode attention with online softmax)
     fkvd_parser = subparsers.add_parser(
         "flowkv-decode",
@@ -3185,6 +3315,16 @@ def main():
         path = compile_post_attn_fused_fullelf(args.embed_dim, args.hidden_dim,
                                                args.num_aie_columns, args.group_size,
                                                args.out)
+        if not args.quiet:
+            print(path)
+    elif args.op == "layer-fused":
+        path = compile_layer_fused(
+            args.embed_dim, args.hidden_dim,
+            args.num_heads, args.num_kv_heads,
+            args.head_dim, args.max_seq_len,
+            args.num_aie_columns, args.group_size,
+            args.out,
+        )
         if not args.quiet:
             print(path)
     elif args.op == "flowkv-decode":
