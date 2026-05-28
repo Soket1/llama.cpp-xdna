@@ -8576,6 +8576,35 @@ static void xdna_plan_layer_fused(
     static const bool dbg = getenv("XDNA_DEBUG_LAYER_FUSED") != NULL;
     static std::atomic<int> dbg_budget{dbg ? 8 : 0};
 
+    // P0.1 segment census — count which ops are in this segment. Useful
+    // to confirm that XDNA_ATTN_SUPPORTS=1 actually pulls Q@K^T, softmax,
+    // scores@V into the XDNA cgraph segment.
+    if (dbg) {
+        static std::atomic<int> census_budget{8};
+        if (census_budget.fetch_sub(1) > 0) {
+            int n_mulmat = 0, n_softmax = 0, n_glu = 0, n_rope = 0;
+            int n_rms_norm = 0, n_add = 0, n_set_rows = 0, n_permute = 0;
+            for (int i = 0; i < cgraph->n_nodes; i++) {
+                switch (cgraph->nodes[i]->op) {
+                    case GGML_OP_MUL_MAT:  n_mulmat++;   break;
+                    case GGML_OP_SOFT_MAX: n_softmax++;  break;
+                    case GGML_OP_GLU:      n_glu++;      break;
+                    case GGML_OP_ROPE:     n_rope++;     break;
+                    case GGML_OP_RMS_NORM: n_rms_norm++; break;
+                    case GGML_OP_ADD:      n_add++;      break;
+                    case GGML_OP_SET_ROWS: n_set_rows++; break;
+                    case GGML_OP_PERMUTE:  n_permute++;  break;
+                    default: break;
+                }
+            }
+            fprintf(stderr,
+                    "P0.1 segment census n_nodes=%d: mulmat=%d softmax=%d "
+                    "glu=%d rope=%d rms_norm=%d add=%d set_rows=%d permute=%d\n",
+                    cgraph->n_nodes, n_mulmat, n_softmax, n_glu, n_rope,
+                    n_rms_norm, n_add, n_set_rows, n_permute);
+        }
+    }
+
     int n_qkv = 0, n_with_rope = 0, n_with_norm = 0, n_with_swiglu = 0;
     for (const auto & kv : qkv_plan.triple_at) {
         const int q_idx = kv.first;
@@ -16754,24 +16783,52 @@ static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const s
         case GGML_OP_MUL_MAT: {
             const struct ggml_tensor * src0 = op->src[0];
             const struct ggml_tensor * src1 = op->src[1];
-            // FlowKV decode attention: Q@K^T and scores@V are batched over
-            // heads (ne[2] = n_heads or n_kv_heads) and non-contiguous after
-            // ggml_permute(0,2,1,3). We must claim them here so the scheduler
-            // assigns them to XDNA; graph_compute's FlowKV matcher handles
-            // the actual dispatch decision.
+            // ── P0.1 EXPERIMENTAL: claim attention math MUL_MATs ───────
+            // Goal: make ggml's scheduler keep Q@K^T, scores@V together
+            // with the rest of the layer in ONE XDNA cgraph segment,
+            // unblocking full-layer fusion (path P0 → FFLM ceiling).
             //
-            // DISABLED: claiming K=64 MUL_MATs changes graph segmentation,
-            // splitting the attention pattern across XNA/CPU segments. The
-            // CPU backend then can't compute the full attention (Q@K^T →
-            // softmax → scores@V) as a unit, producing garbage output.
-            // Re-enable once FlowKV cross-segment dispatch is proven correct.
+            // Shape signature:
+            //   - decode (M=1) or short prefill: src1->ne[1] small
+            //   - K = head_dim (64 for Llama-3.2-1B)
+            //   - multi-head batched: src0->ne[2] = n_kv_heads (>1)
+            //   - non-contiguous src0 (KV cache permuted layout)
             //
-            // static const bool flowkv_decode_enabled_for_supports = xdna_env_enabled("XDNA_ENABLE_FLOWKV_DECODE");
-            // if (flowkv_decode_enabled_for_supports && src1->ne[1] == 1 && src0->ne[0] == 64 && src0->ne[1] > 1) {
-            //     if (src1->type != GGML_TYPE_F32) return false;
-            //     if (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_BF16 || src0->type == GGML_TYPE_F16) return true;
-            //     return false;
-            // }
+            // Gated behind XDNA_ATTN_SUPPORTS=1 (off by default). When
+            // ON, this WILL change cgraph segmentation. Without P0.2
+            // (FlowKV dispatch BEFORE attention math + skip_indices),
+            // the test WILL FAIL — that's expected. Goal of P0.1 is to
+            // confirm cgraph segmentation responds to the claim.
+            static const bool attn_supports_dbg =
+                xdna_env_enabled("XDNA_ATTN_SUPPORTS");
+            if (attn_supports_dbg) {
+                // K=64 attention shape (Llama head_dim).
+                const bool is_attn_q_k_T =
+                    src1->type == GGML_TYPE_F32 &&
+                    src0->ne[0] == 64 &&
+                    src0->ne[2] > 1;
+                // scores@V shape (after permute: src0 = V_cache view).
+                const bool is_attn_scores_v =
+                    src1->type == GGML_TYPE_F32 &&
+                    src0->ne[1] == 64 &&
+                    src0->ne[2] > 1;
+                if (is_attn_q_k_T || is_attn_scores_v) {
+                    static std::atomic<int> dbg_budget{8};
+                    if (dbg_budget.fetch_sub(1) > 0) {
+                        fprintf(stderr,
+                                "supports_op: claim attention MUL_MAT "
+                                "src0=[%lld,%lld,%lld] src1=[%lld,%lld,%lld] "
+                                "type0=%d type1=%d (kind=%s)\n",
+                                (long long)src0->ne[0], (long long)src0->ne[1],
+                                (long long)src0->ne[2],
+                                (long long)src1->ne[0], (long long)src1->ne[1],
+                                (long long)src1->ne[2],
+                                (int)src0->type, (int)src1->type,
+                                is_attn_q_k_T ? "Q@K^T" : "scores@V");
+                    }
+                    return true;
+                }
+            }
             if (!ggml_is_contiguous(src0)) return false;
             if (!ggml_is_contiguous(src1)) return false;
             if (src0->ne[2] != 1 || src0->ne[3] != 1) return false;
