@@ -8610,50 +8610,152 @@ static void xdna_plan_layer_fused(
         const int q_idx = kv.first;
         const auto & triple = kv.second;
         ++n_qkv;
-        auto rope_it = qkv_plan.rope_at.find(q_idx);
-        if (rope_it == qkv_plan.rope_at.end()) continue;
-        ++n_with_rope;
-        auto norm_it = qkv_plan.attn_norm_at.find(q_idx);
-        if (norm_it == qkv_plan.attn_norm_at.end()) continue;
+
+        // P0.1b — independent scans. Don't trust qkv_plan.rope_at /
+        // attn_norm_at: they require strict Q/K/V cgraph order which
+        // Llama-3.2-1B violates (emits Q,V,K), and xdna_try_match_swiglu
+        // rejects prefill (M>1) which kills detection on warmup graphs.
+        // For layer fusion detection we only need structural presence,
+        // not dispatch eligibility.
+
+        // (1) Pre-attention RMS_NORM: walk Q's src[1] chain back. Llama
+        //     pattern: input → RMS_NORM → MUL(gain) → MUL_MAT(Q).
+        int pre_norm_idx = -1;
+        const struct ggml_tensor * w_norm1 = nullptr;
+        {
+            const struct ggml_tensor * q_mm = cgraph->nodes[q_idx];
+            const struct ggml_tensor * cur = q_mm->src[1];
+            for (int s = 0; cur && s < 4; s++) {
+                if (cur->op == GGML_OP_RMS_NORM) {
+                    for (int j = std::max(0, q_idx - 12); j < q_idx; j++) {
+                        if (cgraph->nodes[j] == cur) {
+                            pre_norm_idx = j;
+                            w_norm1 = cur->src[1];   // gain weight (MUL src)
+                            break;
+                        }
+                    }
+                    break;
+                }
+                if (!cur->src[0]) break;
+                if (cur->op == GGML_OP_VIEW || cur->op == GGML_OP_RESHAPE ||
+                    cur->op == GGML_OP_PERMUTE || cur->op == GGML_OP_CONT ||
+                    cur->op == GGML_OP_MUL /* gain */) {
+                    cur = cur->src[0];
+                } else {
+                    break;
+                }
+            }
+        }
+        if (pre_norm_idx < 0) continue;
         ++n_with_norm;
 
-        // Walk forward from this QKV to find the matching SwiGLU pattern.
-        xdna_swiglu_match swm{};
-        bool got_swiglu = false;
-        for (int j = q_idx + 1; j < cgraph->n_nodes; j++) {
-            if (cgraph->nodes[j]->op != GGML_OP_MUL_MAT) continue;
-            if (xdna_try_match_swiglu(cgraph, j, &swm)
-                && swm.fused_layer && swm.is_int4) {
-                got_swiglu = true;
+        // (2) RoPE presence: at least one ROPE op within a small window
+        //     after Q. Llama emits q_rope at q_idx+2 and k_rope at q_idx+7.
+        int q_rope_idx = -1, k_rope_idx = -1;
+        {
+            const int scan_end = std::min(q_idx + 30, cgraph->n_nodes);
+            for (int j = q_idx + 1; j < scan_end; j++) {
+                if (cgraph->nodes[j]->op != GGML_OP_ROPE) continue;
+                if (q_rope_idx < 0) {
+                    q_rope_idx = j;
+                } else if (k_rope_idx < 0) {
+                    k_rope_idx = j;
+                    break;
+                }
+            }
+        }
+        if (q_rope_idx < 0) continue;
+        ++n_with_rope;
+
+        // (3) SwiGLU pattern: GLU op preceded by 2 MUL_MATs (gate, up)
+        //     and followed by a MUL_MAT (down). Window is large because
+        //     the per-layer span is ~36 nodes (incl. attention math).
+        int glu_idx = -1, gate_idx = -1, up_idx = -1, down_idx = -1;
+        const struct ggml_tensor * w_gate = nullptr;
+        const struct ggml_tensor * w_up   = nullptr;
+        const struct ggml_tensor * w_down = nullptr;
+        {
+            const int scan_end = std::min(q_idx + 60, cgraph->n_nodes);
+            for (int j = q_idx + 1; j < scan_end; j++) {
+                if (cgraph->nodes[j]->op != GGML_OP_GLU) continue;
+                if (ggml_get_glu_op(cgraph->nodes[j]) != GGML_GLU_OP_SWIGLU) continue;
+                if (j < 2 || j + 1 >= cgraph->n_nodes) continue;
+                if (cgraph->nodes[j-2]->op != GGML_OP_MUL_MAT) continue;
+                if (cgraph->nodes[j-1]->op != GGML_OP_MUL_MAT) continue;
+                if (cgraph->nodes[j+1]->op != GGML_OP_MUL_MAT) continue;
+                glu_idx  = j;
+                gate_idx = j - 2;
+                up_idx   = j - 1;
+                down_idx = j + 1;
+                w_gate = cgraph->nodes[gate_idx]->src[0];
+                w_up   = cgraph->nodes[up_idx]->src[0];
+                w_down = cgraph->nodes[down_idx]->src[0];
                 break;
             }
         }
-        if (!got_swiglu) continue;
+        if (glu_idx < 0) continue;
         ++n_with_swiglu;
+
+        // (4) Locate O_proj, post-attn ADD, post-attn norm, post-FFN ADD.
+        //     O_proj is the MUL_MAT just before pre-FFN-norm path. Find
+        //     between the kqv-CONT (or the V matmul) and the gate matmul.
+        int o_proj_idx = -1, add_attn_idx = -1, norm_ffn_idx = -1, add_ffn_idx = -1;
+        const struct ggml_tensor * w_o = nullptr;
+        for (int j = q_idx + 1; j < gate_idx; j++) {
+            if (cgraph->nodes[j]->op == GGML_OP_MUL_MAT &&
+                cgraph->nodes[j]->name &&
+                strstr(cgraph->nodes[j]->name, "attn_out")) {
+                o_proj_idx = j;
+                w_o = cgraph->nodes[j]->src[0];
+                break;
+            }
+        }
+        if (o_proj_idx < 0) continue;
+        for (int j = o_proj_idx + 1; j < gate_idx; j++) {
+            if (cgraph->nodes[j]->op == GGML_OP_ADD &&
+                add_attn_idx < 0) {
+                add_attn_idx = j;
+            }
+            if (cgraph->nodes[j]->op == GGML_OP_RMS_NORM &&
+                norm_ffn_idx < 0) {
+                norm_ffn_idx = j;
+            }
+        }
+        // Post-FFN ADD: scan after down_idx.
+        for (int j = down_idx + 1;
+             j < std::min(down_idx + 8, cgraph->n_nodes); j++) {
+            if (cgraph->nodes[j]->op == GGML_OP_ADD) {
+                add_ffn_idx = j;
+                break;
+            }
+        }
 
         xdna_layer_fused_match m{};
         m.q_idx        = triple[0];
         m.k_idx        = triple[1];
         m.v_idx        = triple[2];
-        m.q_rope_idx   = rope_it->second.q_rope_idx;
-        m.k_rope_idx   = rope_it->second.k_rope_idx;
-        m.pre_norm_idx = norm_it->second.norm_idx;
-        m.o_proj_idx   = swm.o_proj_idx;
-        m.add_attn_idx = swm.add_attn_idx;
-        m.norm_ffn_idx = swm.norm_ffn_idx;
-        m.mul_gain_idx = swm.mul_gain_idx;
-        m.glu_idx      = -1;   // swm.glu carries the tensor, idx left -1 here
-        m.add_ffn_idx  = swm.add_ffn_idx;
+        m.q_rope_idx   = q_rope_idx;
+        m.k_rope_idx   = k_rope_idx;
+        m.pre_norm_idx = pre_norm_idx;
+        m.o_proj_idx   = o_proj_idx;
+        m.add_attn_idx = add_attn_idx;
+        m.norm_ffn_idx = norm_ffn_idx;
+        m.gate_idx     = gate_idx;
+        m.up_idx       = up_idx;
+        m.glu_idx      = glu_idx;
+        m.down_idx     = down_idx;
+        m.add_ffn_idx  = add_ffn_idx;
         m.w_q       = cgraph->nodes[triple[0]]->src[0];
         m.w_k       = cgraph->nodes[triple[1]]->src[0];
         m.w_v       = cgraph->nodes[triple[2]]->src[0];
-        m.w_o       = swm.o_proj_mm ? swm.o_proj_mm->src[0] : nullptr;
-        m.w_gate    = swm.gate_w;
-        m.w_up      = swm.up_w;
-        m.w_down    = swm.down_w;
-        m.w_norm1   = norm_it->second.norm
-                      ? norm_it->second.norm->src[1] : nullptr;
-        m.w_norm2   = swm.gain_weight;
+        m.w_o       = w_o;
+        m.w_gate    = w_gate;
+        m.w_up      = w_up;
+        m.w_down    = w_down;
+        m.w_norm1   = w_norm1;
+        m.w_norm2   = (norm_ffn_idx >= 0 && norm_ffn_idx + 1 < cgraph->n_nodes &&
+                       cgraph->nodes[norm_ffn_idx + 1]->op == GGML_OP_MUL)
+                      ? cgraph->nodes[norm_ffn_idx + 1]->src[1] : nullptr;
         out->q_idx_to_match[m.q_idx] = (int)out->matches.size();
         out->matches.push_back(m);
     }
