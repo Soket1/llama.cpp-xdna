@@ -950,6 +950,50 @@ struct xdna_post_attn_fused_layer_t {
 };
 
 // ============================================================================
+// Phase A1.3 LayerFused — full-layer monolithic dispatch. Mirrors the
+// post_attn_fused entry/layer split: one kernel cache shared across all
+// 16 transformer layers, one per-layer BO bundle keyed by w_qkv tensor.
+//
+// Behind XDNA_LAYER_FUSED=1 env gate; falls back to existing dispatch if
+// xclbin not in cache or kernel construction fails.
+// ============================================================================
+struct xdna_layer_fused_entry {
+    xrt::xclbin     xclbin;
+    xrt::hw_context hw_ctx;
+    xrt::kernel     kernel;
+    std::vector<char> insts;
+    xrt::bo         insts_bo;
+
+    std::string cache_key;
+    int64_t embed_dim;
+    int64_t hidden_dim;
+    int num_heads;
+    int num_kv_heads;
+    int head_dim;
+    int max_seq_len;
+    int cols;
+    int group_size;
+
+    // Pre-computed BO byte sizes (mirrors LayerFusedMLIR._bundle_byte_sizes).
+    size_t bo0_bytes;   // w_qkv  (W_norm1 + W_q + W_k + W_v)
+    size_t bo1_bytes;   // w_o    (O_proj weights)
+    size_t bo2_bytes;   // w_ffn  (W_norm2 + gate + up + down)
+    size_t bo3_bytes;   // kv_pair (K_cache | V_cache, per-layer)
+    size_t bo4_bytes;   // activations
+};
+
+// Per-layer state keyed by the w_qkv weight tensor pointer (unique per
+// layer, stable across tokens).
+struct xdna_layer_fused_layer_t {
+    std::unique_ptr<xrt::bo> w_qkv_bo;
+    std::unique_ptr<xrt::bo> w_o_bo;
+    std::unique_ptr<xrt::bo> w_ffn_bo;
+    std::unique_ptr<xrt::bo> kv_pair_bo;
+    std::unique_ptr<xrt::bo> activations_bo;
+    bool weights_packed = false;
+};
+
+// ============================================================================
 // Elementwise 1D BF16 kernel entry (ADD or MUL, size=2048)
 // Used in the Phase A fused post-attention runlist:
 //   O_proj → ADD(attn_res) → NORM → MUL(gain) → SwiGLU → ADD(ffn_res)
@@ -1031,6 +1075,10 @@ struct ggml_backend_xdna_context {
     // Per-layer weight/activation BOs keyed by the o_proj weight tensor pointer.
     std::unordered_map<std::string, xdna_post_attn_fused_entry> post_attn_fused_cache;
     std::unordered_map<const void *, xdna_post_attn_fused_layer_t> post_attn_fused_layer_cache;
+    // Phase A1.3 LayerFused caches (env-gated, XDNA_LAYER_FUSED=1).
+    // Kernel cache keyed by (E,H,nh,nkv,hd,mx,C,G); per-layer BOs keyed by w_qkv ptr.
+    std::unordered_map<std::string, xdna_layer_fused_entry> layer_fused_cache;
+    std::unordered_map<const void *, xdna_layer_fused_layer_t> layer_fused_layer_cache;
     // Phase A: fused post-attention layer dispatch (O_proj+ADD+NORM+MUL+SwiGLU in one runlist)
     std::unordered_map<std::string, xdna_elem1d_entry> elem_add_cache;
     std::unordered_map<std::string, xdna_elem1d_entry> elem_mul_cache;
