@@ -8574,7 +8574,7 @@ static void xdna_plan_layer_fused(
     out->matches.clear();
     if (!xdna_env_enabled("XDNA_LAYER_FUSED")) return;
     static const bool dbg = getenv("XDNA_DEBUG_LAYER_FUSED") != NULL;
-    static std::atomic<int> dbg_budget{dbg ? 4 : 0};
+    static std::atomic<int> dbg_budget{dbg ? 8 : 0};
 
     int n_qkv = 0, n_with_rope = 0, n_with_norm = 0, n_with_swiglu = 0;
     for (const auto & kv : qkv_plan.triple_at) {
