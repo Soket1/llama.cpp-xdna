@@ -165,6 +165,27 @@ PRESETS: dict[str, dict[str, str]] = {
         "XDNA_ENABLE_SWIGLU_INT4":       "1",
         "XDNA_ENABLE_FUSED_LAYER":       "1",
     },
+    "npu_layer_fused": {
+        # Phase A1.3 LayerFused observer (step 4a). Wraps npu_phase_b with
+        # XDNA_LAYER_FUSED=1 + XDNA_DEBUG_LAYER_FUSED=1 so the C++ pre-scan
+        # detector populates xdna_layer_fused_plan and the observer-only
+        # dispatch stub at the Q node logs matches. Stub returns false, so
+        # the normal QKV/SwiGLU flow runs unchanged — this preset MUST
+        # byte-PASS against npu_phase_b. Step 4b will replace the stub
+        # with a real layer_fused xclbin dispatch.
+        "XDNA_ENABLE_GEMV":              "1",
+        "XDNA_ENABLE_SWIGLU":            "1",
+        "XDNA_ENABLE_QKV":               "1",
+        "XDNA_ENABLE_DECODE_BATCH":      "1",
+        "XDNA_ENABLE_TRANSFORMER_BLOCK": "1",
+        "XDNA_ENABLE_FLOWKV_DECODE":     "1",
+        "XDNA_ENABLE_RMS_NORM":          "0",
+        "XDNA_ENABLE_GEMV_INT4":         "1",
+        "XDNA_ENABLE_SWIGLU_INT4":       "1",
+        "XDNA_ENABLE_FUSED_LAYER":       "1",
+        "XDNA_LAYER_FUSED":              "1",
+        "XDNA_DEBUG_LAYER_FUSED":        "1",
+    },
     "npu_int4_v1": {
         # Regression-coverage preset that explicitly forces the old v1
         # INT4 GEMV kernel via XDNA_DISABLE_GEMV_INT4_V2=1. Kept so we
@@ -468,9 +489,9 @@ TESTS: list[Test] = [
         n_predict=12,
         mode="single-turn",
         model=MODEL_Q4_0,
-        variants=["npu_int4"],
+        variants=["npu_int4", "npu_layer_fused"],
         min_prefix_match=1,  # Q4_0 quantization + bf16 dequant drift vs CPU Q4_0.
-        description="Phase 8.1 dispatch path: Q4_0 weights routed through fused INT4 dequant-GEMV on NPU. Baseline is CPU-Q4_0; expect minor drift from bf16-vs-fp32 dequant accumulation.",
+        description="Phase 8.1 dispatch path: Q4_0 weights routed through fused INT4 dequant-GEMV on NPU. Baseline is CPU-Q4_0; expect minor drift from bf16-vs-fp32 dequant accumulation. npu_layer_fused variant verifies the A1.3 observer stub byte-PASSes (no regression).",
     ),
     Test(
         name="paris_drift_64_q4_0_int4",
@@ -839,7 +860,9 @@ def diff_strings(a: str, b: str) -> tuple[int, str]:
 # Test orchestration
 # =============================================================================
 
-def run_test(test: Test, verbose: bool = False) -> bool:
+def run_test(test: Test, verbose: bool = False,
+             show_stderr: bool = False,
+             grep_stderr: str | None = None) -> bool:
     """Returns True if test passed (all variants matched expectations)."""
     print(f"\n=== {test.name} ===")
     if test.description:
@@ -864,13 +887,23 @@ def run_test(test: Test, verbose: bool = False) -> bool:
     for variant in test.variants:
         t0 = time.time()
         try:
-            v_stdout, _ = run_llama(variant, test)
+            v_stdout, v_stderr = run_llama(variant, test)
         except Exception as e:
             print(f"  {variant}: ERROR {e}")
             all_pass = False
             continue
         t_var = time.time() - t0
         v_resp = extract_responses(v_stdout)
+        if show_stderr:
+            lines = v_stderr.splitlines()
+            if grep_stderr:
+                lines = [ln for ln in lines if re.search(grep_stderr, ln)]
+            if lines:
+                print(f"    stderr [{variant}] ({len(lines)} line(s) shown):")
+                for ln in lines[:40]:
+                    print(f"      {ln}")
+                if len(lines) > 40:
+                    print(f"      ... ({len(lines) - 40} more)")
 
         if len(v_resp) != len(baseline_resp):
             outcome = "FAIL"
@@ -1203,6 +1236,10 @@ def main():
     ap.add_argument("test_name", nargs="?", help="Run only this test by name")
     ap.add_argument("--list", action="store_true", help="List test names and exit")
     ap.add_argument("-v", "--verbose", action="store_true", help="Print response text")
+    ap.add_argument("--show-stderr", action="store_true",
+                    help="Print captured llama-cli stderr on PASS too (filtered by --grep-stderr)")
+    ap.add_argument("--grep-stderr", metavar="REGEX", default=None,
+                    help="Substring or regex to grep the captured stderr (with --show-stderr)")
     ap.add_argument("--bench", action="store_true",
                     help="Run perf benchmark across CPU/NPU bf16/NPU INT4 presets")
     ap.add_argument("--bench-mode", choices=["single", "chat", "both"], default="single",
@@ -1247,7 +1284,9 @@ def main():
     n_fail = 0
     t_start = time.time()
     for t in tests:
-        if run_test(t, verbose=args.verbose):
+        if run_test(t, verbose=args.verbose,
+                    show_stderr=args.show_stderr,
+                    grep_stderr=args.grep_stderr):
             n_pass += 1
         else:
             n_fail += 1

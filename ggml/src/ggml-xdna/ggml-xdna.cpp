@@ -8563,6 +8563,8 @@ struct xdna_layer_fused_match {
 
 struct xdna_layer_fused_plan {
     std::vector<xdna_layer_fused_match> matches;
+    // q_idx -> index into `matches` for O(1) lookup during graph walk.
+    std::unordered_map<int, int> q_idx_to_match;
 };
 
 static void xdna_plan_layer_fused(
@@ -8623,6 +8625,7 @@ static void xdna_plan_layer_fused(
         m.w_norm1   = norm_it->second.norm
                       ? norm_it->second.norm->src[1] : nullptr;
         m.w_norm2   = swm.gain_weight;
+        out->q_idx_to_match[m.q_idx] = (int)out->matches.size();
         out->matches.push_back(m);
     }
 
@@ -8634,6 +8637,30 @@ static void xdna_plan_layer_fused(
                 cgraph->n_nodes, n_qkv, n_with_rope, n_with_norm,
                 n_with_swiglu, out->matches.size());
     }
+}
+
+// ============================================================================
+// Phase A1.3 step 4a — observer-only dispatch stub. Logs that a match was
+// reached at runtime; always returns false so the existing QKV/SwiGLU
+// dispatch flow runs unchanged. Step 4b will wire get_or_load_layer_fused
+// + DDR_PATCH + 8-arg submit here.
+// ============================================================================
+static bool ggml_backend_xdna_layer_fused_dispatch(
+        ggml_backend_xdna_context * ctx,
+        const xdna_layer_fused_match & m) {
+    (void)ctx;
+    static const bool dbg = getenv("XDNA_DEBUG_LAYER_FUSED") != NULL;
+    static std::atomic<int> dbg_budget{dbg ? 8 : 0};
+    if (dbg && dbg_budget.fetch_sub(1) > 0) {
+        fprintf(stderr,
+                "layer_fused stub: q=%d k=%d v=%d q_rope=%d k_rope=%d "
+                "pre_norm=%d o_proj=%d add_attn=%d norm_ffn=%d "
+                "add_ffn=%d -> would dispatch (returning false)\n",
+                m.q_idx, m.k_idx, m.v_idx, m.q_rope_idx, m.k_rope_idx,
+                m.pre_norm_idx, m.o_proj_idx, m.add_attn_idx,
+                m.norm_ffn_idx, m.add_ffn_idx);
+    }
+    return false;
 }
 
 // Phase A stub: fused post-attention layer dispatch (NYI).
@@ -8668,6 +8695,10 @@ static xdna_layer_fused_entry * get_or_load_layer_fused_kernel(
         int64_t embed_dim, int64_t hidden_dim,
         int num_heads, int num_kv_heads, int head_dim, int max_seq_len,
         int cols, int group_size);
+struct xdna_layer_fused_match;
+static bool ggml_backend_xdna_layer_fused_dispatch(
+        ggml_backend_xdna_context * ctx,
+        const xdna_layer_fused_match & m);
 
 static bool ggml_backend_xdna_fused_layer_dispatch(
         ggml_backend_xdna_context * ctx,
@@ -14472,6 +14503,20 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                 cpu_run_start = -1;
             }
             continue;
+        }
+
+        // Phase A1.3 step 4a — LayerFused observer hook (no dispatch).
+        // When XDNA_LAYER_FUSED=1 and the pre-scan found a full-layer
+        // match at this Q node, call the stub. It currently logs and
+        // returns false, so the existing QKV/SwiGLU flow below runs
+        // unchanged. Step 4b wires the real dispatch.
+        if (qkv_enabled) {
+            auto lf_it = layer_fused_plan.q_idx_to_match.find(i);
+            if (lf_it != layer_fused_plan.q_idx_to_match.end()) {
+                const xdna_layer_fused_match & lf_m =
+                    layer_fused_plan.matches[lf_it->second];
+                (void)ggml_backend_xdna_layer_fused_dispatch(ctx, lf_m);
+            }
         }
 
         // QKV triple: dispatch Q+K+V as one xrt::runlist at Q's position.
