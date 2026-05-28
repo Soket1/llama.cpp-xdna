@@ -1770,6 +1770,93 @@ static xdna_post_attn_fused_sizes xdna_post_attn_fused_buffer_sizes(
     return s;
 }
 
+// ============================================================================
+// Phase A1.3 LayerFused — per-BO byte sizes. Single source of truth in C++,
+// must mirror op_mlir.py:_bundle_byte_sizes exactly. 5 BOs:
+//   BO0 (in)    = W_norm1 [E*2] | W_q [E×E INT4] | W_k [E×kvE INT4]
+//                              | W_v [E×kvE INT4]   — m_input_qkv=2
+//   BO1 (in)    = W_o   [E×E INT4]                  — m_input_o  =1
+//   BO2 (in)    = W_norm2 [E*2] | W_gate [E×H INT4]
+//                              | W_up   [E×H INT4]
+//                              | W_down [H×E INT4]  — m_input_gu =4, m_input_d=1
+//   BO3 (inout) = K_cache | V_cache  (per-layer, DDR_PATCH'd at dispatch)
+//   BO4 (inout) = activations bundle
+// ============================================================================
+struct xdna_layer_fused_sizes {
+    size_t bo0_bytes;
+    size_t bo1_bytes;
+    size_t bo2_bytes;
+    size_t bo3_bytes;
+    size_t bo4_bytes;
+};
+
+static xdna_layer_fused_sizes xdna_layer_fused_buffer_sizes(
+        int64_t embed_dim, int64_t hidden_dim,
+        int num_heads, int num_kv_heads, int head_dim, int max_seq_len,
+        int cols, int group_size) {
+    (void)num_heads;  // not directly needed for byte-size computation
+    xdna_layer_fused_sizes s{};
+    const int64_t e        = embed_dim;
+    const int64_t h        = hidden_dim;
+    const int64_t g        = group_size;
+    const int64_t kv_e     = (int64_t)num_kv_heads * head_dim;
+    const int64_t mx       = max_seq_len;
+    const int64_t groups_e = e / g;
+    const int64_t groups_h = h / g;
+
+    const int m_input_qkv = 2;   // shim DMA min-byte alignment
+    const size_t packed_q = (size_t)m_input_qkv * (size_t)e / 2
+                          + (size_t)m_input_qkv * (size_t)groups_e * 2;
+    const size_t total_q   = (size_t)cols * (size_t)(e    / cols) * packed_q;
+    const size_t total_kv1 = (size_t)cols * (size_t)(kv_e / cols) * packed_q;
+
+    const int m_input_o = 1;
+    const size_t packed_o = (size_t)m_input_o * (size_t)e / 2
+                          + (size_t)m_input_o * (size_t)groups_e * 2;
+    const size_t total_o = (size_t)cols * (size_t)(e / cols) * packed_o;
+
+    const int m_input_gu = 4;
+    const size_t packed_gu = (size_t)m_input_gu * (size_t)e / 2
+                           + (size_t)m_input_gu * (size_t)groups_e * 2;
+    const size_t total_gu = (size_t)cols * 2
+                          * (size_t)(h / cols / m_input_gu) * packed_gu;
+
+    const int m_input_d = 1;
+    const size_t packed_d = (size_t)m_input_d * (size_t)h / 2
+                          + (size_t)m_input_d * (size_t)groups_h * 2;
+    const size_t total_d = (size_t)cols * (size_t)(e / cols) * packed_d;
+
+    const size_t norm_bytes = (size_t)e * 2;
+
+    s.bo0_bytes = norm_bytes + total_q + 2 * total_kv1;
+    s.bo1_bytes = total_o;
+    s.bo2_bytes = norm_bytes + total_gu + total_d;
+    const size_t kv_one_bytes = (size_t)num_kv_heads
+                              * (size_t)mx * (size_t)head_dim * 2;
+    s.bo3_bytes = 2 * kv_one_bytes;
+
+    // BO4 activations layout (bf16 elements):
+    //   x | rope_lut[2*mx*hd] | scratch | q_rot | k_rot | v |
+    //   attn_out | o_proj_out | inpFF | normed | ffn_in | silu | ffn_out | outL
+    const size_t bo4_elems =
+          (size_t)e
+        + 2 * (size_t)mx * (size_t)head_dim
+        + (size_t)e
+        + (size_t)e
+        + (size_t)kv_e
+        + (size_t)kv_e
+        + (size_t)e
+        + (size_t)e
+        + (size_t)e
+        + (size_t)e
+        + (size_t)e
+        + (size_t)h
+        + (size_t)e
+        + (size_t)e;
+    s.bo4_bytes = bo4_elems * 2;
+    return s;
+}
+
 // Repack Q4_K weights into the same packed INT4 layout used by the v2
 // fused_dequant_gemv kernel. Q4_K uses asymmetric quantization with two
 // levels of scales (super-block fp16 d + per-sub-block 6-bit scale,
@@ -8437,6 +8524,118 @@ static void xdna_plan_fused_layer(const struct ggml_cgraph * cgraph,
     }
 }
 
+// ============================================================================
+// Phase A1.3 LayerFused — full-layer pre-scan detector. Combines QKV plan
+// + SwiGLU matcher to identify cgraph positions where ALL of:
+//   - QKV triple (xdna_qkv_plan::triple_at)
+//   - RoPE on Q + K (xdna_qkv_plan::rope_at)
+//   - pre-attention RMSNorm (xdna_qkv_plan::attn_norm_at)
+//   - downstream INT4 SwiGLU pattern with fused_layer=true
+// are present. Step 2+3: count only, no dispatch site, no skip_indices.
+// Gated by XDNA_LAYER_FUSED=1; XDNA_DEBUG_LAYER_FUSED=1 logs counts.
+// ============================================================================
+struct xdna_layer_fused_match {
+    int q_idx          = -1;
+    int k_idx          = -1;
+    int v_idx          = -1;
+    int q_rope_idx     = -1;
+    int k_rope_idx     = -1;
+    int pre_norm_idx   = -1;
+    int o_proj_idx     = -1;
+    int add_attn_idx   = -1;
+    int norm_ffn_idx   = -1;
+    int mul_gain_idx   = -1;
+    int gate_idx       = -1;   // resolved from swm.gate_mm position if needed
+    int up_idx         = -1;
+    int glu_idx        = -1;
+    int down_idx       = -1;
+    int add_ffn_idx    = -1;
+    const struct ggml_tensor * w_q     = nullptr;
+    const struct ggml_tensor * w_k     = nullptr;
+    const struct ggml_tensor * w_v     = nullptr;
+    const struct ggml_tensor * w_o     = nullptr;
+    const struct ggml_tensor * w_gate  = nullptr;
+    const struct ggml_tensor * w_up    = nullptr;
+    const struct ggml_tensor * w_down  = nullptr;
+    const struct ggml_tensor * w_norm1 = nullptr;
+    const struct ggml_tensor * w_norm2 = nullptr;
+};
+
+struct xdna_layer_fused_plan {
+    std::vector<xdna_layer_fused_match> matches;
+};
+
+static void xdna_plan_layer_fused(
+        const struct ggml_cgraph * cgraph,
+        const xdna_qkv_plan & qkv_plan,
+        xdna_layer_fused_plan * out) {
+    out->matches.clear();
+    if (!xdna_env_enabled("XDNA_LAYER_FUSED")) return;
+    static const bool dbg = getenv("XDNA_DEBUG_LAYER_FUSED") != NULL;
+    static std::atomic<int> dbg_budget{dbg ? 4 : 0};
+
+    int n_qkv = 0, n_with_rope = 0, n_with_norm = 0, n_with_swiglu = 0;
+    for (const auto & kv : qkv_plan.triple_at) {
+        const int q_idx = kv.first;
+        const auto & triple = kv.second;
+        ++n_qkv;
+        auto rope_it = qkv_plan.rope_at.find(q_idx);
+        if (rope_it == qkv_plan.rope_at.end()) continue;
+        ++n_with_rope;
+        auto norm_it = qkv_plan.attn_norm_at.find(q_idx);
+        if (norm_it == qkv_plan.attn_norm_at.end()) continue;
+        ++n_with_norm;
+
+        // Walk forward from this QKV to find the matching SwiGLU pattern.
+        xdna_swiglu_match swm{};
+        bool got_swiglu = false;
+        for (int j = q_idx + 1; j < cgraph->n_nodes; j++) {
+            if (cgraph->nodes[j]->op != GGML_OP_MUL_MAT) continue;
+            if (xdna_try_match_swiglu(cgraph, j, &swm)
+                && swm.fused_layer && swm.is_int4) {
+                got_swiglu = true;
+                break;
+            }
+        }
+        if (!got_swiglu) continue;
+        ++n_with_swiglu;
+
+        xdna_layer_fused_match m{};
+        m.q_idx        = triple[0];
+        m.k_idx        = triple[1];
+        m.v_idx        = triple[2];
+        m.q_rope_idx   = rope_it->second.q_rope_idx;
+        m.k_rope_idx   = rope_it->second.k_rope_idx;
+        m.pre_norm_idx = norm_it->second.norm_idx;
+        m.o_proj_idx   = swm.o_proj_idx;
+        m.add_attn_idx = swm.add_attn_idx;
+        m.norm_ffn_idx = swm.norm_ffn_idx;
+        m.mul_gain_idx = swm.mul_gain_idx;
+        m.glu_idx      = -1;   // swm.glu carries the tensor, idx left -1 here
+        m.add_ffn_idx  = swm.add_ffn_idx;
+        m.w_q       = cgraph->nodes[triple[0]]->src[0];
+        m.w_k       = cgraph->nodes[triple[1]]->src[0];
+        m.w_v       = cgraph->nodes[triple[2]]->src[0];
+        m.w_o       = swm.o_proj_mm ? swm.o_proj_mm->src[0] : nullptr;
+        m.w_gate    = swm.gate_w;
+        m.w_up      = swm.up_w;
+        m.w_down    = swm.down_w;
+        m.w_norm1   = norm_it->second.norm
+                      ? norm_it->second.norm->src[1] : nullptr;
+        m.w_norm2   = swm.gain_weight;
+        out->matches.push_back(m);
+    }
+
+    if (dbg && dbg_budget.fetch_sub(1) > 0) {
+        fprintf(stderr,
+                "xdna_plan_layer_fused: cgraph n_nodes=%d -> qkv=%d "
+                "with_rope=%d with_norm=%d with_swiglu=%d "
+                "-> %zu layer matches\n",
+                cgraph->n_nodes, n_qkv, n_with_rope, n_with_norm,
+                n_with_swiglu, out->matches.size());
+    }
+}
+
 // Phase A stub: fused post-attention layer dispatch (NYI).
 // When XDNA_ENABLE_FUSED_LAYER=1 and the SwiGLU matcher sets m.fused_layer=true,
 // this is called. Currently a no-op: the 7-run runlist requires a single fused
@@ -8452,6 +8651,23 @@ static xdna_post_attn_fused_entry * get_or_load_post_attn_fused_kernel(
         ggml_backend_xdna_context * ctx, const std::string & cache_key,
         int64_t embed_dim, int64_t hidden_dim, int cols, int group_size,
         int m_input_o, int m_input_gu, int m_input_d);
+
+// Phase A1.3 LayerFused forward decls — definitions live alongside the
+// post_attn_fused loaders further below.
+static std::string make_layer_fused_cache_key(
+        int64_t embed_dim, int64_t hidden_dim,
+        int num_heads, int num_kv_heads, int head_dim, int max_seq_len,
+        int cols, int group_size);
+static bool ensure_layer_fused_compiled(
+        ggml_backend_xdna_context * ctx, const std::string & cache_key,
+        int64_t embed_dim, int64_t hidden_dim,
+        int num_heads, int num_kv_heads, int head_dim, int max_seq_len,
+        int cols, int group_size);
+static xdna_layer_fused_entry * get_or_load_layer_fused_kernel(
+        ggml_backend_xdna_context * ctx, const std::string & cache_key,
+        int64_t embed_dim, int64_t hidden_dim,
+        int num_heads, int num_kv_heads, int head_dim, int max_seq_len,
+        int cols, int group_size);
 
 static bool ggml_backend_xdna_fused_layer_dispatch(
         ggml_backend_xdna_context * ctx,
@@ -13501,6 +13717,144 @@ static xdna_post_attn_fused_entry * get_or_load_post_attn_fused_kernel(
 }
 
 // ============================================================================
+// Phase A1.3 LayerFused — kernel cache + on-disk artifacts loader.
+// Bundle dir = ctx->cache_dir + "\\" + cache_key, produced by
+//   compile.py layer-fused --out <bundle_dir>
+// Artifact filenames (match _stage_layer_fused_artifacts in compile.py):
+//   combined.xclbin         — 8-arg MLIR_AIE legacy xclbin
+//   layer_fused_main.insts  — IRON-emitted transaction binary (DDR_PATCH-ready)
+// ============================================================================
+static std::string make_layer_fused_cache_key(
+        int64_t embed_dim, int64_t hidden_dim,
+        int num_heads, int num_kv_heads, int head_dim, int max_seq_len,
+        int cols, int group_size) {
+    char buf[192];
+    snprintf(buf, sizeof(buf),
+             "layer_fused_v1_e%lld_h%lld_nh%d_nkv%d_hd%d_mx%d_c%d_g%d",
+             (long long)embed_dim, (long long)hidden_dim,
+             num_heads, num_kv_heads, head_dim, max_seq_len,
+             cols, group_size);
+    return std::string(buf);
+}
+
+static bool layer_fused_bundle_present(const std::string & bundle_dir) {
+    const std::string xclbin = bundle_dir + "/combined.xclbin";
+    const std::string insts  = bundle_dir + "/layer_fused_main.insts";
+    struct stat st;
+    return ::stat(xclbin.c_str(), &st) == 0
+        && ::stat(insts.c_str(),  &st) == 0;
+}
+
+static bool ensure_layer_fused_compiled(
+        ggml_backend_xdna_context * ctx,
+        const std::string & cache_key,
+        int64_t embed_dim, int64_t hidden_dim,
+        int num_heads, int num_kv_heads, int head_dim, int max_seq_len,
+        int cols, int group_size) {
+    const std::string bundle_dir = ctx->cache_dir + "\\" + cache_key;
+    if (layer_fused_bundle_present(bundle_dir)) return true;
+
+    char cmd[1536];
+    snprintf(cmd, sizeof(cmd),
+             "%s \"%s\" --quiet layer-fused "
+             "--embed-dim %lld --hidden-dim %lld "
+             "--num-heads %d --num-kv-heads %d "
+             "--head-dim %d --max-seq-len %d "
+             "--num-aie-columns %d --group-size %d "
+             "--out \"%s\"%s",
+             xdna_python_cmd(),
+             ctx->compile_script.c_str(),
+             (long long)embed_dim, (long long)hidden_dim,
+             num_heads, num_kv_heads, head_dim, max_seq_len,
+             cols, group_size,
+             bundle_dir.c_str(), xdna_null_redirect());
+    fprintf(stderr,
+            "ggml-xdna: compiling layer_fused E=%lld H=%lld nh=%d nkv=%d "
+            "hd=%d mx=%d cols=%d g=%d (first run, will be cached)...\n",
+            (long long)embed_dim, (long long)hidden_dim,
+            num_heads, num_kv_heads, head_dim, max_seq_len,
+            cols, group_size);
+    int ret = system(cmd);
+    if (ret != 0) {
+        GGML_LOG_ERROR("ggml-xdna: layer_fused compilation failed (exit %d)\n", ret);
+        return false;
+    }
+    if (!layer_fused_bundle_present(bundle_dir)) {
+        GGML_LOG_ERROR("ggml-xdna: layer_fused build succeeded but bundle "
+                       "files missing in %s\n", bundle_dir.c_str());
+        return false;
+    }
+    fprintf(stderr, "ggml-xdna: layer_fused cached at %s\n", bundle_dir.c_str());
+    return true;
+}
+
+static xdna_layer_fused_entry * get_or_load_layer_fused_kernel(
+        ggml_backend_xdna_context * ctx,
+        const std::string & cache_key,
+        int64_t embed_dim, int64_t hidden_dim,
+        int num_heads, int num_kv_heads, int head_dim, int max_seq_len,
+        int cols, int group_size) {
+    std::lock_guard<std::mutex> lock(ctx->cache_mutex);
+    auto it = ctx->layer_fused_cache.find(cache_key);
+    if (it != ctx->layer_fused_cache.end()) return &it->second;
+
+    const std::string bundle_dir  = ctx->cache_dir + "\\" + cache_key;
+    const std::string xclbin_path = bundle_dir + "/combined.xclbin";
+    const std::string insts_path  = bundle_dir + "/layer_fused_main.insts";
+
+    try {
+        xdna_layer_fused_entry entry;
+        entry.cache_key    = cache_key;
+        entry.embed_dim    = embed_dim;
+        entry.hidden_dim   = hidden_dim;
+        entry.num_heads    = num_heads;
+        entry.num_kv_heads = num_kv_heads;
+        entry.head_dim     = head_dim;
+        entry.max_seq_len  = max_seq_len;
+        entry.cols         = cols;
+        entry.group_size   = group_size;
+        const auto sizes = xdna_layer_fused_buffer_sizes(
+            embed_dim, hidden_dim, num_heads, num_kv_heads,
+            head_dim, max_seq_len, cols, group_size);
+        entry.bo0_bytes = sizes.bo0_bytes;
+        entry.bo1_bytes = sizes.bo1_bytes;
+        entry.bo2_bytes = sizes.bo2_bytes;
+        entry.bo3_bytes = sizes.bo3_bytes;
+        entry.bo4_bytes = sizes.bo4_bytes;
+
+        entry.xclbin = xrt::xclbin(xclbin_path);
+        ctx->device.register_xclbin(entry.xclbin);
+        entry.hw_ctx = xrt::hw_context(ctx->device, entry.xclbin.get_uuid());
+        entry.kernel = xrt::kernel(entry.hw_ctx, "MLIR_AIE");
+
+        entry.insts = read_binary_file(insts_path);
+        if (entry.insts.empty()) {
+            GGML_LOG_ERROR("ggml-xdna: failed to read layer_fused insts %s\n",
+                           insts_path.c_str());
+            return nullptr;
+        }
+        entry.insts_bo = xrt::bo(ctx->device, entry.insts.size(),
+                                  xrt::bo::flags::cacheable,
+                                  entry.kernel.group_id(1));
+        entry.insts_bo.write(entry.insts.data());
+        entry.insts_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+        auto [ins, _] = ctx->layer_fused_cache.emplace(cache_key, std::move(entry));
+        fprintf(stderr,
+                "ggml-xdna: loaded layer_fused kernel %s "
+                "(bo0=%zu bo1=%zu bo2=%zu bo3=%zu bo4=%zu bytes per layer)\n",
+                cache_key.c_str(),
+                sizes.bo0_bytes, sizes.bo1_bytes, sizes.bo2_bytes,
+                sizes.bo3_bytes, sizes.bo4_bytes);
+        return &ins->second;
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("ggml-xdna: failed to load layer_fused kernel %s: %s\n",
+                       cache_key.c_str(), e.what());
+        return nullptr;
+    }
+}
+
+// ============================================================================
 // Elementwise 1D BF16 kernel loading (Phase A fused layer runlist)
 // ============================================================================
 
@@ -14009,6 +14363,13 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                     qkv_plan.triple_at.size(), qkv_plan.skip_indices.size());
             fflush(stderr);
         }
+    }
+    // Phase A1.3 step 2+3 — LayerFused detector. Env-gated (XDNA_LAYER_FUSED=1).
+    // Count-only for now; no dispatch site, no skip_indices mutation. Once
+    // we wire dispatch, this plan tells us WHERE to fire layer_fused per layer.
+    xdna_layer_fused_plan layer_fused_plan;
+    if (qkv_enabled) {
+        xdna_plan_layer_fused(cgraph, qkv_plan, &layer_fused_plan);
     }
 
     // Pre-scan for decode GEMV batching. Identifies standalone MUL_MAT M=1
