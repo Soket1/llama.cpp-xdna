@@ -9173,11 +9173,33 @@ static bool ggml_backend_xdna_layer_fused_dispatch(
                 lb.activations_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
             }
 
+            auto t_submit0 = std::chrono::steady_clock::now();
             auto run = entry->kernel(
                 3, entry->insts_bo, (uint32_t)entry->insts.size(),
                 *lb.w_qkv_bo, *lb.w_o_bo, *lb.w_ffn_bo,
                 *lb.kv_pair_bo, *lb.activations_bo);
             auto state = run.wait(std::chrono::milliseconds(10000));
+            auto t_submit1 = std::chrono::steady_clock::now();
+            // P0.4 bench: isolated per-dispatch submit+wait latency. This
+            // is the cost of ONE fused-layer dispatch — compare against
+            // the sum of the per-op dispatches it would replace (QKV +
+            // FlowKV + O_proj + SwiGLU ≈ 4-5 dispatches/layer today).
+            {
+                const int64_t us = std::chrono::duration_cast<
+                    std::chrono::microseconds>(t_submit1 - t_submit0).count();
+                static std::atomic<int64_t> lat_sum{0};
+                static std::atomic<int>     lat_cnt{0};
+                // Skip the first dispatch per layer (cold xclbin swap) by
+                // only accumulating once good>0 — warm steady-state only.
+                lat_sum.fetch_add(us);
+                int c = lat_cnt.fetch_add(1) + 1;
+                if (dbg && (c % 16 == 0 || c <= 4)) {
+                    fprintf(stderr,
+                            "layer_fused BENCH: dispatch submit+wait "
+                            "n=%d mean=%.1f us (last=%lld us)\n",
+                            c, (double)lat_sum.load() / c, (long long)us);
+                }
+            }
             static std::atomic<int> good{0}, bad{0};
             if (state == ERT_CMD_STATE_COMPLETED) {
                 good.fetch_add(1);
