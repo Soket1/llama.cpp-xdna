@@ -8845,10 +8845,74 @@ static bool ggml_backend_xdna_layer_fused_dispatch(
     if (dbg && dbg_budget.fetch_sub(1) > 0) {
         fprintf(stderr,
                 "layer_fused dispatch: kernel LOADED for q=%d "
-                "(bo0=%zu bo1=%zu bo2=%zu bo3=%zu bo4=%zu) -> stub "
-                "returns false until P0.2b\n",
+                "(bo0=%zu bo1=%zu bo2=%zu bo3=%zu bo4=%zu)\n",
                 m.q_idx, entry->bo0_bytes, entry->bo1_bytes,
                 entry->bo2_bytes, entry->bo3_bytes, entry->bo4_bytes);
+    }
+
+    // ── P0.2b-1: experimental zero-BO dispatch probe ───────────────
+    // Gated behind XDNA_LAYER_FUSED_TRY=1. Allocate 5 BOs (zeroed),
+    // sync to device, issue the 8-arg MLIR_AIE submit, wait, log
+    // result. Always return false so the existing CPU path still
+    // produces the correct outputs (this probe is a hang/error test).
+    //
+    // ONE-SHOT per process: we only need to confirm "does the IRON
+    // layer_fused.xclbin actually execute on the NPU?" — anything
+    // beyond that is P0.2b-2 (weight packing) territory.
+    static const bool try_dispatch = xdna_env_enabled("XDNA_LAYER_FUSED_TRY");
+    if (try_dispatch) {
+        static std::atomic<bool> tried{false};
+        if (!tried.exchange(true)) {
+            fprintf(stderr,
+                    "layer_fused PROBE: attempting zero-BO dispatch "
+                    "for q=%d (ONE-SHOT) ...\n", m.q_idx);
+            try {
+                xrt::bo bo0(ctx->device, entry->bo0_bytes,
+                            xrt::bo::flags::host_only,
+                            entry->kernel.group_id(3));
+                xrt::bo bo1(ctx->device, entry->bo1_bytes,
+                            xrt::bo::flags::host_only,
+                            entry->kernel.group_id(4));
+                xrt::bo bo2(ctx->device, entry->bo2_bytes,
+                            xrt::bo::flags::host_only,
+                            entry->kernel.group_id(5));
+                xrt::bo bo3(ctx->device, entry->bo3_bytes,
+                            xrt::bo::flags::host_only,
+                            entry->kernel.group_id(6));
+                xrt::bo bo4(ctx->device, entry->bo4_bytes,
+                            xrt::bo::flags::host_only,
+                            entry->kernel.group_id(7));
+                // Zero-fill is the default for fresh xrt::bo on Windows;
+                // map+memset belt-and-suspenders the assumption.
+                std::memset(bo0.map<void *>(), 0, entry->bo0_bytes);
+                std::memset(bo1.map<void *>(), 0, entry->bo1_bytes);
+                std::memset(bo2.map<void *>(), 0, entry->bo2_bytes);
+                std::memset(bo3.map<void *>(), 0, entry->bo3_bytes);
+                std::memset(bo4.map<void *>(), 0, entry->bo4_bytes);
+                bo0.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                bo1.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                bo2.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                bo3.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                bo4.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                fprintf(stderr,
+                        "layer_fused PROBE: BOs allocated + zeroed + "
+                        "synced. Issuing submit...\n");
+                auto run = entry->kernel(
+                    3, entry->insts_bo, (uint32_t)entry->insts.size(),
+                    bo0, bo1, bo2, bo3, bo4);
+                // 10 s timeout — if the kernel hangs we report and fail
+                // the probe but don't take down the rest of the run.
+                auto state = run.wait(std::chrono::milliseconds(10000));
+                fprintf(stderr,
+                        "layer_fused PROBE: wait returned state=%d "
+                        "(0=normal, non-zero typically means timeout/abort)\n",
+                        (int)state);
+            } catch (const std::exception & e) {
+                fprintf(stderr,
+                        "layer_fused PROBE: dispatch FAILED: %s\n",
+                        e.what());
+            }
+        }
     }
     return false;
 }
