@@ -1950,8 +1950,14 @@ static xdna_layer_fused_sizes xdna_layer_fused_buffer_sizes(
     const int m_input_qkv = 2;   // shim DMA min-byte alignment
     const size_t packed_q = (size_t)m_input_qkv * (size_t)e / 2
                           + (size_t)m_input_qkv * (size_t)groups_e * 2;
-    const size_t total_q   = (size_t)cols * (size_t)(e    / cols) * packed_q;
-    const size_t total_kv1 = (size_t)cols * (size_t)(kv_e / cols) * packed_q;
+    // packed_q is bytes for ONE tile = m_input_qkv rows. Per-col bytes =
+    // (rows_per_col / m_input_qkv) tiles × packed_q. Earlier revisions
+    // omitted the `/ m_input_qkv` divisor here; the resulting 2× oversized
+    // Q/K/V regions left K/V TAPs reading past the packer-written bytes.
+    const size_t total_q   = (size_t)cols
+                           * (size_t)(e    / cols / m_input_qkv) * packed_q;
+    const size_t total_kv1 = (size_t)cols
+                           * (size_t)(kv_e / cols / m_input_qkv) * packed_q;
 
     const int m_input_o = 1;
     const size_t packed_o = (size_t)m_input_o * (size_t)e / 2
@@ -9180,6 +9186,52 @@ static bool ggml_backend_xdna_layer_fused_dispatch(
                         good.load(), bad.load());
             }
 
+            // P0.3 BUG-FIX VALIDATION probe: read bo4 at off_q_rot,
+            // off_k_rot, off_v and count finite/zero bf16 elements.
+            // Before the m_input_qkv-divisor fix in
+            // _bundle_byte_sizes / xdna_layer_fused_sizes: q_rot real,
+            // k_rot all-zero, v all-zero (K/V TAPs read past the
+            // packer-written bytes). After the fix: all three should
+            // be finite.
+            static std::atomic<bool> qkv_probe_done{false};
+            if (dbg && state == ERT_CMD_STATE_COMPLETED
+                    && !qkv_probe_done.exchange(true)) {
+                const int E_pr = 2048, KV_E_pr = 512;
+                const int MX_pr = 2048, HD_pr = 64;
+                const size_t off_q_rot_pr = (size_t)E_pr + 2*(size_t)MX_pr*HD_pr
+                                          + (size_t)E_pr;
+                const size_t off_k_rot_pr = off_q_rot_pr + (size_t)E_pr;
+                const size_t off_v_pr     = off_k_rot_pr + (size_t)KV_E_pr;
+                lb.activations_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+                const uint16_t * bo4_u16 = lb.activations_bo->map<uint16_t *>();
+                auto count_zone = [&](size_t off, int n,
+                                       int *finite, uint16_t *first_v) {
+                    int fin = 0; *first_v = 0;
+                    for (int i = 0; i < n; i++) {
+                        uint16_t v = bo4_u16[off + i];
+                        if (v == 0) continue;
+                        if (((v >> 7) & 0xFF) == 0xFF) continue;
+                        if (fin == 0) *first_v = v;
+                        fin++;
+                    }
+                    *finite = fin;
+                };
+                int q_fin = 0, k_fin = 0, v_fin = 0;
+                uint16_t q_first = 0, k_first = 0, v_first = 0;
+                count_zone(off_q_rot_pr, E_pr,    &q_fin, &q_first);
+                count_zone(off_k_rot_pr, KV_E_pr, &k_fin, &k_first);
+                count_zone(off_v_pr,     KV_E_pr, &v_fin, &v_first);
+                fprintf(stderr,
+                        "layer_fused QKV-VAL: q=%d "
+                        "q_rot fin=%d/%d first=0x%04X | "
+                        "k_rot fin=%d/%d first=0x%04X | "
+                        "v fin=%d/%d first=0x%04X\n",
+                        m.q_idx,
+                        q_fin, E_pr,    q_first,
+                        k_fin, KV_E_pr, k_first,
+                        v_fin, KV_E_pr, v_first);
+            }
+
             // P0.2c-5: one-shot output validation probe. After the
             // dispatch, read bo4[off_outL] and compare against CPU's
             // outL_tensor->data (post-FFN ADD output for this layer).
@@ -14374,7 +14426,7 @@ static std::string make_layer_fused_cache_key(
         int cols, int group_size) {
     char buf[192];
     snprintf(buf, sizeof(buf),
-             "layer_fused_v1_e%lld_h%lld_nh%d_nkv%d_hd%d_mx%d_c%d_g%d",
+             "layer_fused_v2_e%lld_h%lld_nh%d_nkv%d_hd%d_mx%d_c%d_g%d",
              (long long)embed_dim, (long long)hidden_dim,
              num_heads, num_kv_heads, head_dim, max_seq_len,
              cols, group_size);
