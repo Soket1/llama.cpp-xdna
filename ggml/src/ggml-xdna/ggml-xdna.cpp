@@ -9179,6 +9179,60 @@ static bool ggml_backend_xdna_layer_fused_dispatch(
                         "layer_fused PROBE: cumulative good=%d bad=%d\n",
                         good.load(), bad.load());
             }
+
+            // P0.2c-5: one-shot output validation probe. After the
+            // dispatch, read bo4[off_outL] and compare against CPU's
+            // outL_tensor->data (post-FFN ADD output for this layer).
+            // Today expected to mismatch (K/V phase block produces
+            // zeros downstream); becomes the byte-exact validator
+            // when the IRON-side K/V issue is resolved.
+            static std::atomic<bool> outL_probe_done{false};
+            if (dbg && state == ERT_CMD_STATE_COMPLETED
+                    && m.outL_tensor && m.outL_tensor->type == GGML_TYPE_F32
+                    && m.outL_tensor->data
+                    && !outL_probe_done.exchange(true)) {
+                const int E_out = 2048;
+                const size_t off_x_outL_layout = 0;  // placeholder, see below
+                // bo4 outL offset (per design.py:119): off_outL = off_ffn_out + e
+                //   = E + 2*MX*HD + E + E + KV_E + KV_E + E + E + E + E + E + H + E
+                const int E = 2048, KV_E = 512, MX = 2048, HD = 64, H = 8192;
+                const size_t off_outL = (size_t)E + (size_t)2 * MX * HD
+                                      + (size_t)E + (size_t)E
+                                      + (size_t)KV_E + (size_t)KV_E
+                                      + (size_t)E + (size_t)E + (size_t)E
+                                      + (size_t)E + (size_t)E + (size_t)H
+                                      + (size_t)E;
+                lb.activations_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+                const uint16_t * bo4_u16 = lb.activations_bo->map<uint16_t *>();
+                const float * cpu_out = (const float *)m.outL_tensor->data;
+                int finite = 0, zero_cnt = 0, nan_cnt = 0;
+                int near_match = 0;
+                uint16_t first_finite = 0;
+                float max_abs_err = 0.0f;
+                for (int i = 0; i < E_out; i++) {
+                    uint16_t v = bo4_u16[off_outL + i];
+                    uint16_t exp = (v >> 7) & 0xFF;
+                    if (v == 0) { zero_cnt++; continue; }
+                    if (exp == 0xFF) { nan_cnt++; continue; }
+                    if (finite == 0) first_finite = v;
+                    finite++;
+                    // bf16 → f32: zero-extend to top half of u32
+                    uint32_t u32 = (uint32_t)v << 16;
+                    float npu_f;
+                    std::memcpy(&npu_f, &u32, 4);
+                    float err = std::abs(npu_f - cpu_out[i]);
+                    if (err < 0.1f) near_match++;
+                    if (err > max_abs_err) max_abs_err = err;
+                }
+                fprintf(stderr,
+                        "layer_fused OUT-VAL: q=%d state=%d "
+                        "outL finite=%d/%d zero=%d nan=%d "
+                        "near_match=%d max_abs_err=%.4f first=0x%04X\n",
+                        m.q_idx, (int)state,
+                        finite, E_out, zero_cnt, nan_cnt,
+                        near_match, max_abs_err, first_finite);
+                (void)off_x_outL_layout;
+            }
         } catch (const std::exception & e) {
             static std::atomic<int> err_budget{4};
             if (dbg && err_budget.fetch_sub(1) > 0) {
