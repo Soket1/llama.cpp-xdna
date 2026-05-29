@@ -9065,6 +9065,63 @@ static bool ggml_backend_xdna_layer_fused_dispatch(
                 }
             }
 
+            // P0.2c-3: pack weights into BO0/1/2 once per layer.
+            // Triggered when all required tensor pointers are present
+            // and types match. lb.weights_packed prevents re-packing
+            // on subsequent dispatches for the same layer.
+            //
+            // BO3 (kv_pair) stays zeroed — KV cache plumbing comes
+            // after K/V phase IRON-side blocker is resolved.
+            // BO4 (activations) stays zeroed — per-token x copy comes
+            // when dispatch returns true (gated on K/V phase fix).
+            if (!lb.weights_packed
+                    && m.w_q && m.w_k && m.w_v && m.w_o
+                    && m.w_gate && m.w_up && m.w_down
+                    && m.w_norm1 && m.w_norm2
+                    && m.w_q   ->type == GGML_TYPE_Q4_0
+                    && m.w_k   ->type == GGML_TYPE_Q4_0
+                    && m.w_v   ->type == GGML_TYPE_Q4_0
+                    && m.w_o   ->type == GGML_TYPE_Q4_0
+                    && m.w_gate->type == GGML_TYPE_Q4_0
+                    && m.w_up  ->type == GGML_TYPE_Q4_0
+                    && m.w_down->type == GGML_TYPE_Q4_0
+                    && m.w_norm1->type == GGML_TYPE_F32
+                    && m.w_norm2->type == GGML_TYPE_F32) {
+                const int E_pack         = 2048;
+                const int KV_E_pack      = 512;
+                const int H_pack         = 8192;
+                const int cols_pack      = 8;
+                const int gs_pack        = 32;
+                const int m_in_o_pack    = 1;   // post_attn_fused matches
+                const int m_in_gu_pack   = 4;
+                const int m_in_d_pack    = 1;
+                xdna_pack_layer_fused_w_qkv(
+                    m.w_norm1, m.w_q, m.w_k, m.w_v,
+                    E_pack, KV_E_pack, cols_pack, gs_pack,
+                    lb.w_qkv_bo->map<uint8_t *>());
+                xdna_pack_layer_fused_w_o(
+                    m.w_o, E_pack, cols_pack, gs_pack, m_in_o_pack,
+                    lb.w_o_bo->map<uint8_t *>());
+                xdna_pack_layer_fused_w_ffn(
+                    m.w_norm2, m.w_gate, m.w_up, m.w_down,
+                    E_pack, H_pack, cols_pack, gs_pack,
+                    m_in_gu_pack, m_in_d_pack,
+                    lb.w_ffn_bo->map<uint8_t *>());
+                lb.w_qkv_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                lb.w_o_bo  ->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                lb.w_ffn_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                lb.weights_packed = true;
+                if (dbg) {
+                    static std::atomic<int> log_n{0};
+                    if (log_n.fetch_add(1) < 4) {
+                        fprintf(stderr,
+                                "layer_fused PROBE: packed weights for "
+                                "w_qkv=%p (BO0+BO1+BO2 synced)\n",
+                                (const void *)m.w_q);
+                    }
+                }
+            }
+
             auto run = entry->kernel(
                 3, entry->insts_bo, (uint32_t)entry->insts.size(),
                 *lb.w_qkv_bo, *lb.w_o_bo, *lb.w_ffn_bo,
