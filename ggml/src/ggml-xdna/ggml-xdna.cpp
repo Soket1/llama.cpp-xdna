@@ -8702,6 +8702,11 @@ struct xdna_layer_fused_match {
     const struct ggml_tensor * w_down  = nullptr;
     const struct ggml_tensor * w_norm1 = nullptr;
     const struct ggml_tensor * w_norm2 = nullptr;
+    // Per-token input/output tensor pointers — input to pre-RMS (residual
+    // x) and the post-FFN ADD output (outL); used to copy activations
+    // into bo4_off_x and read from bo4_off_outL when dispatch goes live.
+    const struct ggml_tensor * inpL_tensor = nullptr;
+    struct ggml_tensor       * outL_tensor = nullptr;
 };
 
 struct xdna_layer_fused_plan {
@@ -8902,6 +8907,14 @@ static void xdna_plan_layer_fused(
         m.w_norm2   = (norm_ffn_idx >= 0 && norm_ffn_idx + 1 < cgraph->n_nodes &&
                        cgraph->nodes[norm_ffn_idx + 1]->op == GGML_OP_MUL)
                       ? cgraph->nodes[norm_ffn_idx + 1]->src[1] : nullptr;
+        // inpL: input to pre-attn RMS_NORM (the residual x flowing in).
+        m.inpL_tensor = (pre_norm_idx >= 0)
+                        ? cgraph->nodes[pre_norm_idx]->src[0] : nullptr;
+        // outL: post-FFN ADD output. CPU writes the truth here today;
+        // when dispatch goes live we'll write bo4[off_outL] into it
+        // and skip the CPU computation via skip_indices.
+        m.outL_tensor = (add_ffn_idx >= 0)
+                        ? cgraph->nodes[add_ffn_idx] : nullptr;
         out->q_idx_to_match[m.q_idx] = (int)out->matches.size();
         out->matches.push_back(m);
     }
@@ -9120,6 +9133,26 @@ static bool ggml_backend_xdna_layer_fused_dispatch(
                                 (const void *)m.w_q);
                     }
                 }
+            }
+
+            // P0.2c-4: per-token input copy. inpL ggml tensor is F32
+            // [E, batch, 1] (or [E, 1, 1] for decode). Copy first batch
+            // row (single token, decode) to bo4_off_x as bf16.
+            // Skipped silently when inpL not present or wrong type —
+            // the dispatch still runs (with stale bo4[x]) but returns
+            // false so this is a no-op for byte-exactness.
+            if (m.inpL_tensor && m.inpL_tensor->type == GGML_TYPE_F32
+                    && m.inpL_tensor->data) {
+                const int E_in = 2048;
+                const size_t off_x_in = 0;
+                uint16_t * bo4_u16 = lb.activations_bo->map<uint16_t *>();
+                const float * src_f32 = (const float *)m.inpL_tensor->data;
+                for (int i = 0; i < E_in; i++) {
+                    uint32_t bits;
+                    std::memcpy(&bits, &src_f32[i], 4);
+                    bo4_u16[off_x_in + i] = (uint16_t)(bits >> 16);
+                }
+                lb.activations_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
             }
 
             auto run = entry->kernel(
