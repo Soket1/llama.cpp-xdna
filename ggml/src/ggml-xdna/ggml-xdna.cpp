@@ -8708,6 +8708,12 @@ struct xdna_layer_fused_match {
     const struct ggml_tensor * w_down  = nullptr;
     const struct ggml_tensor * w_norm1 = nullptr;
     const struct ggml_tensor * w_norm2 = nullptr;
+    // Qcur/Kcur/Vcur projection outputs (pre-RoPE CPU results at q/k/v_idx)
+    // — used by the QKV-VAL correctness probe to confirm the NPU GEMV
+    // output matches CPU, not just that it is finite/non-zero.
+    const struct ggml_tensor * q_out_tensor = nullptr;
+    const struct ggml_tensor * k_out_tensor = nullptr;
+    const struct ggml_tensor * v_out_tensor = nullptr;
     // Per-token input/output tensor pointers — input to pre-RMS (residual
     // x) and the post-FFN ADD output (outL); used to copy activations
     // into bo4_off_x and read from bo4_off_outL when dispatch goes live.
@@ -8905,6 +8911,12 @@ static void xdna_plan_layer_fused(
         m.w_q       = cgraph->nodes[triple[0]]->src[0];
         m.w_k       = cgraph->nodes[triple[1]]->src[0];
         m.w_v       = cgraph->nodes[triple[2]]->src[0];
+        // Qcur/Kcur/Vcur projection outputs (the MUL_MAT nodes themselves)
+        // — CPU computes these in TRY mode; QKV-VAL probe compares them
+        // against the NPU GEMV output in bo4[q_rot/k_rot/v].
+        m.q_out_tensor = cgraph->nodes[triple[0]];
+        m.k_out_tensor = cgraph->nodes[triple[1]];
+        m.v_out_tensor = cgraph->nodes[triple[2]];
         m.w_o       = w_o;
         m.w_gate    = w_gate;
         m.w_up      = w_up;
@@ -9186,15 +9198,23 @@ static bool ggml_backend_xdna_layer_fused_dispatch(
                         good.load(), bad.load());
             }
 
-            // P0.3 BUG-FIX VALIDATION probe: read bo4 at off_q_rot,
-            // off_k_rot, off_v and count finite/zero bf16 elements.
-            // Before the m_input_qkv-divisor fix in
-            // _bundle_byte_sizes / xdna_layer_fused_sizes: q_rot real,
-            // k_rot all-zero, v all-zero (K/V TAPs read past the
-            // packer-written bytes). After the fix: all three should
-            // be finite.
+            // P0.3/P0.4 QKV CORRECTNESS probe: read bo4 at off_q_rot,
+            // off_k_rot, off_v and compare against a reference Qcur/Kcur/
+            // Vcur computed inline from inpL. Confirms the K/V phases
+            // produce the RIGHT projection values (not just finite/
+            // non-zero data) before we invest in O_proj/FFN drain wiring.
+            //
+            // Reference path mirrors the NPU: normed = rms_norm(inpL) *
+            // w_norm1 (bf16-truncated), then Q[j] = dequant(w_q row j) ·
+            // normed. f32 reference vs bf16 NPU → compare with tolerance.
             static std::atomic<bool> qkv_probe_done{false};
             if (dbg && state == ERT_CMD_STATE_COMPLETED
+                    && m.inpL_tensor && m.inpL_tensor->type == GGML_TYPE_F32
+                    && m.inpL_tensor->data
+                    && m.w_norm1 && m.w_norm1->type == GGML_TYPE_F32
+                    && m.w_q && m.w_q->type == GGML_TYPE_Q4_0
+                    && m.w_k && m.w_k->type == GGML_TYPE_Q4_0
+                    && m.w_v && m.w_v->type == GGML_TYPE_Q4_0
                     && !qkv_probe_done.exchange(true)) {
                 const int E_pr = 2048, KV_E_pr = 512;
                 const int MX_pr = 2048, HD_pr = 64;
@@ -9204,32 +9224,91 @@ static bool ggml_backend_xdna_layer_fused_dispatch(
                 const size_t off_v_pr     = off_k_rot_pr + (size_t)KV_E_pr;
                 lb.activations_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
                 const uint16_t * bo4_u16 = lb.activations_bo->map<uint16_t *>();
-                auto count_zone = [&](size_t off, int n,
-                                       int *finite, uint16_t *first_v) {
-                    int fin = 0; *first_v = 0;
-                    for (int i = 0; i < n; i++) {
-                        uint16_t v = bo4_u16[off + i];
-                        if (v == 0) continue;
-                        if (((v >> 7) & 0xFF) == 0xFF) continue;
-                        if (fin == 0) *first_v = v;
-                        fin++;
+
+                // fp16 → f32 (IEEE half → single).
+                auto fp16_f32 = [](uint16_t h) -> float {
+                    uint32_t s = (uint32_t)(h & 0x8000) << 16;
+                    uint32_t e = (h >> 10) & 0x1F;
+                    uint32_t m = h & 0x3FF;
+                    uint32_t out;
+                    if (e == 0) {
+                        if (m == 0) { out = s; }
+                        else {
+                            e = 127 - 15 + 1;
+                            while ((m & 0x400) == 0) { m <<= 1; e--; }
+                            m &= 0x3FF;
+                            out = s | (e << 23) | (m << 13);
+                        }
+                    } else if (e == 0x1F) {
+                        out = s | 0x7F800000 | (m << 13);
+                    } else {
+                        out = s | ((e - 15 + 127) << 23) | (m << 13);
                     }
-                    *finite = fin;
+                    float f; std::memcpy(&f, &out, 4); return f;
                 };
-                int q_fin = 0, k_fin = 0, v_fin = 0;
-                uint16_t q_first = 0, k_first = 0, v_first = 0;
-                count_zone(off_q_rot_pr, E_pr,    &q_fin, &q_first);
-                count_zone(off_k_rot_pr, KV_E_pr, &k_fin, &k_first);
-                count_zone(off_v_pr,     KV_E_pr, &v_fin, &v_first);
-                fprintf(stderr,
-                        "layer_fused QKV-VAL: q=%d "
-                        "q_rot fin=%d/%d first=0x%04X | "
-                        "k_rot fin=%d/%d first=0x%04X | "
-                        "v fin=%d/%d first=0x%04X\n",
-                        m.q_idx,
-                        q_fin, E_pr,    q_first,
-                        k_fin, KV_E_pr, k_first,
-                        v_fin, KV_E_pr, v_first);
+                auto bf16_f32 = [](uint16_t b) -> float {
+                    uint32_t u = (uint32_t)b << 16; float f;
+                    std::memcpy(&f, &u, 4); return f;
+                };
+                auto f32_bf16trunc = [](float f) -> float {
+                    uint32_t u; std::memcpy(&u, &f, 4);
+                    u &= 0xFFFF0000u; float r; std::memcpy(&r, &u, 4); return r;
+                };
+
+                // normed = rms_norm(inpL) * w_norm1, bf16-truncated.
+                const float * inpL = (const float *)m.inpL_tensor->data;
+                const float * gain = (const float *)m.w_norm1->data;
+                std::vector<float> normed(E_pr);
+                double ss = 0.0;
+                for (int i = 0; i < E_pr; i++) ss += (double)inpL[i] * inpL[i];
+                const float rms_inv = 1.0f / std::sqrt((float)(ss / E_pr) + 1e-5f);
+                for (int i = 0; i < E_pr; i++)
+                    normed[i] = f32_bf16trunc((inpL[i] * rms_inv) * gain[i]);
+
+                // dequant(w row) · normed  (Q4_0: 18-byte blocks, -8 bias).
+                auto deq_dot = [&](const struct ggml_tensor * w,
+                                   int row, int K) -> float {
+                    const uint8_t * base = (const uint8_t *)w->data;
+                    const int nb = K / 32;
+                    const uint8_t * rp = base + (size_t)row * nb * 18;
+                    float acc = 0.0f;
+                    for (int b = 0; b < nb; b++) {
+                        const uint8_t * blk = rp + (size_t)b * 18;
+                        uint16_t h; std::memcpy(&h, blk, 2);
+                        const float d = fp16_f32(h);
+                        const uint8_t * qs = blk + 2;
+                        for (int j = 0; j < 16; j++) {
+                            int v0 = (qs[j] & 0x0F) - 8;
+                            int v1 = ((qs[j] >> 4) & 0x0F) - 8;
+                            acc += d * v0 * normed[b*32 + j];
+                            acc += d * v1 * normed[b*32 + j + 16];
+                        }
+                    }
+                    return acc;
+                };
+
+                auto cmp_zone = [&](const char * nm, const struct ggml_tensor * w,
+                                    size_t off, int rows) {
+                    float max_rel = 0.0f, max_abs = 0.0f;
+                    float ref0 = 0, npu0 = 0;
+                    for (int r = 0; r < rows; r++) {
+                        float ref = deq_dot(w, r, E_pr);
+                        float npu = bf16_f32(bo4_u16[off + r]);
+                        if (r == 0) { ref0 = ref; npu0 = npu; }
+                        float ae = std::abs(ref - npu);
+                        float den = std::abs(ref) > 1e-3f ? std::abs(ref) : 1e-3f;
+                        if (ae > max_abs) max_abs = ae;
+                        if (ae / den > max_rel) max_rel = ae / den;
+                    }
+                    fprintf(stderr,
+                            "layer_fused QKV-VAL %s: rows=%d ref0=%.4f npu0=%.4f "
+                            "max_abs=%.4f max_rel=%.3f\n",
+                            nm, rows, ref0, npu0, max_abs, max_rel);
+                };
+                // Q: 256 rows/col but compare first 64 (head 0). K/V: 64 rows.
+                cmp_zone("Q", m.w_q, off_q_rot_pr, 64);
+                cmp_zone("K", m.w_k, off_k_rot_pr, 64);
+                cmp_zone("V", m.w_v, off_v_pr,     64);
             }
 
             // P0.2c-5: one-shot output validation probe. After the
