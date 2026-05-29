@@ -1671,6 +1671,80 @@ static void xdna_repack_q4_0_to_fused_int4(
 //   w_d  =        9,437,184 B  (cols * tiles_per_col_d  * packed_tile_d)
 //
 // All output buffers must be pre-allocated by the caller.
+// ====== Phase A1.3 LayerFused weight packing ===============================
+// Packs the 3 LayerFused weight BOs from ggml Q4_0 tensors:
+//   bo0 (w_qkv_bundle): [W_norm1 bf16 | W_q INT4 | W_k INT4 | W_v INT4]
+//   bo1 (w_o):          [W_o INT4]
+//   bo2 (w_ffn_bundle): [W_norm2 bf16 | W_gate INT4 | W_up INT4 | W_down INT4]
+// W_norm1/W_norm2 are passed as ggml F32 tensors and converted to bf16
+// inline. INT4 weights reuse the post_attn_fused INT4 repacker (verified
+// layout-compatible by P0.2b-3 probe — q_rot drains finite bf16 ≈ -1.30).
+//
+// Layout offsets must match IRON-windows/iron/operators/layer_fused/
+// design.py:65-102.
+static void xdna_pack_layer_fused_w_qkv(
+        const struct ggml_tensor * w_norm1,   // F32, [E]
+        const struct ggml_tensor * w_q,       // Q4_0, [E,E]
+        const struct ggml_tensor * w_k,       // Q4_0, [E,kv_e]
+        const struct ggml_tensor * w_v,       // Q4_0, [E,kv_e]
+        int64_t embed_dim, int64_t kv_embed_dim,
+        int cols, int group_size,
+        uint8_t * bo0_out) {
+    GGML_ASSERT(group_size == 32);
+    GGML_ASSERT(w_q->type == GGML_TYPE_Q4_0);
+    GGML_ASSERT(w_k->type == GGML_TYPE_Q4_0);
+    GGML_ASSERT(w_v->type == GGML_TYPE_Q4_0);
+    const int m_input_qkv = 2;  // matches design.py:65
+
+    // W_norm1 prefix: F32 → bf16 (round-to-zero by truncating low 16 bits).
+    uint16_t * bo0_u16 = (uint16_t *)bo0_out;
+    const float * norm1_f32 = (const float *)w_norm1->data;
+    for (int64_t i = 0; i < embed_dim; i++) {
+        uint32_t bits;
+        std::memcpy(&bits, &norm1_f32[i], 4);
+        bo0_u16[i] = (uint16_t)(bits >> 16);
+    }
+
+    // INT4 packed regions.
+    const size_t off_W_q_bytes = (size_t)embed_dim * 2;
+    const size_t bytes_col_q = (size_t)((embed_dim    / cols) / m_input_qkv)
+                             * ((size_t)m_input_qkv * embed_dim / 2
+                                + (size_t)m_input_qkv * (embed_dim / group_size) * 2);
+    const size_t bytes_col_kv = (size_t)((kv_embed_dim / cols) / m_input_qkv)
+                              * ((size_t)m_input_qkv * embed_dim / 2
+                                 + (size_t)m_input_qkv * (embed_dim / group_size) * 2);
+    const size_t total_q       = (size_t)cols * bytes_col_q;
+    const size_t total_kv_one  = (size_t)cols * bytes_col_kv;
+    const size_t off_W_k_bytes = off_W_q_bytes + total_q;
+    const size_t off_W_v_bytes = off_W_k_bytes + total_kv_one;
+
+    xdna_repack_q4_0_to_fused_int4(
+        (const uint8_t *)w_q->data,
+        embed_dim, embed_dim, m_input_qkv, cols, group_size,
+        bo0_out + off_W_q_bytes);
+    xdna_repack_q4_0_to_fused_int4(
+        (const uint8_t *)w_k->data,
+        kv_embed_dim, embed_dim, m_input_qkv, cols, group_size,
+        bo0_out + off_W_k_bytes);
+    xdna_repack_q4_0_to_fused_int4(
+        (const uint8_t *)w_v->data,
+        kv_embed_dim, embed_dim, m_input_qkv, cols, group_size,
+        bo0_out + off_W_v_bytes);
+}
+
+// Pack BO1 (w_o) — single Q4_0 weight, M=K=embed_dim. Reuses post_attn
+// repacker directly. m_input_o is the post-attn fused tile size.
+static void xdna_pack_layer_fused_w_o(
+        const struct ggml_tensor * w_o,
+        int64_t embed_dim, int cols, int group_size, int m_input_o,
+        uint8_t * bo1_out) {
+    GGML_ASSERT(w_o->type == GGML_TYPE_Q4_0);
+    xdna_repack_q4_0_to_fused_int4(
+        (const uint8_t *)w_o->data,
+        embed_dim, embed_dim, m_input_o, cols, group_size,
+        bo1_out);
+}
+
 static void xdna_pack_post_attn_fused_weights(
         const uint8_t * o_proj_q4_0,
         const uint8_t * gate_q4_0,
@@ -8620,6 +8694,8 @@ static void xdna_plan_layer_fused(
 
         // (1) Pre-attention RMS_NORM: walk Q's src[1] chain back. Llama
         //     pattern: input → RMS_NORM → MUL(gain) → MUL_MAT(Q).
+        //     Capture the MUL's src[1] as gain weight (the actual
+        //     learned norm scale tensor).
         int pre_norm_idx = -1;
         const struct ggml_tensor * w_norm1 = nullptr;
         {
@@ -8630,16 +8706,17 @@ static void xdna_plan_layer_fused(
                     for (int j = std::max(0, q_idx - 12); j < q_idx; j++) {
                         if (cgraph->nodes[j] == cur) {
                             pre_norm_idx = j;
-                            w_norm1 = cur->src[1];   // gain weight (MUL src)
                             break;
                         }
                     }
                     break;
                 }
                 if (!cur->src[0]) break;
-                if (cur->op == GGML_OP_VIEW || cur->op == GGML_OP_RESHAPE ||
-                    cur->op == GGML_OP_PERMUTE || cur->op == GGML_OP_CONT ||
-                    cur->op == GGML_OP_MUL /* gain */) {
+                if (cur->op == GGML_OP_MUL) {
+                    if (cur->src[1] && !w_norm1) w_norm1 = cur->src[1];
+                    cur = cur->src[0];
+                } else if (cur->op == GGML_OP_VIEW || cur->op == GGML_OP_RESHAPE ||
+                    cur->op == GGML_OP_PERMUTE || cur->op == GGML_OP_CONT) {
                     cur = cur->src[0];
                 } else {
                     break;
