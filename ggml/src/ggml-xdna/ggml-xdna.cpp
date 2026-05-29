@@ -8771,25 +8771,84 @@ static void xdna_plan_layer_fused(
 }
 
 // ============================================================================
-// Phase A1.3 step 4a — observer-only dispatch stub. Logs that a match was
-// reached at runtime; always returns false so the existing QKV/SwiGLU
-// dispatch flow runs unchanged. Step 4b will wire get_or_load_layer_fused
-// + DDR_PATCH + 8-arg submit here.
+// Phase A1.3 step 4a/P0.2a — dispatch entry. P0.2a: try loading the
+// layer_fused xclbin via get_or_load_layer_fused_kernel and log result;
+// still return false so the existing QKV/SwiGLU flow runs and byte-exact
+// regression is preserved. Step P0.2b will pack weights + issue a real
+// 8-arg submit when a per-layer match fires.
 // ============================================================================
+// Forward decls for the LayerFused loaders — definitions live further
+// below alongside the post_attn_fused loaders. Local forward to dispatch.
+static std::string make_layer_fused_cache_key(
+        int64_t embed_dim, int64_t hidden_dim,
+        int num_heads, int num_kv_heads, int head_dim, int max_seq_len,
+        int cols, int group_size);
+static bool ensure_layer_fused_compiled(
+        ggml_backend_xdna_context * ctx, const std::string & cache_key,
+        int64_t embed_dim, int64_t hidden_dim,
+        int num_heads, int num_kv_heads, int head_dim, int max_seq_len,
+        int cols, int group_size);
+static xdna_layer_fused_entry * get_or_load_layer_fused_kernel(
+        ggml_backend_xdna_context * ctx, const std::string & cache_key,
+        int64_t embed_dim, int64_t hidden_dim,
+        int num_heads, int num_kv_heads, int head_dim, int max_seq_len,
+        int cols, int group_size);
+
 static bool ggml_backend_xdna_layer_fused_dispatch(
         ggml_backend_xdna_context * ctx,
         const xdna_layer_fused_match & m) {
-    (void)ctx;
     static const bool dbg = getenv("XDNA_DEBUG_LAYER_FUSED") != NULL;
     static std::atomic<int> dbg_budget{dbg ? 8 : 0};
+
+    // Llama-3.2-1B static config — replace with per-model lookup once
+    // P0.2b lands. embed/hidden/num_heads/num_kv_heads/head_dim/cols/
+    // group_size match our IRON layer_fused build.
+    const int64_t embed_dim    = 2048;
+    const int64_t hidden_dim   = 8192;
+    const int     num_heads    = 32;
+    const int     num_kv_heads = 8;
+    const int     head_dim     = 64;
+    const int     max_seq_len  = 2048;
+    const int     cols         = 8;
+    const int     group_size   = 32;
+
+    const std::string cache_key = make_layer_fused_cache_key(
+        embed_dim, hidden_dim, num_heads, num_kv_heads,
+        head_dim, max_seq_len, cols, group_size);
+
+    // Lazy compile + load. ensure_layer_fused_compiled invokes
+    // `compile.py layer-fused` once; get_or_load_layer_fused_kernel
+    // constructs the xrt::kernel and uploads the insts BO.
+    if (!ensure_layer_fused_compiled(ctx, cache_key,
+            embed_dim, hidden_dim, num_heads, num_kv_heads,
+            head_dim, max_seq_len, cols, group_size)) {
+        if (dbg && dbg_budget.fetch_sub(1) > 0) {
+            fprintf(stderr,
+                    "layer_fused dispatch: compile FAILED for q=%d "
+                    "(returning false)\n", m.q_idx);
+        }
+        return false;
+    }
+    xdna_layer_fused_entry * entry = get_or_load_layer_fused_kernel(
+        ctx, cache_key,
+        embed_dim, hidden_dim, num_heads, num_kv_heads,
+        head_dim, max_seq_len, cols, group_size);
+    if (!entry) {
+        if (dbg && dbg_budget.fetch_sub(1) > 0) {
+            fprintf(stderr,
+                    "layer_fused dispatch: kernel load FAILED for q=%d "
+                    "(returning false)\n", m.q_idx);
+        }
+        return false;
+    }
+
     if (dbg && dbg_budget.fetch_sub(1) > 0) {
         fprintf(stderr,
-                "layer_fused stub: q=%d k=%d v=%d q_rope=%d k_rope=%d "
-                "pre_norm=%d o_proj=%d add_attn=%d norm_ffn=%d "
-                "add_ffn=%d -> would dispatch (returning false)\n",
-                m.q_idx, m.k_idx, m.v_idx, m.q_rope_idx, m.k_rope_idx,
-                m.pre_norm_idx, m.o_proj_idx, m.add_attn_idx,
-                m.norm_ffn_idx, m.add_ffn_idx);
+                "layer_fused dispatch: kernel LOADED for q=%d "
+                "(bo0=%zu bo1=%zu bo2=%zu bo3=%zu bo4=%zu) -> stub "
+                "returns false until P0.2b\n",
+                m.q_idx, entry->bo0_bytes, entry->bo1_bytes,
+                entry->bo2_bytes, entry->bo3_bytes, entry->bo4_bytes);
     }
     return false;
 }
