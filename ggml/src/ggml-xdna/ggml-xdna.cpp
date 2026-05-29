@@ -8850,64 +8850,91 @@ static bool ggml_backend_xdna_layer_fused_dispatch(
                 entry->bo2_bytes, entry->bo3_bytes, entry->bo4_bytes);
     }
 
-    // ── P0.2b-1: experimental zero-BO dispatch probe ───────────────
-    // Gated behind XDNA_LAYER_FUSED_TRY=1. Allocate 5 BOs (zeroed),
-    // sync to device, issue the 8-arg MLIR_AIE submit, wait, log
-    // result. Always return false so the existing CPU path still
-    // produces the correct outputs (this probe is a hang/error test).
+    // ── P0.2b-2: per-layer BO cache + repeated dispatch ────────────
+    // Gated behind XDNA_LAYER_FUSED_TRY=1. Per-layer BO bundle is
+    // keyed by the w_qkv tensor pointer (stable per layer, unique
+    // across layers). First dispatch for each layer allocates the 5
+    // BOs against kernel group_ids 3..7 and zeroes/syncs them; later
+    // dispatches reuse the bundle. BOs stay zeroed for now — weight
+    // packing lands in P0.2b-3.
     //
-    // ONE-SHOT per process: we only need to confirm "does the IRON
-    // layer_fused.xclbin actually execute on the NPU?" — anything
-    // beyond that is P0.2b-2 (weight packing) territory.
+    // Goal: confirm that 16 layer-dispatches per cgraph (× many
+    // graph_compute calls) stay stable without NPU crash, hang or
+    // BO-pool exhaustion. Always returns false so CPU still owns
+    // correctness.
     static const bool try_dispatch = xdna_env_enabled("XDNA_LAYER_FUSED_TRY");
-    if (try_dispatch) {
-        static std::atomic<bool> tried{false};
-        if (!tried.exchange(true)) {
-            fprintf(stderr,
-                    "layer_fused PROBE: attempting zero-BO dispatch "
-                    "for q=%d (ONE-SHOT) ...\n", m.q_idx);
-            try {
-                xrt::bo bo0(ctx->device, entry->bo0_bytes,
-                            xrt::bo::flags::host_only,
-                            entry->kernel.group_id(3));
-                xrt::bo bo1(ctx->device, entry->bo1_bytes,
-                            xrt::bo::flags::host_only,
-                            entry->kernel.group_id(4));
-                xrt::bo bo2(ctx->device, entry->bo2_bytes,
-                            xrt::bo::flags::host_only,
-                            entry->kernel.group_id(5));
-                xrt::bo bo3(ctx->device, entry->bo3_bytes,
-                            xrt::bo::flags::host_only,
-                            entry->kernel.group_id(6));
-                xrt::bo bo4(ctx->device, entry->bo4_bytes,
-                            xrt::bo::flags::host_only,
-                            entry->kernel.group_id(7));
-                // Zero-fill is the default for fresh xrt::bo on Windows;
-                // map+memset belt-and-suspenders the assumption.
-                std::memset(bo0.map<void *>(), 0, entry->bo0_bytes);
-                std::memset(bo1.map<void *>(), 0, entry->bo1_bytes);
-                std::memset(bo2.map<void *>(), 0, entry->bo2_bytes);
-                std::memset(bo3.map<void *>(), 0, entry->bo3_bytes);
-                std::memset(bo4.map<void *>(), 0, entry->bo4_bytes);
-                bo0.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-                bo1.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-                bo2.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-                bo3.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-                bo4.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    if (try_dispatch && m.w_q != nullptr) {
+        try {
+            xdna_layer_fused_layer_t & lb = ctx->layer_fused_layer_cache[m.w_q];
+            if (!lb.w_qkv_bo) {
+                auto alloc_bo = [&](const char * name, size_t bytes, int gid)
+                                    -> std::unique_ptr<xrt::bo> {
+                    try {
+                        return std::make_unique<xrt::bo>(
+                            ctx->device, bytes, xrt::bo::flags::host_only,
+                            entry->kernel.group_id(gid));
+                    } catch (const std::exception & e) {
+                        fprintf(stderr,
+                                "layer_fused PROBE: alloc %s (gid=%d "
+                                "size=%zu) FAIL: %s\n",
+                                name, gid, bytes, e.what());
+                        return nullptr;
+                    }
+                };
+                lb.w_qkv_bo        = alloc_bo("w_qkv",       entry->bo0_bytes, 3);
+                lb.w_o_bo          = alloc_bo("w_o",         entry->bo1_bytes, 4);
+                lb.w_ffn_bo        = alloc_bo("w_ffn",       entry->bo2_bytes, 5);
+                lb.kv_pair_bo      = alloc_bo("kv_pair",     entry->bo3_bytes, 6);
+                lb.activations_bo  = alloc_bo("activations", entry->bo4_bytes, 7);
+                if (!lb.w_qkv_bo || !lb.w_o_bo || !lb.w_ffn_bo
+                        || !lb.kv_pair_bo || !lb.activations_bo) {
+                    ctx->layer_fused_layer_cache.erase(m.w_q);
+                    return false;
+                }
+                std::memset(lb.w_qkv_bo      ->map<void *>(), 0, entry->bo0_bytes);
+                std::memset(lb.w_o_bo        ->map<void *>(), 0, entry->bo1_bytes);
+                std::memset(lb.w_ffn_bo      ->map<void *>(), 0, entry->bo2_bytes);
+                std::memset(lb.kv_pair_bo    ->map<void *>(), 0, entry->bo3_bytes);
+                std::memset(lb.activations_bo->map<void *>(), 0, entry->bo4_bytes);
+                lb.w_qkv_bo      ->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                lb.w_o_bo        ->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                lb.w_ffn_bo      ->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                lb.kv_pair_bo    ->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                lb.activations_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                if (dbg) {
+                    fprintf(stderr,
+                            "layer_fused PROBE: layer cache MISS for "
+                            "w_qkv=%p, BOs allocated + zeroed\n",
+                            (const void *)m.w_q);
+                }
+            }
+            auto run = entry->kernel(
+                3, entry->insts_bo, (uint32_t)entry->insts.size(),
+                *lb.w_qkv_bo, *lb.w_o_bo, *lb.w_ffn_bo,
+                *lb.kv_pair_bo, *lb.activations_bo);
+            auto state = run.wait(std::chrono::milliseconds(10000));
+            static std::atomic<int> good{0}, bad{0};
+            if (state == ERT_CMD_STATE_COMPLETED) {
+                good.fetch_add(1);
+            } else {
+                bad.fetch_add(1);
+                if (dbg && bad.load() <= 4) {
+                    fprintf(stderr,
+                            "layer_fused PROBE: BAD state=%d for q=%d "
+                            "(good=%d bad=%d)\n",
+                            (int)state, m.q_idx, good.load(), bad.load());
+                }
+            }
+            static std::atomic<int> rate_log{0};
+            if (dbg && (good.load() + bad.load()) % 64 == 0 &&
+                rate_log.fetch_add(1) < 4) {
                 fprintf(stderr,
-                        "layer_fused PROBE: BOs allocated + zeroed + "
-                        "synced. Issuing submit...\n");
-                auto run = entry->kernel(
-                    3, entry->insts_bo, (uint32_t)entry->insts.size(),
-                    bo0, bo1, bo2, bo3, bo4);
-                // 10 s timeout — if the kernel hangs we report and fail
-                // the probe but don't take down the rest of the run.
-                auto state = run.wait(std::chrono::milliseconds(10000));
-                fprintf(stderr,
-                        "layer_fused PROBE: wait returned state=%d "
-                        "(0=normal, non-zero typically means timeout/abort)\n",
-                        (int)state);
-            } catch (const std::exception & e) {
+                        "layer_fused PROBE: cumulative good=%d bad=%d\n",
+                        good.load(), bad.load());
+            }
+        } catch (const std::exception & e) {
+            static std::atomic<int> err_budget{4};
+            if (dbg && err_budget.fetch_sub(1) > 0) {
                 fprintf(stderr,
                         "layer_fused PROBE: dispatch FAILED: %s\n",
                         e.what());
