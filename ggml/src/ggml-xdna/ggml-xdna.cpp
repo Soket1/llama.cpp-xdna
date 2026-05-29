@@ -1745,6 +1745,75 @@ static void xdna_pack_layer_fused_w_o(
         bo1_out);
 }
 
+// Pack BO2 (w_ffn bundle) for LayerFused dispatch.
+// Layout per design.py:103-104: [W_norm2 bf16 | W_gate INT4 (interleaved
+// with W_up) | W_down INT4]. The gate+up region uses post_attn_fused's
+// tile-interleaved layout: [col0_g0|col0_u0|col0_g1|col0_u1|...|col1_g0|...]
+// — IDENTICAL to xdna_pack_post_attn_fused_weights. We reuse the proven
+// post_attn_fused gate+up packer logic verbatim.
+static void xdna_pack_layer_fused_w_ffn(
+        const struct ggml_tensor * w_norm2,    // F32, [E]
+        const struct ggml_tensor * w_gate,     // Q4_0, [E,H]
+        const struct ggml_tensor * w_up,       // Q4_0, [E,H]
+        const struct ggml_tensor * w_down,     // Q4_0, [H,E]
+        int64_t embed_dim, int64_t hidden_dim,
+        int cols, int group_size,
+        int m_input_gu, int m_input_d,
+        uint8_t * bo2_out) {
+    GGML_ASSERT(group_size == 32);
+    GGML_ASSERT(w_gate->type == GGML_TYPE_Q4_0);
+    GGML_ASSERT(w_up  ->type == GGML_TYPE_Q4_0);
+    GGML_ASSERT(w_down->type == GGML_TYPE_Q4_0);
+
+    // W_norm2 prefix: F32 → bf16 truncation.
+    uint16_t * bo2_u16 = (uint16_t *)bo2_out;
+    const float * norm2_f32 = (const float *)w_norm2->data;
+    for (int64_t i = 0; i < embed_dim; i++) {
+        uint32_t bits;
+        std::memcpy(&bits, &norm2_f32[i], 4);
+        bo2_u16[i] = (uint16_t)(bits >> 16);
+    }
+
+    const size_t off_W_gate_bytes = (size_t)embed_dim * 2;
+
+    // Gate + Up interleaved (mirrors xdna_pack_post_attn_fused_weights:1718-1728).
+    const int64_t groups_embed     = embed_dim / group_size;
+    const size_t  packed_tile_gu   = (size_t)m_input_gu * (size_t)embed_dim / 2
+                                    + (size_t)m_input_gu * (size_t)groups_embed * 2;
+    const int64_t tiles_per_col_gu = (hidden_dim / cols) / m_input_gu;
+    const size_t  bytes_col_gu     = (size_t)tiles_per_col_gu * packed_tile_gu;
+
+    std::vector<uint8_t> gate_tmp((size_t)cols * bytes_col_gu);
+    std::vector<uint8_t> up_tmp  ((size_t)cols * bytes_col_gu);
+    xdna_repack_q4_0_to_fused_int4(
+        (const uint8_t *)w_gate->data, hidden_dim, embed_dim,
+        m_input_gu, cols, group_size, gate_tmp.data());
+    xdna_repack_q4_0_to_fused_int4(
+        (const uint8_t *)w_up->data, hidden_dim, embed_dim,
+        m_input_gu, cols, group_size, up_tmp.data());
+
+    uint8_t * gu_dst = bo2_out + off_W_gate_bytes;
+    for (int col = 0; col < cols; col++) {
+        const size_t col_base_dst = (size_t)col * 2 * bytes_col_gu;
+        const size_t col_base_src = (size_t)col * bytes_col_gu;
+        for (int64_t t = 0; t < tiles_per_col_gu; t++) {
+            const size_t src_off = col_base_src + (size_t)t * packed_tile_gu;
+            const size_t dst_g   = col_base_dst + (size_t)t * 2 * packed_tile_gu;
+            const size_t dst_u   = dst_g + packed_tile_gu;
+            memcpy(gu_dst + dst_g, gate_tmp.data() + src_off, packed_tile_gu);
+            memcpy(gu_dst + dst_u, up_tmp.data()   + src_off, packed_tile_gu);
+        }
+    }
+
+    // Down: M = embed_dim, K = hidden_dim. Lives after gate+up region.
+    const size_t total_gu_bytes = (size_t)cols * 2 * bytes_col_gu;
+    const size_t off_W_down_bytes = off_W_gate_bytes + total_gu_bytes;
+    xdna_repack_q4_0_to_fused_int4(
+        (const uint8_t *)w_down->data, embed_dim, hidden_dim,
+        m_input_d, cols, group_size,
+        bo2_out + off_W_down_bytes);
+}
+
 static void xdna_pack_post_attn_fused_weights(
         const uint8_t * o_proj_q4_0,
         const uint8_t * gate_q4_0,
