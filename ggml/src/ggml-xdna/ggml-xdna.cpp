@@ -9233,6 +9233,37 @@ static bool ggml_backend_xdna_layer_fused_dispatch(
                         near_match, max_abs_err, first_finite);
                 (void)off_x_outL_layout;
             }
+
+            // P0.2c-6: live mode (XDNA_LAYER_FUSED_LIVE=1). When the
+            // gate is on AND dispatch completed AND outL_tensor is
+            // present: read bo4[off_outL], write it back as F32 into
+            // outL_tensor->data so downstream consumers see the NPU
+            // output, and return true so the call site can populate
+            // skip_indices.
+            //
+            // Stays off by default — turning on requires K/V phase
+            // IRON-side block to be resolved first, otherwise outL
+            // is zeros and would corrupt graph_compute output.
+            static const bool live_mode = xdna_env_enabled("XDNA_LAYER_FUSED_LIVE");
+            if (live_mode && state == ERT_CMD_STATE_COMPLETED
+                    && m.outL_tensor && m.outL_tensor->type == GGML_TYPE_F32
+                    && m.outL_tensor->data) {
+                const int E_lv = 2048, KV_E_lv = 512, MX_lv = 2048, HD_lv = 64, H_lv = 8192;
+                const size_t off_outL_lv = (size_t)E_lv + (size_t)2 * MX_lv * HD_lv
+                                         + (size_t)E_lv + (size_t)E_lv
+                                         + (size_t)KV_E_lv + (size_t)KV_E_lv
+                                         + (size_t)E_lv + (size_t)E_lv + (size_t)E_lv
+                                         + (size_t)E_lv + (size_t)E_lv + (size_t)H_lv
+                                         + (size_t)E_lv;
+                lb.activations_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+                const uint16_t * bo4_u16 = lb.activations_bo->map<uint16_t *>();
+                float * dst_f32 = (float *)m.outL_tensor->data;
+                for (int i = 0; i < E_lv; i++) {
+                    uint32_t bits = (uint32_t)bo4_u16[off_outL_lv + i] << 16;
+                    std::memcpy(&dst_f32[i], &bits, 4);
+                }
+                return true;   // signal call site to populate skip_indices
+            }
         } catch (const std::exception & e) {
             static std::atomic<int> err_budget{4};
             if (dbg && err_budget.fetch_sub(1) > 0) {
@@ -15087,17 +15118,32 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
             continue;
         }
 
-        // Phase A1.3 step 4a — LayerFused observer hook (no dispatch).
+        // Phase A1.3 step 4a — LayerFused observer hook.
         // When XDNA_LAYER_FUSED=1 and the pre-scan found a full-layer
-        // match at this Q node, call the stub. It currently logs and
-        // returns false, so the existing QKV/SwiGLU flow below runs
-        // unchanged. Step 4b wires the real dispatch.
+        // match at this Q node, call the dispatch.
+        //   - In observer mode (XDNA_LAYER_FUSED_TRY=1) the dispatch
+        //     packs/syncs/submits but returns false → existing flow runs
+        //   - In live mode (XDNA_LAYER_FUSED_LIVE=1) the dispatch also
+        //     writes back bo4[off_outL] → outL_tensor and returns true;
+        //     we then add the layer's node range to skip_indices so the
+        //     existing CPU/NPU dispatches for those nodes are bypassed.
         if (qkv_enabled) {
             auto lf_it = layer_fused_plan.q_idx_to_match.find(i);
             if (lf_it != layer_fused_plan.q_idx_to_match.end()) {
                 const xdna_layer_fused_match & lf_m =
                     layer_fused_plan.matches[lf_it->second];
-                (void)ggml_backend_xdna_layer_fused_dispatch(ctx, lf_m);
+                if (ggml_backend_xdna_layer_fused_dispatch(ctx, lf_m)) {
+                    // Layer dispatched on NPU — skip every node in the
+                    // [pre_norm_idx, add_ffn_idx] span. The CPU range
+                    // delegate machinery will treat them as no-ops.
+                    int span_lo = lf_m.pre_norm_idx >= 0 ? lf_m.pre_norm_idx : i;
+                    int span_hi = lf_m.add_ffn_idx;
+                    if (span_lo >= 0 && span_hi >= span_lo) {
+                        for (int j = span_lo; j <= span_hi; j++) {
+                            qkv_plan.skip_indices.insert(j);
+                        }
+                    }
+                }
             }
         }
 
