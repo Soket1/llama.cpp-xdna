@@ -8855,13 +8855,23 @@ static bool ggml_backend_xdna_layer_fused_dispatch(
     // keyed by the w_qkv tensor pointer (stable per layer, unique
     // across layers). First dispatch for each layer allocates the 5
     // BOs against kernel group_ids 3..7 and zeroes/syncs them; later
-    // dispatches reuse the bundle. BOs stay zeroed for now — weight
-    // packing lands in P0.2b-3.
+    // dispatches reuse the bundle.
     //
-    // Goal: confirm that 16 layer-dispatches per cgraph (× many
-    // graph_compute calls) stay stable without NPU crash, hang or
-    // BO-pool exhaustion. Always returns false so CPU still owns
-    // correctness.
+    // P0.2b-3 NEGATIVE FINDING (2026-05-29): seeding bo0[W_norm1]=ones
+    // and bo4[x]=ones, then dispatching, then reading bo4[normed]
+    // returns ALL ZEROS. The xclbin runs to ERT_CMD_STATE_COMPLETED but
+    // the IRON layer_fused/design.py rt.sequence has NO `rt.fill(
+    // normed_tap, ...)` drain wired — pre-RMS output stays in L1, never
+    // written back to DDR. Same applies to all other intermediates
+    // (q_rot, k_rot, v, attn_out, ...). The design's sequence is a
+    // structural placeholder at 66% PDI density: tiles compile and
+    // execute, but the activation flow from BO4[x] → ... → BO4[outL]
+    // is not closed. Real weight packing in C++ here cannot produce
+    // meaningful outputs until P0.3 (drain wiring in design.py).
+    //
+    // This step keeps the per-layer BO cache + stable dispatch loop
+    // (P0.2b-2 behaviour) so we can measure NPU-only latency once the
+    // IRON side closes the activation flow.
     static const bool try_dispatch = xdna_env_enabled("XDNA_LAYER_FUSED_TRY");
     if (try_dispatch && m.w_q != nullptr) {
         try {
@@ -8908,6 +8918,7 @@ static bool ggml_backend_xdna_layer_fused_dispatch(
                             (const void *)m.w_q);
                 }
             }
+
             auto run = entry->kernel(
                 3, entry->insts_bo, (uint32_t)entry->insts.size(),
                 *lb.w_qkv_bo, *lb.w_o_bo, *lb.w_ffn_bo,
