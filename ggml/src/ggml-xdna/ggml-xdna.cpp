@@ -9123,7 +9123,7 @@ static bool ggml_backend_xdna_layer_fused_dispatch(
                 const int H_pack         = 8192;
                 const int cols_pack      = 8;
                 const int gs_pack        = 32;
-                const int m_in_o_pack    = 1;   // post_attn_fused matches
+                const int m_in_o_pack    = 2;   // R2-F1: matches design m_input_o=2 (DMA BD 4B align)
                 const int m_in_gu_pack   = 4;
                 const int m_in_d_pack    = 1;
                 xdna_pack_layer_fused_w_qkv(
@@ -9169,6 +9169,19 @@ static bool ggml_backend_xdna_layer_fused_dispatch(
                     uint32_t bits;
                     std::memcpy(&bits, &src_f32[i], 4);
                     bo4_u16[off_x_in + i] = (uint16_t)(bits >> 16);
+                }
+                // R2-F1: seed bo4[attn_out] with a KNOWN vector (= bf16(inpL))
+                // so the O_proj stage has a deterministic input the O_proj-VAL
+                // probe can reference. (Real attn_out comes from the separate
+                // attention dispatch later.)
+                const int E_o = 2048, KV_E_o = 512, MX_o = 2048, HD_o = 64;
+                const size_t off_attn_out_seed =
+                    (size_t)E_o + 2*(size_t)MX_o*HD_o + (size_t)E_o
+                    + (size_t)E_o + (size_t)KV_E_o + (size_t)KV_E_o;
+                for (int i = 0; i < E_o; i++) {
+                    uint32_t bits;
+                    std::memcpy(&bits, &src_f32[i], 4);
+                    bo4_u16[off_attn_out_seed + i] = (uint16_t)(bits >> 16);
                 }
                 lb.activations_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
             }
@@ -9331,6 +9344,54 @@ static bool ggml_backend_xdna_layer_fused_dispatch(
                 cmp_zone("Q", m.w_q, off_q_rot_pr, 64);
                 cmp_zone("K", m.w_k, off_k_rot_pr, 64);
                 cmp_zone("V", m.w_v, off_v_pr,     64);
+            }
+
+            // R2-F1 O_proj-VAL: bo4[o_out] vs CPU O_proj(attn_out). attn_out
+            // was seeded = bf16(inpL), so ref = dequant(w_o row r) · bf16(inpL).
+            static std::atomic<bool> oproj_probe_done{false};
+            if (dbg && state == ERT_CMD_STATE_COMPLETED
+                    && m.inpL_tensor && m.inpL_tensor->type == GGML_TYPE_F32
+                    && m.inpL_tensor->data
+                    && m.w_o && m.w_o->type == GGML_TYPE_Q4_0
+                    && !oproj_probe_done.exchange(true)) {
+                const int E_op = 2048, KV_E_op = 512, MX_op = 2048, HD_op = 64;
+                const size_t off_o_out_op =
+                    (size_t)E_op + 2*(size_t)MX_op*HD_op + (size_t)E_op
+                    + (size_t)E_op + (size_t)KV_E_op + (size_t)KV_E_op
+                    + (size_t)E_op;                     // attn_out + E
+                auto fp16f = [](uint16_t hh) -> float {
+                    uint32_t s=(uint32_t)(hh&0x8000)<<16, e=(hh>>10)&0x1F, m2=hh&0x3FF, o;
+                    if(e==0){ if(m2==0)o=s; else { e=127-15+1; while(!(m2&0x400)){m2<<=1;e--;} m2&=0x3FF; o=s|(e<<23)|(m2<<13);} }
+                    else if(e==0x1F) o=s|0x7F800000|(m2<<13);
+                    else o=s|((e-15+127)<<23)|(m2<<13);
+                    float f; std::memcpy(&f,&o,4); return f; };
+                auto bf16f = [](uint16_t b){ uint32_t u=(uint32_t)b<<16; float f; std::memcpy(&f,&u,4); return f; };
+                const float * inpL = (const float *)m.inpL_tensor->data;
+                std::vector<float> vin(E_op);
+                for (int i=0;i<E_op;i++){ uint32_t u; std::memcpy(&u,&inpL[i],4); u&=0xFFFF0000u; std::memcpy(&vin[i],&u,4); }
+                lb.activations_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+                const uint16_t * bo4 = lb.activations_bo->map<uint16_t *>();
+                const uint8_t * wb = (const uint8_t *)m.w_o->data;
+                const int nb = E_op/32;
+                float max_abs=0, ref0=0, npu0=0;
+                for (int r=0;r<64;r++){
+                    const uint8_t * rp = wb + (size_t)r*nb*18;
+                    float acc=0;
+                    for (int b=0;b<nb;b++){
+                        const uint8_t * blk=rp+(size_t)b*18; uint16_t hh; std::memcpy(&hh,blk,2);
+                        float d=fp16f(hh); const uint8_t * qs=blk+2;
+                        for (int j=0;j<16;j++){
+                            acc += d*((qs[j]&0xF)-8)*vin[b*32+j];
+                            acc += d*(((qs[j]>>4)&0xF)-8)*vin[b*32+j+16];
+                        }
+                    }
+                    float npu=bf16f(bo4[off_o_out_op+r]);
+                    if(r==0){ref0=acc;npu0=npu;}
+                    float ae=std::abs(acc-npu); if(ae>max_abs)max_abs=ae;
+                }
+                fprintf(stderr,
+                        "layer_fused O_proj-VAL: rows=64 ref0=%.4f npu0=%.4f max_abs=%.4f\n",
+                        ref0, npu0, max_abs);
             }
 
             // P0.2c-5: one-shot output validation probe. After the
@@ -14527,7 +14588,7 @@ static std::string make_layer_fused_cache_key(
         int cols, int group_size) {
     char buf[192];
     snprintf(buf, sizeof(buf),
-             "layer_fused_v2_e%lld_h%lld_nh%d_nkv%d_hd%d_mx%d_c%d_g%d",
+             "layer_fused_v3_e%lld_h%lld_nh%d_nkv%d_hd%d_mx%d_c%d_g%d",
              (long long)embed_dim, (long long)hidden_dim,
              num_heads, num_kv_heads, head_dim, max_seq_len,
              cols, group_size);

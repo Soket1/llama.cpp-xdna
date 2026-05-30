@@ -1991,10 +1991,9 @@ def layer_fused_cache_key(embed_dim: int, hidden_dim: int,
         "num_heads": num_heads, "num_kv_heads": num_kv_heads,
         "head_dim": head_dim, "max_seq_len": max_seq_len,
         "num_aie_columns": num_aie_columns, "group_size": group_size,
-        # v2: bo0 Q/K/V region sizes fixed (used to overcount by m_input_qkv,
-        # so K/V TAPs read from past the packer-written bytes — Q output
-        # finite, K/V zero). Bump invalidates the v1 cached xclbin.
-        "version": 2,
+        # v2: bo0 Q/K/V region sizes fixed (m_input_qkv divisor).
+        # v3 (R2-F1): O_proj stage added (MemTile weight split), m_input_o=2.
+        "version": 3,
     }
     return hashlib.sha256(
         json.dumps(key_data, sort_keys=True).encode()
