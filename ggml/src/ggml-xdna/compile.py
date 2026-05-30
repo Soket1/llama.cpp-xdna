@@ -1994,7 +1994,8 @@ def layer_fused_cache_key(embed_dim: int, hidden_dim: int,
         # v2: bo0 Q/K/V region sizes fixed (m_input_qkv divisor).
         # v3 (R2-F1): O_proj stage added (MemTile weight split), m_input_o=2.
         # v4 (R2-F2b): O_proj output joined on-chip (MemTile) → fewer drains.
-        "version": 4,
+        # v5 (R2-F3): QKV + down outputs via per-column MemTile join (F8).
+        "version": 5,
     }
     return hashlib.sha256(
         json.dumps(key_data, sort_keys=True).encode()
