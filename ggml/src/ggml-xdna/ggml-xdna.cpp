@@ -9394,6 +9394,47 @@ static bool ggml_backend_xdna_layer_fused_dispatch(
                         ref0, npu0, max_abs);
             }
 
+            // R2-F2c FFN-VAL: bo4[ffn_in] vs CPU rms_norm(o_out + inpL)*W_norm2.
+            // Uses the NPU o_out (bo4[o_out]) + seeded inpL — checks the ANM
+            // stage (ADD + post-RMS) in isolation.
+            static std::atomic<bool> ffn_probe_done{false};
+            if (dbg && state == ERT_CMD_STATE_COMPLETED
+                    && m.inpL_tensor && m.inpL_tensor->type == GGML_TYPE_F32
+                    && m.inpL_tensor->data
+                    && m.w_norm2 && m.w_norm2->type == GGML_TYPE_F32
+                    && m.w_norm2->data
+                    && !ffn_probe_done.exchange(true)) {
+                const int E_f = 2048, KV_E_f = 512, MX_f = 2048, HD_f = 64;
+                const size_t off_o = (size_t)E_f + 2*(size_t)MX_f*HD_f + (size_t)E_f
+                                   + (size_t)E_f + (size_t)KV_E_f + (size_t)KV_E_f
+                                   + (size_t)E_f;                  // o_out
+                const size_t off_ffn = off_o + 3*(size_t)E_f;      // ffn_in
+                auto bf16f = [](uint16_t b){ uint32_t u=(uint32_t)b<<16; float f; std::memcpy(&f,&u,4); return f; };
+                lb.activations_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+                const uint16_t * bo4 = lb.activations_bo->map<uint16_t *>();
+                const float * inpL = (const float *)m.inpL_tensor->data;
+                const float * g2   = (const float *)m.w_norm2->data;
+                // inpFF = o_out(NPU) + inpL ; rms over E ; ffn_in = inpFF/rms*g2
+                std::vector<float> inpff(E_f);
+                double ss = 0.0;
+                for (int i = 0; i < E_f; i++) {
+                    uint32_t u; std::memcpy(&u,&inpL[i],4); u&=0xFFFF0000u; float li; std::memcpy(&li,&u,4);
+                    inpff[i] = bf16f(bo4[off_o + i]) + li;
+                    ss += (double)inpff[i]*inpff[i];
+                }
+                const float rinv = 1.0f/std::sqrt((float)(ss/E_f)+1e-5f);
+                float max_abs=0, ref0=0, npu0=0;
+                for (int i = 0; i < E_f; i++) {
+                    float ref = inpff[i]*rinv*g2[i];
+                    float npu = bf16f(bo4[off_ffn + i]);
+                    if(i==0){ref0=ref;npu0=npu;}
+                    float ae=std::abs(ref-npu); if(ae>max_abs)max_abs=ae;
+                }
+                fprintf(stderr,
+                        "layer_fused FFN-VAL (ANM): rows=%d ref0=%.4f npu0=%.4f max_abs=%.4f\n",
+                        E_f, ref0, npu0, max_abs);
+            }
+
             // P0.2c-5: one-shot output validation probe. After the
             // dispatch, read bo4[off_outL] and compare against CPU's
             // outL_tensor->data (post-FFN ADD output for this layer).
@@ -14588,7 +14629,7 @@ static std::string make_layer_fused_cache_key(
         int cols, int group_size) {
     char buf[192];
     snprintf(buf, sizeof(buf),
-             "layer_fused_v4_e%lld_h%lld_nh%d_nkv%d_hd%d_mx%d_c%d_g%d",
+             "layer_fused_v5_e%lld_h%lld_nh%d_nkv%d_hd%d_mx%d_c%d_g%d",
              (long long)embed_dim, (long long)hidden_dim,
              num_heads, num_kv_heads, head_dim, max_seq_len,
              cols, group_size);
