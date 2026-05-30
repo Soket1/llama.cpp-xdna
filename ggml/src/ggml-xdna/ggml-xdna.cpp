@@ -14588,7 +14588,7 @@ static std::string make_layer_fused_cache_key(
         int cols, int group_size) {
     char buf[192];
     snprintf(buf, sizeof(buf),
-             "layer_fused_v3_e%lld_h%lld_nh%d_nkv%d_hd%d_mx%d_c%d_g%d",
+             "layer_fused_v4_e%lld_h%lld_nh%d_nkv%d_hd%d_mx%d_c%d_g%d",
              (long long)embed_dim, (long long)hidden_dim,
              num_heads, num_kv_heads, head_dim, max_seq_len,
              cols, group_size);
