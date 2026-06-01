@@ -1015,6 +1015,7 @@ def build_bench_configs() -> list[BenchConfig]:
         BenchConfig(label="NPU INT4 +SwiGLU",  preset="npu_int4_swiglu",  model=MODEL_Q4_0),
         BenchConfig(label="NPU INT4 QKV fused", preset="npu_int4_qkv_fused", model=MODEL_Q4_0),
         BenchConfig(label="NPU Phase B fused", preset="npu_phase_b",      model=MODEL_Q4_0),
+        BenchConfig(label="NPU Layer Fused Live", preset="npu_layer_fused_live", model=MODEL_Q4_0),
     ]
 
 
