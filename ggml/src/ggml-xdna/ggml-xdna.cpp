@@ -8841,8 +8841,21 @@ static void xdna_plan_layer_fused(
             const int scan_end = std::min(q_idx + 60, cgraph->n_nodes);
             for (int j = q_idx + 1; j < scan_end; j++) {
                 if (cgraph->nodes[j]->op != GGML_OP_GLU) continue;
+                if (dbg) {
+                    fprintf(stderr, "ggml-xdna plan debug: found GLU at %d, op=%d, glu_op=%d, cgraph->n_nodes=%d\n",
+                            j, cgraph->nodes[j]->op, ggml_get_glu_op(cgraph->nodes[j]), cgraph->n_nodes);
+                }
                 if (ggml_get_glu_op(cgraph->nodes[j]) != GGML_GLU_OP_SWIGLU) continue;
-                if (j < 2 || j + 1 >= cgraph->n_nodes) continue;
+                if (j < 2 || j + 1 >= cgraph->n_nodes) {
+                    if (dbg) fprintf(stderr, "ggml-xdna plan debug: j bounds check failed\n");
+                    continue;
+                }
+                if (dbg) {
+                    fprintf(stderr, "ggml-xdna plan debug: j-2 op=%d (%s), j-1 op=%d (%s), j+1 op=%d (%s)\n",
+                            cgraph->nodes[j-2]->op, cgraph->nodes[j-2]->name ? cgraph->nodes[j-2]->name : "null",
+                            cgraph->nodes[j-1]->op, cgraph->nodes[j-1]->name ? cgraph->nodes[j-1]->name : "null",
+                            cgraph->nodes[j+1]->op, cgraph->nodes[j+1]->name ? cgraph->nodes[j+1]->name : "null");
+                }
                 if (cgraph->nodes[j-2]->op != GGML_OP_MUL_MAT) continue;
                 if (cgraph->nodes[j-1]->op != GGML_OP_MUL_MAT) continue;
                 if (cgraph->nodes[j+1]->op != GGML_OP_MUL_MAT) continue;
@@ -8986,7 +8999,7 @@ static bool ggml_backend_xdna_layer_fused_dispatch(
     const int     num_kv_heads = 8;
     const int     head_dim     = 64;
     const int     max_seq_len  = 2048;
-    const int     cols         = 8;
+    const int     cols         = ctx->num_cols;
     const int     group_size   = 32;
 
     const std::string cache_key = make_layer_fused_cache_key(
@@ -9121,7 +9134,7 @@ static bool ggml_backend_xdna_layer_fused_dispatch(
                 const int E_pack         = 2048;
                 const int KV_E_pack      = 512;
                 const int H_pack         = 8192;
-                const int cols_pack      = 8;
+                const int cols_pack      = ctx->num_cols;
                 const int gs_pack        = 32;
                 const int m_in_o_pack    = 2;   // R2-F1: matches design m_input_o=2 (DMA BD 4B align)
                 const int m_in_gu_pack   = 4;

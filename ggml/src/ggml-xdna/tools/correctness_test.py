@@ -186,6 +186,24 @@ PRESETS: dict[str, dict[str, str]] = {
         "XDNA_LAYER_FUSED":              "1",
         "XDNA_DEBUG_LAYER_FUSED":        "1",
     },
+    "npu_layer_fused_live": {
+        # Live 4-column LayerFused execution with closed-loop on-chip dataflow
+        "XDNA_ENABLE_GEMV":              "1",
+        "XDNA_ENABLE_SWIGLU":            "1",
+        "XDNA_ENABLE_QKV":               "1",
+        "XDNA_ENABLE_DECODE_BATCH":      "1",
+        "XDNA_ENABLE_TRANSFORMER_BLOCK": "1",
+        "XDNA_ENABLE_FLOWKV_DECODE":     "1",
+        "XDNA_ENABLE_RMS_NORM":          "0",
+        "XDNA_ENABLE_GEMV_INT4":         "1",
+        "XDNA_ENABLE_SWIGLU_INT4":       "1",
+        "XDNA_ENABLE_FUSED_LAYER":       "1",
+        "XDNA_LAYER_FUSED":              "1",
+        "XDNA_DEBUG_LAYER_FUSED":        "1",
+        "XDNA_LAYER_FUSED_TRY":          "1",
+        "XDNA_LAYER_FUSED_LIVE":         "1",
+        "GGML_XDNA_NUM_COLS":            "4",
+    },
     "npu_int4_v1": {
         # Regression-coverage preset that explicitly forces the old v1
         # INT4 GEMV kernel via XDNA_DISABLE_GEMV_INT4_V2=1. Kept so we
@@ -489,7 +507,7 @@ TESTS: list[Test] = [
         n_predict=12,
         mode="single-turn",
         model=MODEL_Q4_0,
-        variants=["npu_int4", "npu_layer_fused"],
+        variants=["npu_int4", "npu_layer_fused", "npu_layer_fused_live"],
         min_prefix_match=1,  # Q4_0 quantization + bf16 dequant drift vs CPU Q4_0.
         description="Phase 8.1 dispatch path: Q4_0 weights routed through fused INT4 dequant-GEMV on NPU. Baseline is CPU-Q4_0; expect minor drift from bf16-vs-fp32 dequant accumulation. npu_layer_fused variant verifies the A1.3 observer stub byte-PASSes (no regression).",
     ),
@@ -900,10 +918,8 @@ def run_test(test: Test, verbose: bool = False,
                 lines = [ln for ln in lines if re.search(grep_stderr, ln)]
             if lines:
                 print(f"    stderr [{variant}] ({len(lines)} line(s) shown):")
-                for ln in lines[:40]:
+                for ln in lines:
                     print(f"      {ln}")
-                if len(lines) > 40:
-                    print(f"      ... ({len(lines) - 40} more)")
 
         if len(v_resp) != len(baseline_resp):
             outcome = "FAIL"
