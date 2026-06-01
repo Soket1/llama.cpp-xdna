@@ -8744,8 +8744,12 @@ static void xdna_plan_layer_fused(
         if (census_budget.fetch_sub(1) > 0) {
             int n_mulmat = 0, n_softmax = 0, n_glu = 0, n_rope = 0;
             int n_rms_norm = 0, n_add = 0, n_set_rows = 0, n_permute = 0;
+            fprintf(stderr, "=== P0.1 cgraph dump (n_nodes=%d) ===\n", cgraph->n_nodes);
             for (int i = 0; i < cgraph->n_nodes; i++) {
-                switch (cgraph->nodes[i]->op) {
+                const struct ggml_tensor * node = cgraph->nodes[i];
+                fprintf(stderr, "  node[%d]: op=%d (%s), name=%s\n",
+                        i, node->op, ggml_op_name(node->op), node->name ? node->name : "null");
+                switch (node->op) {
                     case GGML_OP_MUL_MAT:  n_mulmat++;   break;
                     case GGML_OP_SOFT_MAX: n_softmax++;  break;
                     case GGML_OP_GLU:      n_glu++;      break;
@@ -8830,15 +8834,16 @@ static void xdna_plan_layer_fused(
         if (q_rope_idx < 0) continue;
         ++n_with_rope;
 
-        // (3) SwiGLU pattern: GLU op preceded by 2 MUL_MATs (gate, up)
-        //     and followed by a MUL_MAT (down). Window is large because
-        //     the per-layer span is ~36 nodes (incl. attention math).
         int glu_idx = -1, gate_idx = -1, up_idx = -1, down_idx = -1;
         const struct ggml_tensor * w_gate = nullptr;
         const struct ggml_tensor * w_up   = nullptr;
         const struct ggml_tensor * w_down = nullptr;
         {
             const int scan_end = std::min(q_idx + 60, cgraph->n_nodes);
+            if (dbg) {
+                fprintf(stderr, "ggml-xdna plan debug: scan SwiGLU for q_idx=%d name=%s, scan_end=%d\n",
+                        q_idx, cgraph->nodes[q_idx]->name ? cgraph->nodes[q_idx]->name : "null", scan_end);
+            }
             for (int j = q_idx + 1; j < scan_end; j++) {
                 if (cgraph->nodes[j]->op != GGML_OP_GLU) continue;
                 if (dbg) {
@@ -8866,10 +8871,18 @@ static void xdna_plan_layer_fused(
                 w_gate = cgraph->nodes[gate_idx]->src[0];
                 w_up   = cgraph->nodes[up_idx]->src[0];
                 w_down = cgraph->nodes[down_idx]->src[0];
+                if (dbg) {
+                    fprintf(stderr, "ggml-xdna plan debug: SwiGLU MATCHED at glu_idx=%d for q_idx=%d!\n", glu_idx, q_idx);
+                }
                 break;
             }
         }
-        if (glu_idx < 0) continue;
+        if (glu_idx < 0) {
+            if (dbg) {
+                fprintf(stderr, "ggml-xdna plan debug: SwiGLU NOT found for q_idx=%d\n", q_idx);
+            }
+            continue;
+        }
         ++n_with_swiglu;
 
         // (4) Locate O_proj, post-attn ADD, post-attn norm, post-FFN ADD.

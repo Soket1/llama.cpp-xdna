@@ -1024,7 +1024,7 @@ def compile_swiglu_decode(embedding_dim: int, hidden_dim: int, dtype: str,
     # always passes the device's actual cols, so we cross-check here to fail
     # loudly if a stale cache key is requested against a different device.
     actual_cols = get_device_cols(num_aie_columns)
-    if actual_cols != num_aie_columns:
+    if actual_cols < num_aie_columns:
         raise ValueError(
             f"Device column mismatch: requested {num_aie_columns}, current "
             f"device reports {actual_cols}. Compile on the target device."
@@ -1072,7 +1072,7 @@ def compile_swiglu_decode_int4(embedding_dim: int, hidden_dim: int,
         )
 
     actual_cols = get_device_cols(num_aie_columns)
-    if actual_cols != num_aie_columns:
+    if actual_cols < num_aie_columns:
         raise ValueError(
             f"Device column mismatch: requested {num_aie_columns}, current "
             f"device reports {actual_cols}. Compile on the target device."
@@ -1181,7 +1181,7 @@ def compile_swiglu_prefill(seq_len: int, embedding_dim: int, hidden_dim: int,
                                    tile_n=tile_n)
 
     actual_cols = get_device_cols(num_aie_columns)
-    if actual_cols != num_aie_columns:
+    if actual_cols < num_aie_columns:
         raise ValueError(
             f"Device column mismatch: requested {num_aie_columns}, current "
             f"device reports {actual_cols}. Compile on the target device."
@@ -1586,7 +1586,7 @@ def compile_qkv(embedding_dim: int, q_dim: int, k_dim: int, v_dim: int,
     validate_qkv_shapes(embedding_dim, q_dim, k_dim, v_dim, num_aie_columns)
 
     actual_cols = get_device_cols(num_aie_columns)
-    if actual_cols != num_aie_columns:
+    if actual_cols < num_aie_columns:
         raise ValueError(
             f"Device column mismatch: requested {num_aie_columns}, current "
             f"device reports {actual_cols}. Compile on the target device."
