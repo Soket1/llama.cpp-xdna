@@ -86,6 +86,16 @@ if (XRT_INCLUDE_DIR AND XRT_COREUTIL_LIB)
     else()
         target_compile_features(xrt_async_spike PRIVATE cxx_std_17)
     endif()
+
+    # Generic MLIR_AIE xclbin replay/dispatch harness (standalone).
+    add_executable(xclbin_replay tools/xclbin_replay.cpp)
+    target_include_directories(xclbin_replay SYSTEM PRIVATE ${XRT_INCLUDE_DIR})
+    target_link_libraries(xclbin_replay PRIVATE ${XRT_COREUTIL_LIB})
+    if (MSVC)
+        target_compile_options(xclbin_replay PRIVATE /std:c++17 /Zc:__cplusplus)
+    else()
+        target_compile_features(xclbin_replay PRIVATE cxx_std_17)
+    endif()
 else()
     message(FATAL_ERROR "XRT not found. Install AMD XRT and source /opt/xilinx/xrt/setup.sh\n"
                         "  XRT_INCLUDE_DIR: ${XRT_INCLUDE_DIR}\n"
