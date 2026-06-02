@@ -119,18 +119,43 @@ int main(int argc, char ** argv) {
         auto nonzero = [](const uint8_t * p, size_t n) -> size_t {
             size_t c = 0; for (size_t i = 0; i < n; i++) c += (p[i] != 0); return c;
         };
+        // Optional per-BO file contents: argv tokens "boN=path" load a file
+        // into bo N (BO size = max(declared, file size)); else fill a pattern.
+        std::string bo_file[5];
+        for (int i = 1; i < argc; i++) {
+            std::string a = argv[i];
+            if (a.size() > 4 && a[0] == 'b' && a[1] == 'o' && a[3] == '=') {
+                int idx = a[2] - '0';
+                if (idx >= 0 && idx < 5) bo_file[idx] = a.substr(4);
+            }
+        }
+
         std::vector<xrt::bo> data_bos(5);
+        size_t act[5] = {0, 0, 0, 0, 0};
         for (int i = 0; i < 5; i++) {
-            if (bo_bytes[i] == 0) continue;
-            data_bos[i] = xrt::bo(device, bo_bytes[i], xrt::bo::flags::host_only,
+            std::vector<char> fd;
+            act[i] = bo_bytes[i];
+            if (!bo_file[i].empty()) {
+                fd = read_file(bo_file[i]);
+                if (fd.size() > act[i]) act[i] = fd.size();
+            }
+            if (act[i] == 0) continue;
+            data_bos[i] = xrt::bo(device, act[i], xrt::bo::flags::host_only,
                                   kernel.group_id(3 + i));
             uint8_t * m = data_bos[i].map<uint8_t*>();
-            // deterministic per-arg byte pattern (avoid all-equal so GEMV != 0)
-            for (size_t b = 0; b < bo_bytes[i]; b++)
-                m[b] = (uint8_t)((b * 131 + i * 17 + 1) & 0xff);
+            // bf16-safe fill: small positive values (~0.008..0.016), never
+            // NaN/inf, so dummy activation/KV inputs don't poison the GEMV.
+            // exp field 0x78 (=2^-7) with varying mantissa.
+            uint16_t * w = reinterpret_cast<uint16_t*>(m);
+            size_t nw = act[i] / 2;
+            for (size_t b = 0; b < nw; b++)
+                w[b] = (uint16_t)(0x3C00u | ((b * 7 + (size_t)i) & 0x3FFu));
+            if (act[i] & 1) m[act[i] - 1] = 0;
+            if (!fd.empty()) std::memcpy(m, fd.data(), fd.size());
             data_bos[i].sync(XCL_BO_SYNC_BO_TO_DEVICE);
-            fprintf(stderr, "replay: bo%d (arg%d) = %zu B  pre-csum=%016llx\n",
-                    i, 3 + i, bo_bytes[i], (unsigned long long)checksum(m, bo_bytes[i]));
+            fprintf(stderr, "replay: bo%d (arg%d) = %zu B %spre-csum=%016llx\n",
+                    i, 3 + i, act[i], (bo_file[i].empty() ? "" : "[file] "),
+                    (unsigned long long)checksum(m, act[i]));
         }
 
         auto run = xrt::run(kernel);
@@ -138,7 +163,7 @@ int main(int argc, char ** argv) {
         run.set_arg(1, insts_bo);
         run.set_arg(2, ninstr);
         for (int i = 0; i < 5; i++) {
-            if (bo_bytes[i] != 0) run.set_arg(3 + i, data_bos[i]);
+            if (act[i] != 0) run.set_arg(3 + i, data_bos[i]);
         }
 
         // Warm dispatch (also the go/no-go: does the NPU complete?).
@@ -159,14 +184,20 @@ int main(int argc, char ** argv) {
         // Read every BO back: which one(s) did the NPU write? A changed csum
         // (vs the pre-dispatch pattern) proves the kernel actually executed.
         for (int i = 0; i < 5; i++) {
-            if (bo_bytes[i] == 0) continue;
+            if (act[i] == 0) continue;
             data_bos[i].sync(XCL_BO_SYNC_BO_FROM_DEVICE);
             const uint8_t * m = data_bos[i].map<uint8_t*>();
-            // re-derive the pre-pattern csum cheaply by sampling: just report
-            // post csum + nonzero count; compare against the pre line above.
             fprintf(stderr, "replay: bo%d post-csum=%016llx nonzero=%zu/%zu\n",
-                    i, (unsigned long long)checksum(m, bo_bytes[i]),
-                    nonzero(m, bo_bytes[i]), bo_bytes[i]);
+                    i, (unsigned long long)checksum(m, act[i]),
+                    nonzero(m, act[i]), act[i]);
+        }
+
+        // Dump bo0 (the layer output activation) for off-line analysis.
+        if (act[0] != 0) {
+            const uint8_t * m = data_bos[0].map<uint8_t*>();
+            std::ofstream of("replay_bo0_out.bin", std::ios::binary);
+            of.write(reinterpret_cast<const char*>(m), (std::streamsize)act[0]);
+            fprintf(stderr, "replay: wrote bo0 -> replay_bo0_out.bin (%zu B)\n", act[0]);
         }
 
         if (iters > 1) {
