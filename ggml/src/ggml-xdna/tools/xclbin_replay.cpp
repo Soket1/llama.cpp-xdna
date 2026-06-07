@@ -122,11 +122,16 @@ int main(int argc, char ** argv) {
         // Optional per-BO file contents: argv tokens "boN=path" load a file
         // into bo N (BO size = max(declared, file size)); else fill a pattern.
         std::string bo_file[5];
+        int dump_idx = 0;   // which BO to dump to replay_bo0_out.bin (default bo0)
         for (int i = 1; i < argc; i++) {
             std::string a = argv[i];
             if (a.size() > 4 && a[0] == 'b' && a[1] == 'o' && a[3] == '=') {
                 int idx = a[2] - '0';
                 if (idx >= 0 && idx < 5) bo_file[idx] = a.substr(4);
+            }
+            if (a.rfind("dump=", 0) == 0) {
+                dump_idx = std::atoi(a.c_str() + 5);
+                if (dump_idx < 0 || dump_idx >= 5) dump_idx = 0;
             }
         }
 
@@ -192,12 +197,16 @@ int main(int argc, char ** argv) {
                     nonzero(m, act[i]), act[i]);
         }
 
-        // Dump bo0 (the layer output activation) for off-line analysis.
-        if (act[0] != 0) {
-            const uint8_t * m = data_bos[0].map<uint8_t*>();
+        // Dump the selected output BO (default bo0; override with dump=N) for
+        // off-line analysis. Filename kept as replay_bo0_out.bin for driver
+        // compatibility regardless of which BO was dumped. Needed for ops whose
+        // output is not arg3/bo0 (e.g. flowkv_decode output = bo3).
+        if (act[dump_idx] != 0) {
+            const uint8_t * m = data_bos[dump_idx].map<uint8_t*>();
             std::ofstream of("replay_bo0_out.bin", std::ios::binary);
-            of.write(reinterpret_cast<const char*>(m), (std::streamsize)act[0]);
-            fprintf(stderr, "replay: wrote bo0 -> replay_bo0_out.bin (%zu B)\n", act[0]);
+            of.write(reinterpret_cast<const char*>(m), (std::streamsize)act[dump_idx]);
+            fprintf(stderr, "replay: wrote bo%d -> replay_bo0_out.bin (%zu B)\n",
+                    dump_idx, act[dump_idx]);
         }
 
         if (iters > 1) {
