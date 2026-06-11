@@ -366,6 +366,53 @@ struct xdna_dispatch_timer {
     }
 };
 
+// ---------------------------------------------------------------------------
+// Per-dispatch HOST submit-latency breakdown (Phase 0 #35 overhead probe).
+// Gate: XDNA_DEBUG_SUBMIT_BREAKDOWN=1. Attributes the ~2ms steady-state host
+// "submit" time into 3 phases so we know WHICH op to optimize before touching
+// anything: KEY = make_cache_key + ensure_compiled (disk I/O!) + get_or_load;
+// PREP = activation pack + bo::sync(TO_DEVICE) + weight-cache lookup;
+// SUB = entry->kernel(...) run construction + XRT submit. Prints a rolling
+// average every 200 calls per kernel name. Pure measurement, no behavior change.
+// ---------------------------------------------------------------------------
+struct xdna_submit_breakdown {
+    int64_t n = 0, key_us = 0, prep_us = 0, sub_us = 0, wait_us = 0, sync_us = 0;
+    int64_t pk = 0, pprep = 0, psub = 0, pwait = 0, psync = 0;   // prev cumulative (for incremental)
+    static bool on() {
+        static const bool e = xdna_env_enabled("XDNA_DEBUG_SUBMIT_BREAKDOWN");
+        return e;
+    }
+    static std::unordered_map<std::string, xdna_submit_breakdown> & store() {
+        static std::unordered_map<std::string, xdna_submit_breakdown> m;
+        return m;
+    }
+    // wait/sync optional (host-only sites pass 0). Prints BOTH cumulative-avg
+    // and the incremental delta-avg over the last 200 calls (the true
+    // steady-state, since cumulative is polluted by warmup).
+    static void add(const char * k, int64_t key, int64_t prep, int64_t sub,
+                    int64_t wait = 0, int64_t sync = 0) {
+        if (!on()) return;
+        auto & a = store()[k];
+        a.n++; a.key_us += key; a.prep_us += prep; a.sub_us += sub;
+        a.wait_us += wait; a.sync_us += sync;
+        if (a.n % 200 == 0) {
+            const double d = 200.0;
+            fprintf(stderr,
+                "ggml-xdna: [SUBMIT-BD] %-16s n=%lld STEADY(last200,us): key=%.1f prep=%.1f submit=%.1f wait=%.1f sync=%.1f host=%.1f full=%.1f\n",
+                k, (long long)a.n,
+                (a.key_us - a.pk) / d, (a.prep_us - a.pprep) / d,
+                (a.sub_us - a.psub) / d, (a.wait_us - a.pwait) / d,
+                (a.sync_us - a.psync) / d,
+                (a.key_us - a.pk + a.prep_us - a.pprep + a.sub_us - a.psub) / d,
+                (a.key_us - a.pk + a.prep_us - a.pprep + a.sub_us - a.psub
+                 + a.wait_us - a.pwait + a.sync_us - a.psync) / d);
+            fflush(stderr);
+            a.pk = a.key_us; a.pprep = a.prep_us; a.psub = a.sub_us;
+            a.pwait = a.wait_us; a.psync = a.sync_us;
+        }
+    }
+};
+
 // Phase 9: backend-wide tracker of in-flight async dispatches. Each
 // entry holds a wait_fn that blocks until the underlying NPU work is
 // complete (this can wrap xrt::run::wait2() for single runs, or
@@ -2695,6 +2742,10 @@ static void ggml_backend_xdna_mul_mat_gemv_int4(ggml_backend_xdna_context * ctx,
         return;
     }
 
+    const bool _bd = xdna_submit_breakdown::on();
+    std::chrono::steady_clock::time_point _bdA, _bdB, _bdC;
+    if (_bd) _bdA = std::chrono::steady_clock::now();
+
     const std::string cache_key = make_cache_key(XDNA_OP_GEMV_INT4, 1, K, N, "uint4", num_cols);
 
     if (!ensure_compiled(ctx, cache_key, XDNA_OP_GEMV_INT4, 1, K, N, "uint4", num_cols)) {
@@ -2705,6 +2756,7 @@ static void ggml_backend_xdna_mul_mat_gemv_int4(ggml_backend_xdna_context * ctx,
 
     xdna_kernel_entry * entry = get_or_load_kernel(ctx, cache_key, XDNA_OP_GEMV_INT4, 1, K, N);
     if (!entry) return;
+    if (_bd) _bdB = std::chrono::steady_clock::now();
 
     try {
         const size_t vec_bytes = (size_t)K * sizeof(uint16_t);
@@ -2858,6 +2910,7 @@ static void ggml_backend_xdna_mul_mat_gemv_int4(ggml_backend_xdna_context * ctx,
         // Dispatch — same arg order as bf16 GEMV (opcode, insts, n_insts, mat, vec, out).
         // [Phase 0 spec-dec probe] XDNA_DEBUG_TIMING=1 prints submit/wait split
         // (kernel(...) returns after XRT submit, run.wait() blocks for NPU done).
+        if (_bd) _bdC = std::chrono::steady_clock::now();
         xdna_dispatch_timer _g4_t("int4_gemv", -1);
         _g4_t.mark_sync_pre_done();
         static const bool dbg_timing = xdna_env_enabled("XDNA_DEBUG_TIMING");
@@ -2867,6 +2920,11 @@ static void ggml_backend_xdna_mul_mat_gemv_int4(ggml_backend_xdna_context * ctx,
                                   *weight_bo_ptr, *a_bo_ptr, *c_bo_ptr);
         const auto t1 = dbg_timing ? std::chrono::steady_clock::now() : t0;
         _g4_t.mark_submit_done();
+        if (_bd) xdna_submit_breakdown::add("int4_gemv",
+            std::chrono::duration_cast<std::chrono::microseconds>(_bdB - _bdA).count(),
+            std::chrono::duration_cast<std::chrono::microseconds>(_bdC - _bdB).count(),
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - _bdC).count());
 
         // Phase 9 async path: opt-in via XDNA_ENABLE_PHASE9=1. Capture all
         // state needed for bias compensation into a deferred lambda + push
@@ -3651,6 +3709,10 @@ static void ggml_backend_xdna_mul_mat_qkv_int4_fused(
     if (total_N % num_cols != 0) return;
     if (K % group_size != 0) return;
 
+    const bool _bd = xdna_submit_breakdown::on();
+    std::chrono::steady_clock::time_point _bdA, _bdB, _bdC;
+    if (_bd) _bdA = std::chrono::steady_clock::now();
+
     const std::string cache_key = make_cache_key(
         XDNA_OP_GEMV_INT4, 1, K, total_N, "uint4", num_cols);
 
@@ -3669,6 +3731,7 @@ static void ggml_backend_xdna_mul_mat_qkv_int4_fused(
     xdna_kernel_entry * entry = get_or_load_kernel(
         ctx, cache_key, XDNA_OP_GEMV_INT4, 1, K, total_N);
     if (!entry) return;
+    if (_bd) _bdB = std::chrono::steady_clock::now();
 
     try {
         const auto [tile_in, tile_out] = xdna_select_gemv_tiles_int4(total_N, K, num_cols);
@@ -3744,13 +3807,28 @@ static void ggml_backend_xdna_mul_mat_qkv_int4_fused(
         }
 
         // Single dispatch for all 3 projections.
+        if (_bd) _bdC = std::chrono::steady_clock::now();
         auto run = entry->kernel(3, entry->insts_bo, (uint32_t)entry->insts.size(),
                                   *weight_bo_ptr, *entry->a_bo, *entry->c_bo);
         _qkv_t.mark_submit_done();
+        const auto _bdD = _bd ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::time_point{};
         run.wait();
         _qkv_t.mark_wait_done();
+        const auto _bdE = _bd ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::time_point{};
         entry->c_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
         _qkv_t.mark_sync_post_done();
+        if (_bd) {
+            using us = std::chrono::microseconds;
+            xdna_submit_breakdown::add("qkv_int4_fused",
+                std::chrono::duration_cast<us>(_bdB - _bdA).count(),
+                std::chrono::duration_cast<us>(_bdC - _bdB).count(),
+                std::chrono::duration_cast<us>(_bdD - _bdC).count(),
+                std::chrono::duration_cast<us>(_bdE - _bdD).count(),
+                std::chrono::duration_cast<us>(
+                    std::chrono::steady_clock::now() - _bdE).count());
+        }
 
         // Bias compensation: S[g] = sum_k(x[k]) in group g.
         const uint16_t * x_bf16  = (const uint16_t *)entry->a_bo->map<void*>();
