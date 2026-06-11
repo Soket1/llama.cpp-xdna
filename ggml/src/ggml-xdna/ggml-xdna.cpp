@@ -395,8 +395,13 @@ struct xdna_submit_breakdown {
         auto & a = store()[k];
         a.n++; a.key_us += key; a.prep_us += prep; a.sub_us += sub;
         a.wait_us += wait; a.sync_us += sync;
-        if (a.n % 200 == 0) {
-            const double d = 200.0;
+        static const int64_t period = []() {
+            const char * p = getenv("XDNA_DEBUG_SUBMIT_BD_PERIOD");
+            int64_t v = (p && *p) ? strtoll(p, NULL, 10) : 200;
+            return v > 0 ? v : 200;
+        }();
+        if (a.n % period == 0) {
+            const double d = (double)period;
             fprintf(stderr,
                 "ggml-xdna: [SUBMIT-BD] %-16s n=%lld STEADY(last200,us): key=%.1f prep=%.1f submit=%.1f wait=%.1f sync=%.1f host=%.1f full=%.1f\n",
                 k, (long long)a.n,
@@ -3006,8 +3011,22 @@ static void ggml_backend_xdna_mul_mat_gemv_int4(ggml_backend_xdna_context * ctx,
         }
 
         // Sync path (Phase 9 disabled). Same as Step 2: wait + inline bias.
+        const auto _bdW = _bd ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::time_point{};
         run.wait();
         _g4_t.mark_wait_done();
+        if (_bd) {
+            using us = std::chrono::microseconds;
+            char shape_key[48];
+            snprintf(shape_key, sizeof(shape_key), "gemv_K%lld_N%lld",
+                     (long long)K, (long long)N);
+            xdna_submit_breakdown::add(shape_key,
+                std::chrono::duration_cast<us>(_bdB - _bdA).count(),
+                std::chrono::duration_cast<us>(_bdC - _bdB).count(),
+                std::chrono::duration_cast<us>(_bdW - _bdC).count(),
+                std::chrono::duration_cast<us>(
+                    std::chrono::steady_clock::now() - _bdW).count(), 0);
+        }
         const auto t2 = dbg_timing ? std::chrono::steady_clock::now() : t1;
         if (dbg_timing) {
             const auto submit_us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
