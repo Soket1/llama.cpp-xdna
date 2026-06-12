@@ -112,6 +112,7 @@ enum xdna_op_kind : int {
     XDNA_OP_GEMV_INT4           = 10, // M==1  fused INT4-dequant + GEMV (Q4_0 weights, bf16 acts)
     XDNA_OP_SWIGLU_DECODE_INT4  = 11, // M==1  W4A16 fused SwiGLU FFN (Q4_0 weights, bf16 acts; Phase 8.2)
     XDNA_OP_GEMV_INT4_BATCH     = 12, // M=2..8 fused INT4-dequant + batched GEMV (spec-dec verify)
+    XDNA_OP_FFN16_2MM           = 13, // M==1 16-tile fused FFN (gate+up+silu+mul+down) single dispatch
 };
 
 // Phase 9: per-entry input/output BO ring for async dispatch. Each call
@@ -141,6 +142,9 @@ struct xdna_kernel_entry {
     // wait-per-op pattern. Phase 9 INT4 GEMV dispatch uses the ring below.
     std::unique_ptr<xrt::bo> a_bo;
     std::unique_ptr<xrt::bo> c_bo;
+    // FFN16_2MM extra BOs: O(out)/W via a_bo-pattern + 2 dummy (D3,D4).
+    std::unique_ptr<xrt::bo> d3_bo;
+    std::unique_ptr<xrt::bo> d4_bo;
     // Phase 9 per-call BO ring. Indexed 0..XDNA_PHASE9_RING_SIZE-1.
     // The ring's per-slot run + deferred lambda live in the context-level
     // inflight tracker (xdna_inflight_tracker), keyed by slot_dst_data[i].
@@ -1343,6 +1347,11 @@ static std::string make_cache_key(xdna_op_kind op_kind,
         // v3 batched GEMV: M encodes M_BATCH (2/4/8).
         snprintf(buf, sizeof(buf), "gemv_int4_v3_K%lld_N%lld_mb%lld_%dcol_g32",
                  (long long)K, (long long)N, (long long)M, num_cols);
+    } else if (op_kind == XDNA_OP_FFN16_2MM) {
+        // 16-tile fused FFN: K=embedding_dim, N=hidden_dim. Single dispatch
+        // (gate+up+silu+mul+down on-chip). num_cols fixed at 4 in the IRON op.
+        snprintf(buf, sizeof(buf), "ffn16_2mm_K%lld_N%lld_%dcol_g32",
+                 (long long)K, (long long)N, num_cols);
     } else {
         snprintf(buf, sizeof(buf), "gemm_%lldx%lldx%lld_%s_%dcol",
                  (long long)M, (long long)K, (long long)N, dtype_in, num_cols);
@@ -2352,6 +2361,17 @@ static bool ensure_compiled(ggml_backend_xdna_context * ctx,
         if (xf.good() && inf.good()) {
             return true;
         }
+    }
+
+    // FFN16_2MM is pre-built offline (IRON op, not in compile.py). If the
+    // xclbin/insts aren't already in the cache dir, we cannot build them here —
+    // signal failure so the caller falls back to the chained swiglu path.
+    if (op_kind == XDNA_OP_FFN16_2MM) {
+        GGML_LOG_ERROR("ggml-xdna: ffn16_2mm xclbin not found in cache (%s); "
+                       "place prebuilt artifacts to enable. Falling back.\n",
+                       xclbin_path.c_str());
+        ctx->kernel_compile_failed.insert(cache_key);
+        return false;
     }
 
     // Compile via Python subprocess
@@ -3937,6 +3957,293 @@ static void ggml_backend_xdna_mul_mat_qkv_int4_fused(
         ggml_backend_xdna_mul_mat_gemv_int4(ctx, q_dst);
         ggml_backend_xdna_mul_mat_gemv_int4(ctx, k_dst);
         ggml_backend_xdna_mul_mat_gemv_int4(ctx, v_dst);
+    }
+}
+
+// =============================================================================
+// decode_ffn16_2mm: 16-tile fused FFN (gate+up+silu+mul+down) single dispatch.
+//
+// Mirrors dev_notes/track_a_build/diff_ffn16_real_weights.py packing (PASS
+// rel_L2=0.0146 on real layer-0 Q4_0 weights). The IRON op is hardcoded to
+// num_cols=4, m_input=4, group_size=32. Weight layout per validate_ffn16_2mm.py:
+//   - per-tile block = gate(GU_T rows) ++ up(GU_T rows) ++ down(DN_E rows),
+//     each M=4-row tile packed as [M*K/2 nibbles][M*(K/G)*2 bf16 scale], pad PACKED.
+//   - gate/up: SIGNED int4 = (nib_unsigned - 8) & 0xF, K=E. SiLU is nonlinear so
+//     the -8 is folded into the weights (no host bias-comp possible).
+//   - down: UNSIGNED int4 = nib_unsigned as-is, K=Hc16. The on-chip reduce
+//     absorbs the +8 (no host bias-comp — kernel and CPU-ref agree on nib*scale).
+//   - W.bin layout: for c in NC, build seq[r] = concat(gate_t, up_t, down_t) for
+//     tile t=c*R+r; then for s in SPC, stream = tiles {s*TPS .. s*TPS+TPS},
+//     col_s = stack(stream, axis=1) (round-major), append col_s flattened.
+// =============================================================================
+
+// Pack one weight matrix slice into m_input-row tiles. src is Q4_0 (logical
+// [n_rows, K]). `sub8` selects signed (gate/up) vs unsigned (down) nibbles.
+// Output: tiles_out[(n_rows/m_input)][pad_to] uint8 (row-major over tiles).
+static void xdna_ffn16_pack_tiles(const uint8_t * q4_0_src,
+                                  int64_t n_rows, int64_t K,
+                                  int m_input, int group_size, bool sub8,
+                                  size_t pad_to, uint8_t * tiles_out) {
+    const int64_t num_groups = K / group_size;
+    const size_t Q4_0_BLOCK = 2 + 16;             // fp16 scale + 16 nibble bytes
+    const size_t row_stride = (size_t)num_groups * Q4_0_BLOCK;
+    const size_t weight_bytes_per_row = (size_t)K / 2;
+    const size_t scale_bytes_per_row  = (size_t)num_groups * 2;
+    const int64_t n_tiles = n_rows / m_input;
+
+    for (int64_t t = 0; t < n_tiles; t++) {
+        uint8_t * tile_dst = tiles_out + (size_t)t * pad_to;
+        // 1. Nibbles for m_input consecutive rows.
+        for (int r = 0; r < m_input; r++) {
+            const uint8_t * row_src = q4_0_src + (size_t)(t * m_input + r) * row_stride;
+            uint8_t * row_dst = tile_dst + (size_t)r * weight_bytes_per_row;
+            for (int64_t g = 0; g < num_groups; g++) {
+                const uint8_t * qs = row_src + (size_t)g * Q4_0_BLOCK + 2;
+                uint8_t e[32];
+                for (int j = 0; j < 16; j++) {
+                    uint8_t lo =  qs[j]       & 0x0F;
+                    uint8_t hi = (qs[j] >> 4) & 0x0F;
+                    if (sub8) { lo = (uint8_t)((lo - 8) & 0x0F); hi = (uint8_t)((hi - 8) & 0x0F); }
+                    e[j]      = lo;
+                    e[j + 16] = hi;
+                }
+                uint8_t * blk_dst = row_dst + (size_t)g * 16;
+                for (int k = 0; k < 16; k++) {
+                    blk_dst[k] = (uint8_t)(e[2*k] | (e[2*k + 1] << 4));
+                }
+            }
+        }
+        // 2. bf16 scales (from fp16 d) for m_input rows, after the nibble region.
+        const size_t scale_region = (size_t)m_input * weight_bytes_per_row;
+        for (int r = 0; r < m_input; r++) {
+            const uint8_t * row_src = q4_0_src + (size_t)(t * m_input + r) * row_stride;
+            uint16_t * scale_dst = (uint16_t *)(tile_dst + scale_region
+                + (size_t)r * scale_bytes_per_row);
+            for (int64_t g = 0; g < num_groups; g++) {
+                uint16_t fp16_val;
+                memcpy(&fp16_val, row_src + (size_t)g * Q4_0_BLOCK, 2);
+                scale_dst[g] = fp16_to_bf16(fp16_val);
+            }
+        }
+    }
+}
+
+// Pack gate/up/down Q4_0 weights into the decode_ffn16_2mm W.bin layout.
+static void xdna_repack_q4_0_ffn16_2mm(
+        const uint8_t * gate_src, const uint8_t * up_src, const uint8_t * down_src,
+        int64_t E, int64_t H, int group_size, uint8_t * packed_out) {
+    const int NC = 4, R = 4, M = 4;
+    const int NT = NC * R;                 // 16
+    const int SPC = 2, TPS = R / SPC;      // 2, 2
+    const int64_t Hc16 = H / NT;           // 512
+    const int64_t GU_T = Hc16 / M;         // 128 tiles per gate/up slice
+    const int64_t DN_T = E / M;            // down output tiles
+    const size_t PACKED    = (size_t)M * E / 2 + (size_t)M * (E / group_size) * 2;
+    const size_t DN_PACKED = (size_t)M * Hc16 / 2 + (size_t)M * (Hc16 / group_size) * 2;
+    const int64_t DN_SUB = PACKED / DN_PACKED;   // how many DN tiles fit a PACKED slot
+    const int64_t DN_E   = DN_T / DN_SUB;
+    const int64_t WT_PER_TILE = GU_T + GU_T + DN_E;
+
+    // Scratch for one tile's gate/up/down packed rows (WT_PER_TILE * PACKED).
+    std::vector<uint8_t> seq((size_t)R * WT_PER_TILE * PACKED);
+
+    size_t out_off = 0;
+    for (int c = 0; c < NC; c++) {
+        // Build seq[r] = concat(gate_t, up_t, down_t) for tile t=c*R+r.
+        for (int r = 0; r < R; r++) {
+            const int t = c * R + r;
+            uint8_t * seq_r = seq.data() + (size_t)r * WT_PER_TILE * PACKED;
+            // gate: rows [t*Hc16 : (t+1)*Hc16] of gate weight (H rows, K=E cols).
+            xdna_ffn16_pack_tiles(gate_src + (size_t)t * Hc16 * ((E / group_size) * 18),
+                                  Hc16, E, M, group_size, /*sub8=*/true,
+                                  PACKED, seq_r);
+            xdna_ffn16_pack_tiles(up_src + (size_t)t * Hc16 * ((E / group_size) * 18),
+                                  Hc16, E, M, group_size, /*sub8=*/true,
+                                  PACKED, seq_r + (size_t)GU_T * PACKED);
+            // down: weight is logical [H rows, E cols] stored row-major over E
+            // output rows, each row K=H. tile t uses hidden cols [t*Hc16:(t+1)*Hc16].
+            // We pack a [E rows, Hc16 cols] slice -> DN_T tiles of DN_PACKED, then
+            // reinterpret as DN_E rows of PACKED (DN_PACKED * DN_SUB == PACKED).
+            // Extract the column slice into a contiguous Q4_0 buffer first.
+            {
+                const int64_t nb_full = E / group_size; (void)nb_full;
+                const int64_t hb = Hc16 / group_size;          // groups in the slice
+                const int64_t hb_full = H / group_size;        // groups per down row
+                std::vector<uint8_t> down_slice((size_t)E * hb * 18);
+                for (int64_t row = 0; row < E; row++) {
+                    const uint8_t * src_row = down_src + (size_t)row * hb_full * 18
+                        + (size_t)(t * hb) * 18;
+                    memcpy(down_slice.data() + (size_t)row * hb * 18,
+                           src_row, (size_t)hb * 18);
+                }
+                xdna_ffn16_pack_tiles(down_slice.data(), E, Hc16, M, group_size,
+                                      /*sub8=*/false, DN_PACKED,
+                                      seq_r + (size_t)(GU_T + GU_T) * PACKED);
+                // Note: DN packed with DN_PACKED stride into a PACKED-strided
+                // region. The IRON op expects DN tiles tightly packed at
+                // DN_PACKED stride within the down sub-region; reshape DN_T
+                // DN_PACKED-tiles -> DN_E PACKED-rows happens implicitly because
+                // DN_PACKED * DN_SUB == PACKED and we wrote them contiguously.
+            }
+        }
+        // For s in SPC: stream = tiles {s*TPS .. s*TPS+TPS}; col_s = stack along
+        // axis=1 (round-major: row-block b of tile (s*TPS+0), then (s*TPS+1)).
+        for (int s = 0; s < SPC; s++) {
+            for (int64_t b = 0; b < WT_PER_TILE; b++) {
+                for (int tt = 0; tt < TPS; tt++) {
+                    const int r = s * TPS + tt;
+                    const uint8_t * row = seq.data()
+                        + (size_t)r * WT_PER_TILE * PACKED + (size_t)b * PACKED;
+                    memcpy(packed_out + out_off, row, PACKED);
+                    out_off += PACKED;
+                }
+            }
+        }
+    }
+}
+
+// Dispatch the fused 16-tile FFN. Reads `input` (F32/bf16, E), writes the down
+// projection result into `down_dst->data` (F32, E). gate/up/down weights Q4_0.
+static bool ggml_backend_xdna_decode_ffn16_2mm(
+        ggml_backend_xdna_context * ctx,
+        struct ggml_tensor * down_dst,
+        const struct ggml_tensor * gate_w,
+        const struct ggml_tensor * up_w,
+        const struct ggml_tensor * down_w,
+        const struct ggml_tensor * input,
+        int num_cols) {
+    if (!ctx->device_valid) return false;
+    if (gate_w->type != GGML_TYPE_Q4_0 || up_w->type != GGML_TYPE_Q4_0 ||
+        down_w->type != GGML_TYPE_Q4_0) return false;
+
+    const int64_t E = input->ne[0];     // embedding dim
+    const int64_t H = gate_w->ne[1];    // hidden dim
+    const int group_size = 32;
+    // The IRON op is hardcoded to NC=4. Only fire on the shape it was built for.
+    if (num_cols != 4) return false;
+    if (E % 32 != 0 || H % 32 != 0) return false;
+    if ((H / 16) % 4 != 0) return false;   // Hc16 must be M-divisible
+
+    const std::string cache_key = make_cache_key(XDNA_OP_FFN16_2MM, 1, E, H,
+                                                 "uint4", num_cols);
+    if (!ensure_compiled(ctx, cache_key, XDNA_OP_FFN16_2MM, 1, E, H,
+                         "uint4", num_cols)) {
+        return false;
+    }
+    xdna_kernel_entry * entry = get_or_load_kernel(ctx, cache_key,
+                                                   XDNA_OP_FFN16_2MM, 1, E, H);
+    if (!entry) return false;
+
+    try {
+        const int NC = 4, R = 4, M = 4, NT = 16, SPC = 2, TPS = 2;
+        const int64_t Hc16 = H / NT;
+        const int64_t GU_T = Hc16 / M;
+        const int64_t DN_T = E / M;
+        const size_t PACKED    = (size_t)M * E / 2 + (size_t)M * (E / group_size) * 2;
+        const size_t DN_PACKED = (size_t)M * Hc16 / 2 + (size_t)M * (Hc16 / group_size) * 2;
+        const int64_t DN_SUB = PACKED / DN_PACKED;
+        const int64_t DN_E   = DN_T / DN_SUB;
+        const int64_t WT_PER_TILE = GU_T + GU_T + DN_E;
+        const size_t W_BYTES = (size_t)NC * SPC * WT_PER_TILE * TPS * PACKED;
+
+        const size_t in_bytes  = (size_t)E * sizeof(uint16_t);   // X (bf16)
+        const size_t out_bytes = (size_t)E * sizeof(uint16_t);   // O (bf16)
+        const size_t dummy_bytes = 64 * sizeof(uint16_t);
+
+        // BO order = O(out, gid3), W(weight, gid4), X(act, gid5), D3(gid6), D4(gid7).
+        if (!entry->c_bo) {  // O — output
+            entry->c_bo = std::make_unique<xrt::bo>(
+                ctx->device, out_bytes, xrt::bo::flags::host_only,
+                entry->kernel.group_id(3));
+        }
+        if (!entry->a_bo) {  // X — activation (group_id 5)
+            entry->a_bo = std::make_unique<xrt::bo>(
+                ctx->device, in_bytes, xrt::bo::flags::host_only,
+                entry->kernel.group_id(5));
+        }
+        if (!entry->d3_bo) {
+            entry->d3_bo = std::make_unique<xrt::bo>(
+                ctx->device, dummy_bytes, xrt::bo::flags::host_only,
+                entry->kernel.group_id(6));
+        }
+        if (!entry->d4_bo) {
+            entry->d4_bo = std::make_unique<xrt::bo>(
+                ctx->device, dummy_bytes, xrt::bo::flags::host_only,
+                entry->kernel.group_id(7));
+        }
+
+        // Activation: f32->bf16 (or copy if already bf16).
+        if (input->type == GGML_TYPE_F32) {
+            f32_to_bf16((const float *)input->data,
+                        (uint16_t *)entry->a_bo->map<void*>(), (size_t)E);
+        } else {
+            memcpy(entry->a_bo->map<void*>(), input->data, in_bytes);
+        }
+        entry->a_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+        // Cached packed weights, keyed by gate weight pointer.
+        xrt::bo * weight_bo_ptr = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(*entry->b_bo_mutex);
+            auto it = entry->b_bo_cache.find(gate_w->data);
+            if (it == entry->b_bo_cache.end()) {
+                xrt::bo new_packed(ctx->device, W_BYTES, xrt::bo::flags::host_only,
+                                   entry->kernel.group_id(4));
+                xdna_repack_q4_0_ffn16_2mm(
+                    (const uint8_t *)gate_w->data, (const uint8_t *)up_w->data,
+                    (const uint8_t *)down_w->data, E, H, group_size,
+                    (uint8_t *)new_packed.map<void*>());
+                new_packed.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                auto [ins, _] = entry->b_bo_cache.emplace(gate_w->data, std::move(new_packed));
+                weight_bo_ptr = &ins->second;
+                fprintf(stderr, "ggml-xdna: warm ffn16_2mm E=%lld H=%lld W=%zuB (%zu cached)\n",
+                        (long long)E, (long long)H, W_BYTES, entry->b_bo_cache.size());
+                fflush(stderr);
+            } else {
+                weight_bo_ptr = &it->second;
+            }
+        }
+
+        xdna_dispatch_timer _ffn_t("ffn16_2mm", -1);
+        _ffn_t.mark_sync_pre_done();
+        auto run = xrt::run(entry->kernel);
+        run.set_arg(0, (uint32_t)3);                       // opcode
+        run.set_arg(1, entry->insts_bo);
+        run.set_arg(2, (uint32_t)entry->insts.size());
+        run.set_arg(3, *entry->c_bo);                      // O (out)
+        run.set_arg(4, *weight_bo_ptr);                    // W
+        run.set_arg(5, *entry->a_bo);                      // X (act)
+        run.set_arg(6, *entry->d3_bo);                     // D3 dummy
+        run.set_arg(7, *entry->d4_bo);                     // D4 dummy
+        run.start();
+        _ffn_t.mark_submit_done();
+        run.wait();
+        _ffn_t.mark_wait_done();
+        entry->c_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        _ffn_t.mark_sync_post_done();
+
+        // Write bf16 output -> dst (ggml MUL_MAT is F32; handle bf16 too).
+        const uint16_t * o_bf16 = (const uint16_t *)entry->c_bo->map<void*>();
+        const int64_t dst_elems = ggml_nelements(down_dst);
+        if (dst_elems < E) {
+            GGML_LOG_ERROR("ggml-xdna: ffn16 dst too small (%lld < %lld)\n",
+                           (long long)dst_elems, (long long)E);
+            return false;
+        }
+        if (down_dst->type == GGML_TYPE_F32) {
+            float * dst_f32 = (float *)down_dst->data;
+            for (int64_t i = 0; i < E; i++) {
+                uint32_t bits = ((uint32_t)o_bf16[i]) << 16;
+                float v; memcpy(&v, &bits, sizeof(v));
+                dst_f32[i] = v;
+            }
+        } else {
+            memcpy(down_dst->data, o_bf16, (size_t)E * sizeof(uint16_t));
+        }
+        return true;
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("ggml-xdna: ffn16_2mm dispatch failed (%s)\n", e.what());
+        return false;
     }
 }
 
@@ -8375,10 +8682,14 @@ static bool xdna_try_match_swiglu(const struct ggml_cgraph * cgraph, int i,
     // Mutually exclusive with int8 above (Q4_0 vs Q8_0 weight types). Stays
     // default-off so 8.1 GEMV-INT4 behavior is unchanged when this is not set.
     static const bool int4_enabled = xdna_env_enabled("XDNA_ENABLE_SWIGLU_INT4");
+    // XDNA_ENABLE_FFN16 routes the matched FFN through our 16-tile fused kernel.
+    // It reuses the is_int4 plumbing (same Q4_0 requirement + M==1) but the
+    // dispatch site picks decode_ffn16_2mm BEFORE the chained swiglu_int4.
+    static const bool ffn16_enabled = xdna_env_enabled("XDNA_ENABLE_FFN16");
     const bool all_q4_0 = (gate_w->type == GGML_TYPE_Q4_0)
                        && (up_w->type   == GGML_TYPE_Q4_0)
                        && (down_w->type == GGML_TYPE_Q4_0);
-    const bool allow_int4 = int4_enabled && all_q4_0;
+    const bool allow_int4 = (int4_enabled || ffn16_enabled) && all_q4_0;
 
     const struct ggml_tensor * ws[3] = { gate_w, up_w, down_w };
     const char * ws_names[3] = { "gate_w", "up_w", "down_w" };
@@ -16451,7 +16762,21 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                 if (m.fused_layer && m.is_int4) {
                     fused_layer_done = ggml_backend_xdna_fused_layer_dispatch(ctx, m);
                 }
-                if (!fused_layer_done && m.is_int4) {
+                // FFN16: our 16-tile fused FFN single dispatch (gate+up+silu+
+                // mul+down). Opt-in via XDNA_ENABLE_FFN16=1. Writes down result
+                // into m.down_mm->data; the GLU/gate/up nodes are skipped by the
+                // i += 3 below. Falls through to swiglu_int4 on any failure.
+                static const bool ffn16_dispatch_enabled =
+                    xdna_env_enabled("XDNA_ENABLE_FFN16");
+                bool ffn16_done = false;
+                if (!fused_layer_done && m.is_int4 && ffn16_dispatch_enabled) {
+                    // The IRON op is hardcoded to 4 columns regardless of the
+                    // device column count used by other kernels.
+                    ffn16_done = ggml_backend_xdna_decode_ffn16_2mm(
+                        ctx, m.down_mm, m.gate_w, m.up_w, m.down_w, m.input,
+                        /*num_cols=*/4);
+                }
+                if (!fused_layer_done && !ffn16_done && m.is_int4) {
                     // Phase 8.2: dispatch through the chained INT4 SwiGLU
                     // (fused dual-GEMV + silu + mul + down GEMV all in one
                     // xrt::runlist). The matcher already verified all three
@@ -16461,7 +16786,7 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                         m.gate_mm, m.up_mm, m.glu, m.down_mm,
                         m.gate_w, m.up_w, m.down_w, m.input,
                         ctx->num_cols);
-                } else if (!fused_layer_done) {
+                } else if (!fused_layer_done && !ffn16_done) {
                     ggml_backend_xdna_mul_mat_swiglu(
                         ctx,
                         m.gate_mm, m.up_mm, m.glu, m.down_mm,

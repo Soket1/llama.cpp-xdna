@@ -308,6 +308,23 @@ PRESETS: dict[str, dict[str, str]] = {
         "XDNA_ENABLE_RMS_NORM":          "0",
         "XDNA_ENABLE_GEMV_INT4":         "1",
     },
+    "npu_ffn16": {
+        # Our 16-tile fused FFN (gate+up+silu+mul+down single dispatch) via
+        # decode_ffn16_2mm. Layered on npu_int4 + SwiGLU matcher enabled +
+        # XDNA_ENABLE_FFN16=1. The matcher must fire (SwiGLU on) so the FFN
+        # 4-node pattern is intercepted before splitting into 3 int4_gemv.
+        # TRANSFORMER_BLOCK off: it routes prefill through a bf16 swiglu path
+        # that is unrelated to our decode FFN16 (and currently unstable here).
+        "XDNA_ENABLE_GEMV":              "1",
+        "XDNA_ENABLE_SWIGLU":            "1",
+        "XDNA_ENABLE_QKV":               "1",
+        "XDNA_ENABLE_DECODE_BATCH":      "1",
+        "XDNA_ENABLE_TRANSFORMER_BLOCK": "0",
+        "XDNA_ENABLE_FLOWKV_DECODE":     "1",
+        "XDNA_ENABLE_RMS_NORM":          "0",
+        "XDNA_ENABLE_GEMV_INT4":         "1",
+        "XDNA_ENABLE_FFN16":             "1",
+    },
     "npu_int4_swiglu": {
         # Same as npu_int4 but ALSO enables the chained INT4 SwiGLU
         # dispatch (Phase 8.2). Kept available for regression coverage
