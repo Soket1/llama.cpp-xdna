@@ -4077,7 +4077,7 @@ static void xdna_repack_q4_0_ffn16_2mm(
                            src_row, (size_t)hb * 18);
                 }
                 xdna_ffn16_pack_tiles(down_slice.data(), E, Hc16, M, group_size,
-                                      /*sub8=*/false, DN_PACKED,
+                                      /*sub8=*/true, DN_PACKED,
                                       seq_r + (size_t)(GU_T + GU_T) * PACKED);
                 // Note: DN packed with DN_PACKED stride into a PACKED-strided
                 // region. The IRON op expects DN tiles tightly packed at
