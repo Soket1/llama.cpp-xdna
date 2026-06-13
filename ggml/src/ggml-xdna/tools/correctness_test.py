@@ -309,12 +309,12 @@ PRESETS: dict[str, dict[str, str]] = {
         "XDNA_ENABLE_GEMV_INT4":         "1",
     },
     "npu_ffn16": {
-        # Our 16-tile fused FFN (gate+up+silu+mul+down single dispatch) via
-        # decode_ffn16_2mm. Layered on npu_int4 + SwiGLU matcher enabled +
-        # XDNA_ENABLE_FFN16=1. The matcher must fire (SwiGLU on) so the FFN
-        # 4-node pattern is intercepted before splitting into 3 int4_gemv.
-        # TRANSFORMER_BLOCK off: it routes prefill through a bf16 swiglu path
-        # that is unrelated to our decode FFN16 (and currently unstable here).
+        # npu_int4_v2 (all the production v2 opts: Phase9 async, fused QKV/RoPE/
+        # norm) PLUS our 16-tile fused FFN (decode_ffn16_2mm) via
+        # XDNA_ENABLE_FFN16=1. This is the apples-to-apples perf comparison vs
+        # npu_int4_v2: same base, only FFN dispatch differs (1 fused vs 3 GEMV).
+        # TRANSFORMER_BLOCK=0: avoids the bf16 prefill swiglu path that conflicts
+        # with our decode FFN16 hook; v2 keeps it at 1 but it only affects prefill.
         "XDNA_ENABLE_GEMV":              "1",
         "XDNA_ENABLE_SWIGLU":            "1",
         "XDNA_ENABLE_QKV":               "1",
@@ -323,6 +323,11 @@ PRESETS: dict[str, dict[str, str]] = {
         "XDNA_ENABLE_FLOWKV_DECODE":     "1",
         "XDNA_ENABLE_RMS_NORM":          "0",
         "XDNA_ENABLE_GEMV_INT4":         "1",
+        "XDNA_ENABLE_QKV_INT4_FUSED":    "1",
+        "XDNA_ENABLE_PHASE9":            "1",
+        "XDNA_ENABLE_QKV_ROPE_FUSED":    "1",
+        "XDNA_ENABLE_SWIGLU_NORM_FUSED": "1",
+        "XDNA_ENABLE_QKV_NORM_FUSED":    "1",
         "XDNA_ENABLE_FFN16":             "1",
     },
     "npu_int4_swiglu": {
