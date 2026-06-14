@@ -1000,6 +1000,54 @@ def compile_fused_dequant_gemv_v2(N: int, K: int, num_aie_columns: int,
     return output_path
 
 
+def compile_decode_ffn16_2mm(embed_dim: int, hidden_dim: int,
+                             num_aie_columns: int, group_size: int,
+                             output_path: str) -> str:
+    """Compile the 16-tile fused FFN (gate+up+silu+mul+down, single dispatch).
+
+    Mirrors compile_fused_dequant_gemv_v2's staging. The IRON op
+    AIEDecodeFFN16_2mm chains all FFN stages on 16 tiles with signed-int4
+    weights (gate/up and down). m_input is fixed at 4 (the op's design).
+
+    Args:
+        embed_dim: Embedding dim E (== reduction K for gate/up). Maps to the
+            backend cache key's K.
+        hidden_dim: FFN hidden dim H. Maps to the cache key's N.
+        num_aie_columns: AIE columns (the op is built for 4).
+        group_size: Quantization group size (Q4_0 = 32).
+        output_path: Destination .xclbin path; matching .insts written alongside.
+    """
+    from iron.operators.decode_ffn16_2mm.op import AIEDecodeFFN16_2mm
+    from iron.common.context import AIEContext
+
+    # Stage IRON's intermediate .mlir/.prj artifacts into a build subdir next to
+    # the output (e.g. <cache>/ffn16_build) so the compile doesn't litter the
+    # CMake build tree (the default AIEContext build_dir is cwd/build).
+    build_root = os.path.join(os.path.dirname(output_path) or ".", "ffn16_build")
+    os.makedirs(build_root, exist_ok=True)
+
+    op = AIEDecodeFFN16_2mm(
+        embed_dim=embed_dim,
+        hidden_dim=hidden_dim,
+        group_size=group_size,
+        m_input=4,
+        num_cols=num_aie_columns,
+        context=AIEContext(build_dir=build_root),
+    )
+    op.compile()
+
+    build_dir = op.context.build_dir
+    compiled_xclbin = build_dir / op.xclbin_artifact.filename
+    compiled_insts = build_dir / op.insts_artifact.filename
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    shutil.copy2(str(compiled_xclbin), output_path)
+    insts_output = output_path.replace(".xclbin", ".insts")
+    shutil.copy2(str(compiled_insts), insts_output)
+
+    return output_path
+
+
 def compile_swiglu_decode(embedding_dim: int, hidden_dim: int, dtype: str,
                           num_aie_columns: int, output_dir: str) -> str:
     """Compile an IRON SwiGLU decode operator and stage its artifacts into output_dir.
@@ -2802,6 +2850,18 @@ def main():
     fdg2_parser.add_argument("--out", type=str, required=True,
                              help="Output xclbin path (no cache mode -- spike use)")
 
+    # decode-ffn16-2mm -- 16-tile fused FFN (gate+up+silu+mul+down, 1 dispatch).
+    ffn16_parser = subparsers.add_parser(
+        "decode-ffn16-2mm",
+        help="16-tile fused FFN (gate+up+silu+mul+down) single dispatch",
+    )
+    ffn16_parser.add_argument("--embed-dim", type=int, required=True)
+    ffn16_parser.add_argument("--hidden-dim", type=int, required=True)
+    ffn16_parser.add_argument("--num-aie-columns", type=int, default=4)
+    ffn16_parser.add_argument("--group-size", type=int, default=32)
+    ffn16_parser.add_argument("--out", type=str, required=True,
+                              help="Output xclbin path; matching .insts alongside")
+
     # V3 -- batched GEMV for spec-dec verification (M_BATCH activation rows).
     fdg3_parser = subparsers.add_parser(
         "fused-dequant-gemv-v3",
@@ -3174,6 +3234,13 @@ def main():
     elif args.op == "fused-dequant-gemv-v2":
         path = compile_fused_dequant_gemv_v2(
             args.N, args.K,
+            args.num_aie_columns, args.group_size, args.out,
+        )
+        if not args.quiet:
+            print(path)
+    elif args.op == "decode-ffn16-2mm":
+        path = compile_decode_ffn16_2mm(
+            args.embed_dim, args.hidden_dim,
             args.num_aie_columns, args.group_size, args.out,
         )
         if not args.quiet:

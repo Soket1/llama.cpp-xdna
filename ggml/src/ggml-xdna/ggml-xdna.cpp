@@ -2363,17 +2363,6 @@ static bool ensure_compiled(ggml_backend_xdna_context * ctx,
         }
     }
 
-    // FFN16_2MM is pre-built offline (IRON op, not in compile.py). If the
-    // xclbin/insts aren't already in the cache dir, we cannot build them here —
-    // signal failure so the caller falls back to the chained swiglu path.
-    if (op_kind == XDNA_OP_FFN16_2MM) {
-        GGML_LOG_ERROR("ggml-xdna: ffn16_2mm xclbin not found in cache (%s); "
-                       "place prebuilt artifacts to enable. Falling back.\n",
-                       xclbin_path.c_str());
-        ctx->kernel_compile_failed.insert(cache_key);
-        return false;
-    }
-
     // Compile via Python subprocess
     char cmd[1024];
     if (op_kind == XDNA_OP_GEMV) {
@@ -2416,6 +2405,19 @@ static bool ensure_compiled(ggml_backend_xdna_context * ctx,
                  xclbin_path.c_str(), xdna_null_redirect());
         fprintf(stderr, "ggml-xdna: compiling INT4 GEMV v3 K=%lld N=%lld M_BATCH=%lld (first run, will be cached)...\n",
                       (long long)K, (long long)N, (long long)M);
+    } else if (op_kind == XDNA_OP_FFN16_2MM) {
+        // 16-tile fused FFN. K = embed_dim, N = hidden_dim. The IRON op fixes
+        // m_input=4 and builds for num_cols columns (typically 4). insts written
+        // alongside the xclbin by compile.py.
+        snprintf(cmd, sizeof(cmd),
+                 "%s \"%s\" --quiet decode-ffn16-2mm --embed-dim %lld --hidden-dim %lld "
+                 "--num-aie-columns %d --group-size 32 --out \"%s\"%s",
+                 xdna_python_cmd(), ctx->compile_script.c_str(),
+                 (long long)K, (long long)N,
+                 num_cols,
+                 xclbin_path.c_str(), xdna_null_redirect());
+        fprintf(stderr, "ggml-xdna: compiling FFN16 E=%lld H=%lld (first run, will be cached)...\n",
+                      (long long)K, (long long)N);
     } else {
         // [INT8 GEMM] Use separate dtype_out when provided (e.g. "i32" for i8 input).
         const char * out_dtype = dtype_out ? dtype_out : dtype_in;
