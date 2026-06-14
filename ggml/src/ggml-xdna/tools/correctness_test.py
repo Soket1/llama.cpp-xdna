@@ -330,6 +330,27 @@ PRESETS: dict[str, dict[str, str]] = {
         "XDNA_ENABLE_QKV_NORM_FUSED":    "1",
         "XDNA_ENABLE_FFN16":             "1",
     },
+    "npu_qkv16": {
+        # npu_ffn16 PLUS our 16-tile fused QKV projection (decode_qkv16) via
+        # XDNA_ENABLE_QKV16=1. Compound test: FFN16 + QKV16 both swapped for our
+        # kernels. The QKV16 hook runs BEFORE qkv_int4_fused and skips it on
+        # success (qkv_int4_fused stays as fallback). RoPE applied inside QKV16.
+        "XDNA_ENABLE_GEMV":              "1",
+        "XDNA_ENABLE_SWIGLU":            "1",
+        "XDNA_ENABLE_QKV":               "1",
+        "XDNA_ENABLE_DECODE_BATCH":      "1",
+        "XDNA_ENABLE_TRANSFORMER_BLOCK": "0",
+        "XDNA_ENABLE_FLOWKV_DECODE":     "1",
+        "XDNA_ENABLE_RMS_NORM":          "0",
+        "XDNA_ENABLE_GEMV_INT4":         "1",
+        "XDNA_ENABLE_QKV_INT4_FUSED":    "1",
+        "XDNA_ENABLE_PHASE9":            "1",
+        "XDNA_ENABLE_QKV_ROPE_FUSED":    "1",
+        "XDNA_ENABLE_SWIGLU_NORM_FUSED": "1",
+        "XDNA_ENABLE_QKV_NORM_FUSED":    "1",
+        "XDNA_ENABLE_FFN16":             "1",
+        "XDNA_ENABLE_QKV16":             "1",
+    },
     "npu_int4_swiglu": {
         # Same as npu_int4 but ALSO enables the chained INT4 SwiGLU
         # dispatch (Phase 8.2). Kept available for regression coverage

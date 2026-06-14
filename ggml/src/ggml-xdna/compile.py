@@ -1000,6 +1000,50 @@ def compile_fused_dequant_gemv_v2(N: int, K: int, num_aie_columns: int,
     return output_path
 
 
+def compile_decode_qkv16(embed_dim: int, qkv_dim: int,
+                         num_aie_columns: int, group_size: int,
+                         output_path: str) -> str:
+    """Compile the 16-tile fused QKV projection (Q+K+V concat, single dispatch).
+
+    Mirrors compile_decode_ffn16_2mm staging. AIEDecodeQKV16 runs 16-tile GEMV +
+    2-level concat-join. Unsigned int4 (fused_dequant_gemv_v2 kernel); host does
+    the +8 bias-comp. m_input fixed at 4.
+
+    Args:
+        embed_dim: Embedding dim E (== reduction K). Maps to backend cache key K.
+        qkv_dim: Total QKV output QD = q_N+k_N+v_N. Maps to cache key N.
+        num_aie_columns: AIE columns (the op is built for 4).
+        group_size: Quantization group size (Q4_0 = 32).
+        output_path: Destination .xclbin path; matching .insts written alongside.
+    """
+    from iron.operators.decode_qkv16.op import AIEDecodeQKV16
+    from iron.common.context import AIEContext
+
+    build_root = os.path.join(os.path.dirname(output_path) or ".", "qkv16_build")
+    os.makedirs(build_root, exist_ok=True)
+
+    op = AIEDecodeQKV16(
+        embed_dim=embed_dim,
+        qkv_dim=qkv_dim,
+        group_size=group_size,
+        m_input=4,
+        num_cols=num_aie_columns,
+        context=AIEContext(build_dir=build_root),
+    )
+    op.compile()
+
+    build_dir = op.context.build_dir
+    compiled_xclbin = build_dir / op.xclbin_artifact.filename
+    compiled_insts = build_dir / op.insts_artifact.filename
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    shutil.copy2(str(compiled_xclbin), output_path)
+    insts_output = output_path.replace(".xclbin", ".insts")
+    shutil.copy2(str(compiled_insts), insts_output)
+
+    return output_path
+
+
 def compile_decode_ffn16_2mm(embed_dim: int, hidden_dim: int,
                              num_aie_columns: int, group_size: int,
                              output_path: str) -> str:
@@ -2862,6 +2906,18 @@ def main():
     ffn16_parser.add_argument("--out", type=str, required=True,
                               help="Output xclbin path; matching .insts alongside")
 
+    # decode-qkv16 -- 16-tile fused QKV projection (Q+K+V concat, 1 dispatch).
+    qkv16_parser = subparsers.add_parser(
+        "decode-qkv16",
+        help="16-tile fused QKV projection (Q+K+V concat) single dispatch",
+    )
+    qkv16_parser.add_argument("--embed-dim", type=int, required=True)
+    qkv16_parser.add_argument("--qkv-dim", type=int, required=True)
+    qkv16_parser.add_argument("--num-aie-columns", type=int, default=4)
+    qkv16_parser.add_argument("--group-size", type=int, default=32)
+    qkv16_parser.add_argument("--out", type=str, required=True,
+                              help="Output xclbin path; matching .insts alongside")
+
     # V3 -- batched GEMV for spec-dec verification (M_BATCH activation rows).
     fdg3_parser = subparsers.add_parser(
         "fused-dequant-gemv-v3",
@@ -3241,6 +3297,13 @@ def main():
     elif args.op == "decode-ffn16-2mm":
         path = compile_decode_ffn16_2mm(
             args.embed_dim, args.hidden_dim,
+            args.num_aie_columns, args.group_size, args.out,
+        )
+        if not args.quiet:
+            print(path)
+    elif args.op == "decode-qkv16":
+        path = compile_decode_qkv16(
+            args.embed_dim, args.qkv_dim,
             args.num_aie_columns, args.group_size, args.out,
         )
         if not args.quiet:

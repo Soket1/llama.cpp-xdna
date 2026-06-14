@@ -113,6 +113,7 @@ enum xdna_op_kind : int {
     XDNA_OP_SWIGLU_DECODE_INT4  = 11, // M==1  W4A16 fused SwiGLU FFN (Q4_0 weights, bf16 acts; Phase 8.2)
     XDNA_OP_GEMV_INT4_BATCH     = 12, // M=2..8 fused INT4-dequant + batched GEMV (spec-dec verify)
     XDNA_OP_FFN16_2MM           = 13, // M==1 16-tile fused FFN (gate+up+silu+mul+down) single dispatch
+    XDNA_OP_QKV16               = 14, // M==1 16-tile fused QKV projection (Q+K+V concat) single dispatch
 };
 
 // Phase 9: per-entry input/output BO ring for async dispatch. Each call
@@ -1352,6 +1353,11 @@ static std::string make_cache_key(xdna_op_kind op_kind,
         // (gate+up+silu+mul+down on-chip). num_cols fixed at 4 in the IRON op.
         snprintf(buf, sizeof(buf), "ffn16_2mm_K%lld_N%lld_%dcol_g32",
                  (long long)K, (long long)N, num_cols);
+    } else if (op_kind == XDNA_OP_QKV16) {
+        // 16-tile fused QKV: K=embedding_dim, N=QD (q_N+k_N+v_N). Single dispatch
+        // (16-tile GEMV + 2-level concat-join). num_cols fixed at 4 in the IRON op.
+        snprintf(buf, sizeof(buf), "qkv16_K%lld_N%lld_%dcol_g32",
+                 (long long)K, (long long)N, num_cols);
     } else {
         snprintf(buf, sizeof(buf), "gemm_%lldx%lldx%lld_%s_%dcol",
                  (long long)M, (long long)K, (long long)N, dtype_in, num_cols);
@@ -2417,6 +2423,18 @@ static bool ensure_compiled(ggml_backend_xdna_context * ctx,
                  num_cols,
                  xclbin_path.c_str(), xdna_null_redirect());
         fprintf(stderr, "ggml-xdna: compiling FFN16 E=%lld H=%lld (first run, will be cached)...\n",
+                      (long long)K, (long long)N);
+    } else if (op_kind == XDNA_OP_QKV16) {
+        // 16-tile fused QKV. K = embed_dim, N = QD (q+k+v). IRON op fixes
+        // m_input=4, num_cols=4. insts written alongside the xclbin.
+        snprintf(cmd, sizeof(cmd),
+                 "%s \"%s\" --quiet decode-qkv16 --embed-dim %lld --qkv-dim %lld "
+                 "--num-aie-columns %d --group-size 32 --out \"%s\"%s",
+                 xdna_python_cmd(), ctx->compile_script.c_str(),
+                 (long long)K, (long long)N,
+                 num_cols,
+                 xclbin_path.c_str(), xdna_null_redirect());
+        fprintf(stderr, "ggml-xdna: compiling QKV16 E=%lld QD=%lld (first run, will be cached)...\n",
                       (long long)K, (long long)N);
     } else {
         // [INT8 GEMM] Use separate dtype_out when provided (e.g. "i32" for i8 input).
@@ -3721,6 +3739,57 @@ static void xdna_repack_q4_0_qkv_fused(
                                     m_input, cols, group_size, packed_out);
 }
 
+// QKV16 round-major packer for decode_qkv16. Concatenates [Q||K||V] into one
+// total_N x K matrix, then packs round-major (per-column, the SL-row slice for
+// tile t = c*R+r split into QKV_T sub-tiles of m rows, 2 half-streams/col),
+// matching validate_qkv16.py. Unsigned int4 (kernel = fused_dequant_gemv_v2,
+// host applies +8 bias-comp). Reuses xdna_ffn16_pack_tiles (sub8=false).
+static void xdna_ffn16_pack_tiles(const uint8_t * q4_0_src, int64_t n_rows, int64_t K,
+                                  int m_input, int group_size, bool sub8,
+                                  size_t pad_to, uint8_t * tiles_out);  // fwd decl
+static void xdna_repack_q4_0_qkv16_roundmajor(
+        const uint8_t * q_src, int64_t q_N,
+        const uint8_t * k_src, int64_t k_N,
+        const uint8_t * v_src, int64_t v_N,
+        int64_t K, int group_size, uint8_t * packed_out) {
+    const int NC = 4, R = 4, M = 4, NT = 16;
+    const int64_t total_N = q_N + k_N + v_N;     // == QD (e.g. 3072)
+    const int64_t SL = total_N / NT;             // rows per tile (192)
+    const int64_t QKV_T = SL / M;                // sub-tiles per tile (48)
+    const size_t PACKED = (size_t)M * K / 2 + (size_t)M * (K / group_size) * 2;
+    const int64_t num_groups = K / group_size;
+    const size_t row_stride = (size_t)num_groups * 18;
+
+    // Concatenate [Q || K || V] into one contiguous Q4_0 matrix (total_N rows).
+    std::vector<uint8_t> concat((size_t)total_N * row_stride);
+    memcpy(concat.data(), q_src, (size_t)q_N * row_stride);
+    memcpy(concat.data() + (size_t)q_N * row_stride, k_src, (size_t)k_N * row_stride);
+    memcpy(concat.data() + (size_t)(q_N + k_N) * row_stride, v_src, (size_t)v_N * row_stride);
+
+    // Per-column round-major (validate_qkv16.py: np.stack(seq, axis=1)). For each
+    // column c, pack the R tiles (t=c*R+r) each into QKV_T sub-tiles, then emit
+    // round-major: for sub-tile b in QKV_T, for r in R → sub-tile b of tile c*R+r.
+    // NO half-stream split (that is the FFN16-2mm layout, not decode_qkv16).
+    std::vector<uint8_t> seq((size_t)R * QKV_T * PACKED);
+    size_t out_off = 0;
+    for (int c = 0; c < NC; c++) {
+        for (int r = 0; r < R; r++) {
+            const int t = c * R + r;
+            const uint8_t * tile_src = concat.data() + (size_t)t * SL * row_stride;
+            xdna_ffn16_pack_tiles(tile_src, SL, K, M, group_size, /*sub8=*/false,
+                                  PACKED, seq.data() + (size_t)r * QKV_T * PACKED);
+        }
+        for (int64_t b = 0; b < QKV_T; b++) {
+            for (int r = 0; r < R; r++) {
+                memcpy(packed_out + out_off,
+                       seq.data() + (size_t)r * QKV_T * PACKED + (size_t)b * PACKED,
+                       PACKED);
+                out_off += PACKED;
+            }
+        }
+    }
+}
+
 static void ggml_backend_xdna_mul_mat_qkv_int4_fused(
         ggml_backend_xdna_context * ctx,
         struct ggml_tensor * q_dst,
@@ -4245,6 +4314,204 @@ static bool ggml_backend_xdna_decode_ffn16_2mm(
         return true;
     } catch (const std::exception & e) {
         GGML_LOG_ERROR("ggml-xdna: ffn16_2mm dispatch failed (%s)\n", e.what());
+        return false;
+    }
+}
+
+// =============================================================================
+// decode_qkv16: 16-tile fused QKV projection (Q+K+V concat) single dispatch.
+//
+// Mirrors dev_notes/track_a_build/diff_qkv16_real_weights.py (PASS rel_L2=0.0069
+// on real layer-0 Q4_0). Kernel = fused_dequant_gemv_v2 (UNSIGNED int4, no -8 in
+// kernel), so the host applies the +8 bias-comp. Output O is FLAT in QKV-row
+// order (tile t = c*R+r produces QKV[t*SL:(t+1)*SL]), == concat [Q||K||V] order,
+// so dst_offsets {0,q_N,q_N+k_N} + RoPE reuse the existing layout. The bias
+// scale per global output row i is just the source Q4_0 fp16 scale of that row
+// (flat), simpler than the tile-major packed-buffer lookup. 5-BO ABI O,W,X,D3,D4.
+//
+// ⚠️ DEFAULT OFF (XDNA_ENABLE_QKV16): correct (e2e rel_L2=0.0031, matches CPU)
+// but a PERF REGRESSION on this shape. Measured live NPU wait = 1709us/layer vs
+// the old 4-col qkv_int4_fused ~865us (replay-warm was 188us — a 9x optimistic
+// figure; live per-dispatch context-switch + 16-tile/concat-join setup dominate).
+// 16-tile only amortizes when N is large (FFN H=8192); QKV N=3072 split 16-way
+// (192 rows/tile) is denser on 4 cols. Kept for a future O16/async-ring attempt.
+// =============================================================================
+static bool ggml_backend_xdna_decode_qkv16(
+        ggml_backend_xdna_context * ctx,
+        struct ggml_tensor * q_dst,
+        struct ggml_tensor * k_dst,
+        struct ggml_tensor * v_dst,
+        struct ggml_tensor * q_rope_dst,
+        struct ggml_tensor * k_rope_dst) {
+    if (!ctx->device_valid) return false;
+    const struct ggml_tensor * w_q = q_dst->src[0];
+    const struct ggml_tensor * w_k = k_dst->src[0];
+    const struct ggml_tensor * w_v = v_dst->src[0];
+    const struct ggml_tensor * input = q_dst->src[1];
+    if (w_q->type != GGML_TYPE_Q4_0 || w_k->type != GGML_TYPE_Q4_0 ||
+        w_v->type != GGML_TYPE_Q4_0) return false;
+
+    const int64_t K   = w_q->ne[0];       // embedding / reduction (2048)
+    const int64_t q_N = w_q->ne[1];
+    const int64_t k_N = w_k->ne[1];
+    const int64_t v_N = w_v->ne[1];
+    const int64_t QD  = q_N + k_N + v_N;   // total output (3072)
+    const int group_size = 32;
+    const int num_cols = 4;                // decode_qkv16 IRON op is hardcoded 4
+    // The op assumes QD split 16-way into SL-row tiles, each SL % m_input == 0.
+    if (QD % 16 != 0) return false;
+    const int64_t SL = QD / 16;
+    if (SL % 4 != 0) return false;
+    if (K % group_size != 0) return false;
+
+    const std::string cache_key = make_cache_key(XDNA_OP_QKV16, 1, K, QD,
+                                                 "uint4", num_cols);
+    if (!ensure_compiled(ctx, cache_key, XDNA_OP_QKV16, 1, K, QD,
+                         "uint4", num_cols)) {
+        return false;
+    }
+    xdna_kernel_entry * entry = get_or_load_kernel(ctx, cache_key,
+                                                   XDNA_OP_QKV16, 1, K, QD);
+    if (!entry) return false;
+
+    try {
+        const int M = 4, NT = 16, R = 4;
+        const int64_t QKV_T = SL / M;
+        const size_t PACKED = (size_t)M * K / 2 + (size_t)M * (K / group_size) * 2;
+        const size_t W_BYTES = (size_t)num_cols * QKV_T * R * PACKED;
+        const size_t in_bytes  = (size_t)K * sizeof(uint16_t);
+        const size_t out_bytes = (size_t)QD * sizeof(uint16_t);
+        const size_t dummy_bytes = 64 * sizeof(uint16_t);
+        const int64_t num_groups_per_row = K / group_size;
+
+        // BO order = O(out, gid3), W(weight, gid4), X(act, gid5), D3(gid6), D4(gid7).
+        if (!entry->c_bo)
+            entry->c_bo = std::make_unique<xrt::bo>(ctx->device, out_bytes,
+                xrt::bo::flags::host_only, entry->kernel.group_id(3));
+        if (!entry->a_bo)
+            entry->a_bo = std::make_unique<xrt::bo>(ctx->device, in_bytes,
+                xrt::bo::flags::host_only, entry->kernel.group_id(5));
+        if (!entry->d3_bo)
+            entry->d3_bo = std::make_unique<xrt::bo>(ctx->device, dummy_bytes,
+                xrt::bo::flags::host_only, entry->kernel.group_id(6));
+        if (!entry->d4_bo)
+            entry->d4_bo = std::make_unique<xrt::bo>(ctx->device, dummy_bytes,
+                xrt::bo::flags::host_only, entry->kernel.group_id(7));
+
+        // Activation f32 -> bf16.
+        if (input->type == GGML_TYPE_F32) {
+            f32_to_bf16((const float *)input->data,
+                        (uint16_t *)entry->a_bo->map<void*>(), (size_t)K);
+        } else {
+            memcpy(entry->a_bo->map<void*>(), input->data, in_bytes);
+        }
+        entry->a_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+        // Cached packed weights, keyed by q weight pointer (stable per layer).
+        xrt::bo * weight_bo_ptr = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(*entry->b_bo_mutex);
+            auto it = entry->b_bo_cache.find(w_q->data);
+            if (it == entry->b_bo_cache.end()) {
+                xrt::bo new_packed(ctx->device, W_BYTES, xrt::bo::flags::host_only,
+                                   entry->kernel.group_id(4));
+                xdna_repack_q4_0_qkv16_roundmajor(
+                    (const uint8_t *)w_q->data, q_N,
+                    (const uint8_t *)w_k->data, k_N,
+                    (const uint8_t *)w_v->data, v_N,
+                    K, group_size, (uint8_t *)new_packed.map<void*>());
+                new_packed.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                auto [ins, _] = entry->b_bo_cache.emplace(w_q->data, std::move(new_packed));
+                weight_bo_ptr = &ins->second;
+                fprintf(stderr, "ggml-xdna: warm qkv16 K=%lld QD=%lld W=%zuB (%zu cached)\n",
+                        (long long)K, (long long)QD, W_BYTES, entry->b_bo_cache.size());
+                fflush(stderr);
+            } else {
+                weight_bo_ptr = &it->second;
+            }
+        }
+
+        auto run = xrt::run(entry->kernel);
+        run.set_arg(0, (uint32_t)3);
+        run.set_arg(1, entry->insts_bo);
+        run.set_arg(2, (uint32_t)entry->insts.size());
+        run.set_arg(3, *entry->c_bo);          // O
+        run.set_arg(4, *weight_bo_ptr);        // W
+        run.set_arg(5, *entry->a_bo);          // X
+        run.set_arg(6, *entry->d3_bo);
+        run.set_arg(7, *entry->d4_bo);
+        run.start();
+        run.wait();
+        entry->c_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+
+        // Host +8 bias-comp. S[g] = sum of activation in group g.
+        const uint16_t * x_bf16  = (const uint16_t *)entry->a_bo->map<void*>();
+        const uint16_t * out_bf16 = (const uint16_t *)entry->c_bo->map<void*>();
+        std::vector<float> S((size_t)num_groups_per_row, 0.0f);
+        for (int64_t g = 0; g < num_groups_per_row; g++) {
+            float sum = 0.0f;
+            for (int kk = 0; kk < group_size; kk++) {
+                uint32_t bits = ((uint32_t)x_bf16[g * group_size + kk]) << 16;
+                float vv; memcpy(&vv, &bits, sizeof(vv));
+                sum += vv;
+            }
+            S[(size_t)g] = sum;
+        }
+
+        // Scale per global output row i = fp16 scale of concat row i (Q then K
+        // then V), read directly from the source Q4_0 weights. row_stride = 18B
+        // per group; scale is the first 2 bytes of each Q4_0 block.
+        const size_t row_stride = (size_t)num_groups_per_row * 18;
+        auto src_for_row = [&](int64_t i) -> const uint8_t * {
+            if (i < q_N) return (const uint8_t *)w_q->data + (size_t)i * row_stride;
+            if (i < q_N + k_N) return (const uint8_t *)w_k->data + (size_t)(i - q_N) * row_stride;
+            return (const uint8_t *)w_v->data + (size_t)(i - q_N - k_N) * row_stride;
+        };
+
+        struct ggml_tensor * out_dsts[3] = { q_dst, k_dst, v_dst };
+        int64_t dst_offsets[3] = { 0, q_N, q_N + k_N };
+        int64_t dst_sizes[3]   = { q_N, k_N, v_N };
+        for (int d = 0; d < 3; d++) {
+            float * dst_f32 = (float *)out_dsts[d]->data;
+            const int64_t off = dst_offsets[d];
+            for (int64_t local_i = 0; local_i < dst_sizes[d]; local_i++) {
+                const int64_t i = off + local_i;
+                const uint8_t * srow = src_for_row(i);
+                float bias = 0.0f;
+                for (int64_t g = 0; g < num_groups_per_row; g++) {
+                    uint16_t fp16_sc;
+                    memcpy(&fp16_sc, srow + (size_t)g * 18, 2);
+                    uint32_t sb = ((uint32_t)fp16_to_bf16(fp16_sc)) << 16;
+                    float sf; memcpy(&sf, &sb, sizeof(sf));
+                    bias += sf * S[(size_t)g];
+                }
+                bias *= 8.0f;
+                uint32_t ob = ((uint32_t)out_bf16[i]) << 16;
+                float out_f; memcpy(&out_f, &ob, sizeof(out_f));
+                dst_f32[local_i] = out_f - bias;
+            }
+            // Fused RoPE on Q (d=0) and K (d=1).
+            if (d == 0 && q_rope_dst) {
+                const int64_t head_dim  = q_rope_dst->src[0]->ne[0];
+                const int64_t num_heads = q_N / head_dim;
+                if (num_heads > 0 && head_dim > 0) {
+                    xdna_apply_rope_f32(dst_f32, num_heads, head_dim, q_rope_dst);
+                    if (q_rope_dst->data != q_dst->data)
+                        memcpy(q_rope_dst->data, dst_f32, (size_t)q_N * sizeof(float));
+                }
+            } else if (d == 1 && k_rope_dst) {
+                const int64_t head_dim  = k_rope_dst->src[0]->ne[0];
+                const int64_t num_heads = k_N / head_dim;
+                if (num_heads > 0 && head_dim > 0) {
+                    xdna_apply_rope_f32(dst_f32, num_heads, head_dim, k_rope_dst);
+                    if (k_rope_dst->data != k_dst->data)
+                        memcpy(k_rope_dst->data, dst_f32, (size_t)k_N * sizeof(float));
+                }
+            }
+        }
+        return true;
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("ggml-xdna: qkv16 dispatch failed (%s)\n", e.what());
         return false;
     }
 }
@@ -15908,6 +16175,14 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                     qkv_plan.skip_indices.insert(rit->second.k_rope_idx);
                             }
                         }
+                        static const bool qkv16_enabled =
+                            xdna_env_enabled("XDNA_ENABLE_QKV16");
+                        bool qkv16_done = false;
+                        if (qkv16_enabled) {
+                            qkv16_done = ggml_backend_xdna_decode_qkv16(
+                                ctx, q_mm, k_mm, v_mm, q_rope_node, k_rope_node);
+                        }
+                        if (!qkv16_done)
                         ggml_backend_xdna_mul_mat_qkv_int4_fused(
                             ctx, q_mm, k_mm, v_mm, q_rope_node, k_rope_node);
                     } else {
