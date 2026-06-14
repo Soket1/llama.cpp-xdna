@@ -15791,7 +15791,51 @@ static ggml_status xdna_delegate_range(ggml_backend_xdna_context * ctx,
     // BEFORE the CPU backend runs. No-op when XDNA_ENABLE_PHASE9=0.
     ctx->inflight.drain();
     struct ggml_cgraph sub = xdna_graph_view(cgraph, i0, i1);
-    return ggml_backend_graph_compute(ctx->cpu_backend, &sub);
+
+    // [CPU-ops profile] XDNA_DEBUG_CPU_OPS=1 accumulates wall-time of delegated
+    // CPU sub-graphs, bucketed by the dominant op (the largest MUL_MAT by N, or
+    // the op kind), and prints a rolling summary. Pure measurement, gated off.
+    static const bool cpu_dbg = xdna_env_enabled("XDNA_DEBUG_CPU_OPS");
+    if (!cpu_dbg) {
+        return ggml_backend_graph_compute(ctx->cpu_backend, &sub);
+    }
+    const auto _t0 = std::chrono::steady_clock::now();
+    ggml_status st = ggml_backend_graph_compute(ctx->cpu_backend, &sub);
+    const int64_t us = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - _t0).count();
+    // Classify by the biggest MUL_MAT N in this range (else first op name).
+    int64_t big_n = 0; const char * tag = nullptr;
+    for (int n = i0; n < i1; n++) {
+        struct ggml_tensor * t = cgraph->nodes[n];
+        if (t->op == GGML_OP_MUL_MAT && t->ne[0] > big_n) {
+            big_n = t->ne[0]; tag = "MUL_MAT";
+        }
+    }
+    char key[64];
+    if (tag && big_n >= 100000)      snprintf(key, sizeof(key), "MUL_MAT_vocab(N=%lld)", (long long)big_n);
+    else if (tag)                    snprintf(key, sizeof(key), "MUL_MAT(N=%lld)", (long long)big_n);
+    else snprintf(key, sizeof(key), "%s", ggml_op_name(cgraph->nodes[i0]->op));
+    struct cpu_acc { int64_t n=0, us=0; };
+    static std::unordered_map<std::string, cpu_acc> acc;
+    static int64_t tot_us = 0, tot_calls = 0;
+    auto & a = acc[key]; a.n++; a.us += us; tot_us += us; tot_calls++;
+    // Range size histogram: how many nodes per delegated CPU sub-graph.
+    static int64_t range_hist[6] = {0};  // 1, 2, 3, 4-8, 9-16, >16
+    const int rn = i1 - i0;
+    range_hist[rn==1?0 : rn==2?1 : rn==3?2 : rn<=8?3 : rn<=16?4 : 5]++;
+    if (tot_calls % 500 == 0) {
+        fprintf(stderr, "ggml-xdna: [CPU-OPS] range-size hist {1:%lld 2:%lld 3:%lld 4-8:%lld 9-16:%lld >16:%lld}\n",
+                (long long)range_hist[0],(long long)range_hist[1],(long long)range_hist[2],
+                (long long)range_hist[3],(long long)range_hist[4],(long long)range_hist[5]);
+        fprintf(stderr, "ggml-xdna: [CPU-OPS] total %lld us over %lld calls:\n",
+                (long long)tot_us, (long long)tot_calls);
+        for (auto & kv : acc)
+            fprintf(stderr, "  %-26s n=%lld sum=%lld us avg=%.1f us\n",
+                    kv.first.c_str(), (long long)kv.second.n, (long long)kv.second.us,
+                    (double)kv.second.us / kv.second.n);
+        fflush(stderr);
+    }
+    return st;
 }
 
 // ============================================================================
