@@ -4211,6 +4211,205 @@ static void xdna_repack_q4_0_ffn16_2mm(
     }
 }
 
+// ── decode_back_mono GUD packer (#32 Option B) ──────────────────────────────
+// Packs real gguf Q4_0 O-proj + gate + up + down into the decode_back_mono W.bin
+// GUD-tile layout (mirrors validate_back_mono.py tile_gud + col_interleave, which
+// matches the on-NPU op). O unsigned (o_scatter in-kernel -8); gate/up/down SIGNED
+// (nib-8)&0xF. VERIFIED on REAL weights vs true ggml: rel_L2=0.023 (the down sign
+// needed the mono-FFN kernel fix, IRON 99d7c53). Down is column-major over hidden,
+// scales are per-output-row (one quant-group per gu-tile's M hidden cols).
+static inline uint8_t xdna_back_mono_down_nibble(const uint8_t * down, int64_t row,
+                                                 int64_t j, int64_t hb_full, int group_size) {
+    const int64_t g_col = j / group_size;
+    const int idx_in_block = (int)(j % group_size);
+    const int half_group = group_size / 2;
+    const size_t Q4_0_BLOCK = 2 + (size_t)half_group;
+    const uint8_t * blk = down + (size_t)row * hb_full * Q4_0_BLOCK + (size_t)g_col * Q4_0_BLOCK;
+    const uint8_t raw = blk[2 + (idx_in_block % half_group)];
+    const uint8_t nib = (idx_in_block < half_group) ? (raw & 0x0F) : ((raw >> 4) & 0x0F);
+    return (uint8_t)((nib - 8) & 0x0F);   // SIGNED int4 (mono down sign-extends)
+}
+
+static void xdna_pack_decode_back_mono(
+        const uint8_t * o_proj, const uint8_t * gate, const uint8_t * up,
+        const uint8_t * down, int64_t E, int64_t H, int group_size,
+        uint8_t * packed_out) {
+    const int NC = 4, R = 4, M = 4;
+    const int NT = NC * R;
+    const int64_t Hc16 = H / NT;
+    const int64_t SL_O = E / NT;
+    const int64_t o_tiles = SL_O / M;
+    const int64_t gu_tiles = Hc16 / M;
+    const int64_t WT_PER_TILE = o_tiles + gu_tiles;
+    const size_t PACKED = (size_t)M * E / 2 + (size_t)M * (E / group_size) * 2;
+    const size_t GUD = 2 * PACKED + (size_t)M * E / 2 + (size_t)E * 2;
+    const int64_t hb_full = H / group_size;
+    const size_t Q4_0_BLOCK = 2 + (size_t)group_size / 2;
+
+    std::vector<uint8_t> buf((size_t)R * WT_PER_TILE * GUD);
+    size_t out_off = 0;
+    for (int c = 0; c < NC; c++) {
+        std::fill(buf.begin(), buf.end(), (uint8_t)0);
+        for (int r = 0; r < R; r++) {
+            const int t = c * R + r;
+            uint8_t * tp = buf.data() + (size_t)r * WT_PER_TILE * GUD;
+            // O (unsigned), gate/up (signed) via the shared tile packer, pad_to=GUD.
+            xdna_ffn16_pack_tiles(o_proj + (size_t)(t * SL_O) * (E / group_size) * 18,
+                                  SL_O, E, M, group_size, /*sub8=*/false, GUD, tp);
+            xdna_ffn16_pack_tiles(gate + (size_t)(t * Hc16) * (E / group_size) * 18,
+                                  Hc16, E, M, group_size, /*sub8=*/true, GUD,
+                                  tp + (size_t)o_tiles * GUD);
+            xdna_ffn16_pack_tiles(up + (size_t)(t * Hc16) * (E / group_size) * 18,
+                                  Hc16, E, M, group_size, /*sub8=*/true, GUD,
+                                  tp + (size_t)o_tiles * GUD + PACKED);
+            // down: column-major over hidden (signed), then per-output scales.
+            for (int64_t cg = 0; cg < gu_tiles; cg++) {
+                const int64_t grp = (cg * M) / group_size;
+                const int64_t g_col = t * (Hc16 / group_size) + grp;
+                for (int rr = 0; rr < M; rr++) {
+                    const int64_t j = (int64_t)t * Hc16 + cg * M + rr;
+                    uint8_t * dst = tp + (size_t)(o_tiles + cg) * GUD + 2 * PACKED + (size_t)rr * (E / 2);
+                    for (int64_t k = 0; k < E / 2; k++) {
+                        const uint8_t n0 = xdna_back_mono_down_nibble(down, 2 * k,     j, hb_full, group_size);
+                        const uint8_t n1 = xdna_back_mono_down_nibble(down, 2 * k + 1, j, hb_full, group_size);
+                        dst[k] = (uint8_t)(n0 | (n1 << 4));
+                    }
+                }
+                uint16_t * sdst = (uint16_t *)(tp + (size_t)(o_tiles + cg) * GUD + 2 * PACKED + (size_t)M * E / 2);
+                for (int64_t i = 0; i < E; i++) {
+                    uint16_t fp16v;
+                    memcpy(&fp16v, down + (size_t)i * hb_full * Q4_0_BLOCK + (size_t)g_col * Q4_0_BLOCK, 2);
+                    sdst[i] = fp16_to_bf16(fp16v);
+                }
+            }
+        }
+        // col-interleave the R tiles along the row axis.
+        for (int64_t b = 0; b < WT_PER_TILE; b++) {
+            for (int r = 0; r < R; r++) {
+                memcpy(packed_out + out_off,
+                       buf.data() + (size_t)r * WT_PER_TILE * GUD + (size_t)b * GUD, GUD);
+                out_off += GUD;
+            }
+        }
+    }
+}
+
+// Dispatch the fused back half (#32 Option B): O-proj + residual + RMSNorm +
+// mono-FFN + residual, ONE dispatch. ABI (4 BOs): O(out,gid3), W(gid4),
+// ATTN(gid5), HIN(gid6). attn = attention output (E), hin = block residual (E).
+static bool ggml_backend_xdna_decode_back_mono(
+        ggml_backend_xdna_context * ctx,
+        struct ggml_tensor * out_dst,
+        const struct ggml_tensor * attn,
+        const struct ggml_tensor * hin,
+        const struct ggml_tensor * o_w,
+        const struct ggml_tensor * gate_w,
+        const struct ggml_tensor * up_w,
+        const struct ggml_tensor * down_w,
+        int num_cols) {
+    if (!ctx->device_valid) return false;
+    if (o_w->type != GGML_TYPE_Q4_0 || gate_w->type != GGML_TYPE_Q4_0 ||
+        up_w->type != GGML_TYPE_Q4_0 || down_w->type != GGML_TYPE_Q4_0) return false;
+    const int64_t E = attn->ne[0];
+    const int64_t H = gate_w->ne[1];
+    const int group_size = 32;
+    if (num_cols != 4) return false;
+    if (E % 32 != 0 || H % 32 != 0) return false;
+    if ((H / 16) % 4 != 0) return false;
+
+    const std::string cache_key = make_cache_key(XDNA_OP_DECODE_BACK_MONO, 1, E, H,
+                                                 "uint4", num_cols);
+    if (!ensure_compiled(ctx, cache_key, XDNA_OP_DECODE_BACK_MONO, 1, E, H,
+                         "uint4", num_cols)) return false;
+    xdna_kernel_entry * entry = get_or_load_kernel(ctx, cache_key,
+                                                   XDNA_OP_DECODE_BACK_MONO, 1, E, H);
+    if (!entry) return false;
+
+    try {
+        const int NC = 4, R = 4, M = 4, NT = 16;
+        const int64_t Hc16 = H / NT;
+        const int64_t SL_O = E / NT;
+        const int64_t o_tiles = SL_O / M;
+        const int64_t gu_tiles = Hc16 / M;
+        const int64_t WT_PER_TILE = o_tiles + gu_tiles;
+        const size_t PACKED = (size_t)M * E / 2 + (size_t)M * (E / group_size) * 2;
+        const size_t GUD = 2 * PACKED + (size_t)M * E / 2 + (size_t)E * 2;
+        const size_t W_BYTES = (size_t)NC * WT_PER_TILE * R * GUD;
+        const size_t e_bytes = (size_t)E * sizeof(uint16_t);
+
+        // BOs: O(out,gid3) via c_bo; ATTN(gid5) via a_bo; HIN(gid6) via d3_bo.
+        if (!entry->c_bo)
+            entry->c_bo = std::make_unique<xrt::bo>(ctx->device, e_bytes,
+                xrt::bo::flags::host_only, entry->kernel.group_id(3));
+        if (!entry->a_bo)
+            entry->a_bo = std::make_unique<xrt::bo>(ctx->device, e_bytes,
+                xrt::bo::flags::host_only, entry->kernel.group_id(5));
+        if (!entry->d3_bo)
+            entry->d3_bo = std::make_unique<xrt::bo>(ctx->device, e_bytes,
+                xrt::bo::flags::host_only, entry->kernel.group_id(6));
+
+        auto fill_e = [&](const struct ggml_tensor * t, xrt::bo * bo) {
+            if (t->type == GGML_TYPE_F32)
+                f32_to_bf16((const float *)t->data, (uint16_t *)bo->map<void*>(), (size_t)E);
+            else
+                memcpy(bo->map<void*>(), t->data, e_bytes);
+            bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        };
+        fill_e(attn, entry->a_bo.get());
+        fill_e(hin, entry->d3_bo.get());
+
+        // Packed weights cached by o_proj pointer (stable per layer).
+        xrt::bo * weight_bo_ptr = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(*entry->b_bo_mutex);
+            auto it = entry->b_bo_cache.find(o_w->data);
+            if (it == entry->b_bo_cache.end()) {
+                xrt::bo new_packed(ctx->device, W_BYTES, xrt::bo::flags::host_only,
+                                   entry->kernel.group_id(4));
+                xdna_pack_decode_back_mono(
+                    (const uint8_t *)o_w->data, (const uint8_t *)gate_w->data,
+                    (const uint8_t *)up_w->data, (const uint8_t *)down_w->data,
+                    E, H, group_size, (uint8_t *)new_packed.map<void*>());
+                new_packed.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                auto [ins, _] = entry->b_bo_cache.emplace(o_w->data, std::move(new_packed));
+                weight_bo_ptr = &ins->second;
+                fprintf(stderr, "ggml-xdna: warm back_mono E=%lld H=%lld W=%zuB (%zu cached)\n",
+                        (long long)E, (long long)H, W_BYTES, entry->b_bo_cache.size());
+                fflush(stderr);
+            } else {
+                weight_bo_ptr = &it->second;
+            }
+        }
+
+        auto run = xrt::run(entry->kernel);
+        run.set_arg(0, (uint32_t)3);
+        run.set_arg(1, entry->insts_bo);
+        run.set_arg(2, (uint32_t)entry->insts.size());
+        run.set_arg(3, *entry->c_bo);          // O (out)
+        run.set_arg(4, *weight_bo_ptr);        // W
+        run.set_arg(5, *entry->a_bo);          // ATTN
+        run.set_arg(6, *entry->d3_bo);         // HIN
+        run.start();
+        run.wait();
+        entry->c_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+
+        const uint16_t * o_bf16 = (const uint16_t *)entry->c_bo->map<void*>();
+        if (out_dst->type == GGML_TYPE_F32) {
+            float * dst = (float *)out_dst->data;
+            for (int64_t i = 0; i < E; i++) {
+                uint32_t bits = ((uint32_t)o_bf16[i]) << 16;
+                float v; memcpy(&v, &bits, sizeof(v)); dst[i] = v;
+            }
+        } else {
+            memcpy(out_dst->data, o_bf16, e_bytes);
+        }
+        return true;
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("ggml-xdna: back_mono dispatch failed (%s)\n", e.what());
+        return false;
+    }
+}
+
 // Dispatch the fused 16-tile FFN. Reads `input` (F32/bf16, E), writes the down
 // projection result into `down_dst->data` (F32, E). gate/up/down weights Q4_0.
 static bool ggml_backend_xdna_decode_ffn16_2mm(
