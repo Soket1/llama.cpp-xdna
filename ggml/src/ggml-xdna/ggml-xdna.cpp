@@ -4620,6 +4620,32 @@ static bool ggml_backend_xdna_decode_front_attn(
 
         // attn_out col-major [q-head0..num_q-1 × head_dim] = natural q-head order.
         const uint16_t * o_bf16 = (const uint16_t *)entry->c_bo->map<void*>();
+        // One-shot diagnostic: in overwrite mode out_dst still holds the CPU
+        // attention result. Compare NPU vs CPU and probe a few orderings to
+        // localize a head-order / input mismatch. XDNA_FRONT_DIAG=1.
+        static const bool front_diag = (getenv("XDNA_FRONT_DIAG") != NULL);
+        static int front_diag_n = 0;
+        if (front_diag && front_diag_n < 3 && out_dst->type == GGML_TYPE_F32) {
+            const float * cpu = (const float *)out_dst->data;
+            std::vector<float> npu(out_elems);
+            for (size_t i = 0; i < out_elems; i++) {
+                uint32_t b = ((uint32_t)o_bf16[i]) << 16; float v; memcpy(&v,&b,4); npu[i]=v;
+            }
+            auto rel = [&](auto map)->double{
+                double num=0,den=0;
+                for (size_t i=0;i<out_elems;i++){ double c=cpu[map(i)]; double d=npu[i]-c; num+=d*d; den+=c*c; }
+                return std::sqrt(num/(den+1e-12));
+            };
+            const int64_t hd=head_dim, ag=attn_group, nkv=num_kv;
+            double r_id  = rel([&](size_t i){return i;});  // identity
+            // NPU layout [g(0..7) × slot(0..3) × hd]; try q-head = g*ag+slot vs slot*nkv+g
+            double r_int = rel([&](size_t i){ int64_t d=i%hd, gs=i/hd, g=gs/ag, s=gs%ag;
+                                              int64_t qh=s*nkv+g; return (size_t)(qh*hd+d); });
+            fprintf(stderr, "ggml-xdna: [FRONT_DIAG] out_elems=%zu E=%lld actual_seq=%lld seq_len=%lld; "
+                    "relL2 identity=%.4f interleave=%.4f | npu[:3]=%.4f,%.4f,%.4f cpu[:3]=%.4f,%.4f,%.4f\n",
+                    out_elems,(long long)E,(long long)actual_seq,(long long)seq_len, r_id, r_int, npu[0],npu[1],npu[2], cpu[0],cpu[1],cpu[2]);
+            fflush(stderr); front_diag_n++;
+        }
         if (out_dst->type == GGML_TYPE_F32) {
             float * dst = (float *)out_dst->data;
             for (size_t i = 0; i < out_elems; i++) {
