@@ -16551,16 +16551,41 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
         }
     }
 
-    if (front_attn_active) {
-        // BRING-UP (overwrite mode, like the FlowKV POC): do NOT skip the CPU
-        // attention/RoPE nodes yet. front_attn dispatches at the kqv_out boundary
-        // and OVERWRITES kqv_out, so CPU attention runs (wasteful) but the NPU
-        // result wins — this is correctness-first and avoids two hazards the
-        // pre-skip approach has: (1) skipping attention BEFORE confirming the
-        // dispatch succeeded → silent garbage on a failed dispatch; (2) blindly
-        // skipping all ROPE-before-QK kills K-RoPE too (front reads cache K as
-        // already-RoPE'd). Once e2e correctness is confirmed, a success-gated skip
-        // of {Q@K^T, SOFT_MAX, scores@V, Q-RoPE-only} can be added as a perf step.
+    // PERF SKIP (correctness proven): when front_attn fires, skip the CPU
+    // attention COMPUTE only — the range [Q@K^T .. kqv_out) = {Q@K^T, scale,
+    // mask-add, SOFT_MAX, scores@V}. This does NOT touch K/V-proj, K-RoPE, or
+    // the cache-copy (all before Q@K^T → front reads the populated, RoPE'd cache),
+    // nor the CONT(kqv_out) node (front writes its src[0], CONT propagates it).
+    // Default-on with front_attn; XDNA_FRONT_NOSKIP=1 reverts to overwrite mode
+    // (CPU attn runs too) for A/B correctness checks. First decode token is
+    // overwrite anyway (flowkv_poc_valid not yet set from a prior scan).
+    static const bool front_noskip = xdna_env_enabled("XDNA_FRONT_NOSKIP");
+    if (front_attn_active && !front_noskip) {
+        int kqv_out_idx = -1;
+        for (int si = 0; si < n; si++) {
+            struct ggml_tensor * nd = cgraph->nodes[si];
+            if ((nd->op == GGML_OP_CONT || nd->op == GGML_OP_RESHAPE) &&
+                nd->name && strstr(nd->name, "kqv_out")) { kqv_out_idx = si; break; }
+        }
+        if (kqv_out_idx >= 0) {
+            int softmax_idx = -1, qk_mm_idx = -1;
+            for (int si = 0; si < kqv_out_idx; si++)
+                if (cgraph->nodes[si]->op == GGML_OP_SOFT_MAX) { softmax_idx = si; break; }
+            if (softmax_idx >= 0) {
+                struct ggml_tensor * trace = cgraph->nodes[softmax_idx]->src[0];
+                for (int g = 0; trace && g < 8; g++) {
+                    if (trace->op == GGML_OP_MUL_MAT) {
+                        for (int si = 0; si < softmax_idx; si++)
+                            if (cgraph->nodes[si] == trace) { qk_mm_idx = si; break; }
+                        break;
+                    }
+                    trace = trace->src[0];
+                }
+            }
+            if (qk_mm_idx >= 0)
+                for (int si = qk_mm_idx; si < kqv_out_idx; si++)
+                    qkv_plan.skip_indices.insert(si);   // Q@K^T..scores@V only
+        }
     }
 
     // Phase A1.3 step 2+3 — LayerFused detector. Env-gated (XDNA_LAYER_FUSED=1).
