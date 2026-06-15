@@ -4461,7 +4461,8 @@ static void xdna_build_rope_lut_bf16(const struct ggml_tensor * rope_node,
 static bool ggml_backend_xdna_decode_front_attn(
         ggml_backend_xdna_context * ctx,
         struct ggml_tensor * out_dst,
-        const struct ggml_tensor * input,        // normed Q-proj input [E]
+        const float * input_snap,                // normed Q-proj input [E] (f32 snapshot)
+        int64_t input_E,
         const struct ggml_tensor * q_w,          // Q weight Q4_0 [E, num_q_heads*head_dim]
         const struct ggml_tensor * rope_node,
         const struct ggml_tensor * k_perm,       // [head_dim, seq_len, kv_heads]
@@ -4470,8 +4471,9 @@ static bool ggml_backend_xdna_decode_front_attn(
     if (!ctx->device_valid) return false;
     if (q_w->type != GGML_TYPE_Q4_0) return false;
     if (num_cols != 4) return false;
+    if (!input_snap || input_E <= 0) return false;
 
-    const int64_t E         = input->ne[0];
+    const int64_t E         = input_E;
     const int64_t head_dim  = k_perm->ne[1] > 0 ? k_perm->ne[0] : 64;  // [hd, seq, kv]
     const int64_t seq_len   = k_perm->ne[1];
     const int64_t num_kv    = k_perm->ne[2];
@@ -4521,13 +4523,38 @@ static bool ggml_backend_xdna_decode_front_attn(
 
         // --- X bundle = [vector(E) | lut(q_rows) | actual_seq + pad16] ---
         uint16_t * xb = (uint16_t *)entry->a_bo->map<void*>();
-        if (input->type == GGML_TYPE_F32)
-            f32_to_bf16((const float *)input->data, xb, (size_t)E);
-        else
-            memcpy(xb, input->data, (size_t)E * dts);
+        f32_to_bf16(input_snap, xb, (size_t)E);
+        {
+            static const bool fd = (getenv("XDNA_FRONT_DIAG") != NULL);
+            static int fdn = 0;
+            if (fd && fdn < 2) {
+                fprintf(stderr, "ggml-xdna: [FRONT_DIAG2] input_snap[:4]=%.4f,%.4f,%.4f,%.4f | "
+                        "k_perm ne=[%lld,%lld,%lld] type=%d v_perm ne=[%lld,%lld,%lld] type=%d\n",
+                        input_snap[0], input_snap[1], input_snap[2], input_snap[3],
+                        (long long)k_perm->ne[0],(long long)k_perm->ne[1],(long long)k_perm->ne[2],(int)k_perm->type,
+                        (long long)v_perm->ne[0],(long long)v_perm->ne[1],(long long)v_perm->ne[2],(int)v_perm->type);
+                fflush(stderr); fdn++;
+            }
+        }
         // head LUT (head_dim) tiled attn_group× over q_rows.
         uint16_t head_lut[256];
         xdna_build_rope_lut_bf16(rope_node, head_dim, head_lut);
+        {
+            static const bool fd = (getenv("XDNA_FRONT_DIAG") != NULL);
+            static int fdn = 0;
+            if (fd && fdn < 2) {
+                int32_t pos = -1; float fb = -1;
+                if (rope_node) {
+                    const int32_t * p = (const int32_t *)rope_node->op_params;
+                    memcpy(&fb, p + 5, 4);
+                    const struct ggml_tensor * pt = rope_node->src[1];
+                    if (pt && pt->type == GGML_TYPE_I32) pos = ((const int32_t*)pt->data)[0];
+                }
+                fprintf(stderr, "ggml-xdna: [FRONT_DIAG3] rope_node=%p pos=%d freq_base=%.1f lut[:4]bf16=%04x,%04x,%04x,%04x\n",
+                        (void*)rope_node, pos, fb, head_lut[0],head_lut[1],head_lut[2],head_lut[3]);
+                fflush(stderr); fdn++;
+            }
+        }
         for (int64_t h = 0; h < attn_group; h++)
             memcpy(xb + E + h * head_dim, head_lut, (size_t)head_dim * dts);
         // actual_seq_len: scan K cache for last non-zero pos (padded tail = 0).
@@ -4625,7 +4652,7 @@ static bool ggml_backend_xdna_decode_front_attn(
         // localize a head-order / input mismatch. XDNA_FRONT_DIAG=1.
         static const bool front_diag = (getenv("XDNA_FRONT_DIAG") != NULL);
         static int front_diag_n = 0;
-        if (front_diag && front_diag_n < 3 && out_dst->type == GGML_TYPE_F32) {
+        if (front_diag && front_diag_n < 20 && out_dst->type == GGML_TYPE_F32) {
             const float * cpu = (const float *)out_dst->data;
             std::vector<float> npu(out_elems);
             for (size_t i = 0; i < out_elems; i++) {
@@ -16454,6 +16481,10 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
     static const struct ggml_tensor * flowkv_poc_v_perm = nullptr;
     static const struct ggml_tensor * flowkv_poc_q_mm = nullptr;
     static const struct ggml_tensor * flowkv_poc_rope_node = nullptr;
+    // Snapshot of the normed Q-proj input, taken at the QKV scan (when src[1] is
+    // valid). By the kqv_out boundary where front_attn dispatches, ggml has
+    // reused that scratch buffer, so reading src[1]->data there gives zeros.
+    static std::vector<float> flowkv_poc_input_snap;
     static int64_t flowkv_poc_head_dim = 0;
     static int64_t flowkv_poc_seq_len = 0;
     static int64_t flowkv_poc_num_kv_heads = 0;
@@ -16859,6 +16890,27 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                             if (rit != qkv_plan.rope_at.end()) {
                                 flowkv_poc_rope_node = rit->second.q_rope;
                             }
+                        }
+                        // Fused-QKV leaves rope_at empty → fall back to ANY ROPE
+                        // node in the graph (pos/freq_base/freq_factors are shared
+                        // across all layers/heads; front_attn only needs the params
+                        // to build its on-chip Q-rope LUT).
+                        if (front_attn_enabled && !flowkv_poc_rope_node) {
+                            for (int rj = 0; rj < n; rj++) {
+                                if (cgraph->nodes[rj]->op == GGML_OP_ROPE) {
+                                    flowkv_poc_rope_node = cgraph->nodes[rj];
+                                    break;
+                                }
+                            }
+                        }
+                        // Snapshot the normed Q-proj input NOW (valid here; the
+                        // scratch buffer is reused by the kqv_out boundary).
+                        if (front_attn_enabled && q_mm->src[1] &&
+                            q_mm->src[1]->type == GGML_TYPE_F32) {
+                            const int64_t ne = q_mm->src[1]->ne[0];
+                            flowkv_poc_input_snap.assign(
+                                (const float *)q_mm->src[1]->data,
+                                (const float *)q_mm->src[1]->data + ne);
                         }
                         flowkv_poc_valid = true;
                         if (flowkv_diag_enabled) {
@@ -17764,7 +17816,8 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                 bool ok = ggml_backend_xdna_decode_front_attn(
                     ctx,
                     kqv_out,
-                    flowkv_poc_q_mm->src[1],
+                    flowkv_poc_input_snap.empty() ? nullptr : flowkv_poc_input_snap.data(),
+                    (int64_t)flowkv_poc_input_snap.size(),
                     flowkv_poc_q_mm->src[0],
                     flowkv_poc_rope_node,
                     flowkv_poc_k_perm,
