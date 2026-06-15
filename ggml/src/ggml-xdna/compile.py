@@ -1092,6 +1092,80 @@ def compile_decode_ffn16_2mm(embed_dim: int, hidden_dim: int,
     return output_path
 
 
+def compile_decode_front_attn(embed_dim: int, head_dim: int, group_size: int,
+                              attn_group: int, num_kv_heads: int, seq_len: int,
+                              num_aie_columns: int, col_offset: int,
+                              output_path: str) -> str:
+    """Compile the fused front-half decode op (Q-GEMV + interleaved RoPE +
+    flowkv attention, #32 Option B). GQA via temporal batching: num_aie_columns
+    central columns each process one kv-head per batch, num_kv_heads/num_cols
+    batches in one dispatch. Q-proj uses the signed-int4 v2 GEMV (on-chip
+    (nib-8)*scale) since its output feeds attention on-chip. Mirrors
+    compile_decode_ffn16_2mm's staging."""
+    from iron.operators.decode_front_attn.op import AIEDecodeFrontAttn
+    from iron.common.context import AIEContext
+
+    build_root = os.path.join(os.path.dirname(output_path) or ".", "front_attn_build")
+    os.makedirs(build_root, exist_ok=True)
+
+    op = AIEDecodeFrontAttn(
+        embed_dim=embed_dim,
+        head_dim=head_dim,
+        group_size=group_size,
+        attn_group=attn_group,
+        num_kv_heads=num_kv_heads,
+        m_input=4,
+        seq_len=seq_len,
+        num_cols=num_aie_columns,
+        col_offset=col_offset,
+        context=AIEContext(build_dir=build_root),
+    )
+    op.compile()
+
+    build_dir = op.context.build_dir
+    compiled_xclbin = build_dir / op.xclbin_artifact.filename
+    compiled_insts = build_dir / op.insts_artifact.filename
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    shutil.copy2(str(compiled_xclbin), output_path)
+    insts_output = output_path.replace(".xclbin", ".insts")
+    shutil.copy2(str(compiled_insts), insts_output)
+
+    return output_path
+
+
+def compile_decode_back_mono(embed_dim: int, hidden_dim: int, group_size: int,
+                             num_aie_columns: int, output_path: str) -> str:
+    """Compile the fused back-half decode op (O-proj + residual + RMSNorm +
+    mono-FFN + residual, #32 Option B). Mirrors compile_decode_ffn16_2mm."""
+    from iron.operators.decode_back_mono.op import AIEDecodeBackMono
+    from iron.common.context import AIEContext
+
+    build_root = os.path.join(os.path.dirname(output_path) or ".", "back_mono_build")
+    os.makedirs(build_root, exist_ok=True)
+
+    op = AIEDecodeBackMono(
+        embed_dim=embed_dim,
+        hidden_dim=hidden_dim,
+        group_size=group_size,
+        m_input=4,
+        num_cols=num_aie_columns,
+        context=AIEContext(build_dir=build_root),
+    )
+    op.compile()
+
+    build_dir = op.context.build_dir
+    compiled_xclbin = build_dir / op.xclbin_artifact.filename
+    compiled_insts = build_dir / op.insts_artifact.filename
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    shutil.copy2(str(compiled_xclbin), output_path)
+    insts_output = output_path.replace(".xclbin", ".insts")
+    shutil.copy2(str(compiled_insts), insts_output)
+
+    return output_path
+
+
 def compile_swiglu_decode(embedding_dim: int, hidden_dim: int, dtype: str,
                           num_aie_columns: int, output_dir: str) -> str:
     """Compile an IRON SwiGLU decode operator and stage its artifacts into output_dir.
@@ -2906,6 +2980,34 @@ def main():
     ffn16_parser.add_argument("--out", type=str, required=True,
                               help="Output xclbin path; matching .insts alongside")
 
+    # decode-front-attn -- fused front half (Q-GEMV + RoPE + flowkv attn, #32).
+    front_attn_parser = subparsers.add_parser(
+        "decode-front-attn",
+        help="Fused front-half decode (Q-GEMV + interleaved RoPE + attention)",
+    )
+    front_attn_parser.add_argument("--embed-dim", type=int, required=True)
+    front_attn_parser.add_argument("--head-dim", type=int, default=64)
+    front_attn_parser.add_argument("--group-size", type=int, default=32)
+    front_attn_parser.add_argument("--attn-group", type=int, required=True)
+    front_attn_parser.add_argument("--num-kv-heads", type=int, required=True)
+    front_attn_parser.add_argument("--seq-len", type=int, default=32)
+    front_attn_parser.add_argument("--num-aie-columns", type=int, default=4)
+    front_attn_parser.add_argument("--col-offset", type=int, default=2)
+    front_attn_parser.add_argument("--out", type=str, required=True,
+                                   help="Output xclbin path; matching .insts alongside")
+
+    # decode-back-mono -- fused back half (O + resid + RMSNorm + FFN, #32).
+    back_mono_parser = subparsers.add_parser(
+        "decode-back-mono",
+        help="Fused back-half decode (O-proj + residual + RMSNorm + mono-FFN)",
+    )
+    back_mono_parser.add_argument("--embed-dim", type=int, required=True)
+    back_mono_parser.add_argument("--hidden-dim", type=int, required=True)
+    back_mono_parser.add_argument("--num-aie-columns", type=int, default=4)
+    back_mono_parser.add_argument("--group-size", type=int, default=32)
+    back_mono_parser.add_argument("--out", type=str, required=True,
+                                  help="Output xclbin path; matching .insts alongside")
+
     # decode-qkv16 -- 16-tile fused QKV projection (Q+K+V concat, 1 dispatch).
     qkv16_parser = subparsers.add_parser(
         "decode-qkv16",
@@ -3298,6 +3400,21 @@ def main():
         path = compile_decode_ffn16_2mm(
             args.embed_dim, args.hidden_dim,
             args.num_aie_columns, args.group_size, args.out,
+        )
+        if not args.quiet:
+            print(path)
+    elif args.op == "decode-front-attn":
+        path = compile_decode_front_attn(
+            args.embed_dim, args.head_dim, args.group_size,
+            args.attn_group, args.num_kv_heads, args.seq_len,
+            args.num_aie_columns, args.col_offset, args.out,
+        )
+        if not args.quiet:
+            print(path)
+    elif args.op == "decode-back-mono":
+        path = compile_decode_back_mono(
+            args.embed_dim, args.hidden_dim, args.group_size,
+            args.num_aie_columns, args.out,
         )
         if not args.quiet:
             print(path)
