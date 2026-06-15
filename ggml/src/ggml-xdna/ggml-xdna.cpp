@@ -1361,12 +1361,11 @@ static std::string make_cache_key(xdna_op_kind op_kind,
         snprintf(buf, sizeof(buf), "qkv16_K%lld_N%lld_%dcol_g32",
                  (long long)K, (long long)N, num_cols);
     } else if (op_kind == XDNA_OP_DECODE_FRONT_ATTN) {
-        // Fused front half (#32 Option B): K=embed_dim, N=head_dim. GQA params
-        // (attn_group=4, num_kv_heads=8, seq_len=32, col_offset=2) hardcoded in
-        // the IRON op like FFN16 bakes group_size; encode them so the cache key
-        // is unambiguous for the llama-3.2-1B shape.
-        snprintf(buf, sizeof(buf), "decode_front_attn_K%lld_N%lld_%dcol_ag4_kv8_sl32_g32",
-                 (long long)K, (long long)N, num_cols);
+        // Fused front half (#32 Option B): K=embed_dim, N=head_dim, M=seq_len (the
+        // KV-cache length, varies with context — MUST be in the key). GQA params
+        // (attn_group=4, num_kv_heads=8, col_offset=2) hardcoded in the IRON op.
+        snprintf(buf, sizeof(buf), "decode_front_attn_K%lld_N%lld_sl%lld_%dcol_ag4_kv8_g32",
+                 (long long)K, (long long)N, (long long)M, num_cols);
     } else if (op_kind == XDNA_OP_DECODE_BACK_MONO) {
         // Fused back half (#32 Option B): K=embed_dim, N=hidden_dim.
         snprintf(buf, sizeof(buf), "decode_back_mono_K%lld_N%lld_%dcol_g32",
@@ -2450,15 +2449,15 @@ static bool ensure_compiled(ggml_backend_xdna_context * ctx,
         fprintf(stderr, "ggml-xdna: compiling QKV16 E=%lld QD=%lld (first run, will be cached)...\n",
                       (long long)K, (long long)N);
     } else if (op_kind == XDNA_OP_DECODE_FRONT_ATTN) {
-        // Fused front half (#32). K=embed_dim, N=head_dim. GQA params hardcoded
-        // for llama-3.2-1B (attn_group=4, num_kv_heads=8, seq_len=32, col_offset=2),
-        // mirroring how FFN16 bakes group_size. insts written alongside the xclbin.
+        // Fused front half (#32). K=embed_dim, N=head_dim, M=seq_len (KV-cache
+        // length, threaded so the op is built for the real context). GQA params
+        // hardcoded for llama-3.2-1B (attn-group 4, num-kv-heads 8, col-offset 2).
         snprintf(cmd, sizeof(cmd),
                  "%s \"%s\" --quiet decode-front-attn --embed-dim %lld --head-dim %lld "
-                 "--attn-group 4 --num-kv-heads 8 --seq-len 32 --col-offset 2 "
+                 "--attn-group 4 --num-kv-heads 8 --seq-len %lld --col-offset 2 "
                  "--num-aie-columns %d --group-size 32 --out \"%s\"%s",
                  xdna_python_cmd(), ctx->compile_script.c_str(),
-                 (long long)K, (long long)N,
+                 (long long)K, (long long)N, (long long)M,
                  num_cols,
                  xclbin_path.c_str(), xdna_null_redirect());
         fprintf(stderr, "ggml-xdna: compiling DECODE_FRONT_ATTN E=%lld hd=%lld (first run, will be cached)...\n",
