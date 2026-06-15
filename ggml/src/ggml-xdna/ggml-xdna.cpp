@@ -114,6 +114,8 @@ enum xdna_op_kind : int {
     XDNA_OP_GEMV_INT4_BATCH     = 12, // M=2..8 fused INT4-dequant + batched GEMV (spec-dec verify)
     XDNA_OP_FFN16_2MM           = 13, // M==1 16-tile fused FFN (gate+up+silu+mul+down) single dispatch
     XDNA_OP_QKV16               = 14, // M==1 16-tile fused QKV projection (Q+K+V concat) single dispatch
+    XDNA_OP_DECODE_FRONT_ATTN   = 15, // M==1 fused front half (Q-GEMV + interleaved RoPE + flowkv attn) #32
+    XDNA_OP_DECODE_BACK_MONO    = 16, // M==1 fused back half (O-proj + residual + RMSNorm + mono-FFN) #32
 };
 
 // Phase 9: per-entry input/output BO ring for async dispatch. Each call
@@ -1358,6 +1360,17 @@ static std::string make_cache_key(xdna_op_kind op_kind,
         // (16-tile GEMV + 2-level concat-join). num_cols fixed at 4 in the IRON op.
         snprintf(buf, sizeof(buf), "qkv16_K%lld_N%lld_%dcol_g32",
                  (long long)K, (long long)N, num_cols);
+    } else if (op_kind == XDNA_OP_DECODE_FRONT_ATTN) {
+        // Fused front half (#32 Option B): K=embed_dim, N=head_dim. GQA params
+        // (attn_group=4, num_kv_heads=8, seq_len=32, col_offset=2) hardcoded in
+        // the IRON op like FFN16 bakes group_size; encode them so the cache key
+        // is unambiguous for the llama-3.2-1B shape.
+        snprintf(buf, sizeof(buf), "decode_front_attn_K%lld_N%lld_%dcol_ag4_kv8_sl32_g32",
+                 (long long)K, (long long)N, num_cols);
+    } else if (op_kind == XDNA_OP_DECODE_BACK_MONO) {
+        // Fused back half (#32 Option B): K=embed_dim, N=hidden_dim.
+        snprintf(buf, sizeof(buf), "decode_back_mono_K%lld_N%lld_%dcol_g32",
+                 (long long)K, (long long)N, num_cols);
     } else {
         snprintf(buf, sizeof(buf), "gemm_%lldx%lldx%lld_%s_%dcol",
                  (long long)M, (long long)K, (long long)N, dtype_in, num_cols);
@@ -2435,6 +2448,31 @@ static bool ensure_compiled(ggml_backend_xdna_context * ctx,
                  num_cols,
                  xclbin_path.c_str(), xdna_null_redirect());
         fprintf(stderr, "ggml-xdna: compiling QKV16 E=%lld QD=%lld (first run, will be cached)...\n",
+                      (long long)K, (long long)N);
+    } else if (op_kind == XDNA_OP_DECODE_FRONT_ATTN) {
+        // Fused front half (#32). K=embed_dim, N=head_dim. GQA params hardcoded
+        // for llama-3.2-1B (attn_group=4, num_kv_heads=8, seq_len=32, col_offset=2),
+        // mirroring how FFN16 bakes group_size. insts written alongside the xclbin.
+        snprintf(cmd, sizeof(cmd),
+                 "%s \"%s\" --quiet decode-front-attn --embed-dim %lld --head-dim %lld "
+                 "--attn-group 4 --num-kv-heads 8 --seq-len 32 --col-offset 2 "
+                 "--num-aie-columns %d --group-size 32 --out \"%s\"%s",
+                 xdna_python_cmd(), ctx->compile_script.c_str(),
+                 (long long)K, (long long)N,
+                 num_cols,
+                 xclbin_path.c_str(), xdna_null_redirect());
+        fprintf(stderr, "ggml-xdna: compiling DECODE_FRONT_ATTN E=%lld hd=%lld (first run, will be cached)...\n",
+                      (long long)K, (long long)N);
+    } else if (op_kind == XDNA_OP_DECODE_BACK_MONO) {
+        // Fused back half (#32). K=embed_dim, N=hidden_dim. insts alongside xclbin.
+        snprintf(cmd, sizeof(cmd),
+                 "%s \"%s\" --quiet decode-back-mono --embed-dim %lld --hidden-dim %lld "
+                 "--num-aie-columns %d --group-size 32 --out \"%s\"%s",
+                 xdna_python_cmd(), ctx->compile_script.c_str(),
+                 (long long)K, (long long)N,
+                 num_cols,
+                 xclbin_path.c_str(), xdna_null_redirect());
+        fprintf(stderr, "ggml-xdna: compiling DECODE_BACK_MONO E=%lld H=%lld (first run, will be cached)...\n",
                       (long long)K, (long long)N);
     } else {
         // [INT8 GEMM] Use separate dtype_out when provided (e.g. "i32" for i8 input).
