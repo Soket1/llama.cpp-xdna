@@ -1388,6 +1388,15 @@ static void f32_to_bf16(const float * src, uint16_t * dst, size_t n) {
     }
 }
 
+// Scalar f32->bf16 (round to nearest even). Free function so dispatch helpers
+// outside the lambdas that define a local one can use it.
+static inline uint16_t f32_to_bf16_scalar(float f) {
+    uint32_t bits;
+    memcpy(&bits, &f, sizeof(bits));
+    bits += (0x7FFF + ((bits >> 16) & 1));
+    return (uint16_t)(bits >> 16);
+}
+
 // Convert bf16 array to f32 (pad lower 16 bits with zeros)
 static void bf16_to_f32(const uint16_t * src, float * dst, size_t n) {
     for (size_t i = 0; i < n; i++) {
@@ -4405,6 +4414,224 @@ static bool ggml_backend_xdna_decode_back_mono(
         return true;
     } catch (const std::exception & e) {
         GGML_LOG_ERROR("ggml-xdna: back_mono dispatch failed (%s)\n", e.what());
+        return false;
+    }
+}
+
+// ── decode_front_attn (#32 Option B, front-only fusion) ─────────────────────
+// Build the interleaved RoPE LUT for one head at token `pos`, mirroring
+// xdna_apply_rope_f32 EXACTLY (incl. optional freq_factors) so it matches the
+// rest of the model: lut[2i]=cos(ang), lut[2i+1]=sin(ang), ang = pos*theta_i/ff,
+// theta_i *= freq_base^(-2/head_dim). Output: head_dim bf16 (HALF cos/sin pairs).
+static void xdna_build_rope_lut_bf16(const struct ggml_tensor * rope_node,
+                                     int64_t head_dim, uint16_t * lut_out) {
+    float freq_base = 10000.0f;
+    const float * freq_factors = nullptr;
+    int32_t pos = 0;
+    if (rope_node) {
+        const int32_t * p = (const int32_t *)rope_node->op_params;
+        memcpy(&freq_base, p + 5, sizeof(float));
+        const struct ggml_tensor * pos_t = rope_node->src[1];
+        if (pos_t && pos_t->type == GGML_TYPE_I32 && pos_t->ne[0] >= 1)
+            pos = ((const int32_t *)pos_t->data)[0];
+        const struct ggml_tensor * ff_t = rope_node->src[2];
+        if (ff_t && ff_t->type == GGML_TYPE_F32 && ff_t->ne[0] >= head_dim / 2)
+            freq_factors = (const float *)ff_t->data;
+    }
+    const int64_t half = head_dim / 2;
+    const float theta_scale = std::pow(freq_base, -2.0f / (float)head_dim);
+    float theta_i = 1.0f;
+    for (int64_t i = 0; i < half; i++) {
+        const float ff = freq_factors ? freq_factors[i] : 1.0f;
+        const float ang = (float)pos * (theta_i / ff);
+        float c = std::cos(ang), s = std::sin(ang);
+        lut_out[2 * i]     = f32_to_bf16_scalar(c);
+        lut_out[2 * i + 1] = f32_to_bf16_scalar(s);
+        theta_i *= theta_scale;
+    }
+}
+
+// Dispatch the fused front half (#32 Option B, front-only): Q-GEMV (signed int4)
+// + interleaved RoPE(Q) on-chip + flowkv decode-attention, ONE dispatch. Writes
+// attn_out (col-major [q-head0..31 × head_dim] = num_kv*attn_group*head_dim) over
+// out_dst (kqv_out), which the existing O-proj path then consumes. K is read from
+// the cache as-is (already RoPE'd by the host pre-cache-write); only Q is rotated.
+// ABI (5 BO, output-first): O(gid3), WT(gid4), X=[vec|lut|actual_seq+pad](gid5),
+// K(gid6), V(gid7).
+static bool ggml_backend_xdna_decode_front_attn(
+        ggml_backend_xdna_context * ctx,
+        struct ggml_tensor * out_dst,
+        const struct ggml_tensor * input,        // normed Q-proj input [E]
+        const struct ggml_tensor * q_w,          // Q weight Q4_0 [E, num_q_heads*head_dim]
+        const struct ggml_tensor * rope_node,
+        const struct ggml_tensor * k_perm,       // [head_dim, seq_len, kv_heads]
+        const struct ggml_tensor * v_perm,
+        int num_cols) {
+    if (!ctx->device_valid) return false;
+    if (q_w->type != GGML_TYPE_Q4_0) return false;
+    if (num_cols != 4) return false;
+
+    const int64_t E         = input->ne[0];
+    const int64_t head_dim  = k_perm->ne[1] > 0 ? k_perm->ne[0] : 64;  // [hd, seq, kv]
+    const int64_t seq_len   = k_perm->ne[1];
+    const int64_t num_kv    = k_perm->ne[2];
+    const int64_t num_q     = q_w->ne[1] / head_dim;
+    const int64_t attn_group = num_q / num_kv;        // q-heads per kv-head (GQA)
+    const int group_size = 32;
+    // The IRON op is built for attn_group=4, num_kv=8 (llama-3.2-1B). Guard.
+    if (attn_group != 4 || num_kv != 8 || head_dim != 64) return false;
+    if (E % group_size != 0) return false;
+    if (seq_len % 32 != 0) return false;               // chunk_size=32
+
+    const int64_t q_rows = attn_group * head_dim;      // 256
+    const std::string cache_key = make_cache_key(XDNA_OP_DECODE_FRONT_ATTN,
+                                                 seq_len, E, head_dim, "uint4", num_cols);
+    if (!ensure_compiled(ctx, cache_key, XDNA_OP_DECODE_FRONT_ATTN,
+                         seq_len, E, head_dim, "uint4", num_cols)) return false;
+    xdna_kernel_entry * entry = get_or_load_kernel(ctx, cache_key,
+                                                   XDNA_OP_DECODE_FRONT_ATTN, seq_len, E, head_dim);
+    if (!entry) return false;
+
+    try {
+        const int M = 4;
+        const int64_t gemv_tiles = q_rows / M;
+        const size_t PACKED = (size_t)M * E / 2 + (size_t)M * (E / group_size) * 2;
+        const size_t A_per_grp = (size_t)gemv_tiles * PACKED;
+        const size_t W_BYTES = (size_t)num_kv * A_per_grp;
+        const int64_t xb_elems = E + q_rows + 16;
+        const int dts = 2;
+        const int64_t ahs = ((seq_len * head_dim * dts + 63) / 64) * 64;
+        const int64_t ahs_elems = ahs / dts;
+        const size_t out_elems = (size_t)num_kv * q_rows;
+        const size_t kv_bytes = (size_t)num_kv * ahs_elems * dts;
+
+        // BOs: O(gid3)=c_bo, X-bundle(gid5)=a_bo, K(gid6)=d3_bo, V(gid7)=d4_bo.
+        if (!entry->c_bo)
+            entry->c_bo = std::make_unique<xrt::bo>(ctx->device, out_elems * dts,
+                xrt::bo::flags::host_only, entry->kernel.group_id(3));
+        if (!entry->a_bo)
+            entry->a_bo = std::make_unique<xrt::bo>(ctx->device, (size_t)xb_elems * dts,
+                xrt::bo::flags::host_only, entry->kernel.group_id(5));
+        if (!entry->d3_bo)
+            entry->d3_bo = std::make_unique<xrt::bo>(ctx->device, kv_bytes,
+                xrt::bo::flags::host_only, entry->kernel.group_id(6));
+        if (!entry->d4_bo)
+            entry->d4_bo = std::make_unique<xrt::bo>(ctx->device, kv_bytes,
+                xrt::bo::flags::host_only, entry->kernel.group_id(7));
+
+        // --- X bundle = [vector(E) | lut(q_rows) | actual_seq + pad16] ---
+        uint16_t * xb = (uint16_t *)entry->a_bo->map<void*>();
+        if (input->type == GGML_TYPE_F32)
+            f32_to_bf16((const float *)input->data, xb, (size_t)E);
+        else
+            memcpy(xb, input->data, (size_t)E * dts);
+        // head LUT (head_dim) tiled attn_group× over q_rows.
+        uint16_t head_lut[256];
+        xdna_build_rope_lut_bf16(rope_node, head_dim, head_lut);
+        for (int64_t h = 0; h < attn_group; h++)
+            memcpy(xb + E + h * head_dim, head_lut, (size_t)head_dim * dts);
+        // actual_seq_len: scan K cache for last non-zero pos (padded tail = 0).
+        const char * k_data = (const char *)k_perm->data;
+        const size_t k_nb0 = k_perm->nb[0], k_nb1 = k_perm->nb[1], k_nb2 = k_perm->nb[2];
+        const bool k_f32 = (k_perm->type == GGML_TYPE_F32);
+        const bool k_f16 = (k_perm->type == GGML_TYPE_F16);
+        auto k_zero = [&](int64_t pos) -> bool {
+            for (int64_t d = 0; d < head_dim; d++) {
+                const char * pp = k_data + pos * k_nb1 + 0 * k_nb2 + d * k_nb0;
+                if (k_f32) { float v; memcpy(&v,pp,4); if (v!=0.0f) return false; }
+                else { uint16_t v; memcpy(&v,pp,2); if (v!=0) return false; }
+            }
+            return true;
+        };
+        int64_t actual_seq = seq_len;
+        if (k_zero(seq_len - 1)) {
+            int64_t lo = 0, hi = seq_len - 1;
+            while (lo < hi) { int64_t mid=(lo+hi+1)/2; if (k_zero(mid)) hi=mid-1; else lo=mid; }
+            actual_seq = lo + 1;
+        }
+        xb[E + q_rows] = f32_to_bf16_scalar((float)actual_seq);
+        entry->a_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+        // --- Q weights: 8 kv-groups × 256 rows, signed int4 (nib-8)&0xF ---
+        xrt::bo * weight_bo_ptr = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(*entry->b_bo_mutex);
+            auto it = entry->b_bo_cache.find(q_w->data);
+            if (it == entry->b_bo_cache.end()) {
+                xrt::bo new_packed(ctx->device, W_BYTES, xrt::bo::flags::host_only,
+                                   entry->kernel.group_id(4));
+                uint8_t * wdst = (uint8_t *)new_packed.map<void*>();
+                const size_t row_stride = (size_t)(E / group_size) * 18;  // Q4_0 row bytes
+                for (int64_t g = 0; g < num_kv; g++) {
+                    const uint8_t * grp_src = (const uint8_t *)q_w->data + (size_t)g * q_rows * row_stride;
+                    xdna_ffn16_pack_tiles(grp_src, q_rows, E, M, group_size, /*sub8=*/true,
+                                          PACKED, wdst + (size_t)g * A_per_grp);
+                }
+                new_packed.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                auto [ins, _] = entry->b_bo_cache.emplace(q_w->data, std::move(new_packed));
+                weight_bo_ptr = &ins->second;
+                fprintf(stderr, "ggml-xdna: warm front_attn E=%lld seq=%lld W=%zuB\n",
+                        (long long)E, (long long)seq_len, W_BYTES);
+                fflush(stderr);
+            } else weight_bo_ptr = &it->second;
+        }
+
+        // --- Stage K/V per kv-head into [num_kv × ahs_elems] (K as-is, already RoPE'd) ---
+        const char * v_data = (const char *)v_perm->data;
+        const size_t v_nb0 = v_perm->nb[0], v_nb1 = v_perm->nb[1], v_nb2 = v_perm->nb[2];
+        const bool v_f32 = (v_perm->type == GGML_TYPE_F32);
+        const bool v_f16 = (v_perm->type == GGML_TYPE_F16);
+        const bool v_rowcontig = (v_perm->ne[0] == head_dim);  // [hd,seq,kv] vs [seq,hd,kv]
+        uint16_t * kdst = (uint16_t *)entry->d3_bo->map<void*>();
+        uint16_t * vdst = (uint16_t *)entry->d4_bo->map<void*>();
+        memset(kdst, 0, kv_bytes); memset(vdst, 0, kv_bytes);
+        auto cvt = [&](const char * pp, bool f32, bool f16) -> uint16_t {
+            if (f32) { float v; memcpy(&v,pp,4); return f32_to_bf16_scalar(v); }
+            if (f16) { ggml_fp16_t h; memcpy(&h,pp,2); float v=ggml_fp16_to_fp32(h); return f32_to_bf16_scalar(v); }
+            uint16_t v; memcpy(&v,pp,2); return v;
+        };
+        for (int64_t g = 0; g < num_kv; g++) {
+            uint16_t * kg = kdst + (size_t)g * ahs_elems;
+            uint16_t * vg = vdst + (size_t)g * ahs_elems;
+            for (int64_t pos = 0; pos < actual_seq; pos++) {
+                for (int64_t d = 0; d < head_dim; d++) {
+                    kg[pos*head_dim + d] = cvt(k_data + pos*k_nb1 + g*k_nb2 + d*k_nb0, k_f32, k_f16);
+                    const char * vp = v_rowcontig ? (v_data + pos*v_nb1 + g*v_nb2 + d*v_nb0)
+                                                  : (v_data + d*v_nb1 + g*v_nb2 + pos*v_nb0);
+                    vg[pos*head_dim + d] = cvt(vp, v_f32, v_f16);
+                }
+            }
+        }
+        entry->d3_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        entry->d4_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+        auto run = xrt::run(entry->kernel);
+        run.set_arg(0, (uint32_t)3);
+        run.set_arg(1, entry->insts_bo);
+        run.set_arg(2, (uint32_t)entry->insts.size());
+        run.set_arg(3, *entry->c_bo);          // O (attn_out)
+        run.set_arg(4, *weight_bo_ptr);        // WT
+        run.set_arg(5, *entry->a_bo);          // X bundle
+        run.set_arg(6, *entry->d3_bo);         // K
+        run.set_arg(7, *entry->d4_bo);         // V
+        run.start();
+        run.wait();
+        entry->c_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+
+        // attn_out col-major [q-head0..num_q-1 × head_dim] = natural q-head order.
+        const uint16_t * o_bf16 = (const uint16_t *)entry->c_bo->map<void*>();
+        if (out_dst->type == GGML_TYPE_F32) {
+            float * dst = (float *)out_dst->data;
+            for (size_t i = 0; i < out_elems; i++) {
+                uint32_t bits = ((uint32_t)o_bf16[i]) << 16;
+                float v; memcpy(&v, &bits, sizeof(v)); dst[i] = v;
+            }
+        } else {
+            memcpy(out_dst->data, o_bf16, out_elems * dts);
+        }
+        return true;
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("ggml-xdna: front_attn dispatch failed (%s)\n", e.what());
         return false;
     }
 }
