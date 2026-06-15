@@ -16426,6 +16426,8 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
     static const struct ggml_tensor * flowkv_poc_q_perm = nullptr;
     static const struct ggml_tensor * flowkv_poc_k_perm = nullptr;
     static const struct ggml_tensor * flowkv_poc_v_perm = nullptr;
+    static const struct ggml_tensor * flowkv_poc_q_mm = nullptr;
+    static const struct ggml_tensor * flowkv_poc_rope_node = nullptr;
     static int64_t flowkv_poc_head_dim = 0;
     static int64_t flowkv_poc_seq_len = 0;
     static int64_t flowkv_poc_num_kv_heads = 0;
@@ -16450,6 +16452,8 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
             flowkv_poc_q_perm = nullptr;
             flowkv_poc_k_perm = nullptr;
             flowkv_poc_v_perm = nullptr;
+            flowkv_poc_q_mm = nullptr;
+            flowkv_poc_rope_node = nullptr;
         }
     }
 
@@ -16473,6 +16477,35 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
             fflush(stderr);
         }
     }
+
+    static const bool front_attn_enabled = xdna_env_enabled("XDNA_ENABLE_FRONT_ATTN");
+    bool front_attn_active = false;
+    if (front_attn_enabled && flowkv_poc_valid && flowkv_poc_q_mm) {
+        const int64_t E = flowkv_poc_q_mm->src[1]->ne[0];
+        const int64_t head_dim = flowkv_poc_head_dim;
+        const int64_t seq_len = flowkv_poc_seq_len;
+        const int64_t num_kv = flowkv_poc_num_kv_heads;
+        const int64_t num_q = flowkv_poc_num_q_heads;
+        const int64_t attn_group = num_q / num_kv;
+        if (flowkv_poc_q_mm->src[0]->type == GGML_TYPE_Q4_0 &&
+            attn_group == 4 && num_kv == 8 && head_dim == 64 &&
+            E % 32 == 0 && seq_len % 32 == 0) {
+            front_attn_active = true;
+        }
+    }
+
+    if (front_attn_active) {
+        // BRING-UP (overwrite mode, like the FlowKV POC): do NOT skip the CPU
+        // attention/RoPE nodes yet. front_attn dispatches at the kqv_out boundary
+        // and OVERWRITES kqv_out, so CPU attention runs (wasteful) but the NPU
+        // result wins — this is correctness-first and avoids two hazards the
+        // pre-skip approach has: (1) skipping attention BEFORE confirming the
+        // dispatch succeeded → silent garbage on a failed dispatch; (2) blindly
+        // skipping all ROPE-before-QK kills K-RoPE too (front reads cache K as
+        // already-RoPE'd). Once e2e correctness is confirmed, a success-gated skip
+        // of {Q@K^T, SOFT_MAX, scores@V, Q-RoPE-only} can be added as a perf step.
+    }
+
     // Phase A1.3 step 2+3 — LayerFused detector. Env-gated (XDNA_LAYER_FUSED=1).
     // Count-only for now; no dispatch site, no skip_indices mutation. Once
     // we wire dispatch, this plan tells us WHERE to fire layer_fused per layer.
@@ -16748,9 +16781,9 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                 // INT4 correctness experiments. When FlowKV graduates from
                 // "POC overwrite" to "NPU replaces CPU attention", this
                 // gate goes away.
-                if (flowkv_decode_enabled && q_mm->src[1]->ne[1] == 1) {  // M=1 decode only
+                if ((flowkv_decode_enabled || front_attn_enabled) && q_mm->src[1]->ne[1] == 1) {  // M=1 decode only
                     static const bool flowkv_on_int4 = xdna_env_enabled("XDNA_FLOWKV_ON_INT4");
-                    if (qkv_int4 && !flowkv_on_int4) {
+                    if (qkv_int4 && !flowkv_on_int4 && !front_attn_enabled) {
                         // FlowKV POC gated off on Q4_0/Q4_K (see comment above).
                         // Skip permute scan -- flowkv_poc_valid stays false.
                         continue;
@@ -16793,6 +16826,14 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                         flowkv_poc_seq_len = k_perm->ne[1];        // seq_len
                         flowkv_poc_num_kv_heads = k_perm->ne[2];
                         flowkv_poc_num_q_heads = q_perm->ne[2];
+                        flowkv_poc_q_mm = q_mm;
+                        flowkv_poc_rope_node = nullptr;
+                        {
+                            auto rit = qkv_plan.rope_at.find(trip[0]);
+                            if (rit != qkv_plan.rope_at.end()) {
+                                flowkv_poc_rope_node = rit->second.q_rope;
+                            }
+                        }
                         flowkv_poc_valid = true;
                         if (flowkv_diag_enabled) {
                             fprintf(stderr, "ggml-xdna: [FlowKV-SCAN] perm found: q=%s ne=[%lld,%lld,%lld] k=%s ne=[%lld,%lld,%lld] v=%s ne=[%lld,%lld,%lld]\n",
@@ -17687,12 +17728,29 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
         // CPU attention has already run and written to kqv_out.
         // We dispatch FlowKV on NPU and OVERWRITE kqv_out with the
         // NPU result. If output matches → FlowKV computes correctly.
-        if (flowkv_decode_enabled && flowkv_poc_valid &&
+        if ((flowkv_decode_enabled || front_attn_active) && flowkv_poc_valid &&
             (node->op == GGML_OP_CONT || node->op == GGML_OP_RESHAPE) &&
             node->name && strstr(node->name, "kqv_out")) {
 
-            struct ggml_tensor * kqv_out = node->src[0];
-            static const bool poc_dbg = getenv("XDNA_DEBUG") != NULL;
+            if (front_attn_active) {
+                struct ggml_tensor * kqv_out = node->src[0];
+                int num_cols = 4;
+                bool ok = ggml_backend_xdna_decode_front_attn(
+                    ctx,
+                    kqv_out,
+                    flowkv_poc_q_mm->src[1],
+                    flowkv_poc_q_mm->src[0],
+                    flowkv_poc_rope_node,
+                    flowkv_poc_k_perm,
+                    flowkv_poc_v_perm,
+                    num_cols
+                );
+                if (!ok) {
+                    GGML_LOG_ERROR("ggml-xdna: front_attn dispatch failed\n");
+                }
+            } else {
+                struct ggml_tensor * kqv_out = node->src[0];
+                static const bool poc_dbg = getenv("XDNA_DEBUG") != NULL;
             int64_t head_dim = flowkv_poc_head_dim;
             int64_t seq_len = flowkv_poc_seq_len;
             int64_t num_kv_heads = flowkv_poc_num_kv_heads;
@@ -18511,6 +18569,7 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
             } else {
                 GGML_LOG_ERROR("ggml-xdna: [FlowKV-POC] kernel load failed\n");
             }
+        }
         }
 
         // View-only nodes are pure metadata — they still need to be in the
