@@ -187,6 +187,26 @@ PRESETS: dict[str, dict[str, str]] = {
         "XDNA_DEBUG_LAYER_FUSED":        "1",
         "XDNA_ATTN_SUPPORTS":            "1",
     },
+    "npu_layer_f3best_probe": {
+        # P6.4d-3c probe: use the coalesced layer_fused graph shape, but fire the
+        # f3best whole-layer dispatch in diagnostic mode (no skip yet). Backend logs
+        # per-layer rel vs CPU l_out; token output should still match because CPU path
+        # remains authoritative until XDNA_LAYER_F3BEST_SKIP=1.
+        "XDNA_ENABLE_GEMV":              "1",
+        "XDNA_ENABLE_SWIGLU":            "1",
+        "XDNA_ENABLE_QKV":               "1",
+        "XDNA_ENABLE_DECODE_BATCH":      "1",
+        "XDNA_ENABLE_TRANSFORMER_BLOCK": "1",
+        "XDNA_ENABLE_FLOWKV_DECODE":     "1",
+        "XDNA_ENABLE_RMS_NORM":          "1",
+        "XDNA_ENABLE_GEMV_INT4":         "1",
+        "XDNA_ENABLE_SWIGLU_INT4":       "1",
+        "XDNA_ENABLE_FUSED_LAYER":       "1",
+        "XDNA_LAYER_FUSED":              "1",
+        "XDNA_DEBUG_LAYER_FUSED":        "1",
+        "XDNA_ENABLE_LAYER_F3BEST":      "1",
+        "XDNA_ATTN_SUPPORTS":            "1",
+    },
     "npu_layer_fused_live": {
         # Live 4-column LayerFused execution with closed-loop on-chip dataflow
         "XDNA_ENABLE_GEMV":              "1",

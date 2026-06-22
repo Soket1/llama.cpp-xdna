@@ -16865,6 +16865,20 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
         xdna_plan_layer_fused(cgraph, qkv_plan, &layer_fused_plan);
     }
 
+    // [P6.4d-3c] f3best whole-layer probe. Fire at the layer's add_ffn node
+    // (l_out): by then the KV cache holds the current token (K/V-proj+SET_ROWS
+    // done) and the CPU l_out is computed, so we can host-stage KV and rel-compare
+    // without a dual-hook. PROBE mode (default): compare vs CPU l_out, NO skip.
+    // XDNA_ENABLE_LAYER_F3BEST=1 arms it; XDNA_LAYER_F3BEST_SKIP=1 commits to skip.
+    static const bool f3best_enabled = xdna_env_enabled("XDNA_ENABLE_LAYER_F3BEST");
+    std::unordered_map<int, int> f3best_addffn_to_match;
+    if (f3best_enabled) {
+        for (size_t mi = 0; mi < layer_fused_plan.matches.size(); mi++) {
+            const xdna_layer_fused_match & m = layer_fused_plan.matches[mi];
+            if (m.add_ffn_idx >= 0) f3best_addffn_to_match[m.add_ffn_idx] = (int)mi;
+        }
+    }
+
     // Pre-scan for decode GEMV batching. Identifies standalone MUL_MAT M=1
     // nodes eligible for runlist batching (gated by XDNA_ENABLE_DECODE_BATCH).
     // Also excludes attention Q@K^T MUL_MATs (followed by SOFT_MAX).
@@ -16981,6 +16995,22 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
             if (lf_it != layer_fused_plan.q_idx_to_match.end()) {
                 const xdna_layer_fused_match & lf_m =
                     layer_fused_plan.matches[lf_it->second];
+                if (f3best_enabled) {
+                    static std::atomic<int> f3best_probe_budget{16};
+                    if (f3best_probe_budget.fetch_sub(1) > 0) {
+                        fprintf(stderr,
+                                "ggml-xdna: [f3best-probe] matched layer q=%d span=[%d,%d] "
+                                "out=%s wq=%s wo=%s gate=%s up=%s down=%s\n",
+                                lf_m.q_idx, lf_m.pre_norm_idx, lf_m.add_ffn_idx,
+                                lf_m.outL_tensor && lf_m.outL_tensor->name[0] ? lf_m.outL_tensor->name : "?",
+                                lf_m.w_q    && lf_m.w_q->name[0]    ? lf_m.w_q->name    : "?",
+                                lf_m.w_o    && lf_m.w_o->name[0]    ? lf_m.w_o->name    : "?",
+                                lf_m.w_gate && lf_m.w_gate->name[0] ? lf_m.w_gate->name : "?",
+                                lf_m.w_up   && lf_m.w_up->name[0]   ? lf_m.w_up->name   : "?",
+                                lf_m.w_down && lf_m.w_down->name[0] ? lf_m.w_down->name : "?");
+                        fflush(stderr);
+                    }
+                }
                 if (ggml_backend_xdna_layer_fused_dispatch(ctx, lf_m)) {
                     // Layer dispatched on NPU — skip every node in the
                     // [pre_norm_idx, add_ffn_idx] span. The CPU range
