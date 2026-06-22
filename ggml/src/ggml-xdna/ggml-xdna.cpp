@@ -16996,6 +16996,7 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                 const xdna_layer_fused_match & lf_m =
                     layer_fused_plan.matches[lf_it->second];
                 if (f3best_enabled) {
+                    static const bool f3best_skip = xdna_env_enabled("XDNA_LAYER_F3BEST_SKIP");
                     static std::atomic<int> f3best_probe_budget{16};
                     if (f3best_probe_budget.fetch_sub(1) > 0) {
                         fprintf(stderr,
@@ -17009,6 +17010,29 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                 lf_m.w_up   && lf_m.w_up->name[0]   ? lf_m.w_up->name   : "?",
                                 lf_m.w_down && lf_m.w_down->name[0] ? lf_m.w_down->name : "?");
                         fflush(stderr);
+                    }
+                    if (!f3best_skip && lf_m.add_ffn_idx >= i && lf_m.outL_tensor && lf_m.inpL_tensor &&
+                        lf_m.w_norm1 && lf_m.w_norm2 && lf_m.w_q && lf_m.w_o && lf_m.w_gate && lf_m.w_up && lf_m.w_down) {
+                        if (cpu_run_start >= 0 && cpu_run_start < i) {
+                            ggml_status s = xdna_delegate_range(ctx, cgraph, cpu_run_start, i);
+                            if (s != GGML_STATUS_SUCCESS) return s;
+                        }
+                        cpu_run_start = -1;
+                        ggml_status s = xdna_delegate_range(ctx, cgraph, i, lf_m.add_ffn_idx + 1);
+                        if (s != GGML_STATUS_SUCCESS) return s;
+                        // TODO(P6.4d-3c): call ggml_backend_xdna_decode_layer_f3best once
+                        // from-match KV staging (current-token K/V projection + cache merge) is wired.
+                        static std::atomic<int> f3best_timing_budget{16};
+                        if (f3best_timing_budget.fetch_sub(1) > 0) {
+                            fprintf(stderr,
+                                    "ggml-xdna: [f3best-probe] CPU reference ready q=%d out=%s (span [%d,%d] delegated)\n",
+                                    lf_m.q_idx,
+                                    lf_m.outL_tensor->name[0] ? lf_m.outL_tensor->name : "?",
+                                    i, lf_m.add_ffn_idx);
+                            fflush(stderr);
+                        }
+                        for (int j = i; j <= lf_m.add_ffn_idx; j++) qkv_plan.skip_indices.insert(j);
+                        continue;
                     }
                 }
                 if (ggml_backend_xdna_layer_fused_dispatch(ctx, lf_m)) {
