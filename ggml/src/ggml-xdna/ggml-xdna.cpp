@@ -1375,8 +1375,10 @@ static std::string make_cache_key(xdna_op_kind op_kind,
         // Full fused decode layer (attn + O-proj + FFN, one dispatch): K=embed_dim,
         // N=hidden_dim, M=seq_len (KV-cache length, varies with context — MUST be in
         // the key). head_dim=64, GQA (attn_group=4, num_kv_heads=8) fixed in the op.
-        snprintf(buf, sizeof(buf), "decode_layer_f3best_K%lld_H%lld_sl%lld_d64_ag4_kv8_g32",
-                 (long long)K, (long long)N, (long long)M);
+        // f3best raw-AIE emitter is currently fixed to the 32-token decode KV window;
+        // actual_seq is carried in XR, but xclbin shape stays SEQ=32.
+        snprintf(buf, sizeof(buf), "decode_layer_f3best_K%lld_H%lld_sl32_d64_ag4_kv8_g32",
+                 (long long)K, (long long)N);
     } else {
         snprintf(buf, sizeof(buf), "gemm_%lldx%lldx%lld_%s_%dcol",
                  (long long)M, (long long)K, (long long)N, dtype_in, num_cols);
@@ -2494,12 +2496,12 @@ static bool ensure_compiled(ggml_backend_xdna_context * ctx,
         // GQA + head_dim fixed for llama-3.2-1B (the emitter validates the shape).
         snprintf(cmd, sizeof(cmd),
                  "%s \"%s\" --quiet decode-layer-f3best --embed-dim %lld --hidden-dim %lld "
-                 "--group-size 32 --head-dim 64 --num-kv-heads 8 --attn-group 4 --seq-len %lld "
+                 "--group-size 32 --head-dim 64 --num-kv-heads 8 --attn-group 4 --seq-len 32 "
                  "--out \"%s\"%s",
                  xdna_python_cmd(), ctx->compile_script.c_str(),
-                 (long long)K, (long long)N, (long long)M,
+                 (long long)K, (long long)N,
                  xclbin_path.c_str(), xdna_null_redirect());
-        fprintf(stderr, "ggml-xdna: compiling DECODE_LAYER_F3BEST E=%lld H=%lld sl=%lld (first run, will be cached)...\n",
+        fprintf(stderr, "ggml-xdna: compiling DECODE_LAYER_F3BEST E=%lld H=%lld sl=32 (first run, will be cached; runtime seq=%lld)...\n",
                       (long long)K, (long long)N, (long long)M);
     } else {
         // [INT8 GEMM] Use separate dtype_out when provided (e.g. "i32" for i8 input).
@@ -4733,11 +4735,20 @@ static bool ggml_backend_xdna_decode_layer_f3best(
         const struct ggml_tensor * k_perm,
         const struct ggml_tensor * v_perm,
         int num_cols) {
-    if (!ctx->device_valid) return false;
+    if (!ctx->device_valid) { fprintf(stderr, "f3best ENTER device invalid\n"); return false; }
+    fprintf(stderr, "f3best ENTER Earg=%lld qtype=%d otype=%d gtype=%d utype=%d dtype=%d gain_type=%d k_ne=[%lld,%lld,%lld] v_ne=[%lld,%lld,%lld]\n",
+            (long long)input_E, (int)q_w->type, (int)o_w->type, (int)gate_w->type,
+            (int)up_w->type, (int)down_w->type, ffn_gain ? (int)ffn_gain->type : -1,
+            (long long)k_perm->ne[0], (long long)k_perm->ne[1], (long long)k_perm->ne[2],
+            (long long)v_perm->ne[0], (long long)v_perm->ne[1], (long long)v_perm->ne[2]);
     if (q_w->type != GGML_TYPE_Q4_0 || o_w->type != GGML_TYPE_Q4_0 ||
         gate_w->type != GGML_TYPE_Q4_0 || up_w->type != GGML_TYPE_Q4_0 ||
-        down_w->type != GGML_TYPE_Q4_0) return false;
-    if (!input_snap || !resid || input_E <= 0) return false;
+        down_w->type != GGML_TYPE_Q4_0) {
+        fprintf(stderr, "f3best guard weight types q=%d o=%d g=%d u=%d d=%d expected=%d\n",
+                (int)q_w->type, (int)o_w->type, (int)gate_w->type, (int)up_w->type, (int)down_w->type, (int)GGML_TYPE_Q4_0);
+        return false;
+    }
+    if (!input_snap || !resid || input_E <= 0) { fprintf(stderr, "f3best guard input null input=%p resid=%p E=%lld\n", (const void*)input_snap, (const void*)resid, (long long)input_E); return false; }
 
     const int64_t NH = 8, M = 4, group_size = 32;
     const int64_t E         = input_E;
@@ -4749,8 +4760,8 @@ static bool ggml_backend_xdna_decode_layer_f3best(
     const int64_t attn_group = num_kv ? num_q / num_kv : 0;
     // The f3best xclbin is built for the llama-3.2-1B geometry. Guard exactly.
     if (E != 2048 || hidden != 8192 || head_dim != 64 || attn_group != 4 ||
-        num_kv != 8 || num_q != 32 || num_cols != 8) return false;
-    if (seq_len % 32 != 0) return false;
+        num_kv != 8 || num_q != 32) { fprintf(stderr,"f3best guard geom fail E=%lld H=%lld hd=%lld ag=%lld kv=%lld q=%lld\n",(long long)E,(long long)hidden,(long long)head_dim,(long long)attn_group,(long long)num_kv,(long long)num_q); return false; }
+    if (seq_len < 32) { fprintf(stderr,"f3best guard seq fail seq=%lld\n",(long long)seq_len); return false; }
 
     const int64_t H8  = hidden / NH;                 // 1024
     const int64_t HH  = hidden;                       // 8192
@@ -4759,7 +4770,7 @@ static bool ggml_backend_xdna_decode_layer_f3best(
     const size_t  WT_BYTES = (size_t)WT_TILES * PACKED;
     const size_t  RS       = (size_t)(E / group_size) * 18;   // 1152 (full E-row Q4_0)
     const size_t  WO_BYTES = 2359296;                 // unused arg3 placeholder
-    const int64_t KVN      = seq_len * head_dim;
+    const int64_t KVN      = 32 * head_dim;             // f3best xclbin KV window is fixed at 32 tokens
     const int     dts      = 2;
     const int64_t XB       = E + 256 + 16;            // 2320
     const int64_t XR_ELEMS = XB + E + E;             // 6416 (x|resid|gain)
@@ -4768,12 +4779,13 @@ static bool ggml_backend_xdna_decode_layer_f3best(
     const std::string cache_key = make_cache_key(XDNA_OP_DECODE_LAYER_F3BEST,
                                                  seq_len, E, hidden, "uint4", num_cols);
     if (!ensure_compiled(ctx, cache_key, XDNA_OP_DECODE_LAYER_F3BEST,
-                         seq_len, E, hidden, "uint4", num_cols)) return false;
+                         seq_len, E, hidden, "uint4", num_cols)) { fprintf(stderr,"f3best ensure_compiled failed cache=%s\n", cache_key.c_str()); return false; }
     xdna_kernel_entry * entry = get_or_load_kernel(ctx, cache_key,
                                                    XDNA_OP_DECODE_LAYER_F3BEST, seq_len, E, hidden);
-    if (!entry) return false;
+    if (!entry) { fprintf(stderr,"f3best get_or_load failed cache=%s\n", cache_key.c_str()); return false; }
 
     try {
+        fprintf(stderr, "f3best BEFORE BO alloc cache=%s\n", cache_key.c_str());
         // BOs: out(grp3)=c_bo, XR(grp4)=a_bo, A weights(grp5)=cached, Wo dummy(grp6)=d3_bo, KV(grp7)=d4_bo.
         if (!entry->c_bo)
             entry->c_bo = std::make_unique<xrt::bo>(ctx->device, OUT_ELEMS * dts,
@@ -4812,9 +4824,9 @@ static bool ggml_backend_xdna_decode_layer_f3best(
             }
             return true;
         };
-        int64_t actual_seq = seq_len;
-        if (k_zero(seq_len - 1)) {
-            int64_t lo = 0, hi = seq_len - 1;
+        int64_t actual_seq = std::min<int64_t>(seq_len, 32);
+        if (actual_seq > 0 && k_zero(actual_seq - 1)) {
+            int64_t lo = 0, hi = actual_seq - 1;
             while (lo < hi) { int64_t mid=(lo+hi+1)/2; if (k_zero(mid)) hi=mid-1; else lo=mid; }
             actual_seq = lo + 1;
         }
@@ -4828,9 +4840,10 @@ static bool ggml_backend_xdna_decode_layer_f3best(
             } else if (ffn_gain->type == GGML_TYPE_F16) {
                 const ggml_fp16_t * g16 = (const ggml_fp16_t *)ffn_gain->data;
                 for (int64_t e = 0; e < E; e++) gdst[e] = f32_to_bf16_scalar(ggml_fp16_to_fp32(g16[e]));
-            } else return false;
+            } else { fprintf(stderr, "f3best guard gain type=%d E=%lld\n", (int)ffn_gain->type, (long long)ffn_gain->ne[0]); return false; }
         }
         entry->a_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        fprintf(stderr, "f3best AFTER XR sync\n");
 
         // --- A-stream weights (per head [Wq|Wo|gate|up|down]), cached by q_w ptr ---
         xrt::bo * a_weights = nullptr;
@@ -17020,8 +17033,8 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                         cpu_run_start = -1;
                         ggml_status s = xdna_delegate_range(ctx, cgraph, i, lf_m.add_ffn_idx + 1);
                         if (s != GGML_STATUS_SUCCESS) return s;
-                        // TODO(P6.4d-3c): call ggml_backend_xdna_decode_layer_f3best once
-                        // from-match KV staging (current-token K/V projection + cache merge) is wired.
+                        // CPU reference is now materialized at outL. Build f3best inputs from the
+                        // same match and run it redundantly (probe mode, no output overwrite).
                         static std::atomic<int> f3best_timing_budget{16};
                         if (f3best_timing_budget.fetch_sub(1) > 0) {
                             fprintf(stderr,
@@ -17031,11 +17044,72 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                     i, lf_m.add_ffn_idx);
                             fflush(stderr);
                         }
+
+                        struct ggml_tensor * k_perm = nullptr;
+                        struct ggml_tensor * v_perm = nullptr;
+                        const int64_t hd = 64;
+                        for (int si = i; si <= lf_m.add_ffn_idx; si++) {
+                            struct ggml_tensor * nd = cgraph->nodes[si];
+                            if (!nd || nd->op != GGML_OP_PERMUTE) continue;
+                            if (!k_perm && nd->ne[0] == hd && nd->ne[1] >= 32 && nd->ne[2] == 8) {
+                                k_perm = nd;
+                            } else if (!v_perm && nd->ne[0] >= 32 && nd->ne[1] == hd && nd->ne[2] == 8) {
+                                v_perm = nd;
+                            }
+                        }
+
+                        bool f3_ok = false;
+                        if (k_perm && v_perm && lf_m.q_rope_idx >= 0) {
+                            std::vector<float> normed(2048, 0.0f);
+                            const float * inpL = (const float *)lf_m.inpL_tensor->data;
+                            const float * gain = (const float *)lf_m.w_norm1->data;
+                            double ss = 0.0;
+                            for (int e = 0; e < 2048; e++) ss += (double)inpL[e] * (double)inpL[e];
+                            const float inv = 1.0f / std::sqrt((float)(ss / 2048.0) + 1e-5f);
+                            for (int e = 0; e < 2048; e++) normed[e] = inpL[e] * inv * gain[e];
+
+                            std::vector<float> npu_out(2048, 0.0f);
+                            struct ggml_tensor dummy = *lf_m.outL_tensor;
+                            dummy.data = npu_out.data();
+                            fprintf(stderr, "ggml-xdna: [f3best-probe] CALL decode_layer_f3best q=%d\n", lf_m.q_idx); fflush(stderr);
+                            f3_ok = ggml_backend_xdna_decode_layer_f3best(
+                                ctx, &dummy, normed.data(), 2048, inpL,
+                                lf_m.w_q, lf_m.w_o, lf_m.w_gate, lf_m.w_up, lf_m.w_down,
+                                lf_m.w_norm2, cgraph->nodes[lf_m.q_rope_idx], k_perm, v_perm,
+                                8);
+                            if (f3_ok && lf_m.outL_tensor->type == GGML_TYPE_F32) {
+                                const float * cpu_out = (const float *)lf_m.outL_tensor->data;
+                                double num = 0.0, den = 0.0;
+                                for (int e = 0; e < 2048; e++) {
+                                    const double d = (double)npu_out[e] - (double)cpu_out[e];
+                                    num += d*d; den += (double)cpu_out[e] * (double)cpu_out[e];
+                                }
+                                static std::atomic<int> rel_budget{64};
+                                if (rel_budget.fetch_sub(1) > 0) {
+                                    fprintf(stderr,
+                                            "ggml-xdna: [f3best-probe] q=%d rel_L2=%.5f k=%s v=%s\n",
+                                            lf_m.q_idx, std::sqrt(num / (den + 1e-12)),
+                                            k_perm->name[0] ? k_perm->name : "?",
+                                            v_perm->name[0] ? v_perm->name : "?");
+                                    fflush(stderr);
+                                }
+                            }
+                        }
+                        if (!f3_ok) {
+                            static std::atomic<int> fail_budget{32};
+                            if (fail_budget.fetch_sub(1) > 0) {
+                                fprintf(stderr,
+                                        "ggml-xdna: [f3best-probe] skip NPU compare q=%d k=%p v=%p rope=%d inp_type=%d\n",
+                                        lf_m.q_idx, (void*)k_perm, (void*)v_perm, lf_m.q_rope_idx,
+                                        lf_m.inpL_tensor ? (int)lf_m.inpL_tensor->type : -1);
+                                fflush(stderr);
+                            }
+                        }
                         for (int j = i; j <= lf_m.add_ffn_idx; j++) qkv_plan.skip_indices.insert(j);
                         continue;
                     }
                 }
-                if (ggml_backend_xdna_layer_fused_dispatch(ctx, lf_m)) {
+                if (!f3best_enabled && ggml_backend_xdna_layer_fused_dispatch(ctx, lf_m)) {
                     // Layer dispatched on NPU — skip every node in the
                     // [pre_norm_idx, add_ffn_idx] span. The CPU range
                     // delegate machinery will treat them as no-ops.
