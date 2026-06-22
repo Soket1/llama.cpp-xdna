@@ -1166,6 +1166,55 @@ def compile_decode_back_mono(embed_dim: int, hidden_dim: int, group_size: int,
     return output_path
 
 
+def compile_decode_layer_f3best(embed_dim: int, hidden_dim: int, group_size: int,
+                                head_dim: int, num_kv_heads: int, attn_group: int,
+                                seq_len: int, output_path: str) -> str:
+    """Compile the full fused decode layer (F3-best, one dispatch, below IRON).
+
+    8 phase-blind center tiles time-mux Q-GEMV+RoPE -> O-proj -> FFN on one weight
+    stream; 8 score + 8 value edge tiles run spatial-8 attention. The MLIR is raw
+    aie-dialect emitted by the operator's design.py (f3best_emit), compiled with the
+    same aiecc backend as the other ops. Shape is fixed to Llama-3.2-1B (the emitter
+    validates). Mirrors compile_decode_ffn16_2mm's staging.
+
+    Args:
+        embed_dim: Embedding dim E (1B: 2048). hidden_dim: FFN hidden H (1B: 8192).
+        group_size: Q4_0 group (32). head_dim: attention head dim (64).
+        num_kv_heads: GQA kv heads (8). attn_group: q-heads per kv (4).
+        seq_len: KV-cache length (32). output_path: .xclbin path; .insts alongside.
+    """
+    from iron.operators.decode_layer_f3best.op import AIEDecodeLayerF3Best
+    from iron.common.context import AIEContext
+
+    build_root = os.path.join(os.path.dirname(output_path) or ".", "layer_f3best_build")
+    os.makedirs(build_root, exist_ok=True)
+
+    op = AIEDecodeLayerF3Best(
+        embed_dim=embed_dim,
+        hidden_dim=hidden_dim,
+        K_gemv=embed_dim,
+        head_dim=head_dim,
+        group_size=group_size,
+        attn_group=attn_group,
+        num_kv_heads=num_kv_heads,
+        m_input=4,
+        seq_len=seq_len,
+        context=AIEContext(build_dir=build_root),
+    )
+    op.compile()
+
+    build_dir = op.context.build_dir
+    compiled_xclbin = build_dir / op.xclbin_artifact.filename
+    compiled_insts = build_dir / op.insts_artifact.filename
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    shutil.copy2(str(compiled_xclbin), output_path)
+    insts_output = output_path.replace(".xclbin", ".insts")
+    shutil.copy2(str(compiled_insts), insts_output)
+
+    return output_path
+
+
 def compile_swiglu_decode(embedding_dim: int, hidden_dim: int, dtype: str,
                           num_aie_columns: int, output_dir: str) -> str:
     """Compile an IRON SwiGLU decode operator and stage its artifacts into output_dir.
@@ -3020,6 +3069,22 @@ def main():
     qkv16_parser.add_argument("--out", type=str, required=True,
                               help="Output xclbin path; matching .insts alongside")
 
+    # decode-layer-f3best -- full fused decode layer (attn + O-proj + FFN) in ONE
+    # dispatch, raw aie-dialect below IRON. 1B-shape only (emitter validates).
+    f3best_parser = subparsers.add_parser(
+        "decode-layer-f3best",
+        help="Full fused decode layer (attn + O-proj + FFN) single dispatch",
+    )
+    f3best_parser.add_argument("--embed-dim", type=int, required=True)
+    f3best_parser.add_argument("--hidden-dim", type=int, required=True)
+    f3best_parser.add_argument("--group-size", type=int, default=32)
+    f3best_parser.add_argument("--head-dim", type=int, default=64)
+    f3best_parser.add_argument("--num-kv-heads", type=int, default=8)
+    f3best_parser.add_argument("--attn-group", type=int, default=4)
+    f3best_parser.add_argument("--seq-len", type=int, default=32)
+    f3best_parser.add_argument("--out", type=str, required=True,
+                               help="Output xclbin path; matching .insts alongside")
+
     # V3 -- batched GEMV for spec-dec verification (M_BATCH activation rows).
     fdg3_parser = subparsers.add_parser(
         "fused-dequant-gemv-v3",
@@ -3422,6 +3487,14 @@ def main():
         path = compile_decode_qkv16(
             args.embed_dim, args.qkv_dim,
             args.num_aie_columns, args.group_size, args.out,
+        )
+        if not args.quiet:
+            print(path)
+    elif args.op == "decode-layer-f3best":
+        path = compile_decode_layer_f3best(
+            args.embed_dim, args.hidden_dim, args.group_size,
+            args.head_dim, args.num_kv_heads, args.attn_group,
+            args.seq_len, args.out,
         )
         if not args.quiet:
             print(path)
