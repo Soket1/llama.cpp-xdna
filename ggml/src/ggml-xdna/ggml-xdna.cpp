@@ -116,6 +116,7 @@ enum xdna_op_kind : int {
     XDNA_OP_QKV16               = 14, // M==1 16-tile fused QKV projection (Q+K+V concat) single dispatch
     XDNA_OP_DECODE_FRONT_ATTN   = 15, // M==1 fused front half (Q-GEMV + interleaved RoPE + flowkv attn) #32
     XDNA_OP_DECODE_BACK_MONO    = 16, // M==1 fused back half (O-proj + residual + RMSNorm + mono-FFN) #32
+    XDNA_OP_DECODE_LAYER_F3BEST = 17, // M==1 full fused decode layer (attn + O-proj + FFN) one dispatch (F3-best)
 };
 
 // Phase 9: per-entry input/output BO ring for async dispatch. Each call
@@ -1370,6 +1371,12 @@ static std::string make_cache_key(xdna_op_kind op_kind,
         // Fused back half (#32 Option B): K=embed_dim, N=hidden_dim.
         snprintf(buf, sizeof(buf), "decode_back_mono_K%lld_N%lld_%dcol_g32",
                  (long long)K, (long long)N, num_cols);
+    } else if (op_kind == XDNA_OP_DECODE_LAYER_F3BEST) {
+        // Full fused decode layer (attn + O-proj + FFN, one dispatch): K=embed_dim,
+        // N=hidden_dim, M=seq_len (KV-cache length, varies with context — MUST be in
+        // the key). head_dim=64, GQA (attn_group=4, num_kv_heads=8) fixed in the op.
+        snprintf(buf, sizeof(buf), "decode_layer_f3best_K%lld_H%lld_sl%lld_d64_ag4_kv8_g32",
+                 (long long)K, (long long)N, (long long)M);
     } else {
         snprintf(buf, sizeof(buf), "gemm_%lldx%lldx%lld_%s_%dcol",
                  (long long)M, (long long)K, (long long)N, dtype_in, num_cols);
@@ -2482,6 +2489,18 @@ static bool ensure_compiled(ggml_backend_xdna_context * ctx,
                  xclbin_path.c_str(), xdna_null_redirect());
         fprintf(stderr, "ggml-xdna: compiling DECODE_BACK_MONO E=%lld H=%lld (first run, will be cached)...\n",
                       (long long)K, (long long)N);
+    } else if (op_kind == XDNA_OP_DECODE_LAYER_F3BEST) {
+        // Full fused decode layer. K=embed_dim, N=hidden_dim, M=seq_len (KV length).
+        // GQA + head_dim fixed for llama-3.2-1B (the emitter validates the shape).
+        snprintf(cmd, sizeof(cmd),
+                 "%s \"%s\" --quiet decode-layer-f3best --embed-dim %lld --hidden-dim %lld "
+                 "--group-size 32 --head-dim 64 --num-kv-heads 8 --attn-group 4 --seq-len %lld "
+                 "--out \"%s\"%s",
+                 xdna_python_cmd(), ctx->compile_script.c_str(),
+                 (long long)K, (long long)N, (long long)M,
+                 xclbin_path.c_str(), xdna_null_redirect());
+        fprintf(stderr, "ggml-xdna: compiling DECODE_LAYER_F3BEST E=%lld H=%lld sl=%lld (first run, will be cached)...\n",
+                      (long long)K, (long long)N, (long long)M);
     } else {
         // [INT8 GEMM] Use separate dtype_out when provided (e.g. "i32" for i8 input).
         const char * out_dtype = dtype_out ? dtype_out : dtype_in;
