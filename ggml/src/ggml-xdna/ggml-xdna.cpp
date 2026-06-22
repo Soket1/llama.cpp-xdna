@@ -4708,6 +4708,227 @@ static bool ggml_backend_xdna_decode_front_attn(
     }
 }
 
+// ── decode_layer_f3best (P6.4d-3): whole fused decode layer in ONE dispatch ──
+// Q-GEMV+RoPE -> spatial-8 attention (KV host-supplied) -> O-proj -> +resid ->
+// ffn_norm(gain) -> FFN, all on-chip. Output BO = [NH FFN partials | s] where
+// s = O_proj+resid; the final layer output is s + sum(partials), formed here.
+// Weight packing is f3best_pack.h (byte-verified vs the Python reference).
+//   input_snap : attn-normed layer input, f32 [E]
+//   resid      : layer input residual (pre-attn-norm), f32 [E]
+//   q/o/gate/up/down_w : Q4_0 weights; ffn_gain : ffn_norm.weight (f32/f16, [E])
+//   k_perm/v_perm : KV cache [head_dim, seq, kv_heads]; rope_node : Q RoPE source
+#include "f3best_pack.h"
+static bool ggml_backend_xdna_decode_layer_f3best(
+        ggml_backend_xdna_context * ctx,
+        struct ggml_tensor * out_dst,
+        const float * input_snap, int64_t input_E,
+        const float * resid,
+        const struct ggml_tensor * q_w,
+        const struct ggml_tensor * o_w,
+        const struct ggml_tensor * gate_w,
+        const struct ggml_tensor * up_w,
+        const struct ggml_tensor * down_w,
+        const struct ggml_tensor * ffn_gain,
+        const struct ggml_tensor * rope_node,
+        const struct ggml_tensor * k_perm,
+        const struct ggml_tensor * v_perm,
+        int num_cols) {
+    if (!ctx->device_valid) return false;
+    if (q_w->type != GGML_TYPE_Q4_0 || o_w->type != GGML_TYPE_Q4_0 ||
+        gate_w->type != GGML_TYPE_Q4_0 || up_w->type != GGML_TYPE_Q4_0 ||
+        down_w->type != GGML_TYPE_Q4_0) return false;
+    if (!input_snap || !resid || input_E <= 0) return false;
+
+    const int64_t NH = 8, M = 4, group_size = 32;
+    const int64_t E         = input_E;
+    const int64_t hidden    = gate_w->ne[1];
+    const int64_t head_dim  = k_perm->ne[0];
+    const int64_t seq_len   = k_perm->ne[1];
+    const int64_t num_kv    = k_perm->ne[2];
+    const int64_t num_q     = q_w->ne[1] / head_dim;
+    const int64_t attn_group = num_kv ? num_q / num_kv : 0;
+    // The f3best xclbin is built for the llama-3.2-1B geometry. Guard exactly.
+    if (E != 2048 || hidden != 8192 || head_dim != 64 || attn_group != 4 ||
+        num_kv != 8 || num_q != 32 || num_cols != 8) return false;
+    if (seq_len % 32 != 0) return false;
+
+    const int64_t H8  = hidden / NH;                 // 1024
+    const int64_t HH  = hidden;                       // 8192
+    const size_t  PACKED   = (size_t)M * E / 2 + (size_t)M * (E / group_size) * 2;  // 4608
+    const int64_t WT_TILES = 896;
+    const size_t  WT_BYTES = (size_t)WT_TILES * PACKED;
+    const size_t  RS       = (size_t)(E / group_size) * 18;   // 1152 (full E-row Q4_0)
+    const size_t  WO_BYTES = 2359296;                 // unused arg3 placeholder
+    const int64_t KVN      = seq_len * head_dim;
+    const int     dts      = 2;
+    const int64_t XB       = E + 256 + 16;            // 2320
+    const int64_t XR_ELEMS = XB + E + E;             // 6416 (x|resid|gain)
+    const size_t  OUT_ELEMS = (size_t)(NH + 1) * E;  // [8 partials | s]
+
+    const std::string cache_key = make_cache_key(XDNA_OP_DECODE_LAYER_F3BEST,
+                                                 seq_len, E, hidden, "uint4", num_cols);
+    if (!ensure_compiled(ctx, cache_key, XDNA_OP_DECODE_LAYER_F3BEST,
+                         seq_len, E, hidden, "uint4", num_cols)) return false;
+    xdna_kernel_entry * entry = get_or_load_kernel(ctx, cache_key,
+                                                   XDNA_OP_DECODE_LAYER_F3BEST, seq_len, E, hidden);
+    if (!entry) return false;
+
+    try {
+        // BOs: out(grp3)=c_bo, XR(grp4)=a_bo, A weights(grp5)=cached, Wo dummy(grp6)=d3_bo, KV(grp7)=d4_bo.
+        if (!entry->c_bo)
+            entry->c_bo = std::make_unique<xrt::bo>(ctx->device, OUT_ELEMS * dts,
+                xrt::bo::flags::host_only, entry->kernel.group_id(3));
+        if (!entry->a_bo)
+            entry->a_bo = std::make_unique<xrt::bo>(ctx->device, (size_t)XR_ELEMS * dts,
+                xrt::bo::flags::host_only, entry->kernel.group_id(4));
+        if (!entry->d3_bo) {
+            entry->d3_bo = std::make_unique<xrt::bo>(ctx->device, WO_BYTES,
+                xrt::bo::flags::host_only, entry->kernel.group_id(6));
+            memset(entry->d3_bo->map<void*>(), 0, WO_BYTES);
+            entry->d3_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);     // never DMA'd, bound once
+        }
+        if (!entry->d4_bo)
+            entry->d4_bo = std::make_unique<xrt::bo>(ctx->device, (size_t)2 * NH * KVN * dts,
+                xrt::bo::flags::host_only, entry->kernel.group_id(7));
+
+        // --- XR bundle: [x(E) | rope-lut(256) | seq+pad(16) | resid(E) | gain(E)] ---
+        uint16_t * xr = (uint16_t *)entry->a_bo->map<void*>();
+        memset(xr, 0, (size_t)XR_ELEMS * dts);
+        f32_to_bf16(input_snap, xr, (size_t)E);
+        uint16_t head_lut[256];
+        xdna_build_rope_lut_bf16(rope_node, head_dim, head_lut);
+        for (int64_t h = 0; h < attn_group; h++)
+            memcpy(xr + E + h * head_dim, head_lut, (size_t)head_dim * dts);
+        // actual_seq: last non-zero K position (padded tail = 0).
+        const char * k_data = (const char *)k_perm->data;
+        const size_t k_nb0 = k_perm->nb[0], k_nb1 = k_perm->nb[1], k_nb2 = k_perm->nb[2];
+        const bool k_f32 = (k_perm->type == GGML_TYPE_F32);
+        const bool k_f16 = (k_perm->type == GGML_TYPE_F16);
+        auto k_zero = [&](int64_t pos) -> bool {
+            for (int64_t d = 0; d < head_dim; d++) {
+                const char * pp = k_data + pos * k_nb1 + 0 * k_nb2 + d * k_nb0;
+                if (k_f32) { float v; memcpy(&v,pp,4); if (v!=0.0f) return false; }
+                else { uint16_t v; memcpy(&v,pp,2); if (v!=0) return false; }
+            }
+            return true;
+        };
+        int64_t actual_seq = seq_len;
+        if (k_zero(seq_len - 1)) {
+            int64_t lo = 0, hi = seq_len - 1;
+            while (lo < hi) { int64_t mid=(lo+hi+1)/2; if (k_zero(mid)) hi=mid-1; else lo=mid; }
+            actual_seq = lo + 1;
+        }
+        xr[E + 256] = f32_to_bf16_scalar((float)actual_seq);
+        f32_to_bf16(resid, xr + XB, (size_t)E);
+        // ffn_norm gain -> bf16 (norm weights are usually f32).
+        {
+            uint16_t * gdst = xr + XB + E;
+            if (ffn_gain->type == GGML_TYPE_F32) {
+                f32_to_bf16((const float *)ffn_gain->data, gdst, (size_t)E);
+            } else if (ffn_gain->type == GGML_TYPE_F16) {
+                const ggml_fp16_t * g16 = (const ggml_fp16_t *)ffn_gain->data;
+                for (int64_t e = 0; e < E; e++) gdst[e] = f32_to_bf16_scalar(ggml_fp16_to_fp32(g16[e]));
+            } else return false;
+        }
+        entry->a_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+        // --- A-stream weights (per head [Wq|Wo|gate|up|down]), cached by q_w ptr ---
+        xrt::bo * a_weights = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(*entry->b_bo_mutex);
+            auto it = entry->b_bo_cache.find(q_w->data);
+            if (it == entry->b_bo_cache.end()) {
+                xrt::bo packed(ctx->device, (size_t)NH * WT_BYTES, xrt::bo::flags::host_only,
+                               entry->kernel.group_id(5));
+                uint8_t * A = (uint8_t *)packed.map<void*>();
+                const uint8_t * qd = (const uint8_t *)q_w->data;
+                const uint8_t * od = (const uint8_t *)o_w->data;
+                const uint8_t * gd = (const uint8_t *)gate_w->data;
+                const uint8_t * ud = (const uint8_t *)up_w->data;
+                const uint8_t * dd = (const uint8_t *)down_w->data;
+                for (int64_t h = 0; h < NH; h++) {
+                    uint8_t * hd = A + (size_t)h * WT_BYTES; size_t off = 0;
+                    f3b::pack_gemv(qd + (size_t)h*256*RS, 256, E, (int)M, (int)group_size, PACKED, hd+off); off += 64*PACKED;
+                    f3b::pack_gemv(od + (size_t)h*256*RS, 256, E, (int)M, (int)group_size, PACKED, hd+off); off += 64*PACKED;
+                    f3b::pack_bcast(gd + (size_t)h*H8*RS, H8, E, E, 0, (int)group_size, PACKED, hd+off); off += 256*PACKED;
+                    f3b::pack_bcast(ud + (size_t)h*H8*RS, H8, E, E, 0, (int)group_size, PACKED, hd+off); off += 256*PACKED;
+                    f3b::pack_bcast(dd, E, H8, HH, h*H8, (int)group_size, PACKED, hd+off); off += 256*PACKED;
+                }
+                packed.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                auto [ins, _] = entry->b_bo_cache.emplace(q_w->data, std::move(packed));
+                a_weights = &ins->second;
+                fprintf(stderr, "ggml-xdna: warm decode_layer_f3best E=%lld seq=%lld A=%zuB\n",
+                        (long long)E, (long long)seq_len, (size_t)NH * WT_BYTES);
+                fflush(stderr);
+            } else a_weights = &it->second;
+        }
+
+        // --- KV cache: [K0..K3 | K4..K7 | V0..V3 | V4..V7], each head seq*head_dim ---
+        const char * v_data = (const char *)v_perm->data;
+        const size_t v_nb0 = v_perm->nb[0], v_nb1 = v_perm->nb[1], v_nb2 = v_perm->nb[2];
+        const bool v_f32 = (v_perm->type == GGML_TYPE_F32);
+        const bool v_f16 = (v_perm->type == GGML_TYPE_F16);
+        const bool v_rowcontig = (v_perm->ne[0] == head_dim);
+        uint16_t * kv = (uint16_t *)entry->d4_bo->map<void*>();
+        memset(kv, 0, (size_t)2 * NH * KVN * dts);
+        auto cvt = [&](const char * pp, bool f32, bool f16) -> uint16_t {
+            if (f32) { float v; memcpy(&v,pp,4); return f32_to_bf16_scalar(v); }
+            if (f16) { ggml_fp16_t h; memcpy(&h,pp,2); return f32_to_bf16_scalar(ggml_fp16_to_fp32(h)); }
+            uint16_t v; memcpy(&v,pp,2); return v;
+        };
+        for (int64_t g = 0; g < NH; g++) {
+            uint16_t * kg = kv + (size_t)g * KVN;
+            uint16_t * vg = kv + (size_t)(NH + g) * KVN;
+            for (int64_t pos = 0; pos < actual_seq; pos++) {
+                for (int64_t d = 0; d < head_dim; d++) {
+                    kg[pos*head_dim + d] = cvt(k_data + pos*k_nb1 + g*k_nb2 + d*k_nb0, k_f32, k_f16);
+                    const char * vp = v_rowcontig ? (v_data + pos*v_nb1 + g*v_nb2 + d*v_nb0)
+                                                  : (v_data + d*v_nb1 + g*v_nb2 + pos*v_nb0);
+                    vg[pos*head_dim + d] = cvt(vp, v_f32, v_f16);
+                }
+            }
+        }
+        entry->d4_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+        auto run = xrt::run(entry->kernel);
+        run.set_arg(0, (uint32_t)3);
+        run.set_arg(1, entry->insts_bo);
+        run.set_arg(2, (uint32_t)entry->insts.size());
+        run.set_arg(3, *entry->c_bo);          // out [partials | s]
+        run.set_arg(4, *entry->a_bo);          // XR
+        run.set_arg(5, *a_weights);            // A weights
+        run.set_arg(6, *entry->d3_bo);         // Wo placeholder (unused)
+        run.set_arg(7, *entry->d4_bo);         // KV
+        run.start();
+        run.wait();
+        entry->c_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+
+        // final[e] = s[e] + sum_h partial[h][e]
+        const uint16_t * ob = (const uint16_t *)entry->c_bo->map<void*>();
+        auto bf16f = [](uint16_t b)->float{ uint32_t u=((uint32_t)b)<<16; float v; memcpy(&v,&u,4); return v; };
+        const uint16_t * s_blk = ob + (size_t)NH * E;
+        if (out_dst->type == GGML_TYPE_F32) {
+            float * dst = (float *)out_dst->data;
+            for (int64_t e = 0; e < E; e++) {
+                float acc = bf16f(s_blk[e]);
+                for (int64_t h = 0; h < NH; h++) acc += bf16f(ob[(size_t)h*E + e]);
+                dst[e] = acc;
+            }
+        } else {
+            uint16_t * dst = (uint16_t *)out_dst->data;
+            for (int64_t e = 0; e < E; e++) {
+                float acc = bf16f(s_blk[e]);
+                for (int64_t h = 0; h < NH; h++) acc += bf16f(ob[(size_t)h*E + e]);
+                dst[e] = f32_to_bf16_scalar(acc);
+            }
+        }
+        return true;
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("ggml-xdna: decode_layer_f3best dispatch failed (%s)\n", e.what());
+        return false;
+    }
+}
+
 // Dispatch the fused 16-tile FFN. Reads `input` (F32/bf16, E), writes the down
 // projection result into `down_dst->data` (F32, E). gate/up/down weights Q4_0.
 static bool ggml_backend_xdna_decode_ffn16_2mm(
