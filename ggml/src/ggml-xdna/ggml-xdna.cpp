@@ -4830,7 +4830,9 @@ static bool ggml_backend_xdna_decode_layer_f3best(
             while (lo < hi) { int64_t mid=(lo+hi+1)/2; if (k_zero(mid)) hi=mid-1; else lo=mid; }
             actual_seq = lo + 1;
         }
-        xr[E + 256] = f32_to_bf16_scalar((float)actual_seq);
+        const int64_t kv_start = actual_seq > 32 ? (actual_seq - 32) : 0;
+        const int64_t kv_len = std::min<int64_t>(actual_seq, 32);
+        xr[E + 256] = f32_to_bf16_scalar((float)kv_len);
         f32_to_bf16(resid, xr + XB, (size_t)E);
         // ffn_norm gain -> bf16 (norm weights are usually f32).
         {
@@ -4892,11 +4894,12 @@ static bool ggml_backend_xdna_decode_layer_f3best(
         for (int64_t g = 0; g < NH; g++) {
             uint16_t * kg = kv + (size_t)g * KVN;
             uint16_t * vg = kv + (size_t)(NH + g) * KVN;
-            for (int64_t pos = 0; pos < actual_seq; pos++) {
+            for (int64_t pos = 0; pos < kv_len; pos++) {
+                const int64_t src_pos = kv_start + pos;
                 for (int64_t d = 0; d < head_dim; d++) {
-                    kg[pos*head_dim + d] = cvt(k_data + pos*k_nb1 + g*k_nb2 + d*k_nb0, k_f32, k_f16);
-                    const char * vp = v_rowcontig ? (v_data + pos*v_nb1 + g*v_nb2 + d*v_nb0)
-                                                  : (v_data + d*v_nb1 + g*v_nb2 + pos*v_nb0);
+                    kg[pos*head_dim + d] = cvt(k_data + src_pos*k_nb1 + g*k_nb2 + d*k_nb0, k_f32, k_f16);
+                    const char * vp = v_rowcontig ? (v_data + src_pos*v_nb1 + g*v_nb2 + d*v_nb0)
+                                                  : (v_data + d*v_nb1 + g*v_nb2 + src_pos*v_nb0);
                     vg[pos*head_dim + d] = cvt(vp, v_f32, v_f16);
                 }
             }
