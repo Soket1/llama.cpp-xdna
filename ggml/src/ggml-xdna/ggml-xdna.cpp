@@ -16754,6 +16754,35 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
         }
     }
 
+    // [P6.4d-3c recon] One-shot dump of the decode graph node list to design the
+    // whole-layer f3best matcher against the real topology. XDNA_DUMP_DECODE_GRAPH=1.
+    {
+        static const bool dump_dg = xdna_env_enabled("XDNA_DUMP_DECODE_GRAPH");
+        static int dumped_dg = 0;
+        if (dump_dg && dumped_dg < 14) {
+            bool is_decode = false;
+            for (int pi = 0; pi < n; pi++) {
+                struct ggml_tensor * nd = cgraph->nodes[pi];
+                if (nd->op == GGML_OP_MUL_MAT && nd->src[1] && nd->src[1]->ne[1] == 1) { is_decode = true; break; }
+            }
+            if (is_decode) {
+                dumped_dg++;
+                fprintf(stderr, "=== [XDNA_DUMP_DECODE_GRAPH] call#%d %d nodes ===\n", dumped_dg, n);
+                for (int pi = 0; pi < n; pi++) {
+                    struct ggml_tensor * t = cgraph->nodes[pi];
+                    const char * s0 = (t->src[0] && t->src[0]->name[0]) ? t->src[0]->name : "?";
+                    const char * s1 = (t->src[1] && t->src[1]->name[0]) ? t->src[1]->name : "?";
+                    fprintf(stderr, "  [%3d] %-12s %-24s ne=[%lld,%lld,%lld,%lld] s0=%s s1=%s\n",
+                            pi, ggml_op_name(t->op), (t->name[0] ? t->name : "?"),
+                            (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2], (long long)t->ne[3],
+                            s0, s1);
+                }
+                fprintf(stderr, "=== [XDNA_DUMP_DECODE_GRAPH] end ===\n");
+                fflush(stderr);
+            }
+        }
+    }
+
     // Pre-scan for QKV triples. Llama.cpp's Qwen3.5 decode interleaves
     // RMSNorm/view ops between Q and K/V MUL_MATs, so a 3-consecutive-node
     // matcher never fires. We group MUL_MATs by shared src[1] activation
