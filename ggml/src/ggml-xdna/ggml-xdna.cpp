@@ -4920,12 +4920,18 @@ static bool ggml_backend_xdna_decode_layer_f3best(
         const uint16_t * ob = (const uint16_t *)entry->c_bo->map<void*>();
         auto bf16f = [](uint16_t b)->float{ uint32_t u=((uint32_t)b)<<16; float v; memcpy(&v,&u,4); return v; };
         const uint16_t * s_blk = ob + (size_t)NH * E;
+        float * diag_extra = nullptr;
+        if (out_dst->type == GGML_TYPE_F32 && out_dst->data && out_dst->nb[0] == 99) {
+            diag_extra = (float *)out_dst->data + E;  // scratch layout: final[E] | s[E] | sum_partials[E]
+        }
         if (out_dst->type == GGML_TYPE_F32) {
             float * dst = (float *)out_dst->data;
             for (int64_t e = 0; e < E; e++) {
-                float acc = bf16f(s_blk[e]);
-                for (int64_t h = 0; h < NH; h++) acc += bf16f(ob[(size_t)h*E + e]);
-                dst[e] = acc;
+                float ps = 0.0f;
+                for (int64_t h = 0; h < NH; h++) ps += bf16f(ob[(size_t)h*E + e]);
+                const float sv = bf16f(s_blk[e]);
+                dst[e] = sv + ps;
+                if (diag_extra) { diag_extra[e] = sv; diag_extra[E + e] = ps; }
             }
         } else {
             uint16_t * dst = (uint16_t *)out_dst->data;
@@ -17068,9 +17074,10 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                             const float inv = 1.0f / std::sqrt((float)(ss / 2048.0) + 1e-5f);
                             for (int e = 0; e < 2048; e++) normed[e] = inpL[e] * inv * gain[e];
 
-                            std::vector<float> npu_out(2048, 0.0f);
+                            std::vector<float> npu_out(2048 * 3, 0.0f);
                             struct ggml_tensor dummy = *lf_m.outL_tensor;
                             dummy.data = npu_out.data();
+                            dummy.nb[0] = 99;  // diagnostic: request [final|s|sum_partials] in scratch
                             fprintf(stderr, "ggml-xdna: [f3best-probe] CALL decode_layer_f3best q=%d\n", lf_m.q_idx); fflush(stderr);
                             f3_ok = ggml_backend_xdna_decode_layer_f3best(
                                 ctx, &dummy, normed.data(), 2048, inpL,
