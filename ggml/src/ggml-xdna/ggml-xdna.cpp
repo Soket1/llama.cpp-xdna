@@ -4909,7 +4909,10 @@ static bool ggml_backend_xdna_decode_layer_f3best(
             uint16_t * kg = kv + (size_t)g * KVN;
             uint16_t * vg = kv + (size_t)(NH + g) * KVN;
             for (int64_t pos = 0; pos < kv_len; pos++) {
-                const int64_t src_pos = kv_start + pos;
+                // StreamingLLM-style window for n_kv>32: slot 0 keeps the
+                // attention sink (abs pos 0), slots 1..31 are the recent tail.
+                // For n_kv<=32 this is exactly the full causal window.
+                const int64_t src_pos = (n_kv > 32 && pos == 0) ? 0 : (n_kv - kv_len + pos);
                 for (int64_t d = 0; d < head_dim; d++) {
                     kg[pos*head_dim + d] = cvt(k_data + src_pos*k_nb1 + g*k_nb2 + d*k_nb0, k_f32, k_f16);
                     const char * vp = v_rowcontig ? (v_data + src_pos*v_nb1 + g*v_nb2 + d*v_nb0)
