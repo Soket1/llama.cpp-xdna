@@ -4736,11 +4736,6 @@ static bool ggml_backend_xdna_decode_layer_f3best(
         const struct ggml_tensor * v_perm,
         int num_cols) {
     if (!ctx->device_valid) { fprintf(stderr, "f3best ENTER device invalid\n"); return false; }
-    fprintf(stderr, "f3best ENTER Earg=%lld qtype=%d otype=%d gtype=%d utype=%d dtype=%d gain_type=%d k_ne=[%lld,%lld,%lld] v_ne=[%lld,%lld,%lld]\n",
-            (long long)input_E, (int)q_w->type, (int)o_w->type, (int)gate_w->type,
-            (int)up_w->type, (int)down_w->type, ffn_gain ? (int)ffn_gain->type : -1,
-            (long long)k_perm->ne[0], (long long)k_perm->ne[1], (long long)k_perm->ne[2],
-            (long long)v_perm->ne[0], (long long)v_perm->ne[1], (long long)v_perm->ne[2]);
     if (q_w->type != GGML_TYPE_Q4_0 || o_w->type != GGML_TYPE_Q4_0 ||
         gate_w->type != GGML_TYPE_Q4_0 || up_w->type != GGML_TYPE_Q4_0 ||
         down_w->type != GGML_TYPE_Q4_0) {
@@ -4824,15 +4819,34 @@ static bool ggml_backend_xdna_decode_layer_f3best(
             }
             return true;
         };
-        int64_t actual_seq = std::min<int64_t>(seq_len, 32);
-        if (actual_seq > 0 && k_zero(actual_seq - 1)) {
-            int64_t lo = 0, hi = actual_seq - 1;
+        // True valid KV depth = last non-zero position + 1, over the FULL cache
+        // range (NOT pre-capped to 32 — that would always pick the first 32 and
+        // exclude the current token when n_kv > 32).
+        int64_t n_kv = seq_len;
+        if (n_kv > 0 && k_zero(n_kv - 1)) {
+            int64_t lo = 0, hi = n_kv - 1;
             while (lo < hi) { int64_t mid=(lo+hi+1)/2; if (k_zero(mid)) hi=mid-1; else lo=mid; }
-            actual_seq = lo + 1;
+            n_kv = lo + 1;
         }
-        const int64_t kv_start = actual_seq > 32 ? (actual_seq - 32) : 0;
-        const int64_t kv_len = std::min<int64_t>(actual_seq, 32);
+        // f3best KV window is fixed at 32: take the TAIL 32 positions so the
+        // current token (last filled) is always included. Exact for n_kv<=32;
+        // a sliding-window approximation for longer contexts.
+        const int64_t kv_len   = std::min<int64_t>(n_kv, 32);
+        const int64_t kv_start = n_kv > 32 ? (n_kv - 32) : 0;
+        const int64_t actual_seq = n_kv;
         xr[E + 256] = f32_to_bf16_scalar((float)kv_len);
+        {
+            int32_t rope_pos = -1;
+            if (rope_node && rope_node->src[1] && rope_node->src[1]->type == GGML_TYPE_I32 &&
+                rope_node->src[1]->ne[0] >= 1 && rope_node->src[1]->data)
+                rope_pos = ((const int32_t *)rope_node->src[1]->data)[0];
+            static std::atomic<int> seq_diag_budget{34};
+            if (seq_diag_budget.fetch_sub(1) > 0) {
+                fprintf(stderr, "ggml-xdna: [f3best-seq] seq_len=%lld actual_seq=%lld kv_start=%lld kv_len=%lld rope_pos=%d\n",
+                        (long long)seq_len, (long long)actual_seq, (long long)kv_start, (long long)kv_len, rope_pos);
+                fflush(stderr);
+            }
+        }
         f32_to_bf16(resid, xr + XB, (size_t)E);
         // ffn_norm gain -> bf16 (norm weights are usually f32).
         {
@@ -17017,7 +17031,11 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
             if (lf_it != layer_fused_plan.q_idx_to_match.end()) {
                 const xdna_layer_fused_match & lf_m =
                     layer_fused_plan.matches[lf_it->second];
-                if (f3best_enabled) {
+                // Only probe TRUE single-token decode (M==1). Warmup (batch=2)
+                // and prefill (M>1) would consume the diag budget and feed the
+                // M=1 f3best xclbin a multi-token graph → false position errors.
+                const bool f3best_is_decode = node->src[1] && node->src[1]->ne[1] == 1;
+                if (f3best_enabled && f3best_is_decode) {
                     static const bool f3best_skip = xdna_env_enabled("XDNA_LAYER_F3BEST_SKIP");
                     static std::atomic<int> f3best_probe_budget{16};
                     if (f3best_probe_budget.fetch_sub(1) > 0) {
@@ -17089,16 +17107,29 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                 8);
                             if (f3_ok && lf_m.outL_tensor->type == GGML_TYPE_F32) {
                                 const float * cpu_out = (const float *)lf_m.outL_tensor->data;
-                                double num = 0.0, den = 0.0;
+                                const float * s_out = npu_out.data() + 2048;
+                                const float * p_out = npu_out.data() + 4096;
+                                const float * cpu_s = (lf_m.add_attn_idx >= 0 && cgraph->nodes[lf_m.add_attn_idx]->type == GGML_TYPE_F32)
+                                    ? (const float *)cgraph->nodes[lf_m.add_attn_idx]->data : nullptr;
+                                double num = 0.0, den = 0.0, nums = 0.0, dens = 0.0, nump = 0.0, denp = 0.0;
                                 for (int e = 0; e < 2048; e++) {
                                     const double d = (double)npu_out[e] - (double)cpu_out[e];
                                     num += d*d; den += (double)cpu_out[e] * (double)cpu_out[e];
+                                    if (cpu_s) {
+                                        const double ds = (double)s_out[e] - (double)cpu_s[e];
+                                        nums += ds*ds; dens += (double)cpu_s[e] * (double)cpu_s[e];
+                                        const double cp = (double)cpu_out[e] - (double)cpu_s[e];
+                                        const double dp = (double)p_out[e] - cp;
+                                        nump += dp*dp; denp += cp*cp;
+                                    }
                                 }
                                 static std::atomic<int> rel_budget{64};
                                 if (rel_budget.fetch_sub(1) > 0) {
                                     fprintf(stderr,
-                                            "ggml-xdna: [f3best-probe] q=%d rel_L2=%.5f k=%s v=%s\n",
+                                            "ggml-xdna: [f3best-probe] q=%d rel=%.5f s=%.5f p=%.5f k=%s v=%s\n",
                                             lf_m.q_idx, std::sqrt(num / (den + 1e-12)),
+                                            cpu_s ? std::sqrt(nums / (dens + 1e-12)) : -1.0,
+                                            cpu_s ? std::sqrt(nump / (denp + 1e-12)) : -1.0,
                                             k_perm->name[0] ? k_perm->name : "?",
                                             v_perm->name[0] ? v_perm->name : "?");
                                     fflush(stderr);
