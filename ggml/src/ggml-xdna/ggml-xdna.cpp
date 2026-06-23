@@ -1375,9 +1375,9 @@ static std::string make_cache_key(xdna_op_kind op_kind,
         // Full fused decode layer (attn + O-proj + FFN, one dispatch): K=embed_dim,
         // N=hidden_dim, M=seq_len (KV-cache length, varies with context — MUST be in
         // the key). head_dim=64, GQA (attn_group=4, num_kv_heads=8) fixed in the op.
-        // f3best raw-AIE emitter is currently fixed to the 32-token decode KV window;
-        // actual_seq is carried in XR, but xclbin shape stays SEQ=32.
-        snprintf(buf, sizeof(buf), "decode_layer_f3best_K%lld_H%lld_sl32_d64_ag4_kv8_g32",
+        // f3best raw-AIE emitter KV window is fixed at SEQ=256 (whole-sequence
+        // single-chunk attention); actual_seq is carried in XR for shorter contexts.
+        snprintf(buf, sizeof(buf), "decode_layer_f3best_K%lld_H%lld_sl256_d64_ag4_kv8_g32",
                  (long long)K, (long long)N);
     } else {
         snprintf(buf, sizeof(buf), "gemm_%lldx%lldx%lld_%s_%dcol",
@@ -2496,7 +2496,7 @@ static bool ensure_compiled(ggml_backend_xdna_context * ctx,
         // GQA + head_dim fixed for llama-3.2-1B (the emitter validates the shape).
         snprintf(cmd, sizeof(cmd),
                  "%s \"%s\" --quiet decode-layer-f3best --embed-dim %lld --hidden-dim %lld "
-                 "--group-size 32 --head-dim 64 --num-kv-heads 8 --attn-group 4 --seq-len 32 "
+                 "--group-size 32 --head-dim 64 --num-kv-heads 8 --attn-group 4 --seq-len 256 "
                  "--out \"%s\"%s",
                  xdna_python_cmd(), ctx->compile_script.c_str(),
                  (long long)K, (long long)N,
@@ -4765,7 +4765,7 @@ static bool ggml_backend_xdna_decode_layer_f3best(
     const size_t  WT_BYTES = (size_t)WT_TILES * PACKED;
     const size_t  RS       = (size_t)(E / group_size) * 18;   // 1152 (full E-row Q4_0)
     const size_t  WO_BYTES = 2359296;                 // unused arg3 placeholder
-    const int64_t KVN      = 32 * head_dim;             // f3best xclbin KV window is fixed at 32 tokens
+    const int64_t KVN      = 256 * head_dim;            // f3best xclbin KV window is fixed at 256 tokens
     const int     dts      = 2;
     const int64_t XB       = E + 256 + 16;            // 2320
     const int64_t XR_ELEMS = XB + E + E;             // 6416 (x|resid|gain)
@@ -4820,19 +4820,17 @@ static bool ggml_backend_xdna_decode_layer_f3best(
             return true;
         };
         // True valid KV depth = last non-zero position + 1, over the FULL cache
-        // range (NOT pre-capped to 32 — that would always pick the first 32 and
-        // exclude the current token when n_kv > 32).
+        // range (NOT pre-capped — that would exclude the current token).
         int64_t n_kv = seq_len;
         if (n_kv > 0 && k_zero(n_kv - 1)) {
             int64_t lo = 0, hi = n_kv - 1;
             while (lo < hi) { int64_t mid=(lo+hi+1)/2; if (k_zero(mid)) hi=mid-1; else lo=mid; }
             n_kv = lo + 1;
         }
-        // f3best KV window is fixed at 32: take the TAIL 32 positions so the
-        // current token (last filled) is always included. Exact for n_kv<=32;
-        // a sliding-window approximation for longer contexts.
-        const int64_t kv_len   = std::min<int64_t>(n_kv, 32);
-        const int64_t kv_start = n_kv > 32 ? (n_kv - 32) : 0;
+        // f3best KV window is fixed at 256: exact full causal attention for
+        // n_kv<=256; a StreamingLLM sink+recent approximation for longer contexts.
+        const int64_t kv_len   = std::min<int64_t>(n_kv, 256);
+        const int64_t kv_start = n_kv > 256 ? (n_kv - 256) : 0;
         const int64_t actual_seq = n_kv;
         xr[E + 256] = f32_to_bf16_scalar((float)kv_len);
         {
@@ -4909,10 +4907,10 @@ static bool ggml_backend_xdna_decode_layer_f3best(
             uint16_t * kg = kv + (size_t)g * KVN;
             uint16_t * vg = kv + (size_t)(NH + g) * KVN;
             for (int64_t pos = 0; pos < kv_len; pos++) {
-                // StreamingLLM-style window for n_kv>32: slot 0 keeps the
-                // attention sink (abs pos 0), slots 1..31 are the recent tail.
-                // For n_kv<=32 this is exactly the full causal window.
-                const int64_t src_pos = (n_kv > 32 && pos == 0) ? 0 : (n_kv - kv_len + pos);
+                // StreamingLLM-style window for n_kv>256: slot 0 keeps the
+                // attention sink (abs pos 0), slots 1..255 are the recent tail.
+                // For n_kv<=256 this is exactly the full causal window.
+                const int64_t src_pos = (n_kv > 256 && pos == 0) ? 0 : (n_kv - kv_len + pos);
                 for (int64_t d = 0; d < head_dim; d++) {
                     kg[pos*head_dim + d] = cvt(k_data + src_pos*k_nb1 + g*k_nb2 + d*k_nb0, k_f32, k_f16);
                     const char * vp = v_rowcontig ? (v_data + src_pos*v_nb1 + g*v_nb2 + d*v_nb0)
