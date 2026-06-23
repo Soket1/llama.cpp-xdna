@@ -17088,13 +17088,25 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
 
                         bool f3_ok = false;
                         if (k_perm && v_perm && lf_m.q_rope_idx >= 0) {
+                            // input_snap = ggml's TRUE attn-norm output (the tensor Q/K/V-proj
+                            // actually consume = q-node src[1]), NOT a hand-recomputed rms_norm.
+                            // (Hand rms over inpL_tensor was ~6.5x off — wrong source tensor.)
                             std::vector<float> normed(2048, 0.0f);
                             const float * inpL = (const float *)lf_m.inpL_tensor->data;
-                            const float * gain = (const float *)lf_m.w_norm1->data;
-                            double ss = 0.0;
-                            for (int e = 0; e < 2048; e++) ss += (double)inpL[e] * (double)inpL[e];
-                            const float inv = 1.0f / std::sqrt((float)(ss / 2048.0) + 1e-5f);
-                            for (int e = 0; e < 2048; e++) normed[e] = inpL[e] * inv * gain[e];
+                            {
+                                struct ggml_tensor * qn = cgraph->nodes[i];
+                                const struct ggml_tensor * qin = qn ? qn->src[1] : nullptr;
+                                if (qin && qin->type == GGML_TYPE_F32 && qin->data && qin->ne[0] == 2048) {
+                                    memcpy(normed.data(), qin->data, 2048 * sizeof(float));
+                                } else {
+                                    // fallback: hand rms_norm * gain (legacy path)
+                                    const float * gain = (const float *)lf_m.w_norm1->data;
+                                    double ss = 0.0;
+                                    for (int e = 0; e < 2048; e++) ss += (double)inpL[e] * (double)inpL[e];
+                                    const float inv = 1.0f / std::sqrt((float)(ss / 2048.0) + 1e-5f);
+                                    for (int e = 0; e < 2048; e++) normed[e] = inpL[e] * inv * gain[e];
+                                }
+                            }
 
                             std::vector<float> npu_out(2048 * 3, 0.0f);
                             struct ggml_tensor dummy = *lf_m.outL_tensor;
