@@ -17153,6 +17153,34 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                 }
                             }
 
+                            // BUG2 localization: run the EXISTING decode_front_attn kernel (Q-GEMV+
+                            // rope_il+flowkv -> attn_out to DDR, SAME flowkv/rope as f3best) on the
+                            // SAME hand-rms normed + cache K/V, and diff its attn_out vs cpu_attn_out
+                            // (0.0345 ground truth). Match (in some head order) => the attention KERNEL
+                            // is correct on real K, so f3best's bug is its 8-tile relay; mismatch =>
+                            // the attention kernel itself is wrong on real K.
+                            {
+                                static std::atomic<int> fa_budget{3};
+                                if (fa_budget.fetch_sub(1) > 0) {
+                                    std::vector<float> fa_out(2048, 0.0f);
+                                    struct ggml_tensor fad = *lf_m.outL_tensor;
+                                    fad.data = fa_out.data(); fad.type = GGML_TYPE_F32;
+                                    fad.ne[0] = 2048; fad.ne[1] = 1; fad.nb[0] = 4;
+                                    bool fok = ggml_backend_xdna_decode_front_attn(
+                                        ctx, &fad, normed.data(), 2048, lf_m.w_q,
+                                        cgraph->nodes[lf_m.q_rope_idx], k_perm, v_perm, 4);
+                                    if (fok) {
+                                        const int64_t hd=64, ag=4, nkv=8;
+                                        auto rel=[&](auto map)->double{ double nu=0,de=0; for(int64_t i=0;i<2048;i++){ double c=cpu_attn_out[map(i)]; double d=(double)fa_out[i]-c; nu+=d*d; de+=c*c;} return std::sqrt(nu/(de+1e-12)); };
+                                        double rid = rel([&](int64_t i){return i;});
+                                        double rint= rel([&](int64_t i){ int64_t d=i%hd,gs=i/hd,g=gs/ag,s=gs%ag; int64_t qh=s*nkv+g; return qh*hd+d; });
+                                        double rkvm= rel([&](int64_t i){ int64_t d=i%hd,gs=i/hd,g=gs/ag,s=gs%ag; int64_t qh=g*ag+s; return qh*hd+d; });
+                                        fprintf(stderr,"ggml-xdna: [f3best-frontattn] q=%d front_attn vs cpu_attn_out: id=%.4f interleave=%.4f kvmajor=%.4f\n",
+                                                lf_m.q_idx, rid, rint, rkvm); fflush(stderr);
+                                    } else { fprintf(stderr,"ggml-xdna: [f3best-frontattn] q=%d dispatch FAILED\n", lf_m.q_idx); fflush(stderr); }
+                                }
+                            }
+
                             std::vector<float> npu_out(2048 * 3, 0.0f);
                             struct ggml_tensor dummy = *lf_m.outL_tensor;
                             dummy.data = npu_out.data();
