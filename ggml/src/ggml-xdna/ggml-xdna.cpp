@@ -17138,11 +17138,20 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                 }
                                 static std::atomic<int> rel_budget{64};
                                 if (rel_budget.fetch_sub(1) > 0) {
+                                    // abs norms: is NPU attn output present-but-wrong, or near-zero?
+                                    // s = O + resid; resid = inpL. O_npu = s_out - inpL ; O_cpu = cpu_s - inpL.
+                                    double nOn=0, nOc=0, nR=0;
+                                    if (cpu_s) for (int e=0;e<2048;e++){
+                                        double on=(double)s_out[e]-(double)inpL[e];
+                                        double oc=(double)cpu_s[e]-(double)inpL[e];
+                                        nOn+=on*on; nOc+=oc*oc; nR+=(double)inpL[e]*(double)inpL[e];
+                                    }
                                     fprintf(stderr,
-                                            "ggml-xdna: [f3best-probe] q=%d rel=%.5f s=%.5f p=%.5f k=%s v=%s\n",
+                                            "ggml-xdna: [f3best-probe] q=%d rel=%.5f s=%.5f p=%.5f |Onpu|=%.4f |Ocpu|=%.4f |resid|=%.4f k=%s v=%s\n",
                                             lf_m.q_idx, std::sqrt(num / (den + 1e-12)),
                                             cpu_s ? std::sqrt(nums / (dens + 1e-12)) : -1.0,
                                             cpu_s ? std::sqrt(nump / (denp + 1e-12)) : -1.0,
+                                            std::sqrt(nOn), std::sqrt(nOc), std::sqrt(nR),
                                             k_perm->name[0] ? k_perm->name : "?",
                                             v_perm->name[0] ? v_perm->name : "?");
                                     fflush(stderr);
