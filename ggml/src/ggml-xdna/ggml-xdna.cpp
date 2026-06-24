@@ -17120,6 +17120,39 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                 for (int e = 0; e < 2048; e++) normed[e] = inpL[e] * inv * gain[e];
                             }
 
+                            // CORRECT CPU attention output (head-major [h*64+d]), built from the
+                            // hand-rms normed + Wq + cache K/V + IL rope. This is the 0.0345 ground
+                            // truth (pre-O-proj). Used by the head-permutation test in the f3_ok block
+                            // to detect a KV-head->score-tile routing/relay scramble in f3best.
+                            std::vector<float> cpu_attn_out(2048, 0.0f);
+                            {
+                                int64_t pos0 = 0;
+                                const struct ggml_tensor * rn2 = cgraph->nodes[lf_m.q_rope_idx];
+                                if (rn2 && rn2->src[1] && rn2->src[1]->type==GGML_TYPE_I32 && rn2->src[1]->data)
+                                    pos0 = ((const int32_t*)rn2->src[1]->data)[0];
+                                float fb=10000.0f; { const int32_t* pp=(const int32_t*)rn2->op_params; memcpy(&fb,pp+5,4); }
+                                const int64_t n_cap = k_perm->ne[1];
+                                const int64_t nval = (pos0+1 < n_cap) ? (pos0+1) : n_cap;
+                                const struct ggml_tensor * wqT2 = lf_m.w_q;
+                                if (wqT2 && wqT2->data && wqT2->type==GGML_TYPE_Q4_0 && wqT2->ne[0]==2048 && wqT2->ne[1]==2048) {
+                                    const uint8_t* qwb=(const uint8_t*)wqT2->data;
+                                    const char* kd=(const char*)k_perm->data; const char* vd=(const char*)v_perm->data;
+                                    bool kf=k_perm->type==GGML_TYPE_F16, vf=v_perm->type==GGML_TYPE_F16; bool vrc=(v_perm->ne[0]==64);
+                                    auto rdh=[&](const char* pp,bool f16)->float{ if(f16){ggml_fp16_t h;memcpy(&h,pp,2);return ggml_fp16_to_fp32(h);} float v;memcpy(&v,pp,4);return v; };
+                                    std::vector<float> Qv(2048,0.0f);
+                                    for(int64_t n=0;n<2048;n++){ const uint8_t* row=qwb+(size_t)n*64*18; double a=0;
+                                        for(int64_t b=0;b<64;b++){ const uint8_t* blk=row+b*18; ggml_fp16_t sh;memcpy(&sh,blk,2);float scq=ggml_fp16_to_fp32(sh);const uint8_t* qs=blk+2;
+                                            for(int j=0;j<32;j++){int nib=(j<16)?(qs[j]&0xF):(qs[j-16]>>4);a+=(double)((nib-8)*scq)*(double)normed[b*32+j];}}
+                                        Qv[n]=(float)a; }
+                                    for(int64_t h=0;h<32;h++){ float* q=&Qv[h*64]; float th=1.0f; for(int i=0;i<32;i++){float ang=(float)pos0*th;float c=std::cos(ang),s=std::sin(ang);float x0=q[2*i],x1=q[2*i+1];q[2*i]=x0*c-x1*s;q[2*i+1]=x0*s+x1*c;th*=std::pow(fb,-2.0f/64.0f);} }
+                                    std::vector<float> scv(nval,0.0f);
+                                    for(int64_t h=0;h<32;h++){ const int64_t g=h/4; const float* q=&Qv[h*64];
+                                        float mx=-1e30f; for(int64_t p=0;p<nval;p++){double dot=0;for(int64_t d=0;d<64;d++){float kv_=rdh(kd+p*k_perm->nb[1]+g*k_perm->nb[2]+d*k_perm->nb[0],kf);dot+=(double)q[d]*(double)kv_;}float sv=(float)dot*0.125f;scv[p]=sv;if(sv>mx)mx=sv;}
+                                        double sm=0;for(int64_t p=0;p<nval;p++){scv[p]=std::exp(scv[p]-mx);sm+=scv[p];}float iv=1.0f/(float)sm;
+                                        for(int64_t d=0;d<64;d++){double ac=0;for(int64_t p=0;p<nval;p++){const char* vp=vrc?(vd+p*v_perm->nb[1]+g*v_perm->nb[2]+d*v_perm->nb[0]):(vd+d*v_perm->nb[1]+g*v_perm->nb[2]+p*v_perm->nb[0]);ac+=(double)(scv[p]*iv)*(double)rdh(vp,vf);}cpu_attn_out[h*64+d]=(float)ac;} }
+                                }
+                            }
+
                             std::vector<float> npu_out(2048 * 3, 0.0f);
                             struct ggml_tensor dummy = *lf_m.outL_tensor;
                             dummy.data = npu_out.data();
@@ -17172,6 +17205,37 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                             k_perm->name[0] ? k_perm->name : "?",
                                             v_perm->name[0] ? v_perm->name : "?");
                                     fflush(stderr);
+                                }
+                                // HEAD-PERMUTATION test: O_npu = s_out - inpL. Try permutations of the
+                                // CORRECT cpu_attn_out, O-project each, find which matches O_npu best.
+                                // A low rel for a non-identity perm => f3best scrambles head routing.
+                                static std::atomic<int> perm_budget{4};
+                                if (perm_budget.fetch_sub(1) > 0 && lf_m.w_o && lf_m.w_o->type == GGML_TYPE_Q4_0) {
+                                    const float * s_outp = npu_out.data() + 2048;
+                                    const uint8_t * wob = (const uint8_t *)lf_m.w_o->data;
+                                    auto oproj_rel_np = [&](const std::vector<float>& av) -> double {
+                                        double on=0, od=0;
+                                        for (int64_t n=0;n<2048;n++){ const uint8_t* row=wob+(size_t)n*64*18; double acc=0;
+                                            for(int64_t b=0;b<64;b++){const uint8_t* blk=row+b*18;ggml_fp16_t sh;memcpy(&sh,blk,2);float sc=ggml_fp16_to_fp32(sh);const uint8_t* qs=blk+2;
+                                                for(int j=0;j<32;j++){int nib=(j<16)?(qs[j]&0xF):(qs[j-16]>>4);acc+=(double)((nib-8)*sc)*(double)av[b*32+j];}}
+                                            double onp=(double)s_outp[n]-(double)inpL[n]; double dd=acc-onp; on+=dd*dd; od+=onp*onp; }
+                                        return std::sqrt(on/(od+1e-12));
+                                    };
+                                    auto permute = [&](int mode) -> std::vector<float> {
+                                        std::vector<float> r(2048);
+                                        for (int h=0;h<32;h++){ int sh;
+                                            switch(mode){ case 0: sh=h; break;                 // identity
+                                                          case 1: sh=(h%4)*8+(h/4); break;     // 4x8 <-> 8x4 transpose
+                                                          case 2: sh=(h%8)*4+(h/8); break;     // 8x4 <-> 4x8 transpose
+                                                          case 3: sh=31-h; break;              // reverse
+                                                          default: sh=h; }
+                                            for(int d=0;d<64;d++) r[h*64+d]=cpu_attn_out[sh*64+d]; }
+                                        return r;
+                                    };
+                                    double p0=oproj_rel_np(permute(0)), p1=oproj_rel_np(permute(1)),
+                                           p2=oproj_rel_np(permute(2)), p3=oproj_rel_np(permute(3));
+                                    fprintf(stderr,"ggml-xdna: [f3best-perm] q=%d O_npu vs CPU-attn: id=%.4f tr48=%.4f tr84=%.4f rev=%.4f\n",
+                                            lf_m.q_idx, p0, p1, p2, p3); fflush(stderr);
                                 }
                             }
                         }
