@@ -17112,6 +17112,10 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                             struct ggml_tensor dummy = *lf_m.outL_tensor;
                             dummy.data = npu_out.data();
                             dummy.nb[0] = 99;  // diagnostic: request [final|s|sum_partials] in scratch
+                            // One-shot dump of REAL e2e tensors for layer 0 so the standalone can
+                            // validate attention/O-proj on real (focused) data instead of random K.
+                            // Layout per file: raw f32. K/V dumped in [head, pos, dim] order (NH=8,
+                            // pos=n_kv, dim=64) using the permute strides.
                             fprintf(stderr, "ggml-xdna: [f3best-probe] CALL decode_layer_f3best q=%d\n", lf_m.q_idx); fflush(stderr);
                             f3_ok = ggml_backend_xdna_decode_layer_f3best(
                                 ctx, &dummy, normed.data(), 2048, inpL,
