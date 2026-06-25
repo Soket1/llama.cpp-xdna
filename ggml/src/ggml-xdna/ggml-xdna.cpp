@@ -17185,10 +17185,36 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                             struct ggml_tensor dummy = *lf_m.outL_tensor;
                             dummy.data = npu_out.data();
                             dummy.nb[0] = 99;  // diagnostic: request [final|s|sum_partials] in scratch
-                            // One-shot dump of REAL e2e tensors for layer 0 so the standalone can
-                            // validate attention/O-proj on real (focused) data instead of random K.
-                            // Layout per file: raw f32. K/V dumped in [head, pos, dim] order (NH=8,
-                            // pos=n_kv, dim=64) using the permute strides.
+                            // One-shot dump of REAL e2e tensors for the FIRST f3best call (= layer 0,
+                            // matching the standalone's blk.0 weights) so the standalone can validate
+                            // attention/O-proj on real data instead of random K. normed.bin = 2048 f32;
+                            // kv.bin = [int32 nvd, int32 nh=8][K nh*nvd*64 f32][V nh*nvd*64 f32], head-
+                            // major pos-major dim-minor (= standalone Kheads[h] layout), via permute strides.
+                            {
+                                static std::atomic<bool> dumped_real{false};
+                                bool exp_d = false;
+                                if (dumped_real.compare_exchange_strong(exp_d, true)) {
+                                    const std::string dir = "C:/llama.cpp-xdna/dev_notes/track_a_build/f3best_realdump";
+                                    int64_t pos0d = 0;
+                                    const struct ggml_tensor * rnd = cgraph->nodes[lf_m.q_rope_idx];
+                                    if (rnd && rnd->src[1] && rnd->src[1]->type==GGML_TYPE_I32 && rnd->src[1]->data)
+                                        pos0d = ((const int32_t *)rnd->src[1]->data)[0];
+                                    int64_t nvd = pos0d + 1; if (nvd > k_perm->ne[1]) nvd = k_perm->ne[1];
+                                    const bool kf16d = k_perm->type==GGML_TYPE_F16, vf16d = v_perm->type==GGML_TYPE_F16;
+                                    const bool vrcd = (v_perm->ne[0]==64);
+                                    auto rdhd = [&](const char* pp, bool f16)->float{ if(f16){ggml_fp16_t h;memcpy(&h,pp,2);return ggml_fp16_to_fp32(h);} float v;memcpy(&v,pp,4);return v; };
+                                    if (FILE* f = fopen((dir+"/normed.bin").c_str(),"wb")) { fwrite(normed.data(),4,2048,f); fclose(f); }
+                                    std::vector<float> Kb((size_t)8*nvd*64), Vb((size_t)8*nvd*64);
+                                    for (int64_t g=0; g<8; g++) for (int64_t p=0; p<nvd; p++) for (int64_t d=0; d<64; d++) {
+                                        Kb[((size_t)g*nvd+p)*64+d] = rdhd((const char*)k_perm->data + p*k_perm->nb[1] + g*k_perm->nb[2] + d*k_perm->nb[0], kf16d);
+                                        const char* vp = vrcd ? ((const char*)v_perm->data + p*v_perm->nb[1] + g*v_perm->nb[2] + d*v_perm->nb[0])
+                                                              : ((const char*)v_perm->data + d*v_perm->nb[1] + g*v_perm->nb[2] + p*v_perm->nb[0]);
+                                        Vb[((size_t)g*nvd+p)*64+d] = rdhd(vp, vf16d);
+                                    }
+                                    if (FILE* f = fopen((dir+"/kv.bin").c_str(),"wb")) { int32_t hdr[2]={(int32_t)nvd,8}; fwrite(hdr,4,2,f); fwrite(Kb.data(),4,Kb.size(),f); fwrite(Vb.data(),4,Vb.size(),f); fclose(f); }
+                                    fprintf(stderr, "ggml-xdna: [f3best-dump] wrote normed+kv nvd=%lld q=%d\n", (long long)nvd, lf_m.q_idx); fflush(stderr);
+                                }
+                            }
                             fprintf(stderr, "ggml-xdna: [f3best-probe] CALL decode_layer_f3best q=%d\n", lf_m.q_idx); fflush(stderr);
                             f3_ok = ggml_backend_xdna_decode_layer_f3best(
                                 ctx, &dummy, normed.data(), 2048, inpL,
