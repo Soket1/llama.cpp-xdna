@@ -1375,9 +1375,10 @@ static std::string make_cache_key(xdna_op_kind op_kind,
         // Full fused decode layer (attn + O-proj + FFN, one dispatch): K=embed_dim,
         // N=hidden_dim, M=seq_len (KV-cache length, varies with context — MUST be in
         // the key). head_dim=64, GQA (attn_group=4, num_kv_heads=8) fixed in the op.
-        // f3best raw-AIE emitter KV window is fixed at SEQ=256 (whole-sequence
-        // single-chunk attention); actual_seq is carried in XR for shorter contexts.
-        snprintf(buf, sizeof(buf), "decode_layer_f3best_K%lld_H%lld_sl256_d64_ag4_kv8_g32",
+        // f3best raw-AIE emitter KV window is fixed at SEQ=256; attention is MULTI-CHUNK
+        // (chunk=128) — single-chunk-256 corrupted the 4th q-head (#70/#74). actual_seq is
+        // carried in XR for shorter contexts. _mc suffix forces regen past the broken xclbin.
+        snprintf(buf, sizeof(buf), "decode_layer_f3best_K%lld_H%lld_sl256_d64_ag4_kv8_g32_mc",
                  (long long)K, (long long)N);
     } else {
         snprintf(buf, sizeof(buf), "gemm_%lldx%lldx%lld_%s_%dcol",
