@@ -4922,6 +4922,11 @@ static bool ggml_backend_xdna_decode_layer_f3best(
         }
         entry->d4_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
+        // De-risk #35-B: decompose the LIVE dispatch into create+setarg / start+wait /
+        // sync to decide if the 2.8x-vs-replay gap is host-overhead (fixable by run
+        // reuse) or NPU/DMA-bound (needs pipelining). Env-gated, ~zero cost when unset.
+        static const bool f3b_time = xdna_env_enabled("XDNA_F3BEST_TIME");
+        const auto _f3_t0 = std::chrono::steady_clock::now();
         auto run = xrt::run(entry->kernel);
         run.set_arg(0, (uint32_t)3);
         run.set_arg(1, entry->insts_bo);
@@ -4931,19 +4936,33 @@ static bool ggml_backend_xdna_decode_layer_f3best(
         run.set_arg(5, *a_weights);            // A weights
         run.set_arg(6, *entry->d3_bo);         // Wo placeholder (unused)
         run.set_arg(7, *entry->d4_bo);         // KV
-        // De-risk #35: time the LIVE f3best dispatch (NPU run+wait+sync) vs the
-        // 1166us warm replay ceiling. Env-gated, zero-cost when unset.
-        static const bool f3b_time = xdna_env_enabled("XDNA_F3BEST_TIME");
-        std::chrono::steady_clock::time_point _f3t0;
-        if (f3b_time) _f3t0 = std::chrono::steady_clock::now();
+        const auto _f3_t1 = std::chrono::steady_clock::now();
+        // WARM2 probe (#35 cold-overhead): run a throwaway dispatch FIRST (back-to-back, no host
+        // gap), then the timed one. If d2 << d1, the live 3.3ms is idle-cold (NPU re-warms after a
+        // host gap) → lever = remove inter-dispatch host gaps. If d2 ≈ d1, it's genuine per-dispatch
+        // NPU cost (not recoverable by priming).
+        static const bool f3b_warm2 = xdna_env_enabled("XDNA_F3BEST_WARM2");
+        double _w_d1 = 0.0;
+        if (f3b_warm2) {
+            run.start(); run.wait();
+            _w_d1 = std::chrono::duration<double, std::micro>(
+                std::chrono::steady_clock::now() - _f3_t1).count();
+        }
+        const auto _f3_ts = std::chrono::steady_clock::now();
         run.start();
         run.wait();
+        const auto _f3_t2 = std::chrono::steady_clock::now();
         entry->c_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
         if (f3b_time) {
-            double _us = std::chrono::duration<double, std::micro>(
-                std::chrono::steady_clock::now() - _f3t0).count();
-            fprintf(stderr, "ggml-xdna: [f3best-time] run+wait+sync=%.1f us (E=%lld seq=%lld)\n",
-                    _us, (long long)E, (long long)seq_len);
+            auto _us = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b){
+                return std::chrono::duration<double, std::micro>(b - a).count(); };
+            const auto _f3_t3 = std::chrono::steady_clock::now();
+            if (f3b_warm2)
+                fprintf(stderr, "ggml-xdna: [f3best-warm2] d1(cold)=%.0f d2(back2back)=%.0f us\n",
+                        _w_d1, _us(_f3_ts,_f3_t2));
+            else
+                fprintf(stderr, "ggml-xdna: [f3best-time] create+setarg=%.0f start+wait=%.0f sync=%.0f total=%.0f us\n",
+                        _us(_f3_t0,_f3_t1), _us(_f3_ts,_f3_t2), _us(_f3_t2,_f3_t3), _us(_f3_t0,_f3_t3));
             fflush(stderr);
         }
 
@@ -17084,9 +17103,17 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                             int kv_hi = -1;
                             const int attn_hi = (lf_m.add_attn_idx >= i && lf_m.add_attn_idx <= lf_m.add_ffn_idx)
                                                 ? lf_m.add_attn_idx : lf_m.add_ffn_idx;
-                            for (int si = i; si <= attn_hi; si++)
-                                if (cgraph->nodes[si] && cgraph->nodes[si]->op == GGML_OP_CPY) kv_hi = si;
+                            for (int si = i; si <= attn_hi; si++)   // KV cache write = GGML_OP_SET_ROWS (not CPY)
+                                if (cgraph->nodes[si] && cgraph->nodes[si]->op == GGML_OP_SET_ROWS) kv_hi = si;
                             const int deleg_hi = (f3best_kvrun || kv_hi < 0) ? lf_m.add_ffn_idx : kv_hi;
+                            static std::atomic<int> _kvdbg{2};
+                            if (_kvdbg.fetch_sub(1) > 0) {
+                                fprintf(stderr, "ggml-xdna: [f3best-kvdbg] i=%d attn_hi=%d add_ffn=%d kv_hi=%d deleg_hi=%d %s span-ops:",
+                                        i, attn_hi, lf_m.add_ffn_idx, kv_hi, deleg_hi, kv_hi<0?"(FELLBACK full-span!)":"(prefix)");
+                                for (int si = i; si <= lf_m.add_ffn_idx; si++)
+                                    if (cgraph->nodes[si]) fprintf(stderr, " %d:%s", si, ggml_op_name(cgraph->nodes[si]->op));
+                                fprintf(stderr, "\n"); fflush(stderr);
+                            }
                             {
                                 ggml_status sk = xdna_delegate_range(ctx, cgraph, i, deleg_hi + 1);
                                 if (sk != GGML_STATUS_SUCCESS) return sk;
