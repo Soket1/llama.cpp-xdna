@@ -4931,9 +4931,21 @@ static bool ggml_backend_xdna_decode_layer_f3best(
         run.set_arg(5, *a_weights);            // A weights
         run.set_arg(6, *entry->d3_bo);         // Wo placeholder (unused)
         run.set_arg(7, *entry->d4_bo);         // KV
+        // De-risk #35: time the LIVE f3best dispatch (NPU run+wait+sync) vs the
+        // 1166us warm replay ceiling. Env-gated, zero-cost when unset.
+        static const bool f3b_time = xdna_env_enabled("XDNA_F3BEST_TIME");
+        std::chrono::steady_clock::time_point _f3t0;
+        if (f3b_time) _f3t0 = std::chrono::steady_clock::now();
         run.start();
         run.wait();
         entry->c_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        if (f3b_time) {
+            double _us = std::chrono::duration<double, std::micro>(
+                std::chrono::steady_clock::now() - _f3t0).count();
+            fprintf(stderr, "ggml-xdna: [f3best-time] run+wait+sync=%.1f us (E=%lld seq=%lld)\n",
+                    _us, (long long)E, (long long)seq_len);
+            fflush(stderr);
+        }
 
         // final[e] = s[e] + sum_h partial[h][e]
         const uint16_t * ob = (const uint16_t *)entry->c_bo->map<void*>();
@@ -17038,6 +17050,70 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                 // M=1 f3best xclbin a multi-token graph → false position errors.
                 const bool f3best_is_decode = node->src[1] && node->src[1]->ne[1] == 1;
                 if (f3best_enabled && f3best_is_decode) {
+                    // ── #35 stage-a LIVE wiring (XDNA_LAYER_F3BEST_LIVE): f3best drives the
+                    // layer output DIRECTLY — one whole-layer dispatch REPLACES the ~94 per-op
+                    // GEMV dispatches (FFLM's measured 1-fused-dispatch/layer shape). Reversible
+                    // (flag-gated); any guard fail → f3best returns false → per-op fallback runs.
+                    static const bool f3best_live = xdna_env_enabled("XDNA_LAYER_F3BEST_LIVE");
+                    if (f3best_live && lf_m.add_ffn_idx >= i && lf_m.outL_tensor &&
+                        lf_m.outL_tensor->type == GGML_TYPE_F32 && lf_m.outL_tensor->data &&
+                        lf_m.inpL_tensor && lf_m.inpL_tensor->data && lf_m.w_norm1 &&
+                        lf_m.w_norm2 && lf_m.w_q && lf_m.w_o && lf_m.w_gate && lf_m.w_up &&
+                        lf_m.w_down && lf_m.q_rope_idx >= 0) {
+                        struct ggml_tensor * k_perm = nullptr, * v_perm = nullptr;
+                        for (int si = i; si <= lf_m.add_ffn_idx; si++) {
+                            struct ggml_tensor * nd = cgraph->nodes[si];
+                            if (!nd || nd->op != GGML_OP_PERMUTE) continue;
+                            if (!k_perm && nd->ne[0]==64 && nd->ne[1]>=32 && nd->ne[2]==8) k_perm = nd;
+                            else if (!v_perm && nd->ne[0]>=32 && nd->ne[1]==64 && nd->ne[2]==8) v_perm = nd;
+                        }
+                        if (k_perm && v_perm) {
+                            if (cpu_run_start >= 0) {   // materialize inpL + KV cache first
+                                ggml_status s = xdna_delegate_range(ctx, cgraph, cpu_run_start, i);
+                                if (s != GGML_STATUS_SUCCESS) return s;
+                                cpu_run_start = -1;
+                            }
+                            // KV-cache coherence (root-caused via KVRUN discriminator): delegate ONLY
+                            // the KV-write prefix — QKV-proj + RoPE + the cpy-to-cache nodes — so this
+                            // token's K/V lands in the ggml cache for FUTURE tokens; f3best then replaces
+                            // attn/O/FFN and writes outL. (f3best computes K/V internally but does NOT
+                            // write the ggml cache, so the per-op cpy nodes must run.) XDNA_F3BEST_LIVE_
+                            // KVRUN=1 forces the full-span delegate (diagnostic/safe). No cpy found =>
+                            // fall back to full span so correctness never depends on the heuristic.
+                            static const bool f3best_kvrun = xdna_env_enabled("XDNA_F3BEST_LIVE_KVRUN");
+                            int kv_hi = -1;
+                            const int attn_hi = (lf_m.add_attn_idx >= i && lf_m.add_attn_idx <= lf_m.add_ffn_idx)
+                                                ? lf_m.add_attn_idx : lf_m.add_ffn_idx;
+                            for (int si = i; si <= attn_hi; si++)
+                                if (cgraph->nodes[si] && cgraph->nodes[si]->op == GGML_OP_CPY) kv_hi = si;
+                            const int deleg_hi = (f3best_kvrun || kv_hi < 0) ? lf_m.add_ffn_idx : kv_hi;
+                            {
+                                ggml_status sk = xdna_delegate_range(ctx, cgraph, i, deleg_hi + 1);
+                                if (sk != GGML_STATUS_SUCCESS) return sk;
+                            }
+                            std::vector<float> normed(2048, 0.0f);   // BUG1 fix: hand-rms(inpL)*w_norm1
+                            const float * inpL = (const float *)lf_m.inpL_tensor->data;
+                            const float * gain = (const float *)lf_m.w_norm1->data;
+                            double ss = 0.0;
+                            for (int e = 0; e < 2048; e++) ss += (double)inpL[e]*(double)inpL[e];
+                            const float inv = 1.0f/std::sqrt((float)(ss/2048.0)+1e-5f);
+                            for (int e = 0; e < 2048; e++) normed[e] = inpL[e]*inv*gain[e];
+                            const bool ok = ggml_backend_xdna_decode_layer_f3best(
+                                ctx, lf_m.outL_tensor, normed.data(), 2048, inpL,
+                                lf_m.w_q, lf_m.w_o, lf_m.w_gate, lf_m.w_up, lf_m.w_down,
+                                lf_m.w_norm2, cgraph->nodes[lf_m.q_rope_idx], k_perm, v_perm, 8);
+                            if (ok) {
+                                for (int j = i; j <= lf_m.add_ffn_idx; j++) qkv_plan.skip_indices.insert(j);
+                                static std::atomic<int> live_log{4};
+                                if (live_log.fetch_sub(1) > 0) {
+                                    fprintf(stderr, "ggml-xdna: [f3best-LIVE] layer q=%d span=[%d,%d] -> outL authoritative\n",
+                                            lf_m.q_idx, i, lf_m.add_ffn_idx); fflush(stderr);
+                                }
+                                continue;   // layer done on NPU; skip per-op path entirely
+                            }
+                            // ok==false: f3best guard failed → fall through to per-op (cpu_run_start=-1)
+                        }
+                    }
                     static const bool f3best_skip = xdna_env_enabled("XDNA_LAYER_F3BEST_SKIP");
                     static std::atomic<int> f3best_probe_budget{16};
                     if (f3best_probe_budget.fetch_sub(1) > 0) {
