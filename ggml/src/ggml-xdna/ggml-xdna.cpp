@@ -17114,9 +17114,24 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                     if (cgraph->nodes[si]) fprintf(stderr, " %d:%s", si, ggml_op_name(cgraph->nodes[si]->op));
                                 fprintf(stderr, "\n"); fflush(stderr);
                             }
+                            // Skip the REDUNDANT Q-proj/Q-rope (nodes [i, q_rope_idx]) from the CPU
+                            // delegate — f3best computes Q on-chip; only the K/V path [q_rope_idx+1, kv_hi]
+                            // is needed for the cache write. Q-proj is the biggest matmul (2048x2048 vs
+                            // K/V 2048x512), so cutting it shrinks the inter-dispatch host gap (less NPU
+                            // idle-cooling). The whole span stays in skip_indices, so Q-proj never runs.
+                            const int kv_lo = (!f3best_kvrun && kv_hi >= 0 && lf_m.q_rope_idx >= i &&
+                                               lf_m.q_rope_idx < deleg_hi) ? lf_m.q_rope_idx + 1 : i;
                             {
-                                ggml_status sk = xdna_delegate_range(ctx, cgraph, i, deleg_hi + 1);
+                                static const bool _gdbg = xdna_env_enabled("XDNA_F3BEST_GAPDBG");
+                                const auto _gd0 = std::chrono::steady_clock::now();
+                                ggml_status sk = xdna_delegate_range(ctx, cgraph, kv_lo, deleg_hi + 1);
                                 if (sk != GGML_STATUS_SUCCESS) return sk;
+                                if (_gdbg) {
+                                    static std::atomic<int> _gn{0}; static double _gsum=0;
+                                    double _g = std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-_gd0).count();
+                                    int n=_gn.fetch_add(1); _gsum+=_g;
+                                    if (n%32==31) { fprintf(stderr,"ggml-xdna: [f3best-gap] KV-delegate[%d,%d] avg=%.0f us (n=%d)\n", kv_lo, deleg_hi, _gsum/(n+1), n+1); fflush(stderr); }
+                                }
                             }
                             std::vector<float> normed(2048, 0.0f);   // BUG1 fix: hand-rms(inpL)*w_norm1
                             const float * inpL = (const float *)lf_m.inpL_tensor->data;
