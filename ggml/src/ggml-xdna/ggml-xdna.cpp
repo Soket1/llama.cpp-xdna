@@ -167,6 +167,12 @@ struct xdna_kernel_entry {
     // GEMM: transposed to [K,N] row-major. GEMV: native [N,K] row-major.
     std::unordered_map<const void *, xrt::bo> b_bo_cache;
     std::unique_ptr<std::mutex> b_bo_mutex = std::make_unique<std::mutex>();
+    // #35: cached xrt::run PER LAYER (keyed by weight-data ptr, like b_bo_cache).
+    // The FIRST start() of a (run+bound-args) config pays a ~2ms one-time setup;
+    // re-starting the SAME run with the SAME args is warm (~1.1ms vs 3.3ms, WARM2).
+    // set_arg is done ONCE at creation; reuse just re-syncs BO contents + start, so
+    // every layer is warm from token 2 on (token 1 pays the 16 one-time setups).
+    std::unordered_map<const void *, std::unique_ptr<xrt::run>> run_cache_map;
 };
 
 // ---------------------------------------------------------------------------
@@ -4927,26 +4933,60 @@ static bool ggml_backend_xdna_decode_layer_f3best(
         // reuse) or NPU/DMA-bound (needs pipelining). Env-gated, ~zero cost when unset.
         static const bool f3b_time = xdna_env_enabled("XDNA_F3BEST_TIME");
         const auto _f3_t0 = std::chrono::steady_clock::now();
-        auto run = xrt::run(entry->kernel);
-        run.set_arg(0, (uint32_t)3);
-        run.set_arg(1, entry->insts_bo);
-        run.set_arg(2, (uint32_t)entry->insts.size());
-        run.set_arg(3, *entry->c_bo);          // out [partials | s]
-        run.set_arg(4, *entry->a_bo);          // XR
-        run.set_arg(5, *a_weights);            // A weights
-        run.set_arg(6, *entry->d3_bo);         // Wo placeholder (unused)
-        run.set_arg(7, *entry->d4_bo);         // KV
+        // #35: reuse ONE cached run object across all dispatches (XDNA_F3BEST_REUSE, default on).
+        // First start() pays the ~2ms command/BO setup once; re-set_arg+re-start of the SAME run
+        // is warm. New-run-per-dispatch (the old path) paid the 2ms cold setup EVERY layer.
+        // Run-reuse measured NO-OP (the NPU only keeps the LAST dispatch's weight-BO/DMA config
+        // warm; cycling 16 per-layer weight BOs re-pays cold DMA setup each time regardless of run
+        // caching). Default OFF (known-good new-run-per-dispatch); opt-in for experiments only.
+        static const bool f3b_reuse = xdna_env_enabled("XDNA_F3BEST_REUSE");
+        std::unique_ptr<xrt::run> _tmp_run;
+        xrt::run * run_p = nullptr;
+        bool _fresh = true;
+        if (f3b_reuse) {
+            auto rit = entry->run_cache_map.find(q_w->data);
+            if (rit != entry->run_cache_map.end()) { run_p = rit->second.get(); _fresh = false; }
+            else {
+                auto nr = std::make_unique<xrt::run>(entry->kernel);
+                run_p = nr.get();
+                entry->run_cache_map.emplace(q_w->data, std::move(nr));
+            }
+        } else {
+            _tmp_run = std::make_unique<xrt::run>(entry->kernel);
+            run_p = _tmp_run.get();
+        }
+        xrt::run & run = *run_p;
+        if (_fresh) {   // bind args ONCE; BO handles are stable per layer, only contents change
+            run.set_arg(0, (uint32_t)3);
+            run.set_arg(1, entry->insts_bo);
+            run.set_arg(2, (uint32_t)entry->insts.size());
+            run.set_arg(3, *entry->c_bo);          // out [partials | s]
+            run.set_arg(4, *entry->a_bo);          // XR
+            run.set_arg(5, *a_weights);            // A weights
+            run.set_arg(6, *entry->d3_bo);         // Wo placeholder (unused)
+            run.set_arg(7, *entry->d4_bo);         // KV
+        }
         const auto _f3_t1 = std::chrono::steady_clock::now();
         // WARM2 probe (#35 cold-overhead): run a throwaway dispatch FIRST (back-to-back, no host
         // gap), then the timed one. If d2 << d1, the live 3.3ms is idle-cold (NPU re-warms after a
         // host gap) → lever = remove inter-dispatch host gaps. If d2 ≈ d1, it's genuine per-dispatch
         // NPU cost (not recoverable by priming).
         static const bool f3b_warm2 = xdna_env_enabled("XDNA_F3BEST_WARM2");
-        double _w_d1 = 0.0;
+        double _w_d1 = 0.0, _w_gap = 0.0;
         if (f3b_warm2) {
             run.start(); run.wait();
             _w_d1 = std::chrono::duration<double, std::micro>(
                 std::chrono::steady_clock::now() - _f3_t1).count();
+            // COOLING-THRESHOLD sweep: idle the NPU for gap_us (host busy-spin, no dispatch)
+            // before d2, cycling the gap. d2 vs gap shows how fast the NPU cools after a dispatch.
+            static const double _gaps[8] = {0, 50, 100, 200, 400, 800, 1500, 3000};
+            static std::atomic<int> _gci{0};
+            _w_gap = _gaps[_gci.fetch_add(1) & 7];
+            if (_w_gap > 0.0) {
+                const auto _g0 = std::chrono::steady_clock::now();
+                while (std::chrono::duration<double, std::micro>(
+                        std::chrono::steady_clock::now() - _g0).count() < _w_gap) { /* spin */ }
+            }
         }
         const auto _f3_ts = std::chrono::steady_clock::now();
         run.start();
@@ -4958,8 +4998,8 @@ static bool ggml_backend_xdna_decode_layer_f3best(
                 return std::chrono::duration<double, std::micro>(b - a).count(); };
             const auto _f3_t3 = std::chrono::steady_clock::now();
             if (f3b_warm2)
-                fprintf(stderr, "ggml-xdna: [f3best-warm2] d1(cold)=%.0f d2(back2back)=%.0f us\n",
-                        _w_d1, _us(_f3_ts,_f3_t2));
+                fprintf(stderr, "ggml-xdna: [f3best-warm2] gap=%.0f d1=%.0f d2=%.0f us\n",
+                        _w_gap, _w_d1, _us(_f3_ts,_f3_t2));
             else
                 fprintf(stderr, "ggml-xdna: [f3best-time] create+setarg=%.0f start+wait=%.0f sync=%.0f total=%.0f us\n",
                         _us(_f3_t0,_f3_t1), _us(_f3_ts,_f3_t2), _us(_f3_t2,_f3_t3), _us(_f3_t0,_f3_t3));
