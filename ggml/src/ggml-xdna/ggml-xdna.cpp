@@ -16861,6 +16861,31 @@ static ggml_status xdna_delegate_range(ggml_backend_xdna_context * ctx,
 
 static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     xdna_profile_sink::get().note_token_start();
+    // #35 whole-graph_compute wall timer (XDNA_F3BEST_LOOPTIME) — shows total per-call time
+    // vs the unified-loop time, isolating the non-decode-layer cost (lm_head/framework).
+    static std::chrono::steady_clock::time_point _gc_last_exit{};
+    static bool _gc_have_last = false;
+    static double _gc_sum_us = 0, _gc_gap_us = 0; static int _gc_calls = 0;
+    if (xdna_env_enabled("XDNA_F3BEST_LOOPTIME") && _gc_have_last) {
+        _gc_gap_us += std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-_gc_last_exit).count();
+    }
+    struct _GCT { std::chrono::steady_clock::time_point t0; bool on;
+        ~_GCT(){ _gc_last_exit=std::chrono::steady_clock::now(); _gc_have_last=true; if(!on) return;
+            _gc_sum_us += std::chrono::duration<double,std::micro>(_gc_last_exit-t0).count(); _gc_calls++;
+            if(_gc_calls%10==0){ fprintf(stderr,"ggml-xdna: [f3best-acc] %d graph_compute calls: gc_sum=%.0fms gap_sum=%.0fms (gc_avg=%.1f gap_avg=%.1f ms/call)\n",
+                _gc_calls,_gc_sum_us/1000,_gc_gap_us/1000,_gc_sum_us/1000.0/_gc_calls,_gc_gap_us/1000.0/_gc_calls); fflush(stderr);} } }
+        _gct{ std::chrono::steady_clock::now(), xdna_env_enabled("XDNA_F3BEST_LOOPTIME") };
+    if (xdna_env_enabled("XDNA_F3BEST_LOOPTIME")) {
+        static std::atomic<int> _mb{2};
+        if (_mb.fetch_sub(1) > 0) {
+            int64_t maxN=0; int maxi=-1; int nmm=0;
+            for (int z=0; z<cgraph->n_nodes; z++){ struct ggml_tensor*t=cgraph->nodes[z];
+                if(t->op!=GGML_OP_MUL_MAT)continue; nmm++;
+                if(t->ne[0]>maxN){maxN=t->ne[0]; maxi=z;} }
+            fprintf(stderr,"ggml-xdna: [f3best-graphscan] n_nodes=%d n_mulmat=%d maxN=%lld @node%d (=lm_head? in THIS xdna graph)\n",
+                    cgraph->n_nodes, nmm, (long long)maxN, maxi); fflush(stderr);
+        }
+    }
     // [spec-dec probe] aggregate M histograms across many calls.
     {
         static const bool dbg = xdna_env_enabled("XDNA_DEBUG_SPECDEC");
