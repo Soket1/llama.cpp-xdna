@@ -5044,6 +5044,39 @@ static bool ggml_backend_xdna_decode_layer_f3best(
             run.set_arg(6, *entry->d3_bo);         // Wo placeholder (unused)
             run.set_arg(7, *entry->d4_bo);         // KV
         }
+        // #35 DE-RISK (XDNA_F3BEST_LOOPPROBE=N): dispatch this SAME run N times back-to-back
+        // WITHIN one backend call, alternating the weight BO each iter (mimics 16 different
+        // layers dispatched in a tight loop with no graph-walk round-trip between). If iters
+        // 1..N-1 stay ~1.1ms warm, the "16 layers in one call" fix is confirmed on OUR path
+        // (only iter 0 pays cold). Timing-only; the real dispatch below still runs for output.
+        {
+            static const int f3b_loopn = []{ const char* e = getenv("XDNA_F3BEST_LOOPPROBE");
+                return e ? atoi(e) : 0; }();
+            if (f3b_loopn > 0) {
+                if (!entry->shared_weight_bo) {
+                    entry->shared_weight_bo = std::make_unique<xrt::bo>(
+                        ctx->device, (size_t)NH * WT_BYTES, xrt::bo::flags::host_only,
+                        entry->kernel.group_id(5));
+                    pack_weights((uint8_t *)entry->shared_weight_bo->map<void*>());
+                    entry->shared_weight_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                }
+                std::string _seq;
+                for (int _k = 0; _k < f3b_loopn; _k++) {
+                    run.set_arg(5, (_k & 1) ? *entry->shared_weight_bo : *a_weights);  // alternate BO
+                    const auto _p0 = std::chrono::steady_clock::now();
+                    run.start(); run.wait();
+                    double _pd = std::chrono::duration<double,std::micro>(
+                        std::chrono::steady_clock::now() - _p0).count();
+                    char _b[16]; snprintf(_b, sizeof(_b), " %.0f", _pd); _seq += _b;
+                }
+                run.set_arg(5, *a_weights);   // restore correct weights for the real dispatch
+                static std::atomic<int> _lpdbg{3};
+                if (_lpdbg.fetch_sub(1) > 0) {
+                    fprintf(stderr, "ggml-xdna: [f3best-loopprobe] N=%d start+wait us:%s\n", f3b_loopn, _seq.c_str());
+                    fflush(stderr);
+                }
+            }
+        }
         const auto _f3_t1 = std::chrono::steady_clock::now();
         // WARM2 probe (#35 cold-overhead): run a throwaway dispatch FIRST (back-to-back, no host
         // gap), then the timed one. If d2 << d1, the live 3.3ms is idle-cold (NPU re-warms after a
