@@ -173,6 +173,24 @@ struct xdna_kernel_entry {
     // set_arg is done ONCE at creation; reuse just re-syncs BO contents + start, so
     // every layer is warm from token 2 on (token 1 pays the 16 one-time setups).
     std::unordered_map<const void *, std::unique_ptr<xrt::run>> run_cache_map;
+    // #35 sub-buffer experiment (XDNA_F3BEST_SUBBUF): ONE big parent weight BO
+    // holds every layer's weight slot; each layer binds a sub-buffer at its slot
+    // offset to arg5 (contents = that layer's packed weights). Tests whether a
+    // sub-buffer at a per-layer offset keeps the weight-DMA config WARM (~1.1ms)
+    // vs a distinct per-layer BO which re-primes the shim DMA cold (~3.15ms).
+    // Memory cost is identical to the per-layer path (16 slots vs 16 BOs = 528MB).
+    std::unique_ptr<xrt::bo> parent_weight_bo;
+    int weight_slot_next = 0;
+    // #35 isolation probe (XDNA_F3BEST_ONEBO): bind ONE shared weight BO for ALL
+    // 16 layers (wrong weights → garbage output, timing-only). Tests whether
+    // BO-IDENTITY alone keeps the weight-DMA warm; decides if DDR_PATCH-into-one-BO
+    // (which keeps arg5 constant + patches the offset in insts) can reach ~1.1ms.
+    std::unique_ptr<xrt::bo> shared_weight_bo;
+    // #35 (XDNA_F3BEST_ONERUN): ONE run object reused across ALL 16 layers, re-set_arg(5)
+    // per layer (c/a/d4 BOs are shared → bound once). WARM2 proved warmth is tied to
+    // repeating the SAME run object; this tests whether re-patching one run in place keeps
+    // every layer warm (the reachable ~30 t/s path if BO-switch is not the cold cause).
+    std::unique_ptr<xrt::run> shared_run;
 };
 
 // ---------------------------------------------------------------------------
@@ -4867,34 +4885,84 @@ static bool ggml_backend_xdna_decode_layer_f3best(
         fprintf(stderr, "f3best AFTER XR sync\n");
 
         // --- A-stream weights (per head [Wq|Wo|gate|up|down]), cached by q_w ptr ---
+        // Pack the 5 projections' Q4_0 weights into a device buffer `A` (WT_BYTES/head).
+        auto pack_weights = [&](uint8_t * A) {
+            const uint8_t * qd = (const uint8_t *)q_w->data;
+            const uint8_t * od = (const uint8_t *)o_w->data;
+            const uint8_t * gd = (const uint8_t *)gate_w->data;
+            const uint8_t * ud = (const uint8_t *)up_w->data;
+            const uint8_t * dd = (const uint8_t *)down_w->data;
+            for (int64_t h = 0; h < NH; h++) {
+                uint8_t * hd = A + (size_t)h * WT_BYTES; size_t off = 0;
+                f3b::pack_gemv(qd + (size_t)h*256*RS, 256, E, (int)M, (int)group_size, PACKED, hd+off); off += 64*PACKED;
+                f3b::pack_gemv(od + (size_t)h*256*RS, 256, E, (int)M, (int)group_size, PACKED, hd+off); off += 64*PACKED;
+                f3b::pack_bcast(gd + (size_t)h*H8*RS, H8, E, E, 0, (int)group_size, PACKED, hd+off); off += 256*PACKED;
+                f3b::pack_bcast(ud + (size_t)h*H8*RS, H8, E, E, 0, (int)group_size, PACKED, hd+off); off += 256*PACKED;
+                f3b::pack_bcast(dd, E, H8, HH, h*H8, (int)group_size, PACKED, hd+off); off += 256*PACKED;
+            }
+        };
+        // #35 sub-buffer test: XDNA_F3BEST_SUBBUF binds each layer's weights as a
+        // sub-buffer of ONE big parent BO (per-layer offset) instead of a distinct
+        // BO. If the weight-DMA config stays warm across layers, live start+wait
+        // drops ~3.15ms→~1.1ms (XDNA_F3BEST_TIME). Default OFF = per-layer BO.
+        static const bool f3b_subbuf = xdna_env_enabled("XDNA_F3BEST_SUBBUF");
+        static const bool f3b_onebo  = xdna_env_enabled("XDNA_F3BEST_ONEBO");
+        const int F3B_MAX_LAYERS = 16;   // llama-3.2-1B geometry (guarded above)
         xrt::bo * a_weights = nullptr;
         {
             std::lock_guard<std::mutex> lock(*entry->b_bo_mutex);
+            if (f3b_onebo) {
+                // ISOLATION (timing-only, garbage output): every layer binds the
+                // SAME BO. If start+wait drops to ~1.1ms, BO-identity is the warm
+                // lever → DDR_PATCH-into-one-BO is viable. If it stays ~3.1ms, the
+                // cold cost is per-dispatch (not weight-BO switching) and DDR_PATCH
+                // will not help either.
+                if (!entry->shared_weight_bo) {
+                    entry->shared_weight_bo = std::make_unique<xrt::bo>(
+                        ctx->device, (size_t)NH * WT_BYTES, xrt::bo::flags::host_only,
+                        entry->kernel.group_id(5));
+                    pack_weights((uint8_t *)entry->shared_weight_bo->map<void*>());
+                    entry->shared_weight_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                    fprintf(stderr, "ggml-xdna: [f3best-onebo] shared weight BO bound to ALL layers\n");
+                    fflush(stderr);
+                }
+                a_weights = entry->shared_weight_bo.get();
+            }
+            else {
             auto it = entry->b_bo_cache.find(q_w->data);
-            if (it == entry->b_bo_cache.end()) {
+            if (it != entry->b_bo_cache.end()) {
+                a_weights = &it->second;
+            } else if (f3b_subbuf && entry->weight_slot_next < F3B_MAX_LAYERS) {
+                if (!entry->parent_weight_bo) {
+                    entry->parent_weight_bo = std::make_unique<xrt::bo>(
+                        ctx->device, (size_t)F3B_MAX_LAYERS * NH * WT_BYTES,
+                        xrt::bo::flags::host_only, entry->kernel.group_id(5));
+                    fprintf(stderr, "ggml-xdna: [f3best-subbuf] parent BO alloc %zuMB (%d slots)\n",
+                            ((size_t)F3B_MAX_LAYERS * NH * WT_BYTES) >> 20, F3B_MAX_LAYERS);
+                    fflush(stderr);
+                }
+                const int slot = entry->weight_slot_next++;
+                const size_t off = (size_t)slot * NH * WT_BYTES;
+                xrt::bo sub(*entry->parent_weight_bo, (size_t)NH * WT_BYTES, off);
+                pack_weights((uint8_t *)sub.map<void*>());
+                sub.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                auto [ins, _] = entry->b_bo_cache.emplace(q_w->data, std::move(sub));
+                a_weights = &ins->second;
+                fprintf(stderr, "ggml-xdna: [f3best-subbuf] slot=%d off=%zu size=%zuB\n",
+                        slot, off, (size_t)NH * WT_BYTES);
+                fflush(stderr);
+            } else {
                 xrt::bo packed(ctx->device, (size_t)NH * WT_BYTES, xrt::bo::flags::host_only,
                                entry->kernel.group_id(5));
-                uint8_t * A = (uint8_t *)packed.map<void*>();
-                const uint8_t * qd = (const uint8_t *)q_w->data;
-                const uint8_t * od = (const uint8_t *)o_w->data;
-                const uint8_t * gd = (const uint8_t *)gate_w->data;
-                const uint8_t * ud = (const uint8_t *)up_w->data;
-                const uint8_t * dd = (const uint8_t *)down_w->data;
-                for (int64_t h = 0; h < NH; h++) {
-                    uint8_t * hd = A + (size_t)h * WT_BYTES; size_t off = 0;
-                    f3b::pack_gemv(qd + (size_t)h*256*RS, 256, E, (int)M, (int)group_size, PACKED, hd+off); off += 64*PACKED;
-                    f3b::pack_gemv(od + (size_t)h*256*RS, 256, E, (int)M, (int)group_size, PACKED, hd+off); off += 64*PACKED;
-                    f3b::pack_bcast(gd + (size_t)h*H8*RS, H8, E, E, 0, (int)group_size, PACKED, hd+off); off += 256*PACKED;
-                    f3b::pack_bcast(ud + (size_t)h*H8*RS, H8, E, E, 0, (int)group_size, PACKED, hd+off); off += 256*PACKED;
-                    f3b::pack_bcast(dd, E, H8, HH, h*H8, (int)group_size, PACKED, hd+off); off += 256*PACKED;
-                }
+                pack_weights((uint8_t *)packed.map<void*>());
                 packed.sync(XCL_BO_SYNC_BO_TO_DEVICE);
                 auto [ins, _] = entry->b_bo_cache.emplace(q_w->data, std::move(packed));
                 a_weights = &ins->second;
                 fprintf(stderr, "ggml-xdna: warm decode_layer_f3best E=%lld seq=%lld A=%zuB\n",
                         (long long)E, (long long)seq_len, (size_t)NH * WT_BYTES);
                 fflush(stderr);
-            } else a_weights = &it->second;
+            }
+            }   // end else (not f3b_onebo)
         }
 
         // --- KV cache: [K0..K3 | K4..K7 | V0..V3 | V4..V7], each head seq*head_dim ---
@@ -4940,10 +5008,17 @@ static bool ggml_backend_xdna_decode_layer_f3best(
         // warm; cycling 16 per-layer weight BOs re-pays cold DMA setup each time regardless of run
         // caching). Default OFF (known-good new-run-per-dispatch); opt-in for experiments only.
         static const bool f3b_reuse = xdna_env_enabled("XDNA_F3BEST_REUSE");
+        static const bool f3b_onerun = xdna_env_enabled("XDNA_F3BEST_ONERUN");
         std::unique_ptr<xrt::run> _tmp_run;
         xrt::run * run_p = nullptr;
-        bool _fresh = true;
-        if (f3b_reuse) {
+        bool _fresh = true;      // _fresh => bind ALL args
+        bool _rebind_w = false;  // reused run => rebind only arg5 (weights); shared BOs stay
+        if (f3b_onerun) {
+            if (!entry->shared_run) {
+                entry->shared_run = std::make_unique<xrt::run>(entry->kernel);
+                run_p = entry->shared_run.get();
+            } else { run_p = entry->shared_run.get(); _fresh = false; _rebind_w = true; }
+        } else if (f3b_reuse) {
             auto rit = entry->run_cache_map.find(q_w->data);
             if (rit != entry->run_cache_map.end()) { run_p = rit->second.get(); _fresh = false; }
             else {
@@ -4956,6 +5031,9 @@ static bool ggml_backend_xdna_decode_layer_f3best(
             run_p = _tmp_run.get();
         }
         xrt::run & run = *run_p;
+        if (_rebind_w) {          // one-run path: only the weights arg differs per layer
+            run.set_arg(5, *a_weights);
+        }
         if (_fresh) {   // bind args ONCE; BO handles are stable per layer, only contents change
             run.set_arg(0, (uint32_t)3);
             run.set_arg(1, entry->insts_bo);
@@ -4986,6 +5064,46 @@ static bool ggml_backend_xdna_decode_layer_f3best(
                 const auto _g0 = std::chrono::steady_clock::now();
                 while (std::chrono::duration<double, std::micro>(
                         std::chrono::steady_clock::now() - _g0).count() < _w_gap) { /* spin */ }
+            }
+            // ISOLATION (XDNA_F3BEST_WARM2_SYNC): re-run the per-layer BO syncs between d1 and d2
+            // (mimics real inter-layer host work WITHOUT another kernel dispatch). If d2 goes cold
+            // here, the shared-BO syncs reset the DMA priming (cheap fix); if d2 stays warm, the
+            // culprit is the intervening OTHER-layer dispatch (→ batch via runlist).
+            static const bool f3b_warm2_sync = xdna_env_enabled("XDNA_F3BEST_WARM2_SYNC");
+            if (f3b_warm2_sync) {
+                entry->c_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+                entry->a_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                entry->d4_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            }
+            // ISOLATION (XDNA_F3BEST_WARM2_REWRITE): host-WRITE the input BOs via map() between
+            // d1 and d2 (what the real per-layer loop does when it rebuilds XR/KV). If d2 goes
+            // cold here, dirtying the bound-BO host pages resets the primed DMA → fix = ping-pong
+            // input BOs so the next layer's host write doesn't touch the in-flight primed buffer.
+            static const bool f3b_warm2_rewrite = xdna_env_enabled("XDNA_F3BEST_WARM2_REWRITE");
+            if (f3b_warm2_rewrite) {
+                volatile uint16_t * _xr = (uint16_t *)entry->a_bo->map<void*>();
+                for (size_t _k = 0; _k < (size_t)XR_ELEMS; _k++) _xr[_k] = _xr[_k];
+                volatile uint16_t * _kv = (uint16_t *)entry->d4_bo->map<void*>();
+                for (size_t _k = 0; _k < (size_t)2 * NH * KVN; _k++) _kv[_k] = _kv[_k];
+                entry->a_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                entry->d4_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            }
+            // ISOLATION (XDNA_F3BEST_WARM2_DIFFW): d2 binds a DIFFERENT weight BO than d1
+            // (same run, same scope, consecutive — but weights change, exactly what a
+            // 16-layer INTERNAL dispatch loop would do). If d2 stays ~1.1ms warm, then
+            // doing all 16 layers in ONE backend call (no graph-walk round-trip between)
+            // makes layers 1..15 warm → ~30-35 t/s. If d2 goes cold, warm needs an
+            // identical repeat and is unreachable across real layers.
+            static const bool f3b_warm2_diffw = xdna_env_enabled("XDNA_F3BEST_WARM2_DIFFW");
+            if (f3b_warm2_diffw) {
+                if (!entry->shared_weight_bo) {
+                    entry->shared_weight_bo = std::make_unique<xrt::bo>(
+                        ctx->device, (size_t)NH * WT_BYTES, xrt::bo::flags::host_only,
+                        entry->kernel.group_id(5));
+                    pack_weights((uint8_t *)entry->shared_weight_bo->map<void*>());
+                    entry->shared_weight_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                }
+                run.set_arg(5, *entry->shared_weight_bo);   // d2 will read a different BO than d1
             }
         }
         const auto _f3_ts = std::chrono::steady_clock::now();
@@ -17161,10 +17279,18 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                             // idle-cooling). The whole span stays in skip_indices, so Q-proj never runs.
                             const int kv_lo = (!f3best_kvrun && kv_hi >= 0 && lf_m.q_rope_idx >= i &&
                                                lf_m.q_rope_idx < deleg_hi) ? lf_m.q_rope_idx + 1 : i;
+                            // #35 ISOLATION (XDNA_F3BEST_NODELEG): skip the K/V-write delegate
+                            // entirely (KV cache goes stale → output degrades after token 1, but
+                            // it removes the intervening NPU K/V-proj dispatch between f3best
+                            // layers). If f3best start+wait drops ~3.1ms→~1.1ms here, the cold is
+                            // caused by the interleaved OTHER-xclbin dispatch (→ fold KV-write into
+                            // f3best so all 16 per-token dispatches are the SAME xclbin, warm).
+                            static const bool f3best_nodeleg = xdna_env_enabled("XDNA_F3BEST_NODELEG");
                             {
                                 static const bool _gdbg = xdna_env_enabled("XDNA_F3BEST_GAPDBG");
                                 const auto _gd0 = std::chrono::steady_clock::now();
-                                ggml_status sk = xdna_delegate_range(ctx, cgraph, kv_lo, deleg_hi + 1);
+                                ggml_status sk = f3best_nodeleg ? GGML_STATUS_SUCCESS
+                                               : xdna_delegate_range(ctx, cgraph, kv_lo, deleg_hi + 1);
                                 if (sk != GGML_STATUS_SUCCESS) return sk;
                                 if (_gdbg) {
                                     static std::atomic<int> _gn{0}; static double _gsum=0;
