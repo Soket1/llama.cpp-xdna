@@ -17259,7 +17259,109 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                 // and prefill (M>1) would consume the diag budget and feed the
                 // M=1 f3best xclbin a multi-token graph → false position errors.
                 const bool f3best_is_decode = node->src[1] && node->src[1]->ne[1] == 1;
+                // #35 unified-loop DE-RISK (XDNA_F3BEST_LOOPDBG): one-shot dump of the
+                // inter-layer residual chain — is match[L].outL_tensor the SAME buffer as
+                // match[L+1].inpL_tensor? If so, f3best writing outL_L auto-provides inpL_{L+1}
+                // and the 16-layer loop needs no explicit residual copy.
+                if (f3best_enabled && f3best_is_decode && xdna_env_enabled("XDNA_F3BEST_LOOPDBG")) {
+                    static std::atomic<int> _ldbg{1};
+                    if (_ldbg.fetch_sub(1) > 0) {
+                        auto & M = layer_fused_plan.matches;
+                        fprintf(stderr, "ggml-xdna: [f3best-loopdbg] %zu matches\n", M.size());
+                        for (size_t L = 0; L < M.size(); L++) {
+                            fprintf(stderr, "  L%zu q=%d pre_norm=%d add_ffn=%d inpL=%p outL=%p%s\n",
+                                    L, M[L].q_idx, M[L].pre_norm_idx, M[L].add_ffn_idx,
+                                    (void*)(M[L].inpL_tensor?M[L].inpL_tensor->data:nullptr),
+                                    (void*)(M[L].outL_tensor?M[L].outL_tensor->data:nullptr),
+                                    (L+1<M.size() && M[L].outL_tensor && M[L+1].inpL_tensor &&
+                                     M[L].outL_tensor->data == M[L+1].inpL_tensor->data) ? "  outL==next.inpL" : "");
+                        }
+                        fflush(stderr);
+                    }
+                }
                 if (f3best_enabled && f3best_is_decode) {
+                    // ── #35 UNIFIED LOOP (XDNA_F3BEST_LOOP): dispatch ALL decode layers inside
+                    // ONE backend call (no graph-walk round-trip between layers) so layers 1..N
+                    // stay WARM (~1.1ms); only layer 0 pays cold. Measured lever to ~30-40 t/s
+                    // (LOOPPROBE: iter0=3250us, iters 1..15 ~1100us). Triggered at the graph-FIRST
+                    // layer (min q_idx); layers processed in q_idx order (matches is unordered).
+                    // Per layer: CPU KV-write delegate + hand-rms + f3best writing outL, which is
+                    // the next layer's inpL via the shared in-place residual buffer. Two-pass:
+                    // validate ALL layers first (no partial dispatch), else fall back to per-layer.
+                    static const bool f3best_loop = xdna_env_enabled("XDNA_F3BEST_LOOP");
+                    if (f3best_loop) {
+                        if (qkv_plan.skip_indices.count(i)) continue;  // already done by an earlier loop run
+                        auto & MM = layer_fused_plan.matches;
+                        int min_q = -1;
+                        for (auto & mm : MM) if (mm.q_idx >= 0 && (min_q < 0 || mm.q_idx < min_q)) min_q = mm.q_idx;
+                        if (i == min_q) {
+                            struct LoopLayer { const xdna_layer_fused_match* m; int kv_lo, kv_hi;
+                                               struct ggml_tensor* kp; struct ggml_tensor* vp; };
+                            std::vector<int> order;
+                            for (size_t oi = 0; oi < MM.size(); oi++) order.push_back((int)oi);
+                            std::sort(order.begin(), order.end(),
+                                      [&](int a, int b){ return MM[a].q_idx < MM[b].q_idx; });
+                            std::vector<LoopLayer> plan; bool ok_all = true;
+                            for (int oi : order) {
+                                const auto & m = MM[oi];
+                                if (!(m.q_idx>=0 && m.add_ffn_idx>=m.q_idx && m.outL_tensor &&
+                                      m.outL_tensor->type==GGML_TYPE_F32 && m.outL_tensor->data &&
+                                      m.inpL_tensor && m.inpL_tensor->data && m.w_norm1 && m.w_norm2 &&
+                                      m.w_q && m.w_o && m.w_gate && m.w_up && m.w_down &&
+                                      m.q_rope_idx>=0 && m.pre_norm_idx>=0)) { ok_all=false; break; }
+                                struct ggml_tensor *kp=nullptr,*vp=nullptr;
+                                for (int si=m.q_idx; si<=m.add_ffn_idx; si++){ struct ggml_tensor*nd=cgraph->nodes[si];
+                                    if(!nd||nd->op!=GGML_OP_PERMUTE)continue;
+                                    if(!kp&&nd->ne[0]==64&&nd->ne[1]>=32&&nd->ne[2]==8)kp=nd;
+                                    else if(!vp&&nd->ne[0]>=32&&nd->ne[1]==64&&nd->ne[2]==8)vp=nd; }
+                                if(!kp||!vp){ok_all=false;break;}
+                                int attn_hi=(m.add_attn_idx>=m.q_idx&&m.add_attn_idx<=m.add_ffn_idx)?m.add_attn_idx:m.add_ffn_idx;
+                                int kv_hi=-1; for(int si=m.q_idx;si<=attn_hi;si++)
+                                    if(cgraph->nodes[si]&&cgraph->nodes[si]->op==GGML_OP_SET_ROWS) kv_hi=si;
+                                if(kv_hi<0){ok_all=false;break;}
+                                plan.push_back({&m, m.pre_norm_idx, kv_hi, kp, vp});
+                            }
+                            if (ok_all) {
+                                if (cpu_run_start >= 0) {   // materialize embeddings → inpL for layer 0
+                                    ggml_status s=xdna_delegate_range(ctx,cgraph,cpu_run_start,i);
+                                    if(s!=GGML_STATUS_SUCCESS)return s; cpu_run_start=-1; }
+                                static const bool _looptime = xdna_env_enabled("XDNA_F3BEST_LOOPTIME");
+                                double _t_kv=0,_t_f3=0; const auto _lt0=std::chrono::steady_clock::now();
+                                std::vector<float> normed(2048,0.0f); bool disp_ok=true;
+                                for (auto & L : plan) {
+                                    // CPU KV-write prefix (attn_norm + Q/K/V-proj + rope + SET_ROWS) from the
+                                    // shared residual buffer; then f3best writes outL = next layer's inpL.
+                                    const auto _k0=std::chrono::steady_clock::now();
+                                    ggml_status sk=xdna_delegate_range(ctx,cgraph,L.kv_lo,L.kv_hi+1);
+                                    if(sk!=GGML_STATUS_SUCCESS)return sk;
+                                    if(_looptime) _t_kv+=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-_k0).count();
+                                    const float* inpL=(const float*)L.m->inpL_tensor->data;
+                                    const float* gain=(const float*)L.m->w_norm1->data;
+                                    double ss=0.0; for(int e=0;e<2048;e++) ss+=(double)inpL[e]*(double)inpL[e];
+                                    const float inv=1.0f/std::sqrt((float)(ss/2048.0)+1e-5f);
+                                    for(int e=0;e<2048;e++) normed[e]=inpL[e]*inv*gain[e];
+                                    const auto _q0=std::chrono::steady_clock::now();
+                                    bool ok=ggml_backend_xdna_decode_layer_f3best(ctx,L.m->outL_tensor,normed.data(),2048,inpL,
+                                        L.m->w_q,L.m->w_o,L.m->w_gate,L.m->w_up,L.m->w_down,L.m->w_norm2,
+                                        cgraph->nodes[L.m->q_rope_idx],L.kp,L.vp,8);
+                                    if(_looptime) _t_f3+=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-_q0).count();
+                                    if(!ok){disp_ok=false;break;}
+                                }
+                                if(_looptime){ double _tot=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-_lt0).count();
+                                    static std::atomic<int> _lti{4}; if(_lti.fetch_sub(1)>0){
+                                    fprintf(stderr,"ggml-xdna: [f3best-looptime] token: KVdeleg=%.0f f3best(incl NPU)=%.0f total=%.0f us\n",_t_kv,_t_f3,_tot); fflush(stderr);} }
+                                // Skip ALL layers' full spans [pre_norm..add_ffn] regardless (avoid double
+                                // dispatch); on the (validated → near-impossible) mid-abort, log loudly.
+                                for(auto&m:MM){int lo=m.pre_norm_idx>=0?m.pre_norm_idx:m.q_idx;
+                                    for(int j=lo;j<=m.add_ffn_idx;j++) qkv_plan.skip_indices.insert(j);}
+                                if(!disp_ok) fprintf(stderr,"ggml-xdna: [f3best-LOOP] ABORT mid-dispatch (token may be corrupt)\n");
+                                static std::atomic<int> _lp{2};
+                                if(_lp.fetch_sub(1)>0){fprintf(stderr,"ggml-xdna: [f3best-LOOP] dispatched %zu layers in ONE call\n",plan.size());fflush(stderr);}
+                                continue;   // whole decoder stack done on NPU in one backend call
+                            }
+                            // ok_all=false: buffer untouched → fall through to the safe per-layer path.
+                        }
+                    }
                     // ── #35 stage-a LIVE wiring (XDNA_LAYER_F3BEST_LIVE): f3best drives the
                     // layer output DIRECTLY — one whole-layer dispatch REPLACES the ~94 per-op
                     // GEMV dispatches (FFLM's measured 1-fused-dispatch/layer shape). Reversible
