@@ -20251,7 +20251,17 @@ static bool xdna_shape_dispatchable_gemv(int64_t K, int64_t N) {
         if (dbg) fprintf(stderr, "ggml-xdna: gemv reject: per_col=%lld (must be >=8)\n", (long long)per_col);
         return false;
     }
-    if (N > 32768) return false;
+    // #77 lm_head-on-NPU: the vocab projection (N=128256, tied token_embd Q4_0)
+    // routes through the int4 GEMV instead of CPU-Q6_K (~11ms). It builds clean
+    // at num_cols=4 (tile_out=64). Gated by XDNA_ENABLE_LMHEAD_NPU so the model
+    // must carry a Q4_0/Q4_K vocab weight; a Q6_K vocab tensor never reaches
+    // this path (supports_op only claims Q4_0/Q4_K). All other N>32768 shapes
+    // stay on CPU (aiecc BD overflow above ~485 N-tiles/shim for generic N).
+    static const bool lmhead_npu = xdna_env_enabled("XDNA_ENABLE_LMHEAD_NPU");
+    if (N > 32768) {
+        if (lmhead_npu && N == 128256) return true;
+        return false;
+    }
     return true;
 }
 

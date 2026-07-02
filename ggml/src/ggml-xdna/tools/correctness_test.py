@@ -52,6 +52,10 @@ MODEL     = REPO_ROOT / "models" / "llama-3.2-1b-instruct-BF16.gguf"
 # produces the right answer in that fallback regime. When Priority 8
 # INT4 work lands, tighten the tolerances and expand to NPU dispatch.
 MODEL_Q4_0   = REPO_ROOT / "models" / "llama-3.2-1b-instruct-Q4_0.gguf"
+# #77 lm_head-on-NPU: same Q4_0 model but token_embd/vocab requantized Q6_K->Q4_0
+# (--token-embedding-type q4_0) so the vocab projection is readable by the int4
+# GEMV kernel. Quality cost measured at +2.2% PPL (within error bars).
+MODEL_Q4_0_VOCABQ4 = REPO_ROOT / "models" / "llama-3.2-1b-instruct-Q4_0-vocabQ4.gguf"
 MODEL_Q4_K_M = REPO_ROOT / "models" / "llama-3.2-1b-instruct-Q4_K_M.gguf"
 MODEL_QWEN35_9B_Q4_0 = REPO_ROOT / "models" / "Qwen3.5-9B-Q4_0.gguf"
 # Llama 3.2 3B (head_dim=128, 28 layers, GQA 3:1). Used to validate the
@@ -226,6 +230,27 @@ PRESETS: dict[str, dict[str, str]] = {
         "XDNA_ATTN_SUPPORTS":            "1",
         "XDNA_LAYER_F3BEST_LIVE":        "1",
         "XDNA_F3BEST_LOOP":              "1",
+    },
+    "npu_f3best_loop_lmhead": {
+        # #77: f3best unified loop + vocab projection (lm_head) on NPU. Requires
+        # MODEL_Q4_0_VOCABQ4 (token_embd requantized to Q4_0) so the N=128256
+        # MUL_MAT routes through the int4 GEMV instead of CPU-Q6_K (~11ms/token).
+        "XDNA_ENABLE_GEMV":              "1",
+        "XDNA_ENABLE_SWIGLU":            "1",
+        "XDNA_ENABLE_QKV":               "1",
+        "XDNA_ENABLE_DECODE_BATCH":      "1",
+        "XDNA_ENABLE_TRANSFORMER_BLOCK": "1",
+        "XDNA_ENABLE_FLOWKV_DECODE":     "1",
+        "XDNA_ENABLE_RMS_NORM":          "1",
+        "XDNA_ENABLE_GEMV_INT4":         "1",
+        "XDNA_ENABLE_SWIGLU_INT4":       "1",
+        "XDNA_ENABLE_FUSED_LAYER":       "1",
+        "XDNA_LAYER_FUSED":              "1",
+        "XDNA_ENABLE_LAYER_F3BEST":      "1",
+        "XDNA_ATTN_SUPPORTS":            "1",
+        "XDNA_LAYER_F3BEST_LIVE":        "1",
+        "XDNA_F3BEST_LOOP":              "1",
+        "XDNA_ENABLE_LMHEAD_NPU":        "1",
     },
     "npu_layer_fused_live": {
         # Live 4-column LayerFused execution with closed-loop on-chip dataflow
@@ -1123,6 +1148,11 @@ def build_bench_configs() -> list[BenchConfig]:
         BenchConfig(label="NPU INT4 QKV fused", preset="npu_int4_qkv_fused", model=MODEL_Q4_0),
         BenchConfig(label="NPU Phase B fused", preset="npu_phase_b",      model=MODEL_Q4_0),
         BenchConfig(label="NPU Layer Fused Live", preset="npu_layer_fused_live", model=MODEL_Q4_0),
+        BenchConfig(label="NPU f3best LOOP",   preset="npu_f3best_loop",  model=MODEL_Q4_0),
+        # #77: lm_head on NPU. vocabQ4 model + its own CPU baseline for a fair
+        # (same-weights) t/s and token-match comparison.
+        BenchConfig(label="CPU Q4_0 vocabQ4",  preset="cpu_baseline",         model=MODEL_Q4_0_VOCABQ4),
+        BenchConfig(label="NPU f3best LOOP +lmhead", preset="npu_f3best_loop_lmhead", model=MODEL_Q4_0_VOCABQ4),
     ]
 
 
