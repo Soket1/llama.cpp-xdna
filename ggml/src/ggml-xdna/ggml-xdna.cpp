@@ -127,6 +127,13 @@ enum xdna_op_kind : int {
 // bytes, typical ~80KB.
 static constexpr int XDNA_PHASE9_RING_SIZE = 4;
 
+struct xdna_f3best_kv_cache {
+    std::unique_ptr<xrt::bo> bo;
+    int64_t last_n_kv = 0;
+    const void * last_k_data = nullptr;
+    const void * last_v_data = nullptr;
+};
+
 struct xdna_kernel_entry {
     xdna_op_kind  op_kind;
     xrt::xclbin   xclbin;
@@ -173,6 +180,10 @@ struct xdna_kernel_entry {
     // set_arg is done ONCE at creation; reuse just re-syncs BO contents + start, so
     // every layer is warm from token 2 on (token 1 pays the 16 one-time setups).
     std::unordered_map<const void *, std::unique_ptr<xrt::run>> run_cache_map;
+    // #79: per-layer packed-KV BO cache for f3best. The xclbin sees the same
+    // arg7 layout, but steady decode appends only new K/V slots instead of
+    // re-packing the full 256-token window for every layer and token.
+    std::unordered_map<const void *, xdna_f3best_kv_cache> f3best_kv_cache_map;
     // #35 sub-buffer experiment (XDNA_F3BEST_SUBBUF): ONE big parent weight BO
     // holds every layer's weight slot; each layer binds a sub-buffer at its slot
     // offset to arg5 (contents = that layer's packed weights). Tests whether a
@@ -4745,6 +4756,29 @@ static bool ggml_backend_xdna_decode_front_attn(
 //   q/o/gate/up/down_w : Q4_0 weights; ffn_gain : ffn_norm.weight (f32/f16, [E])
 //   k_perm/v_perm : KV cache [head_dim, seq, kv_heads]; rope_node : Q RoPE source
 #include "f3best_pack.h"
+
+struct xdna_f3best_gluetime_accum {
+    double rms_us = 0.0;
+    double xr_us = 0.0;
+    double xr_sync_us = 0.0;
+    double weight_us = 0.0;
+    double kv_zero_us = 0.0;
+    double kv_copy_us = 0.0;
+    double kv_sync_us = 0.0;
+    double runprep_us = 0.0;
+    double npu_us = 0.0;
+    double outsync_us = 0.0;
+    double reduce_us = 0.0;
+    double f3call_us = 0.0;
+};
+
+static thread_local xdna_f3best_gluetime_accum g_xdna_f3best_gluetime;
+
+static inline double xdna_elapsed_us(std::chrono::steady_clock::time_point a,
+                                     std::chrono::steady_clock::time_point b = std::chrono::steady_clock::now()) {
+    return std::chrono::duration<double, std::micro>(b - a).count();
+}
+
 static bool ggml_backend_xdna_decode_layer_f3best(
         ggml_backend_xdna_context * ctx,
         struct ggml_tensor * out_dst,
@@ -4805,7 +4839,9 @@ static bool ggml_backend_xdna_decode_layer_f3best(
     if (!entry) { fprintf(stderr,"f3best get_or_load failed cache=%s\n", cache_key.c_str()); return false; }
 
     try {
-        fprintf(stderr, "f3best BEFORE BO alloc cache=%s\n", cache_key.c_str());
+        static const bool f3b_gluetime = xdna_env_enabled("XDNA_F3BEST_GLUETIME");
+        static const bool f3b_debug = xdna_env_enabled("XDNA_F3BEST_DEBUG");
+        if (f3b_debug) fprintf(stderr, "f3best BEFORE BO alloc cache=%s\n", cache_key.c_str());
         // BOs: out(grp3)=c_bo, XR(grp4)=a_bo, A weights(grp5)=cached, Wo dummy(grp6)=d3_bo, KV(grp7)=d4_bo.
         if (!entry->c_bo)
             entry->c_bo = std::make_unique<xrt::bo>(ctx->device, OUT_ELEMS * dts,
@@ -4819,11 +4855,10 @@ static bool ggml_backend_xdna_decode_layer_f3best(
             memset(entry->d3_bo->map<void*>(), 0, WO_BYTES);
             entry->d3_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);     // never DMA'd, bound once
         }
-        if (!entry->d4_bo)
-            entry->d4_bo = std::make_unique<xrt::bo>(ctx->device, (size_t)2 * NH * KVN * dts,
-                xrt::bo::flags::host_only, entry->kernel.group_id(7));
+        // arg7 KV BO is per-layer cached below (#79), not a single shared d4_bo.
 
         // --- XR bundle: [x(E) | rope-lut(256) | seq+pad(16) | resid(E) | gain(E)] ---
+        const auto _gt_xr0 = std::chrono::steady_clock::now();
         uint16_t * xr = (uint16_t *)entry->a_bo->map<void*>();
         memset(xr, 0, (size_t)XR_ELEMS * dts);
         f32_to_bf16(input_snap, xr, (size_t)E);
@@ -4864,7 +4899,7 @@ static bool ggml_backend_xdna_decode_layer_f3best(
                 rope_node->src[1]->ne[0] >= 1 && rope_node->src[1]->data)
                 rope_pos = ((const int32_t *)rope_node->src[1]->data)[0];
             static std::atomic<int> seq_diag_budget{34};
-            if (seq_diag_budget.fetch_sub(1) > 0) {
+            if (f3b_debug && seq_diag_budget.fetch_sub(1) > 0) {
                 fprintf(stderr, "ggml-xdna: [f3best-seq] seq_len=%lld actual_seq=%lld kv_start=%lld kv_len=%lld rope_pos=%d\n",
                         (long long)seq_len, (long long)actual_seq, (long long)kv_start, (long long)kv_len, rope_pos);
                 fflush(stderr);
@@ -4881,10 +4916,14 @@ static bool ggml_backend_xdna_decode_layer_f3best(
                 for (int64_t e = 0; e < E; e++) gdst[e] = f32_to_bf16_scalar(ggml_fp16_to_fp32(g16[e]));
             } else { fprintf(stderr, "f3best guard gain type=%d E=%lld\n", (int)ffn_gain->type, (long long)ffn_gain->ne[0]); return false; }
         }
+        if (f3b_gluetime) g_xdna_f3best_gluetime.xr_us += xdna_elapsed_us(_gt_xr0);
+        const auto _gt_xrs0 = std::chrono::steady_clock::now();
         entry->a_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
-        fprintf(stderr, "f3best AFTER XR sync\n");
+        if (f3b_gluetime) g_xdna_f3best_gluetime.xr_sync_us += xdna_elapsed_us(_gt_xrs0);
+        if (f3b_debug) fprintf(stderr, "f3best AFTER XR sync\n");
 
         // --- A-stream weights (per head [Wq|Wo|gate|up|down]), cached by q_w ptr ---
+        const auto _gt_w0 = std::chrono::steady_clock::now();
         // Pack the 5 projections' Q4_0 weights into a device buffer `A` (WT_BYTES/head).
         auto pack_weights = [&](uint8_t * A) {
             const uint8_t * qd = (const uint8_t *)q_w->data;
@@ -4958,33 +4997,66 @@ static bool ggml_backend_xdna_decode_layer_f3best(
                 packed.sync(XCL_BO_SYNC_BO_TO_DEVICE);
                 auto [ins, _] = entry->b_bo_cache.emplace(q_w->data, std::move(packed));
                 a_weights = &ins->second;
-                fprintf(stderr, "ggml-xdna: warm decode_layer_f3best E=%lld seq=%lld A=%zuB\n",
-                        (long long)E, (long long)seq_len, (size_t)NH * WT_BYTES);
-                fflush(stderr);
+                if (f3b_debug) {
+                    fprintf(stderr, "ggml-xdna: warm decode_layer_f3best E=%lld seq=%lld A=%zuB\n",
+                            (long long)E, (long long)seq_len, (size_t)NH * WT_BYTES);
+                    fflush(stderr);
+                }
             }
             }   // end else (not f3b_onebo)
         }
+        if (f3b_gluetime) g_xdna_f3best_gluetime.weight_us += xdna_elapsed_us(_gt_w0);
 
         // --- KV cache: [K0..K3 | K4..K7 | V0..V3 | V4..V7], each head seq*head_dim ---
+        const auto _gt_kvz0 = std::chrono::steady_clock::now();
         const char * v_data = (const char *)v_perm->data;
         const size_t v_nb0 = v_perm->nb[0], v_nb1 = v_perm->nb[1], v_nb2 = v_perm->nb[2];
         const bool v_f32 = (v_perm->type == GGML_TYPE_F32);
         const bool v_f16 = (v_perm->type == GGML_TYPE_F16);
         const bool v_rowcontig = (v_perm->ne[0] == head_dim);
-        uint16_t * kv = (uint16_t *)entry->d4_bo->map<void*>();
-        memset(kv, 0, (size_t)2 * NH * KVN * dts);
+        xdna_f3best_kv_cache * kv_cache = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(*entry->b_bo_mutex);
+            auto & kc = entry->f3best_kv_cache_map[q_w->data];
+            if (!kc.bo) {
+                kc.bo = std::make_unique<xrt::bo>(ctx->device, (size_t)2 * NH * KVN * dts,
+                    xrt::bo::flags::host_only, entry->kernel.group_id(7));
+                memset(kc.bo->map<void*>(), 0, (size_t)2 * NH * KVN * dts);
+                kc.last_n_kv = 0;
+                kc.last_k_data = nullptr;
+                kc.last_v_data = nullptr;
+            }
+            kv_cache = &kc;
+        }
+        xrt::bo & kv_bo = *kv_cache->bo;
+        uint16_t * kv = (uint16_t *)kv_bo.map<void*>();
+        static const bool f3b_kv_append = xdna_env_enabled("XDNA_F3BEST_KV_APPEND");
+        static const bool f3b_kv_verify = xdna_env_enabled("XDNA_F3BEST_KV_VERIFY");
+        const bool kv_can_append = f3b_kv_append && n_kv <= 256 && kv_cache->last_n_kv > 0 &&
+                                   n_kv == kv_cache->last_n_kv + 1 &&
+                                   kv_cache->last_k_data == k_perm->data &&
+                                   kv_cache->last_v_data == v_perm->data;
+        const bool kv_full_fill = !kv_can_append;
+        if (kv_full_fill) {
+            memset(kv, 0, (size_t)2 * NH * KVN * dts);
+        }
+        if (f3b_gluetime) g_xdna_f3best_gluetime.kv_zero_us += xdna_elapsed_us(_gt_kvz0);
+        const auto _gt_kvc0 = std::chrono::steady_clock::now();
         auto cvt = [&](const char * pp, bool f32, bool f16) -> uint16_t {
             if (f32) { float v; memcpy(&v,pp,4); return f32_to_bf16_scalar(v); }
             if (f16) { ggml_fp16_t h; memcpy(&h,pp,2); return f32_to_bf16_scalar(ggml_fp16_to_fp32(h)); }
             uint16_t v; memcpy(&v,pp,2); return v;
         };
+        const int64_t fill_begin = kv_full_fill ? 0 : std::min<int64_t>(kv_cache->last_n_kv, kv_len);
+        const int64_t fill_end   = kv_full_fill ? kv_len : kv_len;
         for (int64_t g = 0; g < NH; g++) {
             uint16_t * kg = kv + (size_t)g * KVN;
             uint16_t * vg = kv + (size_t)(NH + g) * KVN;
-            for (int64_t pos = 0; pos < kv_len; pos++) {
+            for (int64_t pos = fill_begin; pos < fill_end; pos++) {
                 // StreamingLLM-style window for n_kv>256: slot 0 keeps the
                 // attention sink (abs pos 0), slots 1..255 are the recent tail.
-                // For n_kv<=256 this is exactly the full causal window.
+                // For n_kv<=256 this is exactly the full causal window; append
+                // mode writes only newly materialized positions.
                 const int64_t src_pos = (n_kv > 256 && pos == 0) ? 0 : (n_kv - kv_len + pos);
                 for (int64_t d = 0; d < head_dim; d++) {
                     kg[pos*head_dim + d] = cvt(k_data + src_pos*k_nb1 + g*k_nb2 + d*k_nb0, k_f32, k_f16);
@@ -4994,7 +5066,50 @@ static bool ggml_backend_xdna_decode_layer_f3best(
                 }
             }
         }
-        entry->d4_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        if (f3b_kv_verify) {
+            std::vector<uint16_t> kv_ref((size_t)2 * NH * KVN, (uint16_t)0);
+            for (int64_t g = 0; g < NH; g++) {
+                uint16_t * kg = kv_ref.data() + (size_t)g * KVN;
+                uint16_t * vg = kv_ref.data() + (size_t)(NH + g) * KVN;
+                for (int64_t pos = 0; pos < kv_len; pos++) {
+                    const int64_t src_pos = (n_kv > 256 && pos == 0) ? 0 : (n_kv - kv_len + pos);
+                    for (int64_t d = 0; d < head_dim; d++) {
+                        kg[pos*head_dim + d] = cvt(k_data + src_pos*k_nb1 + g*k_nb2 + d*k_nb0, k_f32, k_f16);
+                        const char * vp = v_rowcontig ? (v_data + src_pos*v_nb1 + g*v_nb2 + d*v_nb0)
+                                                      : (v_data + d*v_nb1 + g*v_nb2 + src_pos*v_nb0);
+                        vg[pos*head_dim + d] = cvt(vp, v_f32, v_f16);
+                    }
+                }
+            }
+            size_t mism = 0, first = (size_t)-1;
+            const size_t kv_words = (size_t)2 * NH * KVN;
+            for (size_t wi = 0; wi < kv_words; wi++) {
+                if (kv[wi] != kv_ref[wi]) {
+                    if (first == (size_t)-1) first = wi;
+                    mism++;
+                }
+            }
+            static std::atomic<int> _kvv_budget{16};
+            if (_kvv_budget.fetch_sub(1) > 0 || mism != 0) {
+                fprintf(stderr, "ggml-xdna: [f3best-kvverify] %s n_kv=%lld kv_len=%lld fill=[%lld,%lld) mism=%zu first=%zd\n",
+                        kv_full_fill ? "full" : "append", (long long)n_kv, (long long)kv_len,
+                        (long long)fill_begin, (long long)fill_end, mism, first == (size_t)-1 ? -1LL : (long long)first);
+                fflush(stderr);
+            }
+        }
+        kv_cache->last_n_kv = n_kv;
+        kv_cache->last_k_data = k_perm->data;
+        kv_cache->last_v_data = v_perm->data;
+        if (f3b_debug) {
+            fprintf(stderr, "ggml-xdna: [f3best-kvpack] %s fill=[%lld,%lld) n_kv=%lld kv_len=%lld\n",
+                    kv_full_fill ? "full" : "append", (long long)fill_begin, (long long)fill_end,
+                    (long long)n_kv, (long long)kv_len);
+            fflush(stderr);
+        }
+        if (f3b_gluetime) g_xdna_f3best_gluetime.kv_copy_us += xdna_elapsed_us(_gt_kvc0);
+        const auto _gt_kvs0 = std::chrono::steady_clock::now();
+        kv_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        if (f3b_gluetime) g_xdna_f3best_gluetime.kv_sync_us += xdna_elapsed_us(_gt_kvs0);
 
         // De-risk #35-B: decompose the LIVE dispatch into create+setarg / start+wait /
         // sync to decide if the 2.8x-vs-replay gap is host-overhead (fixable by run
@@ -5011,13 +5126,14 @@ static bool ggml_backend_xdna_decode_layer_f3best(
         static const bool f3b_onerun = xdna_env_enabled("XDNA_F3BEST_ONERUN");
         std::unique_ptr<xrt::run> _tmp_run;
         xrt::run * run_p = nullptr;
-        bool _fresh = true;      // _fresh => bind ALL args
-        bool _rebind_w = false;  // reused run => rebind only arg5 (weights); shared BOs stay
+        bool _fresh = true;       // _fresh => bind ALL args
+        bool _rebind_w = false;   // one-run path: weight BO changes per layer
+        bool _rebind_kv = false;  // one-run path: KV BO also changes per layer (#79)
         if (f3b_onerun) {
             if (!entry->shared_run) {
                 entry->shared_run = std::make_unique<xrt::run>(entry->kernel);
                 run_p = entry->shared_run.get();
-            } else { run_p = entry->shared_run.get(); _fresh = false; _rebind_w = true; }
+            } else { run_p = entry->shared_run.get(); _fresh = false; _rebind_w = true; _rebind_kv = true; }
         } else if (f3b_reuse) {
             auto rit = entry->run_cache_map.find(q_w->data);
             if (rit != entry->run_cache_map.end()) { run_p = rit->second.get(); _fresh = false; }
@@ -5031,8 +5147,11 @@ static bool ggml_backend_xdna_decode_layer_f3best(
             run_p = _tmp_run.get();
         }
         xrt::run & run = *run_p;
-        if (_rebind_w) {          // one-run path: only the weights arg differs per layer
+        if (_rebind_w) {
             run.set_arg(5, *a_weights);
+        }
+        if (_rebind_kv) {
+            run.set_arg(7, kv_bo);
         }
         if (_fresh) {   // bind args ONCE; BO handles are stable per layer, only contents change
             run.set_arg(0, (uint32_t)3);
@@ -5042,7 +5161,7 @@ static bool ggml_backend_xdna_decode_layer_f3best(
             run.set_arg(4, *entry->a_bo);          // XR
             run.set_arg(5, *a_weights);            // A weights
             run.set_arg(6, *entry->d3_bo);         // Wo placeholder (unused)
-            run.set_arg(7, *entry->d4_bo);         // KV
+            run.set_arg(7, kv_bo);                 // KV
         }
         // #35 DE-RISK (XDNA_F3BEST_LOOPPROBE=N): dispatch this SAME run N times back-to-back
         // WITHIN one backend call, alternating the weight BO each iter (mimics 16 different
@@ -5078,6 +5197,7 @@ static bool ggml_backend_xdna_decode_layer_f3best(
             }
         }
         const auto _f3_t1 = std::chrono::steady_clock::now();
+        if (f3b_gluetime) g_xdna_f3best_gluetime.runprep_us += xdna_elapsed_us(_f3_t0, _f3_t1);
         // WARM2 probe (#35 cold-overhead): run a throwaway dispatch FIRST (back-to-back, no host
         // gap), then the timed one. If d2 << d1, the live 3.3ms is idle-cold (NPU re-warms after a
         // host gap) → lever = remove inter-dispatch host gaps. If d2 ≈ d1, it's genuine per-dispatch
@@ -5106,7 +5226,7 @@ static bool ggml_backend_xdna_decode_layer_f3best(
             if (f3b_warm2_sync) {
                 entry->c_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
                 entry->a_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
-                entry->d4_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                kv_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
             }
             // ISOLATION (XDNA_F3BEST_WARM2_REWRITE): host-WRITE the input BOs via map() between
             // d1 and d2 (what the real per-layer loop does when it rebuilds XR/KV). If d2 goes
@@ -5116,10 +5236,10 @@ static bool ggml_backend_xdna_decode_layer_f3best(
             if (f3b_warm2_rewrite) {
                 volatile uint16_t * _xr = (uint16_t *)entry->a_bo->map<void*>();
                 for (size_t _k = 0; _k < (size_t)XR_ELEMS; _k++) _xr[_k] = _xr[_k];
-                volatile uint16_t * _kv = (uint16_t *)entry->d4_bo->map<void*>();
+                volatile uint16_t * _kv = (uint16_t *)kv_bo.map<void*>();
                 for (size_t _k = 0; _k < (size_t)2 * NH * KVN; _k++) _kv[_k] = _kv[_k];
                 entry->a_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
-                entry->d4_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                kv_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
             }
             // ISOLATION (XDNA_F3BEST_WARM2_DIFFW): d2 binds a DIFFERENT weight BO than d1
             // (same run, same scope, consecutive — but weights change, exactly what a
@@ -5143,7 +5263,10 @@ static bool ggml_backend_xdna_decode_layer_f3best(
         run.start();
         run.wait();
         const auto _f3_t2 = std::chrono::steady_clock::now();
+        if (f3b_gluetime) g_xdna_f3best_gluetime.npu_us += xdna_elapsed_us(_f3_ts, _f3_t2);
+        const auto _gt_os0 = std::chrono::steady_clock::now();
         entry->c_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        if (f3b_gluetime) g_xdna_f3best_gluetime.outsync_us += xdna_elapsed_us(_gt_os0);
         if (f3b_time) {
             auto _us = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b){
                 return std::chrono::duration<double, std::micro>(b - a).count(); };
@@ -5158,6 +5281,7 @@ static bool ggml_backend_xdna_decode_layer_f3best(
         }
 
         // final[e] = s[e] + sum_h partial[h][e]
+        const auto _gt_red0 = std::chrono::steady_clock::now();
         const uint16_t * ob = (const uint16_t *)entry->c_bo->map<void*>();
         auto bf16f = [](uint16_t b)->float{ uint32_t u=((uint32_t)b)<<16; float v; memcpy(&v,&u,4); return v; };
         const uint16_t * s_blk = ob + (size_t)NH * E;
@@ -5182,6 +5306,7 @@ static bool ggml_backend_xdna_decode_layer_f3best(
                 dst[e] = f32_to_bf16_scalar(acc);
             }
         }
+        if (f3b_gluetime) g_xdna_f3best_gluetime.reduce_us += xdna_elapsed_us(_gt_red0);
         return true;
     } catch (const std::exception & e) {
         GGML_LOG_ERROR("ggml-xdna: decode_layer_f3best dispatch failed (%s)\n", e.what());
@@ -17351,7 +17476,9 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                     ggml_status s=xdna_delegate_range(ctx,cgraph,cpu_run_start,i);
                                     if(s!=GGML_STATUS_SUCCESS)return s; cpu_run_start=-1; }
                                 static const bool _looptime = xdna_env_enabled("XDNA_F3BEST_LOOPTIME");
+                                static const bool _glue = xdna_env_enabled("XDNA_F3BEST_GLUETIME");
                                 double _t_kv=0,_t_f3=0; const auto _lt0=std::chrono::steady_clock::now();
+                                if (_glue) g_xdna_f3best_gluetime = {};
                                 std::vector<float> normed(2048,0.0f); bool disp_ok=true;
                                 for (auto & L : plan) {
                                     // CPU KV-write prefix (attn_norm + Q/K/V-proj + rope + SET_ROWS) from the
@@ -17360,21 +17487,38 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                     ggml_status sk=xdna_delegate_range(ctx,cgraph,L.kv_lo,L.kv_hi+1);
                                     if(sk!=GGML_STATUS_SUCCESS)return sk;
                                     if(_looptime) _t_kv+=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-_k0).count();
+                                    const auto _r0=std::chrono::steady_clock::now();
                                     const float* inpL=(const float*)L.m->inpL_tensor->data;
                                     const float* gain=(const float*)L.m->w_norm1->data;
                                     double ss=0.0; for(int e=0;e<2048;e++) ss+=(double)inpL[e]*(double)inpL[e];
                                     const float inv=1.0f/std::sqrt((float)(ss/2048.0)+1e-5f);
                                     for(int e=0;e<2048;e++) normed[e]=inpL[e]*inv*gain[e];
+                                    if (_glue) g_xdna_f3best_gluetime.rms_us += xdna_elapsed_us(_r0);
                                     const auto _q0=std::chrono::steady_clock::now();
                                     bool ok=ggml_backend_xdna_decode_layer_f3best(ctx,L.m->outL_tensor,normed.data(),2048,inpL,
                                         L.m->w_q,L.m->w_o,L.m->w_gate,L.m->w_up,L.m->w_down,L.m->w_norm2,
                                         cgraph->nodes[L.m->q_rope_idx],L.kp,L.vp,8);
-                                    if(_looptime) _t_f3+=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-_q0).count();
+                                    {
+                                        const double _q_us = xdna_elapsed_us(_q0);
+                                        if(_looptime) _t_f3+=_q_us;
+                                        if(_glue) g_xdna_f3best_gluetime.f3call_us += _q_us;
+                                    }
                                     if(!ok){disp_ok=false;break;}
                                 }
                                 if(_looptime){ double _tot=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-_lt0).count();
                                     static std::atomic<int> _lti{4}; if(_lti.fetch_sub(1)>0){
                                     fprintf(stderr,"ggml-xdna: [f3best-looptime] token: KVdeleg=%.0f f3best(incl NPU)=%.0f total=%.0f us\n",_t_kv,_t_f3,_tot); fflush(stderr);} }
+                                if(_glue){
+                                    const auto &G = g_xdna_f3best_gluetime;
+                                    const double _acct = G.rms_us + G.xr_us + G.xr_sync_us + G.weight_us +
+                                                         G.kv_zero_us + G.kv_copy_us + G.kv_sync_us + G.runprep_us +
+                                                         G.npu_us + G.outsync_us + G.reduce_us;
+                                    const double _host = G.f3call_us - G.npu_us;
+                                    static std::atomic<int> _gti{8}; if(_gti.fetch_sub(1)>0){
+                                    fprintf(stderr,"ggml-xdna: [f3best-gluetime] token: layers=%zu f3wall=%.0f host=%.0f acct=%.0f rms=%.0f xr=%.0f xrsync=%.0f w=%.0f kvzero=%.0f kvcopy=%.0f kvsync=%.0f runprep=%.0f npu=%.0f outsync=%.0f reduce=%.0f us\n",
+                                            plan.size(), G.f3call_us, _host, _acct, G.rms_us, G.xr_us, G.xr_sync_us, G.weight_us,
+                                            G.kv_zero_us, G.kv_copy_us, G.kv_sync_us, G.runprep_us, G.npu_us, G.outsync_us, G.reduce_us);
+                                    fflush(stderr);} }
                                 // Skip ALL layers' full spans [pre_norm..add_ffn] regardless (avoid double
                                 // dispatch); on the (validated → near-impossible) mid-abort, log loudly.
                                 for(auto&m:MM){int lo=m.pre_norm_idx>=0?m.pre_norm_idx:m.q_idx;
