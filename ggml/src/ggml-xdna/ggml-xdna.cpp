@@ -132,6 +132,7 @@ struct xdna_f3best_kv_cache {
     int64_t last_n_kv = 0;
     const void * last_k_data = nullptr;
     const void * last_v_data = nullptr;
+    uint64_t last_prefix_hash = 0;
 };
 
 struct xdna_kernel_entry {
@@ -5025,28 +5026,55 @@ static bool ggml_backend_xdna_decode_layer_f3best(
                 kc.last_n_kv = 0;
                 kc.last_k_data = nullptr;
                 kc.last_v_data = nullptr;
+                kc.last_prefix_hash = 0;
             }
             kv_cache = &kc;
         }
         xrt::bo & kv_bo = *kv_cache->bo;
         uint16_t * kv = (uint16_t *)kv_bo.map<void*>();
         static const bool f3b_kv_append = xdna_env_enabled("XDNA_F3BEST_KV_APPEND");
+        static const bool f3b_kv_append_auto = !xdna_env_enabled("XDNA_F3BEST_NO_KV_APPEND_AUTO");
         static const bool f3b_kv_verify = xdna_env_enabled("XDNA_F3BEST_KV_VERIFY");
-        const bool kv_can_append = f3b_kv_append && n_kv <= 256 && kv_cache->last_n_kv > 0 &&
+        auto cvt = [&](const char * pp, bool f32, bool f16) -> uint16_t {
+            if (f32) { float v; memcpy(&v,pp,4); return f32_to_bf16_scalar(v); }
+            if (f16) { ggml_fp16_t h; memcpy(&h,pp,2); return f32_to_bf16_scalar(ggml_fp16_to_fp32(h)); }
+            uint16_t v; memcpy(&v,pp,2); return v;
+        };
+        auto hmix = [](uint64_t h, uint16_t v) -> uint64_t {
+            h ^= (uint64_t)v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+            return h;
+        };
+        auto kv_prefix_hash = [&](int64_t prefix_len) -> uint64_t {
+            if (prefix_len <= 0) return 0;
+            int64_t p0 = 0, p1 = prefix_len / 2, p2 = prefix_len - 1;
+            uint64_t h = 1469598103934665603ULL;
+            const int64_t probes[3] = {p0, p1, p2};
+            for (int pi = 0; pi < 3; pi++) {
+                const int64_t pos = probes[pi];
+                for (int64_t g = 0; g < NH; g++) {
+                    for (int64_t d = 0; d < head_dim; d += 7) {
+                        h = hmix(h, cvt(k_data + pos*k_nb1 + g*k_nb2 + d*k_nb0, k_f32, k_f16));
+                        const char * vp = v_rowcontig ? (v_data + pos*v_nb1 + g*v_nb2 + d*v_nb0)
+                                                      : (v_data + d*v_nb1 + g*v_nb2 + pos*v_nb0);
+                        h = hmix(h, cvt(vp, v_f32, v_f16));
+                    }
+                }
+            }
+            return h;
+        };
+        const int64_t prefix_len = std::min<int64_t>(kv_cache->last_n_kv, kv_len);
+        const bool kv_prefix_same = prefix_len > 0 && kv_prefix_hash(prefix_len) == kv_cache->last_prefix_hash;
+        const bool kv_append_enabled = f3b_kv_append || f3b_kv_append_auto;
+        const bool kv_can_append = kv_append_enabled && n_kv <= 256 && kv_cache->last_n_kv > 0 &&
                                    n_kv == kv_cache->last_n_kv + 1 &&
                                    kv_cache->last_k_data == k_perm->data &&
-                                   kv_cache->last_v_data == v_perm->data;
+                                   kv_cache->last_v_data == v_perm->data && kv_prefix_same;
         const bool kv_full_fill = !kv_can_append;
         if (kv_full_fill) {
             memset(kv, 0, (size_t)2 * NH * KVN * dts);
         }
         if (f3b_gluetime) g_xdna_f3best_gluetime.kv_zero_us += xdna_elapsed_us(_gt_kvz0);
         const auto _gt_kvc0 = std::chrono::steady_clock::now();
-        auto cvt = [&](const char * pp, bool f32, bool f16) -> uint16_t {
-            if (f32) { float v; memcpy(&v,pp,4); return f32_to_bf16_scalar(v); }
-            if (f16) { ggml_fp16_t h; memcpy(&h,pp,2); return f32_to_bf16_scalar(ggml_fp16_to_fp32(h)); }
-            uint16_t v; memcpy(&v,pp,2); return v;
-        };
         const int64_t fill_begin = kv_full_fill ? 0 : std::min<int64_t>(kv_cache->last_n_kv, kv_len);
         const int64_t fill_end   = kv_full_fill ? kv_len : kv_len;
         for (int64_t g = 0; g < NH; g++) {
@@ -5100,6 +5128,7 @@ static bool ggml_backend_xdna_decode_layer_f3best(
         kv_cache->last_n_kv = n_kv;
         kv_cache->last_k_data = k_perm->data;
         kv_cache->last_v_data = v_perm->data;
+        kv_cache->last_prefix_hash = kv_prefix_hash(kv_len);
         if (f3b_debug) {
             fprintf(stderr, "ggml-xdna: [f3best-kvpack] %s fill=[%lld,%lld) n_kv=%lld kv_len=%lld\n",
                     kv_full_fill ? "full" : "append", (long long)fill_begin, (long long)fill_end,
