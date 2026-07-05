@@ -20,7 +20,87 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <chrono>
 #include <vector>
+
+static bool xdna_fw_prof_enabled() {
+    static const bool v = []() {
+        const char * e = getenv("XDNA_FW_PROF");
+        return e != nullptr && strcmp(e, "0") != 0;
+    }();
+    return v;
+}
+
+static bool xdna_fw_prof_verbose_enabled() {
+    static const bool v = []() {
+        const char * e = getenv("XDNA_FW_PROF_VERBOSE");
+        return e != nullptr && strcmp(e, "0") != 0;
+    }();
+    return xdna_fw_prof_enabled() && v;
+}
+
+static bool xdna_fw_prof_sync_enabled() {
+    static const bool v = []() {
+        const char * e = getenv("XDNA_FW_PROF_SYNC");
+        return e != nullptr && strcmp(e, "0") != 0;
+    }();
+    return xdna_fw_prof_enabled() && v;
+}
+
+static double xdna_fw_elapsed_us(std::chrono::steady_clock::time_point t0) {
+    return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+}
+
+struct xdna_fw_prof_call_accum {
+    double copy_wait_us = 0.0;
+    double copy_submit_us = 0.0;
+    double backend_enqueue_us = 0.0;
+    double backend_sync_us = 0.0;
+    double event_record_us = 0.0;
+    double callback_sync_us = 0.0;
+    uint64_t copy_bytes = 0;
+    uint64_t copy_count = 0;
+};
+
+struct xdna_fw_prof_sched_accum {
+    uint64_t calls = 0;
+    uint64_t alloc_reused = 0;
+    uint64_t graph_nodes = 0;
+    uint64_t splits = 0;
+    double sched_total_us = 0.0;
+    double alloc_us = 0.0;
+    double compute_splits_us = 0.0;
+    double copy_wait_us = 0.0;
+    double copy_submit_us = 0.0;
+    double backend_enqueue_us = 0.0;
+    double backend_sync_us = 0.0;
+    double event_record_us = 0.0;
+    double callback_sync_us = 0.0;
+    uint64_t copy_bytes = 0;
+    uint64_t copy_count = 0;
+};
+
+struct xdna_fw_prof_tensor_copy_accum {
+    uint64_t calls = 0;
+    uint64_t bytes = 0;
+    uint64_t host_to_backend = 0;
+    uint64_t backend_to_host = 0;
+    uint64_t backend_to_backend = 0;
+    uint64_t slow = 0;
+    double total_us = 0.0;
+};
+
+enum xdna_fw_prof_copy_kind {
+    XDNA_FW_PROF_COPY_NONE = 0,
+    XDNA_FW_PROF_COPY_H2D,
+    XDNA_FW_PROF_COPY_D2H,
+    XDNA_FW_PROF_COPY_D2D,
+    XDNA_FW_PROF_COPY_SLOW,
+};
+
+static thread_local xdna_fw_prof_call_accum g_xdna_fw_prof_call;
+static xdna_fw_prof_sched_accum g_xdna_fw_prof_sched;
+static xdna_fw_prof_tensor_copy_accum g_xdna_fw_prof_tensor_copy;
 
 #ifdef __APPLE__
 #include <sys/types.h>
@@ -481,11 +561,19 @@ void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor
         return;
     }
 
+    const bool fw_prof = xdna_fw_prof_enabled();
+    const size_t nbytes_prof = fw_prof ? ggml_nbytes(src) : 0;
+    const auto t0 = fw_prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    xdna_fw_prof_copy_kind copy_kind = XDNA_FW_PROF_COPY_NONE;
+
     if (ggml_backend_buffer_is_host(src->buffer)) {
+        copy_kind = XDNA_FW_PROF_COPY_H2D;
         ggml_backend_tensor_set(dst, src->data, 0, ggml_nbytes(src));
     } else if (ggml_backend_buffer_is_host(dst->buffer)) {
+        copy_kind = XDNA_FW_PROF_COPY_D2H;
         ggml_backend_tensor_get(src, dst->data, 0, ggml_nbytes(src));
     } else if (!ggml_backend_buffer_copy_tensor(src, dst)) {
+        copy_kind = XDNA_FW_PROF_COPY_SLOW;
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: warning: slow copy from %s to %s\n", __func__, ggml_backend_buffer_name(src->buffer), ggml_backend_buffer_name(dst->buffer));
 #endif // NDEBUG
@@ -494,6 +582,21 @@ void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor
         ggml_backend_tensor_get(src, data, 0, nbytes);
         ggml_backend_tensor_set(dst, data, 0, nbytes);
         free(data);
+    } else {
+        copy_kind = XDNA_FW_PROF_COPY_D2D;
+    }
+
+    if (fw_prof) {
+        g_xdna_fw_prof_tensor_copy.calls++;
+        g_xdna_fw_prof_tensor_copy.bytes += nbytes_prof;
+        g_xdna_fw_prof_tensor_copy.total_us += xdna_fw_elapsed_us(t0);
+        switch (copy_kind) {
+            case XDNA_FW_PROF_COPY_H2D:  g_xdna_fw_prof_tensor_copy.host_to_backend++; break;
+            case XDNA_FW_PROF_COPY_D2H:  g_xdna_fw_prof_tensor_copy.backend_to_host++; break;
+            case XDNA_FW_PROF_COPY_D2D:  g_xdna_fw_prof_tensor_copy.backend_to_backend++; break;
+            case XDNA_FW_PROF_COPY_SLOW: g_xdna_fw_prof_tensor_copy.slow++; break;
+            default: break;
+        }
     }
 }
 
@@ -1586,6 +1689,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
+    const bool fw_prof = xdna_fw_prof_enabled();
+    const bool fw_prof_verbose = xdna_fw_prof_verbose_enabled();
+    const bool fw_prof_sync = xdna_fw_prof_sync_enabled();
+    if (fw_prof) {
+        g_xdna_fw_prof_call = {};
+    }
+
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
@@ -1594,6 +1704,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        double split_copy_wait_us = 0.0;
+        double split_copy_submit_us = 0.0;
+        double split_backend_enqueue_us = 0.0;
+        double split_backend_sync_us = 0.0;
+        double split_event_record_us = 0.0;
+        double split_callback_sync_us = 0.0;
+        uint64_t split_copy_bytes = 0;
+        uint64_t split_copy_count = 0;
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
@@ -1603,18 +1721,32 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
+                auto t_wait = fw_prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                 } else {
                     ggml_backend_synchronize(split_backend);
                 }
+                if (fw_prof) {
+                    split_copy_wait_us += xdna_fw_elapsed_us(t_wait);
+                }
+                auto t_copy = fw_prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 ggml_backend_tensor_copy(input, input_cpy);
+                if (fw_prof) {
+                    split_copy_submit_us += xdna_fw_elapsed_us(t_copy);
+                    split_copy_bytes += ggml_nbytes(input);
+                    split_copy_count++;
+                }
             } else {
                 // wait for the split backend to finish using the input before overwriting it
+                auto t_wait = fw_prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
                 } else {
                     ggml_backend_synchronize(split_backend);
+                }
+                if (fw_prof) {
+                    split_copy_wait_us += xdna_fw_elapsed_us(t_wait);
                 }
 
                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
@@ -1629,7 +1761,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     const int64_t n_expert   = node->op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1];
                     const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
 
+                    auto t_input_wait = fw_prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                     ggml_backend_synchronize(input_backend);
+                    if (fw_prof) {
+                        split_copy_wait_us += xdna_fw_elapsed_us(t_input_wait);
+                    }
 
                     // get the ids
                     ggml_tensor * ids_tensor = node->src[2];
@@ -1647,8 +1783,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                     if (ids_tensor != prev_ids_tensor) {
                         ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
+                        auto t_ids_copy = fw_prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                         ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
+                        if (fw_prof) {
+                            split_copy_submit_us += xdna_fw_elapsed_us(t_ids_copy);
+                            split_copy_bytes += ggml_nbytes(ids_tensor);
+                            split_copy_count++;
+                        }
+                        auto t_ids_wait = fw_prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                         ggml_backend_synchronize(ids_backend);
+                        if (fw_prof) {
+                            split_copy_wait_us += xdna_fw_elapsed_us(t_ids_wait);
+                        }
 
                         // find the used experts
                         used_ids.clear();
@@ -1670,13 +1816,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
                         const size_t padding = std::min<size_t>(expert_size, 512);
                         const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
+                        const size_t copy_size = expert_size_copy + padding_end;
 
+                        auto t_copy = fw_prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                         ggml_backend_tensor_set_async(split_backend,
                             input_cpy,
                             (const uint8_t *)input->data + expert_offset, expert_offset,
                             // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
                             // this is necessary for MMQ in the CUDA backend
-                            expert_size_copy + padding_end);
+                            copy_size);
+                        if (fw_prof) {
+                            split_copy_submit_us += xdna_fw_elapsed_us(t_copy);
+                            split_copy_bytes += copy_size;
+                            split_copy_count++;
+                        }
                     };
 
                     int id = 0;
@@ -1705,23 +1858,47 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 } else {
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
-                    if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
+                    auto t_copy = fw_prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                    const bool async_ok = split_backend->iface.cpy_tensor_async && split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy);
+                    if (fw_prof) {
+                        split_copy_submit_us += xdna_fw_elapsed_us(t_copy);
+                        split_copy_bytes += ggml_nbytes(input);
+                        split_copy_count++;
+                    }
+                    if (!async_ok) {
+                        auto t_fallback_wait = fw_prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                         ggml_backend_synchronize(input_backend);
                         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                         } else {
                             ggml_backend_synchronize(split_backend);
                         }
+                        if (fw_prof) {
+                            split_copy_wait_us += xdna_fw_elapsed_us(t_fallback_wait);
+                        }
+                        t_copy = fw_prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                         ggml_backend_tensor_copy(input, input_cpy);
+                        if (fw_prof) {
+                            split_copy_submit_us += xdna_fw_elapsed_us(t_copy);
+                        }
                     }
                 }
             }
         }
 
         if (!sched->callback_eval) {
+            auto t_backend = fw_prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            if (fw_prof) {
+                split_backend_enqueue_us += xdna_fw_elapsed_us(t_backend);
+            }
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
+            }
+            if (fw_prof_sync) {
+                auto t_sync = std::chrono::steady_clock::now();
+                ggml_backend_synchronize(split_backend);
+                split_backend_sync_us += xdna_fw_elapsed_us(t_sync);
             }
         } else {
             // similar to ggml_backend_compare_graph_backend
@@ -1741,13 +1918,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 struct ggml_cgraph gv = ggml_graph_view(&split->graph, j0, j1 + 1);
 
+                auto t_backend = fw_prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
+                if (fw_prof) {
+                    split_backend_enqueue_us += xdna_fw_elapsed_us(t_backend);
+                }
                 if (ec != GGML_STATUS_SUCCESS) {
                     return ec;
                 }
 
                 // TODO: pass backend to the callback, then the user can decide if they want to synchronize
+                auto t_callback_sync = fw_prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 ggml_backend_synchronize(split_backend);
+                if (fw_prof) {
+                    split_callback_sync_us += xdna_fw_elapsed_us(t_callback_sync);
+                }
 
                 if (need && !sched->callback_eval(t, false, sched->callback_eval_user_data)) {
                     break;
@@ -1760,7 +1945,49 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // record the event of this copy
         if (split->n_inputs > 0) {
             if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                auto t_event = fw_prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
+                if (fw_prof) {
+                    split_event_record_us += xdna_fw_elapsed_us(t_event);
+                }
+            }
+        }
+
+        if (fw_prof) {
+            g_xdna_fw_prof_call.copy_wait_us += split_copy_wait_us;
+            g_xdna_fw_prof_call.copy_submit_us += split_copy_submit_us;
+            g_xdna_fw_prof_call.backend_enqueue_us += split_backend_enqueue_us;
+            g_xdna_fw_prof_call.backend_sync_us += split_backend_sync_us;
+            g_xdna_fw_prof_call.event_record_us += split_event_record_us;
+            g_xdna_fw_prof_call.callback_sync_us += split_callback_sync_us;
+            g_xdna_fw_prof_call.copy_bytes += split_copy_bytes;
+            g_xdna_fw_prof_call.copy_count += split_copy_count;
+
+            if (fw_prof_verbose && (g_xdna_fw_prof_sched.calls < 8 || (g_xdna_fw_prof_sched.calls % 50) == 0)) {
+                int64_t max_mulmat_ne0 = 0;
+                bool likely_lm_head = false;
+                const char * first_op = split->graph.n_nodes > 0 ? ggml_op_name(split->graph.nodes[0]->op) : "none";
+                const char * first_name = split->graph.n_nodes > 0 ? split->graph.nodes[0]->name : "none";
+                const char * last_op = split->graph.n_nodes > 0 ? ggml_op_name(split->graph.nodes[split->graph.n_nodes - 1]->op) : "none";
+                const char * last_name = split->graph.n_nodes > 0 ? split->graph.nodes[split->graph.n_nodes - 1]->name : "none";
+                for (int i = 0; i < split->graph.n_nodes; ++i) {
+                    const ggml_tensor * node = split->graph.nodes[i];
+                    if (node->op == GGML_OP_MUL_MAT && node->ne[0] > max_mulmat_ne0) {
+                        max_mulmat_ne0 = node->ne[0];
+                    }
+                    if ((node->flags & GGML_TENSOR_FLAG_OUTPUT) || strstr(node->name, "output") || strstr(node->name, "result")) {
+                        likely_lm_head = likely_lm_head || node->op == GGML_OP_MUL_MAT || node->ne[0] > 32000;
+                    }
+                }
+                fprintf(stderr,
+                        "ggml-xdna: [fw-prof:split] call=%llu split=%d/%d backend=%s nodes=%d inputs=%d copy_wait=%.0fus copy_submit=%.0fus copy_bytes=%llu enqueue=%.0fus sync_wait=%.0fus cb_sync=%.0fus event=%.0fus sync=%s first=%s:%s last=%s:%s max_mulmat_ne0=%lld likely_lm_head=%d\n",
+                        (unsigned long long) g_xdna_fw_prof_sched.calls,
+                        split_id, sched->n_splits, ggml_backend_name(split_backend), split->graph.n_nodes, split->n_inputs,
+                        split_copy_wait_us, split_copy_submit_us, (unsigned long long) split_copy_bytes,
+                        split_backend_enqueue_us, split_backend_sync_us, split_callback_sync_us, split_event_record_us,
+                        fw_prof_sync ? "on" : "off",
+                        first_op, first_name, last_op, last_name,
+                        (long long) max_mulmat_ne0, likely_lm_head ? 1 : 0);
             }
         }
     }
@@ -1932,17 +2159,95 @@ enum ggml_status ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, st
 
 enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     GGML_ASSERT(sched);
+    const bool fw_prof = xdna_fw_prof_enabled();
+    const bool fw_prof_verbose = xdna_fw_prof_verbose_enabled();
+    const auto t_total = fw_prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    double alloc_us = 0.0;
+    const bool was_alloc = sched->is_alloc;
+
     if (!sched->is_reset && !sched->is_alloc) {
         ggml_backend_sched_reset(sched);
     }
 
     if (!sched->is_alloc) {
+        const auto t_alloc = fw_prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         if (!ggml_backend_sched_alloc_graph(sched, graph)) {
             return GGML_STATUS_ALLOC_FAILED;
         }
+        if (fw_prof) {
+            alloc_us = xdna_fw_elapsed_us(t_alloc);
+        }
     }
 
-    return ggml_backend_sched_compute_splits(sched);
+    const auto t_compute = fw_prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    enum ggml_status res = ggml_backend_sched_compute_splits(sched);
+    if (fw_prof) {
+        const double compute_us = xdna_fw_elapsed_us(t_compute);
+        const double total_us = xdna_fw_elapsed_us(t_total);
+        g_xdna_fw_prof_sched.calls++;
+        g_xdna_fw_prof_sched.alloc_reused += was_alloc ? 1 : 0;
+        g_xdna_fw_prof_sched.graph_nodes += graph->n_nodes;
+        g_xdna_fw_prof_sched.splits += sched->n_splits;
+        g_xdna_fw_prof_sched.sched_total_us += total_us;
+        g_xdna_fw_prof_sched.alloc_us += alloc_us;
+        g_xdna_fw_prof_sched.compute_splits_us += compute_us;
+        g_xdna_fw_prof_sched.copy_wait_us += g_xdna_fw_prof_call.copy_wait_us;
+        g_xdna_fw_prof_sched.copy_submit_us += g_xdna_fw_prof_call.copy_submit_us;
+        g_xdna_fw_prof_sched.backend_enqueue_us += g_xdna_fw_prof_call.backend_enqueue_us;
+        g_xdna_fw_prof_sched.backend_sync_us += g_xdna_fw_prof_call.backend_sync_us;
+        g_xdna_fw_prof_sched.event_record_us += g_xdna_fw_prof_call.event_record_us;
+        g_xdna_fw_prof_sched.callback_sync_us += g_xdna_fw_prof_call.callback_sync_us;
+        g_xdna_fw_prof_sched.copy_bytes += g_xdna_fw_prof_call.copy_bytes;
+        g_xdna_fw_prof_sched.copy_count += g_xdna_fw_prof_call.copy_count;
+
+        if (fw_prof_verbose && (g_xdna_fw_prof_sched.calls <= 8 || (g_xdna_fw_prof_sched.calls % 50) == 0)) {
+            fprintf(stderr,
+                    "ggml-xdna: [fw-prof:sched] call=%llu nodes=%d splits=%d reused=%d total=%.0fus alloc=%.0fus compute_splits=%.0fus copy_wait=%.0fus copy_submit=%.0fus copy_bytes=%llu enqueue=%.0fus sync_wait=%.0fus cb_sync=%.0fus event=%.0fus status=%d\n",
+                    (unsigned long long) g_xdna_fw_prof_sched.calls,
+                    graph->n_nodes, sched->n_splits, was_alloc ? 1 : 0,
+                    total_us, alloc_us, compute_us,
+                    g_xdna_fw_prof_call.copy_wait_us, g_xdna_fw_prof_call.copy_submit_us,
+                    (unsigned long long) g_xdna_fw_prof_call.copy_bytes,
+                    g_xdna_fw_prof_call.backend_enqueue_us, g_xdna_fw_prof_call.backend_sync_us,
+                    g_xdna_fw_prof_call.callback_sync_us, g_xdna_fw_prof_call.event_record_us,
+                    (int) res);
+        }
+        if ((g_xdna_fw_prof_sched.calls % 50) == 0) {
+            const double inv = 1.0 / (double) g_xdna_fw_prof_sched.calls;
+            fprintf(stderr,
+                    "ggml-xdna: [fw-prof] sched calls=%llu avg_total=%.3fms avg_alloc=%.3fms avg_compute_splits=%.3fms avg_copy_wait=%.3fms avg_copy_submit=%.3fms avg_enqueue=%.3fms avg_sync_wait=%.3fms avg_cb_sync=%.3fms avg_event=%.3fms avg_nodes=%.1f avg_splits=%.2f copy_MB=%.3f/call copies=%.2f/call reused=%llu/%llu sync=%s\n",
+                    (unsigned long long) g_xdna_fw_prof_sched.calls,
+                    g_xdna_fw_prof_sched.sched_total_us * inv / 1000.0,
+                    g_xdna_fw_prof_sched.alloc_us * inv / 1000.0,
+                    g_xdna_fw_prof_sched.compute_splits_us * inv / 1000.0,
+                    g_xdna_fw_prof_sched.copy_wait_us * inv / 1000.0,
+                    g_xdna_fw_prof_sched.copy_submit_us * inv / 1000.0,
+                    g_xdna_fw_prof_sched.backend_enqueue_us * inv / 1000.0,
+                    g_xdna_fw_prof_sched.backend_sync_us * inv / 1000.0,
+                    g_xdna_fw_prof_sched.callback_sync_us * inv / 1000.0,
+                    g_xdna_fw_prof_sched.event_record_us * inv / 1000.0,
+                    (double) g_xdna_fw_prof_sched.graph_nodes * inv,
+                    (double) g_xdna_fw_prof_sched.splits * inv,
+                    (double) g_xdna_fw_prof_sched.copy_bytes * inv / (1024.0 * 1024.0),
+                    (double) g_xdna_fw_prof_sched.copy_count * inv,
+                    (unsigned long long) g_xdna_fw_prof_sched.alloc_reused,
+                    (unsigned long long) g_xdna_fw_prof_sched.calls,
+                    xdna_fw_prof_sync_enabled() ? "on" : "off");
+            if (g_xdna_fw_prof_tensor_copy.calls > 0) {
+                fprintf(stderr,
+                        "ggml-xdna: [fw-prof] tensor_copy calls=%llu bytes=%.3fMB total=%.3fms avg=%.1fus h2d=%llu d2h=%llu dev=%llu slow=%llu\n",
+                        (unsigned long long) g_xdna_fw_prof_tensor_copy.calls,
+                        (double) g_xdna_fw_prof_tensor_copy.bytes / (1024.0 * 1024.0),
+                        g_xdna_fw_prof_tensor_copy.total_us / 1000.0,
+                        g_xdna_fw_prof_tensor_copy.total_us / (double) g_xdna_fw_prof_tensor_copy.calls,
+                        (unsigned long long) g_xdna_fw_prof_tensor_copy.host_to_backend,
+                        (unsigned long long) g_xdna_fw_prof_tensor_copy.backend_to_host,
+                        (unsigned long long) g_xdna_fw_prof_tensor_copy.backend_to_backend,
+                        (unsigned long long) g_xdna_fw_prof_tensor_copy.slow);
+            }
+        }
+    }
+    return res;
 }
 
 void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {

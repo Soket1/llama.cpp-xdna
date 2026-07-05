@@ -12,6 +12,7 @@
 #include <cfloat>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
@@ -345,6 +346,39 @@ static uint32_t get_rng_seed(uint32_t seed) {
     }
     return seed;
 }
+
+static bool xdna_fw_prof_enabled_sampler() {
+    static const bool v = []() {
+        const char * e = getenv("XDNA_FW_PROF");
+        return e != nullptr && strcmp(e, "0") != 0;
+    }();
+    return v;
+}
+
+static bool xdna_fw_prof_verbose_enabled_sampler() {
+    static const bool v = []() {
+        const char * e = getenv("XDNA_FW_PROF_VERBOSE");
+        return e != nullptr && strcmp(e, "0") != 0;
+    }();
+    return xdna_fw_prof_enabled_sampler() && v;
+}
+
+static double xdna_fw_elapsed_us_sampler(std::chrono::steady_clock::time_point t0) {
+    return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+}
+
+struct xdna_fw_sampler_accum {
+    uint64_t calls = 0;
+    uint64_t backend_selected = 0;
+    uint64_t candidates = 0;
+    double total_us = 0.0;
+    double fetch_us = 0.0;
+    double build_us = 0.0;
+    double apply_us = 0.0;
+    double accept_us = 0.0;
+};
+
+static xdna_fw_sampler_accum g_xdna_fw_sampler_accum;
 
 // llama_sampler API
 
@@ -804,17 +838,34 @@ struct llama_sampler * llama_sampler_chain_init(struct llama_sampler_chain_param
 }
 
 llama_token llama_sampler_sample(struct llama_sampler * smpl, struct llama_context * ctx, int32_t idx) {
+    const bool fw_prof = xdna_fw_prof_enabled_sampler();
+    const bool fw_prof_verbose = xdna_fw_prof_verbose_enabled_sampler();
+    const auto t_total = fw_prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto t_fetch = fw_prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const llama_token   sampled_token  = llama_get_sampled_token_ith     (ctx, idx);
     const float *       sampled_probs  = llama_get_sampled_probs_ith     (ctx, idx);
     const float *       sampled_logits = llama_get_sampled_logits_ith    (ctx, idx);
     const llama_token * sampled_ids    = llama_get_sampled_candidates_ith(ctx, idx);
+    double fetch_us = fw_prof ? xdna_fw_elapsed_us_sampler(t_fetch) : 0.0;
 
     // If a backend sampler has already sampled a token, return it.
     if (sampled_token != LLAMA_TOKEN_NULL) {
         LLAMA_LOG_DEBUG("%s: Backend sampler selected token for idx %d. Skipping CPU samplers\n", __func__, idx);
+        if (fw_prof) {
+            const double total_us = xdna_fw_elapsed_us_sampler(t_total);
+            g_xdna_fw_sampler_accum.calls++;
+            g_xdna_fw_sampler_accum.backend_selected++;
+            g_xdna_fw_sampler_accum.total_us += total_us;
+            g_xdna_fw_sampler_accum.fetch_us += fetch_us;
+            if (fw_prof_verbose && (g_xdna_fw_sampler_accum.calls <= 8 || (g_xdna_fw_sampler_accum.calls % 50) == 0)) {
+                fprintf(stderr, "ggml-xdna: [fw-prof:sample] call=%llu idx=%d total=%.0fus fetch=%.0fus build=0us apply=0us accept=0us candidates=0 source=backend_token token=%d\n",
+                        (unsigned long long) g_xdna_fw_sampler_accum.calls, idx, total_us, fetch_us, sampled_token);
+            }
+        }
         return sampled_token;
     }
 
+    const auto t_build = fw_prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const llama_model * model = llama_get_model(ctx);
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
@@ -832,14 +883,17 @@ llama_token llama_sampler_sample(struct llama_sampler * smpl, struct llama_conte
     }
 
     auto & cur = *cur_ptr;
+    const char * source = "raw_logits";
 
     if (sampled_probs) {
+        source = "sampled_probs";
         const uint32_t sampled_probs_count = llama_get_sampled_probs_count_ith(ctx, idx);
         cur.resize(sampled_probs_count);
         for (uint32_t i = 0; i < sampled_probs_count; ++i) {
             cur[i] = llama_token_data{sampled_ids[i], sampled_logits[i], sampled_probs[i]};
         }
     } else if (sampled_logits) {
+        source = "sampled_logits";
         const uint32_t sampled_logits_count = llama_get_sampled_logits_count_ith(ctx, idx);
         cur.resize(sampled_logits_count);
         for (llama_token i = 0; i < (int)sampled_logits_count; i++) {
@@ -853,6 +907,7 @@ llama_token llama_sampler_sample(struct llama_sampler * smpl, struct llama_conte
             cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
         }
     }
+    const double build_us = fw_prof ? xdna_fw_elapsed_us_sampler(t_build) : 0.0;
 
     llama_token_data_array cur_p = {
         /* .data       = */ cur.data(),
@@ -861,13 +916,45 @@ llama_token llama_sampler_sample(struct llama_sampler * smpl, struct llama_conte
         /* .sorted     = */ false,
     };
 
+    const auto t_apply = fw_prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     llama_sampler_apply(smpl, &cur_p);
+    const double apply_us = fw_prof ? xdna_fw_elapsed_us_sampler(t_apply) : 0.0;
 
     GGML_ASSERT(cur_p.selected >= 0 && cur_p.selected < (int32_t) cur_p.size);
 
     auto token = cur_p.data[cur_p.selected].id;
 
+    const auto t_accept = fw_prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     llama_sampler_accept(smpl, token);
+    const double accept_us = fw_prof ? xdna_fw_elapsed_us_sampler(t_accept) : 0.0;
+
+    if (fw_prof) {
+        const double total_us = xdna_fw_elapsed_us_sampler(t_total);
+        g_xdna_fw_sampler_accum.calls++;
+        g_xdna_fw_sampler_accum.candidates += cur_p.size;
+        g_xdna_fw_sampler_accum.total_us += total_us;
+        g_xdna_fw_sampler_accum.fetch_us += fetch_us;
+        g_xdna_fw_sampler_accum.build_us += build_us;
+        g_xdna_fw_sampler_accum.apply_us += apply_us;
+        g_xdna_fw_sampler_accum.accept_us += accept_us;
+        if (fw_prof_verbose && (g_xdna_fw_sampler_accum.calls <= 8 || (g_xdna_fw_sampler_accum.calls % 50) == 0)) {
+            fprintf(stderr, "ggml-xdna: [fw-prof:sample] call=%llu idx=%d total=%.0fus fetch=%.0fus build=%.0fus apply=%.0fus accept=%.0fus candidates=%zu source=%s\n",
+                    (unsigned long long) g_xdna_fw_sampler_accum.calls, idx, total_us, fetch_us, build_us, apply_us, accept_us, cur_p.size, source);
+        }
+        if ((g_xdna_fw_sampler_accum.calls % 50) == 0) {
+            const double inv = 1.0 / (double) g_xdna_fw_sampler_accum.calls;
+            fprintf(stderr,
+                    "ggml-xdna: [fw-prof] sampler calls=%llu avg_total=%.3fms avg_fetch=%.3fms avg_build=%.3fms avg_apply=%.3fms avg_accept=%.3fms avg_candidates=%.1f backend_selected=%llu\n",
+                    (unsigned long long) g_xdna_fw_sampler_accum.calls,
+                    g_xdna_fw_sampler_accum.total_us * inv / 1000.0,
+                    g_xdna_fw_sampler_accum.fetch_us * inv / 1000.0,
+                    g_xdna_fw_sampler_accum.build_us * inv / 1000.0,
+                    g_xdna_fw_sampler_accum.apply_us * inv / 1000.0,
+                    g_xdna_fw_sampler_accum.accept_us * inv / 1000.0,
+                    (double) g_xdna_fw_sampler_accum.candidates * inv,
+                    (unsigned long long) g_xdna_fw_sampler_accum.backend_selected);
+        }
+    }
 
     return token;
 }
