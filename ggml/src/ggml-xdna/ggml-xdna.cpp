@@ -20569,8 +20569,20 @@ static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const s
         case GGML_OP_DUP:
             return true;
 
-        // Indexing (embeddings, KV cache writes).
-        case GGML_OP_GET_ROWS:
+        // Indexing. Keep token embedding lookup on CPU: claiming
+        // GET_ROWS(token_embd.weight) makes the scheduler copy the full
+        // embedding table (~215 MB for 1B Q4_0) into the XDNA split every
+        // decode token even though XDNA delegates the op. Other GET_ROWS
+        // nodes stay claimable to avoid fragmenting the fused decode segment.
+        case GGML_OP_GET_ROWS: {
+            const struct ggml_tensor * src0 = op->src[0];
+            if (src0 != nullptr && src0->buffer != nullptr &&
+                ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                strstr(src0->name, "token_embd") != nullptr) {
+                return false;
+            }
+            return true;
+        }
         case GGML_OP_SET_ROWS:
             return true;
 

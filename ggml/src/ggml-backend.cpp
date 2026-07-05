@@ -1718,6 +1718,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+            const bool verbose_input = fw_prof_verbose && (g_xdna_fw_prof_sched.calls < 8 || (g_xdna_fw_prof_sched.calls % 50) == 0);
+            const bool input_is_weight = input->buffer != nullptr && ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+            bool input_async_ok = false;
+            bool input_fallback = false;
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
@@ -1732,6 +1736,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
                 auto t_copy = fw_prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 ggml_backend_tensor_copy(input, input_cpy);
+                input_fallback = true;
                 if (fw_prof) {
                     split_copy_submit_us += xdna_fw_elapsed_us(t_copy);
                     split_copy_bytes += ggml_nbytes(input);
@@ -1860,6 +1865,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
                     auto t_copy = fw_prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                     const bool async_ok = split_backend->iface.cpy_tensor_async && split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy);
+                    input_async_ok = async_ok;
                     if (fw_prof) {
                         split_copy_submit_us += xdna_fw_elapsed_us(t_copy);
                         split_copy_bytes += ggml_nbytes(input);
@@ -1878,11 +1884,28 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         }
                         t_copy = fw_prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                         ggml_backend_tensor_copy(input, input_cpy);
+                        input_fallback = true;
                         if (fw_prof) {
                             split_copy_submit_us += xdna_fw_elapsed_us(t_copy);
                         }
                     }
                 }
+            }
+
+            if (verbose_input) {
+                const char * input_backend_name = input_backend ? ggml_backend_name(input_backend) : "none";
+                fprintf(stderr,
+                        "ggml-xdna: [fw-prof:copy-input] call=%llu split=%d/%d input=%d/%d name=%s bytes=%llu flags=0x%x usage=%s input_backend=%s split_backend=%s route=%s input_cpy=%s\n",
+                        (unsigned long long) g_xdna_fw_prof_sched.calls,
+                        split_id, sched->n_splits, input_id, split->n_inputs,
+                        input->name,
+                        (unsigned long long) ggml_nbytes(input),
+                        input->flags,
+                        input_is_weight ? "weights" : "other",
+                        input_backend_name,
+                        ggml_backend_name(split_backend),
+                        (input->flags & GGML_TENSOR_FLAG_INPUT) ? "user-sync" : (input_async_ok ? "async" : (input_fallback ? "fallback-sync" : "none")),
+                        input_cpy ? input_cpy->name : "null");
             }
         }
 
