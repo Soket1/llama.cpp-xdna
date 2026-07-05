@@ -378,7 +378,16 @@ struct xdna_fw_sampler_accum {
     double accept_us = 0.0;
 };
 
+struct xdna_fw_sampler_api_accum {
+    uint64_t apply_calls = 0;
+    uint64_t accept_calls = 0;
+    uint64_t candidates = 0;
+    double apply_us = 0.0;
+    double accept_us = 0.0;
+};
+
 static xdna_fw_sampler_accum g_xdna_fw_sampler_accum;
+static xdna_fw_sampler_api_accum g_xdna_fw_sampler_api_accum;
 
 // llama_sampler API
 
@@ -405,7 +414,13 @@ void llama_sampler_accept(struct llama_sampler * smpl, llama_token token) {
     }
 
     if (smpl->iface->accept) {
+        const bool fw_prof = xdna_fw_prof_enabled_sampler();
+        const auto t0 = fw_prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         smpl->iface->accept(smpl, token);
+        if (fw_prof) {
+            g_xdna_fw_sampler_api_accum.accept_calls++;
+            g_xdna_fw_sampler_api_accum.accept_us += xdna_fw_elapsed_us_sampler(t0);
+        }
     }
 }
 
@@ -415,7 +430,33 @@ void llama_sampler_apply(struct llama_sampler * smpl, struct llama_token_data_ar
     }
 
     GGML_ASSERT(smpl->iface->apply);
+    const bool fw_prof = xdna_fw_prof_enabled_sampler();
+    const auto t0 = fw_prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     smpl->iface->apply(smpl, cur_p);
+    if (fw_prof) {
+        g_xdna_fw_sampler_api_accum.apply_calls++;
+        g_xdna_fw_sampler_api_accum.candidates += cur_p ? cur_p->size : 0;
+        g_xdna_fw_sampler_api_accum.apply_us += xdna_fw_elapsed_us_sampler(t0);
+        if (xdna_fw_prof_verbose_enabled_sampler() && (g_xdna_fw_sampler_api_accum.apply_calls <= 8 || (g_xdna_fw_sampler_api_accum.apply_calls % 50) == 0)) {
+            fprintf(stderr,
+                    "ggml-xdna: [fw-prof:sample-api] apply_call=%llu candidates=%zu apply=%.0fus avg_apply=%.1fus accept_calls=%llu avg_accept=%.1fus\n",
+                    (unsigned long long) g_xdna_fw_sampler_api_accum.apply_calls,
+                    cur_p ? cur_p->size : 0,
+                    xdna_fw_elapsed_us_sampler(t0),
+                    g_xdna_fw_sampler_api_accum.apply_us / (double) g_xdna_fw_sampler_api_accum.apply_calls,
+                    (unsigned long long) g_xdna_fw_sampler_api_accum.accept_calls,
+                    g_xdna_fw_sampler_api_accum.accept_calls ? g_xdna_fw_sampler_api_accum.accept_us / (double) g_xdna_fw_sampler_api_accum.accept_calls : 0.0);
+        }
+        if ((g_xdna_fw_sampler_api_accum.apply_calls % 50) == 0) {
+            fprintf(stderr,
+                    "ggml-xdna: [fw-prof] sampler_api apply_calls=%llu avg_apply=%.3fms avg_candidates=%.1f accept_calls=%llu avg_accept=%.3fms\n",
+                    (unsigned long long) g_xdna_fw_sampler_api_accum.apply_calls,
+                    g_xdna_fw_sampler_api_accum.apply_us / (double) g_xdna_fw_sampler_api_accum.apply_calls / 1000.0,
+                    (double) g_xdna_fw_sampler_api_accum.candidates / (double) g_xdna_fw_sampler_api_accum.apply_calls,
+                    (unsigned long long) g_xdna_fw_sampler_api_accum.accept_calls,
+                    g_xdna_fw_sampler_api_accum.accept_calls ? g_xdna_fw_sampler_api_accum.accept_us / (double) g_xdna_fw_sampler_api_accum.accept_calls / 1000.0 : 0.0);
+        }
+    }
 }
 
 void llama_sampler_reset(struct llama_sampler * smpl) {
