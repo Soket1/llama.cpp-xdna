@@ -17468,8 +17468,7 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                     // Per layer: CPU KV-write delegate + hand-rms + f3best writing outL, which is
                     // the next layer's inpL via the shared in-place residual buffer. Two-pass:
                     // validate ALL layers first (no partial dispatch), else fall back to per-layer.
-                    static const bool f3best_loop = xdna_env_enabled("XDNA_F3BEST_LOOP");
-                    if (f3best_loop) {
+                    if (true) { // XDNA_F3BEST_LOOP now always-on (removed flag)
                         if (qkv_plan.skip_indices.count(i)) continue;  // already done by an earlier loop run
                         auto & MM = layer_fused_plan.matches;
                         int min_q = -1;
