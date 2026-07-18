@@ -17549,14 +17549,17 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                             plan.size(), G.f3call_us, _host, _acct, G.rms_us, G.xr_us, G.xr_sync_us, G.weight_us,
                                             G.kv_zero_us, G.kv_copy_us, G.kv_sync_us, G.runprep_us, G.npu_us, G.outsync_us, G.reduce_us);
                                     fflush(stderr);} }
-                                // Skip ALL layers' full spans [pre_norm..add_ffn] regardless (avoid double
-                                // dispatch); on the (validated → near-impossible) mid-abort, log loudly.
-                                for(auto&m:MM){int lo=m.pre_norm_idx>=0?m.pre_norm_idx:m.q_idx;
-                                    for(int j=lo;j<=m.add_ffn_idx;j++) qkv_plan.skip_indices.insert(j);}
-                                if(!disp_ok) fprintf(stderr,"ggml-xdna: [f3best-LOOP] ABORT mid-dispatch (token may be corrupt)\n");
-                                static std::atomic<int> _lp{2};
-                                if(_lp.fetch_sub(1)>0){fprintf(stderr,"ggml-xdna: [f3best-LOOP] dispatched %zu layers in ONE call\n",plan.size());fflush(stderr);}
-                                continue;   // whole decoder stack done on NPU in one backend call
+                                if (disp_ok) {
+                                    // Skip ALL layers' full spans — avoid re-dispatch by per-op path.
+                                    for(auto&m:MM){int lo=m.pre_norm_idx>=0?m.pre_norm_idx:m.q_idx;
+                                        for(int j=lo;j<=m.add_ffn_idx;j++) qkv_plan.skip_indices.insert(j);}
+                                    static std::atomic<int> _lp{2};
+                                    if(_lp.fetch_sub(1)>0){fprintf(stderr,"ggml-xdna: [f3best-LOOP] dispatched %zu layers in ONE call\n",plan.size());fflush(stderr);}
+                                    continue;   // whole decoder stack done on NPU in one backend call
+                                } else {
+                                    fprintf(stderr,"ggml-xdna: [f3best-LOOP] ABORT mid-dispatch — falling back to per-layer path\n");
+                                    fflush(stderr);
+                                }
                             }
                             // ok_all=false: buffer untouched → fall through to the safe per-layer path.
                         }
