@@ -134,4 +134,11 @@ static inline void pack_bcast(const uint8_t * q4_0_src, int64_t n_rows,
     }
 }
 
+
+// Q-bcast pack wrapper for #86 diagnostics: full K columns, k_off=0.
+static inline void pack_qo_bcast(const uint8_t * q4_0_src, int64_t n_rows, int64_t K_full,
+                                 int group_size, size_t pad_to, uint8_t * tiles_out) {
+    pack_bcast(q4_0_src, n_rows, K_full, K_full, 0, group_size, pad_to, tiles_out);
+}
+
 }  // namespace f3b

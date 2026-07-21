@@ -96,6 +96,15 @@ if (XRT_INCLUDE_DIR AND XRT_COREUTIL_LIB)
     else()
         target_compile_features(xclbin_replay PRIVATE cxx_std_17)
     endif()
+
+    add_executable(xclbin_switch_cost tools/xclbin_switch_cost.cpp)
+    target_include_directories(xclbin_switch_cost SYSTEM PRIVATE ${XRT_INCLUDE_DIR})
+    target_link_libraries(xclbin_switch_cost PRIVATE ${XRT_COREUTIL_LIB})
+    if (MSVC)
+        target_compile_options(xclbin_switch_cost PRIVATE /std:c++17 /Zc:__cplusplus)
+    else()
+        target_compile_features(xclbin_switch_cost PRIVATE cxx_std_17)
+    endif()
 else()
     message(FATAL_ERROR "XRT not found. Install AMD XRT and source /opt/xilinx/xrt/setup.sh\n"
                         "  XRT_INCLUDE_DIR: ${XRT_INCLUDE_DIR}\n"
