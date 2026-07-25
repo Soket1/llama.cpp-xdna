@@ -702,6 +702,16 @@ TESTS: list[Test] = [
         description="V2 INT4 GEMV kernel (PR #101 optimized: compile-time DIM_K/G + double-pump + AIE pipelining). ~4x faster than v1 on the dominant FFN shapes per xrt_async_spike.",
     ),
     Test(
+        name="paris_short_q4_0_f3best_loop",
+        prompt="What is the capital of France?",
+        n_predict=16,
+        mode="single-turn",
+        model=MODEL_Q4_0,
+        variants=["npu_f3best_loop"],
+        min_prefix_match=1,
+        description="f3best LOOP token-match vs CPU: 16 layers in 1 backend call, ~28 t/s. xrt::run cached per weight-BO.",
+    ),
+    Test(
         name="paris_short_q4_0_phase_b",
         prompt="What is the capital of France?",
         n_predict=12,
