@@ -1160,6 +1160,7 @@ struct ggml_backend_xdna_context {
     std::string compile_script;
     std::unordered_map<std::string, xdna_kernel_entry> kernel_cache;
     std::unordered_set<std::string> kernel_compile_failed;
+    std::unordered_set<std::string> kernel_compile_succeeded;
     std::unordered_map<std::string, xdna_swiglu_kernel_entry> swiglu_cache;
     std::unordered_map<std::string, xdna_swiglu_fused_entry> swiglu_fused_cache;
     std::unordered_set<std::string> swiglu_compile_failed;
@@ -2424,6 +2425,10 @@ static bool ensure_compiled(ggml_backend_xdna_context * ctx,
     if (ctx->kernel_compile_failed.count(cache_key)) {
         return false;
     }
+    // Positive cache: skip disk I/O if we already succeeded for this key
+    if (ctx->kernel_compile_succeeded.count(cache_key)) {
+        return true;
+    }
 
     std::string xclbin_path = ctx->cache_dir + GGML_XDNA_PATH_SEP + cache_key + ".xclbin";
     std::string insts_path  = ctx->cache_dir + GGML_XDNA_PATH_SEP + cache_key + ".insts";
@@ -2573,6 +2578,7 @@ static bool ensure_compiled(ggml_backend_xdna_context * ctx,
     }
 
     fprintf(stderr, "ggml-xdna: compilation complete, cached at %s\n", xclbin_path.c_str());
+    ctx->kernel_compile_succeeded.insert(cache_key);
     return true;
 }
 
