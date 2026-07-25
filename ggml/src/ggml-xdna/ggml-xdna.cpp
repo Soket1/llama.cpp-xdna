@@ -5152,13 +5152,11 @@ static bool ggml_backend_xdna_decode_layer_f3best(
         // reuse) or NPU/DMA-bound (needs pipelining). Env-gated, ~zero cost when unset.
         static const bool f3b_time = xdna_env_enabled("XDNA_F3BEST_TIME");
         const auto _f3_t0 = std::chrono::steady_clock::now();
-        // #35: reuse ONE cached run object across all dispatches (XDNA_F3BEST_REUSE, default on).
-        // First start() pays the ~2ms command/BO setup once; re-set_arg+re-start of the SAME run
-        // is warm. New-run-per-dispatch (the old path) paid the 2ms cold setup EVERY layer.
-        // Run-reuse measured NO-OP (the NPU only keeps the LAST dispatch's weight-BO/DMA config
-        // warm; cycling 16 per-layer weight BOs re-pays cold DMA setup each time regardless of run
-        // caching). Default OFF (known-good new-run-per-dispatch); opt-in for experiments only.
-        static const bool f3b_reuse = xdna_env_enabled("XDNA_F3BEST_REUSE");
+        // #35: cache xrt::run per weight-BO so we re-use warm runs across tokens.
+        // With the LOOP (16 layers/backend-call), each layer gets a fresh run every call;
+        // caching eliminates ~44µs xrt::run construction + set_arg per layer (~0.7ms/token).
+        // Env XDNA_F3BEST_REUSE=0 disables caching (diagnostic fallback).
+        static const bool f3b_reuse = !xdna_env_enabled("XDNA_F3BEST_REUSE");
         static const bool f3b_onerun = xdna_env_enabled("XDNA_F3BEST_ONERUN");
         std::unique_ptr<xrt::run> _tmp_run;
         xrt::run * run_p = nullptr;
