@@ -73,8 +73,16 @@
 !/models/ggml-vocab-*.gguf*
 !/models/templates
 
-# NPU Caches
-/npu_kernels*
+# NPU Caches.
+#
+# npu_kernels_win_8col/ holds the prebuilt XDNA 2 kernels and IS tracked: the
+# whole set is ~1 MB, and shipping it is what lets a clone run without the AIE
+# toolchain installed. Only the aiecc scratch directories it leaves behind
+# (*_build/ and the per-op work dirs) are ignored -- those are ~6 MB of
+# intermediates regenerated on every compile.
+/npu_kernels_wsl*
+/npu_kernels_win_8col_v2*
+/npu_kernels_win_8col/*/
 /IRON-windows/
 /iron_repo/
 
