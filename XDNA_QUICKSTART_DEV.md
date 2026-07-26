@@ -140,9 +140,11 @@ IRON-windows намеренно лежит вне этого репозитор�
 ```powershell
 # 1. NPU Driver — через Windows Update или AMD Support
 # 2. AMD XRT Windows SDK — каталог, где есть include\xrt\xrt_device.h,
-#    lib\xrt_coreutil.lib и xclbinutil.exe. Канонической ссылки у нас НЕТ:
-#    в github.com/amd/xdna-driver релизов нет вообще, а установщик Ryzen AI
-#    создаёт C:\Program Files\RyzenAI\xrt\ ПУСТЫМ. См. XDNA_QUICKSTART.md.
+#    lib\xrt_coreutil.lib и xclbinutil.exe. Штатно идёт с Ryzen AI Software
+#    (ryzenai.docs.amd.com/en/latest/inst/install.html), см. также
+#    mlir-aie-windows-guide.md. НО: у нас установщик 1.7.1 этих файлов не дал
+#    (RyzenAI\xrt\ пустой), и сборка идёт против отдельного xrt_windows_sdk.zip.
+#    В github.com/amd/xdna-driver релизов нет вообще. Детали — XDNA_QUICKSTART.md.
 # 3. Visual Studio 2022 Build Tools (C++ Desktop + CMake tools)
 # 4. Python 3.10+ (для compile.py)
 ```

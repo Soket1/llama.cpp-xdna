@@ -67,22 +67,25 @@ git describe --tags   # должно быть вида b8746-<N>-g<hash>
 ## Требования
 
 - **NPU-драйвер** — через Windows Update или AMD Support. Проверить: Диспетчер устройств → Системные устройства → NPU Compute Accelerator Device.
-- **AMD XRT Windows SDK** — ⚠️ **это самый трудный шаг, и честной ссылки у нас нет.**
-  Нужен каталог, в котором есть все три вещи:
+- **AMD XRT Windows SDK** — ⚠️ **самый неочевидный шаг.** Штатный источник —
+  [Ryzen AI Software](https://ryzenai.docs.amd.com/en/latest/inst/install.html) (см. также
+  [mlir-aie-windows-guide.md](./mlir-aie-windows-guide.md) в этом репозитории). Установщик
+  обычно кладёт XRT в `C:\Xilinx\XRT` или `C:\Program Files\AMD\XRT` — CMake ищет там сам,
+  переменная не нужна.
+
+  Критерий пригодности каталога — в нём должны быть все три:
   ```
   include\xrt\xrt_device.h
   lib\xrt_coreutil.lib
   xclbinutil.exe
   ```
-  Что проверено про то, откуда его НЕ взять: в `github.com/amd/xdna-driver` релизов нет
-  вообще; установщик Ryzen AI 1.7.1 кладёт `C:\Program Files\RyzenAI\xrt\`, но там **пусто** —
-  ни заголовков, ни `.lib`, ни `xclbinutil`. У нас этот SDK лежит распакованным архивом
-  (`xrt_windows_sdk.zip`, 67 МБ) без каких-либо опознавательных файлов внутри, и восстановить
-  его происхождение мы не смогли.
 
-  Если у вас его нет — сборка C++-части остановится на этом шаге. Об этом стоит завести issue,
-  а не искать вслепую: возможно, у вас он окажется в составе другого пакета AMD, и тогда мы
-  впишем ссылку.
+  ⚠️ **На нашей машине установщик Ryzen AI 1.7.1 их не дал**: он создал
+  `C:\Program Files\RyzenAI\xrt\` пустым, а `xclbinutil.exe`, `xrt-smi.exe`, заголовков и
+  `.lib` нигде в `Program Files` нет. Сборка идёт против отдельно полученного архива
+  `xrt_windows_sdk.zip` (67 МБ), распакованного вручную; на него и указывает `XILINX_XRT`.
+  Так что если после установки Ryzen AI трёх файлов выше у вас нет — это ожидаемо, и нужен
+  именно SDK-архив. В `github.com/amd/xdna-driver` его нет: там вообще нет релизов.
 - **Visual Studio 2022 Build Tools** — C++ Desktop + CMake.
 - **Visual C++ Redistributable** — https://aka.ms/vs/17/release/vc_redist.x64.exe
 
