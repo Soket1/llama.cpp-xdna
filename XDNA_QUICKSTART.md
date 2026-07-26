@@ -67,8 +67,22 @@ git describe --tags   # должно быть вида b8746-<N>-g<hash>
 ## Требования
 
 - **NPU-драйвер** — через Windows Update или AMD Support. Проверить: Диспетчер устройств → Системные устройства → NPU Compute Accelerator Device.
-- **AMD XRT Windows SDK** — нужен каталог с `include/` и `lib/` (в поставке это внутренний `...\xrt_sdk\xrt`). Идёт в составе пакета AMD для разработки под NPU.
-  ⚠️ В `github.com/amd/xdna-driver` релизов нет — прошлые версии этого документа отправляли туда напрасно.
+- **AMD XRT Windows SDK** — ⚠️ **это самый трудный шаг, и честной ссылки у нас нет.**
+  Нужен каталог, в котором есть все три вещи:
+  ```
+  include\xrt\xrt_device.h
+  lib\xrt_coreutil.lib
+  xclbinutil.exe
+  ```
+  Что проверено про то, откуда его НЕ взять: в `github.com/amd/xdna-driver` релизов нет
+  вообще; установщик Ryzen AI 1.7.1 кладёт `C:\Program Files\RyzenAI\xrt\`, но там **пусто** —
+  ни заголовков, ни `.lib`, ни `xclbinutil`. У нас этот SDK лежит распакованным архивом
+  (`xrt_windows_sdk.zip`, 67 МБ) без каких-либо опознавательных файлов внутри, и восстановить
+  его происхождение мы не смогли.
+
+  Если у вас его нет — сборка C++-части остановится на этом шаге. Об этом стоит завести issue,
+  а не искать вслепую: возможно, у вас он окажется в составе другого пакета AMD, и тогда мы
+  впишем ссылку.
 - **Visual Studio 2022 Build Tools** — C++ Desktop + CMake.
 - **Visual C++ Redistributable** — https://aka.ms/vs/17/release/vc_redist.x64.exe
 
@@ -94,6 +108,24 @@ cmake --build build --config Release
 ## Запуск
 
 Модель: возьмите GGUF Llama-3.2-1B-Instruct и получите Q4_0 через `llama-quantize` (мы тестируем именно на такой сборке файла).
+
+### Проще всего — скриптом
+
+```powershell
+.\run-npu.ps1 -Model models\llama-3.2-1b-instruct-Q4_0.gguf -Prompt "What is the capital of France?"
+```
+
+Он сам выставляет весь набор переменных, добавляет `-fa off`, указывает на каталог кернелов
+и предупреждает, если в окружении осталась `XILINX_XRT`. Всё после `--` уходит в `llama-cli`
+как есть:
+
+```powershell
+.\run-npu.ps1 -Model models\llama-3.2-1b-instruct-Q4_0.gguf -- -p "Hi" -n 128
+```
+
+### То же самое вручную
+
+Полезно понимать, что именно включается:
 
 ```powershell
 # Кернелы из репозитория
