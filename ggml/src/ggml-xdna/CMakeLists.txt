@@ -1,16 +1,19 @@
-# Check for XRT (Xilinx Runtime) — required for XDNA NPU access
+# Check for XRT (Xilinx Runtime) — required for XDNA NPU access.
+#
+# Only xrt_coreutil is looked up: it is the one this backend links. There used
+# to be a second find_library for xrt_core here, and it is NOT missing by
+# accident — the Windows SDK ships no xrt_core import library at all, so it
+# resolved to NOTFOUND even on a perfectly working install while nothing ever
+# read the variable. It stayed around as a decoy that reads like the reason a
+# Windows configure failed, so it is gone.
 find_path(XRT_INCLUDE_DIR
     NAMES xrt/xrt_device.h
     HINTS
         /opt/xilinx/xrt/include
         $ENV{XILINX_XRT}/include
-)
-
-find_library(XRT_CORE_LIB
-    NAMES xrt_core
-    HINTS
-        /opt/xilinx/xrt/lib
-        $ENV{XILINX_XRT}/lib
+        "$ENV{XRT_ROOT}/include"
+        "C:/Program Files/Xilinx/XRT/include"
+        "C:/Xilinx/XRT/include"
 )
 
 find_library(XRT_COREUTIL_LIB
@@ -18,6 +21,9 @@ find_library(XRT_COREUTIL_LIB
     HINTS
         /opt/xilinx/xrt/lib
         $ENV{XILINX_XRT}/lib
+        "$ENV{XRT_ROOT}/lib"
+        "C:/Program Files/Xilinx/XRT/lib"
+        "C:/Xilinx/XRT/lib"
 )
 
 if (XRT_INCLUDE_DIR AND XRT_COREUTIL_LIB)
@@ -106,7 +112,19 @@ if (XRT_INCLUDE_DIR AND XRT_COREUTIL_LIB)
         target_compile_features(xclbin_switch_cost PRIVATE cxx_std_17)
     endif()
 else()
-    message(FATAL_ERROR "XRT not found. Install AMD XRT and source /opt/xilinx/xrt/setup.sh\n"
-                        "  XRT_INCLUDE_DIR: ${XRT_INCLUDE_DIR}\n"
+    if (WIN32)
+        string(CONCAT XRT_HELP
+            "Install the AMD XRT Windows SDK, then set XILINX_XRT (or XRT_ROOT) to the\n"
+            "directory holding include/ and lib/ -- for the shipped SDK that is the inner\n"
+            "...\\xrt_sdk\\xrt, not the archive root -- and re-run cmake.\n"
+            "XILINX_XRT is a CONFIGURE-time variable here. Leaving it set at RUNTIME makes\n"
+            "XRT look for xrt_core.dll underneath it (the DLL actually lives in the NPU\n"
+            "driver package), and the kernel compile then dies with no output at all.\n"
+            "ggml-xdna/compile.py therefore uses XDNA_XRT_SDK_DIR for its own lookup.")
+    else()
+        set(XRT_HELP "Install AMD XRT and source /opt/xilinx/xrt/setup.sh")
+    endif()
+    message(FATAL_ERROR "XRT not found. ${XRT_HELP}\n"
+                        "  XRT_INCLUDE_DIR:  ${XRT_INCLUDE_DIR}\n"
                         "  XRT_COREUTIL_LIB: ${XRT_COREUTIL_LIB}")
 endif()
