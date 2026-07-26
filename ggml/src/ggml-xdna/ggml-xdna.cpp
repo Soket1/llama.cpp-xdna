@@ -1322,11 +1322,29 @@ struct ggml_backend_xdna_context {
         // CPU backend for fallback. Our buffers are plain host RAM so CPU
         // can operate on them directly — no copies needed.
         cpu_backend = ggml_backend_cpu_init();
-        // Number of AIE columns to use
+        // Number of AIE columns to request. The default is 4 for historical
+        // reasons -- it dates from the first XRT dispatch, when every design
+        // was 4-column -- while the test harness pins 8, which is what the
+        // published numbers were measured at. Both work: the fused decode
+        // layer is column-agnostic, only the per-op GEMV cache key differs
+        // (..._4col_g32 vs ..._8col_g32), and both variants ship in the repo.
         num_cols = 4;
         const char * cols_env = getenv("GGML_XDNA_NUM_COLS");
-        if (cols_env) {
-            num_cols = atoi(cols_env);
+        if (cols_env && *cols_env) {
+            // Validate: atoi() maps an empty or non-numeric value to 0, which
+            // used to sail through and leave the backend requesting ZERO
+            // columns -- every dispatch then silently did nothing, with no
+            // error anywhere. An unset variable is fine; a malformed one is not.
+            char * end = nullptr;
+            const long parsed = strtol(cols_env, &end, 10);
+            if (end && *end == '\0' && parsed >= 1 && parsed <= 8) {
+                num_cols = (int) parsed;
+            } else {
+                fprintf(stderr,
+                        "ggml-xdna: ignoring GGML_XDNA_NUM_COLS='%s' "
+                        "(expected an integer 1..8); using %d\n",
+                        cols_env, num_cols);
+            }
         }
         fprintf(stderr, "ggml-xdna: using %d AIE columns\n", num_cols);
     }

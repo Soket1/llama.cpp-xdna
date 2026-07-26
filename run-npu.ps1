@@ -57,6 +57,12 @@ if ($env:XILINX_XRT) {
 
 $env:GGML_XDNA_CACHE_DIR = $cache
 
+# Бэкенд по умолчанию просит 4 колонки (наследие первого XRT-диспатча), а все
+# опубликованные замеры сняты на 8. Разница только в том, какой вариант per-op
+# GEMV берётся (..._4col_g32 против ..._8col_g32) -- слитый слой одинаков в обоих
+# случаях. Ставим 8, чтобы вы получили ровно ту конфигурацию, что в таблице.
+$env:GGML_XDNA_NUM_COLS = "8"
+
 # Пресет npu_f3best_loop -- тот же набор, что в ggml/src/ggml-xdna/tools/correctness_test.py
 $flags = @(
     "XDNA_ENABLE_GEMV", "XDNA_ENABLE_SWIGLU", "XDNA_ENABLE_QKV",
