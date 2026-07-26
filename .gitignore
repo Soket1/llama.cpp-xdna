@@ -159,10 +159,13 @@ poetry.toml
 # emscripten
 a.out.*
 
-# Claude Code local-only settings (may contain secrets like PATs).
-# The tracked .claude/settings.json (if any) can carry team-wide config;
-# .local.json never gets committed.
-/.claude/settings.local.json
+# Claude Code local state: settings.local.json (may carry secrets like PATs),
+# plans, workflows, and agent worktrees -- the last of which are full copies of
+# the repository. None of it belongs in the fork, and leaving it merely
+# untracked meant one `git add -A` away from committing all of it.
+# Note: .claude/skills/verify/SKILL.md is already tracked and stays tracked --
+# ignoring a path does not untrack what git already follows.
+/.claude/
 
 # Local-only reverse-engineering notes about third-party closed binaries.
 /FFLM_REVERSE_ENGINEERING.md
