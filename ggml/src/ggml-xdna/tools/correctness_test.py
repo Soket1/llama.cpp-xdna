@@ -1322,10 +1322,10 @@ def build_bench_configs_lookup() -> list[tuple[str, str, Path, int]]:
     ]
 
 
-def run_bench(mode: str, model: str = "llama") -> int:
+def run_bench(mode: str, model: str = "llama", only: str | None = None) -> int:
     if mode == "both":
-        rc1 = run_bench("single", model)
-        rc2 = run_bench("chat",   model)
+        rc1 = run_bench("single", model, only)
+        rc2 = run_bench("chat",   model, only)
         return rc1 or rc2
 
     if model == "qwen":
@@ -1336,6 +1336,17 @@ def run_bench(mode: str, model: str = "llama") -> int:
         configs = build_bench_configs_gemma()
     else:
         configs = build_bench_configs()
+    if only:
+        pats = [p.strip().lower() for p in only.split(",") if p.strip()]
+        kept = [c for c in configs if any(p in c.label.lower() for p in pats)]
+        if not kept:
+            print(f"ERROR: --bench-only {only!r} matched none of: "
+                  + ", ".join(repr(c.label) for c in configs))
+            return 2
+        print(f"[bench-only {only!r}] {len(kept)}/{len(configs)} configs: "
+              + ", ".join(c.label for c in kept))
+        configs = kept
+    # Only the configs we will actually run must have their model present.
     missing = [c.model for c in configs if not c.model.exists()]
     if missing:
         for m in missing:
@@ -1373,7 +1384,9 @@ def run_bench(mode: str, model: str = "llama") -> int:
         print(f"  {label:24s}  {median(decodes):11.2f}  {median(prompts):11.2f}")
 
     # N-gram lookup bench: shows spec-dec speedup without draft model.
-    if model == "llama" and mode == "single":
+    # The n-gram block re-benches a fixed preset set and its baseline comes from rows[0],
+    # which is meaningless once the caller narrowed the configs. Skip it under --bench-only.
+    if model == "llama" and mode == "single" and not only:
         lookup_configs = build_bench_configs_lookup()
         baseline_tps = median([d for _, decodes, _ in rows[:1] for d in decodes]) or 0
         print(f"\n--- n-gram lookup spec-dec (repetitive prompt, baseline~{baseline_tps:.1f} t/s) ---")
@@ -1403,14 +1416,26 @@ def main():
     ap.add_argument("--show-stderr", action="store_true",
                     help="Print captured llama-cli stderr on PASS too (filtered by --grep-stderr)")
     ap.add_argument("--grep-stderr", metavar="REGEX", default=None,
-                    help="Substring or regex to grep the captured stderr (with --show-stderr)")
+                    help="Substring or regex to grep the captured stderr (implies --show-stderr)")
     ap.add_argument("--bench", action="store_true",
                     help="Run perf benchmark across CPU/NPU bf16/NPU INT4 presets")
+    ap.add_argument("--bench-only", metavar="SUBSTR", default=None,
+                    help="Bench only configs whose label contains SUBSTR (case-insensitive, "
+                         "comma-separated for several). E.g. --bench-only 'f3best' to skip the "
+                         "slow legacy presets when comparing two variants.")
     ap.add_argument("--bench-mode", choices=["single", "chat", "both"], default="single",
                     help="Bench mode: single-turn, chat (-cnv), or both (default: single)")
     ap.add_argument("--model", choices=["llama", "qwen", "llama3b", "gemma"], default="llama",
                     help="Bench model: llama (1B Q4_0, default), qwen (3.5-9B), llama3b (3.2 3B Q4_0), or gemma (3 1B Q4_K_M)")
     args = ap.parse_args()
+
+    # --grep-stderr alone silently did nothing (the filter only runs under show_stderr),
+    # which reads as "the instrumentation is broken" rather than "wrong flag". Imply it.
+    if args.grep_stderr:
+        args.show_stderr = True
+    if args.bench_only and not args.bench:
+        print("ERROR: --bench-only requires --bench")
+        return 2
 
     if args.list:
         for t in TESTS:
@@ -1426,7 +1451,7 @@ def main():
         return 2
 
     if args.bench:
-        return run_bench(args.bench_mode, args.model)
+        return run_bench(args.bench_mode, args.model, args.bench_only)
     # Check all model files referenced by selected tests exist.
     tests = TESTS
     if args.test_name:
