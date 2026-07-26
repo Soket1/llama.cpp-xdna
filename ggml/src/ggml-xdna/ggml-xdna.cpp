@@ -17514,7 +17514,19 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                 int kv_hi=-1; for(int si=m.q_idx;si<=attn_hi;si++)
                                     if(cgraph->nodes[si]&&cgraph->nodes[si]->op==GGML_OP_SET_ROWS) kv_hi=si;
                                 if(kv_hi<0){ok_all=false;break;}
-                                plan.push_back({&m, m.pre_norm_idx, kv_hi, kp, vp});
+                                // ⚠️ MEASURED, opt-in only: starting the CPU prefix at q_rope_idx+1
+                                // skips the Q-proj/Q-rope that f3best also computes on-chip, and
+                                // halves this delegate (KVdeleg 1500us -> 700us/token). BUT the
+                                // generated text then DRIFTS from the CPU baseline after ~21 chars,
+                                // while the full [pre_norm .. kv_hi] span is byte-exact. So the two
+                                // Q paths are NOT equivalent (f3best's on-chip Q differs enough to
+                                // change sampling); the LIVE path's same trick is suspect as well.
+                                // Default = correct. XDNA_F3BEST_SKIPQ=1 to re-measure the fast form.
+                                static const bool f3b_skipq = xdna_env_enabled("XDNA_F3BEST_SKIPQ");
+                                const int kv_lo = (f3b_skipq && m.q_rope_idx >= m.pre_norm_idx &&
+                                                   m.q_rope_idx < kv_hi) ? m.q_rope_idx + 1
+                                                                         : m.pre_norm_idx;
+                                plan.push_back({&m, kv_lo, kv_hi, kp, vp});
                             }
                             if (ok_all) {
                                 if (cpu_run_start >= 0) {   // materialize embeddings → inpL for layer 0
