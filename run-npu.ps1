@@ -44,7 +44,7 @@ if (-not (Test-Path $Model)) {
 }
 
 $cache = Join-Path $root "npu_kernels_win_8col"
-if (-not (Test-Path (Join-Path $cache "decode_layer_f3best_K2048_H8192_sl256_d64_ag4_kv8_g32_mc_preq_vexp_vreg.xclbin"))) {
+if (-not (Test-Path (Join-Path $cache "decode_layer_f3best_K2048_H8192_sl256_d64_ag4_kv8_g32_mc_preq_vexp_vreg_dq8.xclbin"))) {
     throw "В $cache нет слитого decode-кернела. Каталог должен приехать вместе с репозиторием."
 }
 

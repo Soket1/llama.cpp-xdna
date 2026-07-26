@@ -37,7 +37,7 @@ attn_group=4, num_kv=8, num_q=32`. Не совпало — молча идёт �
 
 | Файл | Что считает |
 |---|---|
-| `decode_layer_f3best_K2048_H8192_sl256_d64_ag4_kv8_g32_mc_preq_vexp_vreg` | **весь decode-слой одним диспатчем** — быстрый путь |
+| `decode_layer_f3best_K2048_H8192_sl256_d64_ag4_kv8_g32_mc_preq_vexp_vreg_dq8` | **весь decode-слой одним диспатчем** — быстрый путь |
 | `qkv16_K2048_N3072_4col_g32` | слитая проекция Q+K+V (2048+512+512=3072) |
 | `ffn16_2mm_K2048_N8192_4col_g32` | FFN gate+up+SiLU+mul+down на 16 тайлах |
 | `decode_front_attn_K2048_N64_sl256_4col_ag4_kv8_g32` | Q-GEMV + RoPE + attention |
