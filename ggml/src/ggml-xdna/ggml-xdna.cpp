@@ -1435,7 +1435,7 @@ static std::string make_cache_key(xdna_op_kind op_kind,
         // carried in XR for shorter contexts. _mc suffix forces regen past the broken xclbin;
         // _preq/_vexp add flowkv score density cuts; _vreg holds the flowkv value
         // accumulator in registers across the position loop (same numerics, -17.6us/layer).
-        snprintf(buf, sizeof(buf), "decode_layer_f3best_K%lld_H%lld_sl256_d64_ag4_kv8_g32_mc_preq_vexp_vreg_dq8",
+        snprintf(buf, sizeof(buf), "decode_layer_f3best_K%lld_H%lld_sl256_d64_ag4_kv8_g32_mc_preq_vexp_vreg_dq8_qp",
                  (long long)K, (long long)N);
     } else {
         snprintf(buf, sizeof(buf), "gemm_%lldx%lldx%lld_%s_%dcol",
