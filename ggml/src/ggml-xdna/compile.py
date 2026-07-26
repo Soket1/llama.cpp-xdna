@@ -22,26 +22,61 @@ import numpy as np
 import os
 
 if os.name == 'nt':
-    # Add XRT driver directory to DLL search path for pyxrt
-    driver_dir = r'C:\Windows\System32\DriverStore\FileRepository\kipudrv.inf_amd64_1a1aa059597c4810'
-    if os.path.exists(driver_dir):
-        os.add_dll_directory(driver_dir)
+    # pyxrt needs the NPU driver's DLLs on the search path. The DriverStore
+    # directory carries a per-install hash that changes on every driver update,
+    # so glob for it rather than pinning one — a pinned path goes stale on the
+    # author's own machine after the next driver bump.
+    import glob as _glob
+    for _d in sorted(_glob.glob(
+            r'C:\Windows\System32\DriverStore\FileRepository\kipudrv.inf_amd64_*'),
+            reverse=True):
+        if os.path.isdir(_d):
+            os.add_dll_directory(_d)
+            break
 
-    # Add XRT SDK python folder to DLL path too
-    xrt_sdk_dlls = r'C:\Users\Kuhnya\Downloads\xrt_windows_sdk\xrt_sdk\xrt\bin\condautils'
-    if os.path.exists(xrt_sdk_dlls):
-        os.add_dll_directory(xrt_sdk_dlls)
+    # aiecc needs xclbinutil.exe to package the .xclbin. Without it aiecc only
+    # *warns* and silently produces nothing, which then fails much later and
+    # unhelpfully — so resolve it here and fail loudly if it is missing.
+    #
+    # Do NOT use XILINX_XRT to point at the SDK: XRT itself reads that variable
+    # to locate xrt_core.dll, and an SDK tree that lacks the DLL (the driver
+    # package above is what actually carries it) makes pyxrt.device() die with
+    # "No such library". XDNA_XRT_SDK_DIR is ours; XRT_ROOT is what IRON honors.
+    _xrt_root = None
+    _cands = []
+    for _var in ('XDNA_XRT_SDK_DIR', 'XRT_ROOT'):
+        _v = os.environ.get(_var)
+        if _v:
+            _cands += [_v, os.path.join(_v, 'xrt')]
+    _cands += [r'C:\Program Files\Xilinx\XRT', r'C:\Xilinx\XRT',
+               # Local fallback: the XRT Windows SDK unpacked in place. Keeps
+               # this machine building when nothing is set in the environment.
+               os.path.expanduser(r'~\Downloads\xrt_windows_sdk\xrt_sdk\xrt')]
+    for _c in _cands:
+        if os.path.isfile(os.path.join(_c, 'xclbinutil.exe')):
+            _xrt_root = _c
+            break
 
-    # Add xclbinutil directory to PATH so aiecc can find it for xclbin packaging.
-    xclbinutil_dir = r'C:\Users\Kuhnya\Downloads\xrt_windows_sdk\xrt_sdk\xrt'
-    if os.path.exists(xclbinutil_dir):
-        os.environ['PATH'] = xclbinutil_dir + os.pathsep + os.environ.get('PATH', '')
+    if _xrt_root:
+        os.environ['PATH'] = _xrt_root + os.pathsep + os.environ.get('PATH', '')
+        _cond = os.path.join(_xrt_root, 'bin', 'condautils')
+        if os.path.isdir(_cond):
+            os.add_dll_directory(_cond)
+    elif not shutil.which('xclbinutil'):
+        raise SystemExit(
+            "xclbinutil.exe not found. Set XDNA_XRT_SDK_DIR (or XRT_ROOT) to the\n"
+            "XRT root — the directory that contains xclbinutil.exe — or put it on\n"
+            "PATH. Do not use XILINX_XRT for this; XRT reads that variable to find\n"
+            "xrt_core.dll and pointing it at an SDK tree breaks pyxrt.device().\n"
+            f"Looked in: {', '.join(_cands)}")
 
-    # Patch Peano path for Windows
+    # Peano (the AIE clang). PEANO_INSTALL_DIR wins; otherwise fall back to the
+    # Ryzen-AI conda env, which is where the installer puts it.
     import aie.utils.config as aie_config
-    peano_dir = r'C:\ProgramData\miniforge3\envs\ryzen-ai-1.7.1\Lib\site-packages\win64.o\tools\peano'
-    if os.path.exists(peano_dir):
-        aie_config.peano_install_dir = lambda: peano_dir
+    _peano = os.environ.get('PEANO_INSTALL_DIR') or \
+        r'C:\ProgramData\miniforge3\envs\ryzen-ai-1.7.1\Lib\site-packages\win64.o\tools\peano'
+    if os.path.isdir(_peano):
+        aie_config.peano_install_dir = lambda: _peano
 
 
 def get_device_cols(requested_cols: int) -> int:

@@ -26,6 +26,7 @@ Exit code 0 if all tests pass, 1 otherwise.
 from __future__ import annotations
 
 import argparse
+import glob
 import os
 import re
 import subprocess
@@ -68,13 +69,26 @@ MODEL_LLAMA_3B_Q4_0 = REPO_ROOT / "models" / "llama-3.2-3b-q4_0.gguf"
 # matchers don't fire (different arch from Llama).
 MODEL_GEMMA_3_1B_Q4_K_M = REPO_ROOT / "models" / "gemma-3-1b-it-Q4_K_M.gguf"
 
+# The NPU driver package (carries xrt_core.dll). Its DriverStore directory name
+# ends in a per-install hash that changes on every driver update, so glob for it
+# instead of pinning one -- a pinned path silently goes stale after a bump.
+_DRIVER_DIRS = sorted(
+    glob.glob("C:\\Windows\\System32\\DriverStore\\FileRepository\\kipudrv.inf_amd64_*"),
+    reverse=True)
+_DRIVER_DIR = _DRIVER_DIRS[0] if _DRIVER_DIRS else ""
+
 # Driver/SDK paths -- adjust if your install differs.
 BASE_ENV: dict[str, str] = {
-    "AMD_DRIVER_DIR":         "C:\\Windows\\System32\\DriverStore\\FileRepository\\kipudrv.inf_amd64_1a1aa059597c4810",
+    "AMD_DRIVER_DIR":         _DRIVER_DIR,
     "PYTHONPATH":             "C:\\Users\\Kuhnya\\Downloads\\xrt_windows_sdk\\xrt_sdk\\xrt\\python;C:\\Python313\\Lib\\site-packages",
     "GGML_XDNA_PYTHON_CMD":   "C:\\Python313\\python.exe",
     "PEANO_INSTALL_DIR":      "C:\\ProgramData\\miniforge3\\envs\\ryzen-ai-1.7.1\\Lib\\site-packages\\win64.o\\tools\\peano",
     "XRT_BIN_DIR":            "C:\\Users\\Kuhnya\\Downloads\\xrt_windows_sdk\\xrt_sdk\\xrt",
+    # compile.py locates xclbinutil through this. Deliberately NOT XILINX_XRT:
+    # XRT reads that one to find xrt_core.dll, so setting it to the SDK tree
+    # makes pyxrt.device() fail with "No such library" and the build dies with
+    # no output at all.
+    "XDNA_XRT_SDK_DIR":       "C:\\Users\\Kuhnya\\Downloads\\xrt_windows_sdk\\xrt_sdk\\xrt",
     "MLIR_AIE_BIN_DIR":       "C:\\ProgramData\\miniforge3\\envs\\ryzen-ai-1.7.1\\Lib\\site-packages\\mlir_aie\\bin",
     "GGML_XDNA_CACHE_DIR":    str(REPO_ROOT / "npu_kernels_win_8col"),
     # Common runtime flags expected by ggml-xdna
@@ -85,7 +99,7 @@ BASE_ENV: dict[str, str] = {
 
 # Build PATH by prepending the NPU/MLIR tool dirs (Windows-style).
 _extra_path = (
-    "C:\\Windows\\System32\\DriverStore\\FileRepository\\kipudrv.inf_amd64_1a1aa059597c4810;"
+    (_DRIVER_DIR + ";" if _DRIVER_DIR else "") +
     "C:\\ProgramData\\miniforge3\\envs\\ryzen-ai-1.7.1\\Lib\\site-packages\\win64.o\\tools\\peano\\bin;"
     "C:\\Users\\Kuhnya\\Downloads\\xrt_windows_sdk\\xrt_sdk\\xrt;"
     "C:\\ProgramData\\miniforge3\\envs\\ryzen-ai-1.7.1\\Lib\\site-packages\\mlir_aie\\bin;"
