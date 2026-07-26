@@ -1413,6 +1413,14 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
 
+    // mul_mat with BF16 output precision. The result tensor type is GGML_TYPE_BF16
+    // instead of GGML_TYPE_F32. Backends that natively produce BF16 (e.g. XDNA NPU)
+    // can skip extra f32↔bf16 conversions when the consumer also accepts BF16.
+    GGML_API struct ggml_tensor * ggml_mul_mat_bf16(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b);
+
     // change the precision of a matrix multiplication
     // set to GGML_PREC_F32 for higher precision (useful for phi-2)
     GGML_API void ggml_mul_mat_set_prec(

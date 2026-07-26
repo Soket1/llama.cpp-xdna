@@ -2842,7 +2842,11 @@ static void ggml_backend_xdna_mul_mat_gemm(ggml_backend_xdna_context * ctx, stru
                 dst_f32[i] = (float)c_i32[i] * combined_scale;
             }
         } else {
-            bf16_to_f32((const uint16_t *)entry->c_bo->map<void*>(), (float *)dst->data, c_elems);
+            if (dst->type == GGML_TYPE_BF16) {
+                memcpy(dst->data, entry->c_bo->map<void*>(), c_elems * sizeof(uint16_t));
+            } else {
+                bf16_to_f32((const uint16_t *)entry->c_bo->map<void*>(), (float *)dst->data, c_elems);
+            }
         }
     } catch (const std::exception & e) {
         GGML_LOG_ERROR("ggml-xdna: XRT dispatch failed (%s)\n", e.what());
@@ -3098,7 +3102,8 @@ static void ggml_backend_xdna_mul_mat_gemv_int4(ggml_backend_xdna_context * ctx,
                              K, N, num_groups_per_row, m_input, group_size,
                              rows_per_col, tiles_per_col,
                              packed_bytes_per_tile, per_tile_total,
-                             is_q4_K, dst_data = dst->data]() {
+                             is_q4_K, dst_data = dst->data,
+                             dst_is_bf16 = (dst->type == GGML_TYPE_BF16)]() {
                 c_bo_ptr->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
                 const uint16_t * x_bf16 = (const uint16_t *)a_bo_ptr->map<void*>();
                 std::vector<float> S((size_t)num_groups_per_row, 0.0f);
@@ -3114,7 +3119,6 @@ static void ggml_backend_xdna_mul_mat_gemv_int4(ggml_backend_xdna_context * ctx,
                 }
                 const uint8_t * packed = (const uint8_t *)weight_bo_ptr->map<void*>();
                 const uint16_t * out_bf16 = (const uint16_t *)c_bo_ptr->map<void*>();
-                float * dst_f32 = (float *)dst_data;
                 for (int64_t i = 0; i < N; i++) {
                     const int64_t col = i / rows_per_col;
                     const int64_t local_row = i % rows_per_col;
@@ -3150,7 +3154,12 @@ static void ggml_backend_xdna_mul_mat_gemv_int4(ggml_backend_xdna_context * ctx,
                     uint32_t out_bits = ((uint32_t)out_bf16[i]) << 16;
                     float out_f;
                     memcpy(&out_f, &out_bits, sizeof(out_f));
-                    dst_f32[i] = out_f - bias;
+                    float result_f = out_f - bias;
+                    if (dst_is_bf16) {
+                        ((uint16_t *)dst_data)[i] = f32_to_bf16_scalar(result_f);
+                    } else {
+                        ((float *)dst_data)[i] = result_f;
+                    }
                 }
                 entry->slot_active[slot] = false;
             };
@@ -3215,7 +3224,7 @@ static void ggml_backend_xdna_mul_mat_gemv_int4(ggml_backend_xdna_context * ctx,
         // Scales live at packed_offset + K/2 within each tile.
         const uint8_t * packed = (const uint8_t *)weight_bo_ptr->map<void*>();
         const uint16_t * out_bf16 = (const uint16_t *)c_bo_ptr->map<void*>();
-        float * dst_f32 = (float *)dst->data;
+        const bool dst_is_bf16 = (dst->type == GGML_TYPE_BF16);
 
         for (int64_t i = 0; i < N; i++) {
             const int64_t col = i / rows_per_col;
@@ -3232,10 +3241,6 @@ static void ggml_backend_xdna_mul_mat_gemv_int4(ggml_backend_xdna_context * ctx,
 
             float bias = 0.0f;
             if (is_q4_K) {
-                // Q4_K: bias = sum_g (min[i,g] * S[g]).
-                // Mins live in a flat M-row section at the very end of
-                // the packed BO (per_tile_total). The per-row stride is
-                // num_groups_per_row * 2 bytes.
                 const uint16_t * mn_row =
                     (const uint16_t *)(packed + per_tile_total
                         + (size_t)i * (size_t)num_groups_per_row * 2);
@@ -3259,7 +3264,12 @@ static void ggml_backend_xdna_mul_mat_gemv_int4(ggml_backend_xdna_context * ctx,
             uint32_t out_bits = ((uint32_t)out_bf16[i]) << 16;
             float out_f;
             memcpy(&out_f, &out_bits, sizeof(out_f));
-            dst_f32[i] = out_f - bias;
+            float result_f = out_f - bias;
+            if (dst_is_bf16) {
+                ((uint16_t *)dst->data)[i] = f32_to_bf16_scalar(result_f);
+            } else {
+                ((float *)dst->data)[i] = result_f;
+            }
         }
 
         // One-shot accuracy probe: dump first 8 values of (raw kernel, bias,
@@ -3289,11 +3299,12 @@ static void ggml_backend_xdna_mul_mat_gemv_int4(ggml_backend_xdna_context * ctx,
                 fprintf(stderr, "  row0 g=%d scale=%g min=%g S=%g\n",
                         g, sf, mn, S[(size_t)g]);
             }
+            float * dst_f32_probe = (float *)dst->data;
             for (int i = 0; i < 8 && i < N; i++) {
                 uint32_t b = ((uint32_t)out_bf16[i]) << 16;
                 float raw; memcpy(&raw, &b, sizeof(float));
                 fprintf(stderr, "  i=%d raw_kernel=%g dst=%g\n",
-                        i, raw, dst_f32[i]);
+                        i, raw, dst_f32_probe[i]);
             }
             fprintf(stderr, "=== END Q4_K PROBE ===\n\n");
             fflush(stderr);
@@ -3303,6 +3314,7 @@ static void ggml_backend_xdna_mul_mat_gemv_int4(ggml_backend_xdna_context * ctx,
         static const bool probe_enabled = getenv("XDNA_DEBUG") != NULL;
         if (probe_enabled && !probe_done && !is_q4_K) {  // probe is Q4_0-specific
             probe_done = true;
+            float * dst_f32 = (float *)dst->data;
             fprintf(stderr, "\n=== INT4 ACCURACY PROBE (first dispatch) ===\n");
             fprintf(stderr, "  weight=%s shape K=%lld N=%lld cols=%d\n",
                     src0->name, (long long)K, (long long)N, num_cols);
