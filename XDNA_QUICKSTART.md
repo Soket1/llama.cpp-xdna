@@ -67,25 +67,23 @@ git describe --tags   # должно быть вида b8746-<N>-g<hash>
 ## Требования
 
 - **NPU-драйвер** — через Windows Update или AMD Support. Проверить: Диспетчер устройств → Системные устройства → NPU Compute Accelerator Device.
-- **AMD XRT Windows SDK** — ⚠️ **самый неочевидный шаг.** Штатный источник —
-  [Ryzen AI Software](https://ryzenai.docs.amd.com/en/latest/inst/install.html) (см. также
-  [mlir-aie-windows-guide.md](./mlir-aie-windows-guide.md) в этом репозитории). Установщик
-  обычно кладёт XRT в `C:\Xilinx\XRT` или `C:\Program Files\AMD\XRT` — CMake ищет там сам,
-  переменная не нужна.
+- **AMD XRT Windows SDK** — скачайте архив из релизов самого XRT:
 
-  Критерий пригодности каталога — в нём должны быть все три:
-  ```
-  include\xrt\xrt_device.h
-  lib\xrt_coreutil.lib
-  xclbinutil.exe
-  ```
+  **https://github.com/Xilinx/XRT/releases/download/2.21.75/xrt_windows_sdk.zip** (68 МБ)
 
-  ⚠️ **На нашей машине установщик Ryzen AI 1.7.1 их не дал**: он создал
-  `C:\Program Files\RyzenAI\xrt\` пустым, а `xclbinutil.exe`, `xrt-smi.exe`, заголовков и
-  `.lib` нигде в `Program Files` нет. Сборка идёт против отдельно полученного архива
-  `xrt_windows_sdk.zip` (67 МБ), распакованного вручную; на него и указывает `XILINX_XRT`.
-  Так что если после установки Ryzen AI трёх файлов выше у вас нет — это ожидаемо, и нужен
-  именно SDK-архив. В `github.com/amd/xdna-driver` его нет: там вообще нет релизов.
+  Распакуйте куда угодно; нужный каталог — **внутренний** `...\xrt_sdk\xrt`, в нём лежат
+  `include\xrt\xrt_device.h`, `lib\xrt_coreutil.lib` и `xclbinutil.exe`. Именно этой сборкой
+  собран и проверен наш бинарник (XRT 2.21.0, upstream-коммит `4eb1f439` от 03.02.2026;
+  локальный архив совпадает с ассетом релиза побайтово). Лицензия Apache 2.0.
+
+  ⚠️ Двe вещи, которые сбивают с толку:
+  - установщик **Ryzen AI 1.7.1 этого SDK не даёт** — он создаёт `C:\Program Files\RyzenAI\xrt\`
+    пустым, и ни `xclbinutil.exe`, ни заголовков, ни `.lib` в `Program Files` не появляется.
+    Если после установки Ryzen AI их нет — так и должно быть, берите архив выше;
+  - в `github.com/amd/xdna-driver` релизов нет вообще, туда ходить бесполезно.
+
+  Если XRT у вас уже установлен штатно в `C:\Xilinx\XRT` или `C:\Program Files\AMD\XRT` —
+  CMake найдёт его сам, переменная не нужна.
 - **Visual Studio 2022 Build Tools** — C++ Desktop + CMake.
 - **Visual C++ Redistributable** — https://aka.ms/vs/17/release/vc_redist.x64.exe
 
