@@ -72,10 +72,10 @@
 | AMD XRT SDK | 2.21.0, hash `4eb1f439` (03.02.2026) | пакет AMD для разработки под NPU |
 | MSVC | 19.44.35222 (BuildTools 14.44.35207) | VS 2022 Build Tools |
 | CMake | 4.3.2 | pip |
-| Ryzen AI | 1.7.1, conda-окружение `ryzen-ai-1.7.1` | нужен ради peano (кернельный clang) |
 | Python (сборка кернелов) | 3.13, отдельный `C:\Python313` | не conda-окружение |
-| `llvm-aie` | 21.0.0.2026050701+7bc5ade6 | pip |
-| `mlir-aie` | 0.0.1.2026033105+e4f35d6 | pip |
+| `llvm-aie` (**clang 21.0.0**, `7bc5ade6`) | 21.0.0.2026050701+7bc5ade6 | pip — **им и собираются кернелы** |
+| `mlir-aie` (aiecc) | 0.0.1.2026033105+e4f35d6 | pip |
+| Ryzen AI | 1.7.1, conda `ryzen-ai-1.7.1` | ⚠️ установлен, но в сборке кернелов **не участвует** (см. ниже) |
 | `iron` | 0.1.0, editable → `IRON-windows` | наш форк, `pip install -e` |
 | `numpy` / `ml_dtypes` | 2.4.4 / 0.5.4 | pip |
 
@@ -145,10 +145,29 @@ IRON-windows намеренно лежит вне этого репозитор�
 # 4. Python 3.10+ (для compile.py)
 ```
 
-⚠️ **Тулчейн раздвоен, и это не опечатка.** Кернельный `clang` берётся из peano в
-conda-окружении Ryzen AI, а `opt`/`llc` для aiecc — из pip-пакета `llvm-aie`
-(в conda-копии они вырезаны, IRON это молча детектит и делает fallback). Установка
-только по `requirements.txt` даёт лишь pip-половину; такая конфигурация не проверялась.
+### Какой clang реально компилирует кернелы
+
+На машине лежат два разных Peano, и это сбивает с толку:
+
+| | clang | opt/llc |
+|---|---|---|
+| conda `ryzen-ai-1.7.1` → `win64.o/tools/peano` | 20.0.0git (`gitenterprise.xilinx.com`, `4dbd91a8`) | **нет** |
+| pip `llvm-aie` в `C:\Python313` | **21.0.0** (`github.com/Xilinx/llvm-aie`, `7bc5ade6`) | есть |
+
+`compile.py` патчит `aie_config.peano_install_dir` на conda-путь, а харнесс дополнительно
+ставит туда же `PEANO_INSTALL_DIR` — **и то и другое не имеет эффекта.**
+`IRON-windows/iron/common/context.py:_resolve_peano_dir()` принимает каталог, только если в
+нём есть `opt`; conda-вариант отбрасывается на обоих шагах, и возвращается pip-каталог.
+Проверено прямым вызовом: при обоих механизмах, указывающих на conda, функция возвращает
+`C:\Python313\Lib\site-packages\llvm-aie`.
+
+Дальше этот один каталог используется целиком: `clang` берётся как
+`peano_dir/bin/clang.exe` (`compilation/base.py:1120`), он же передаётся aiecc как
+`--peano` (`base.py:906`). ⇒ **кернелы собраны clang 21.0.0, conda-peano не участвует.**
+
+Практический вывод: для сборки кернелов достаточно pip-половины (`mlir-aie` + `llvm-aie` +
+наш `iron`). Ryzen AI на этой машине установлен, но в пересборке кернелов не задействован —
+полностью удалять его и перепроверять мы не пробовали.
 
 ## Сборка
 

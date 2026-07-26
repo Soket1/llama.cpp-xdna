@@ -70,8 +70,17 @@ if os.name == 'nt':
             "xrt_core.dll and pointing it at an SDK tree breaks pyxrt.device().\n"
             f"Looked in: {', '.join(_cands)}")
 
-    # Peano (the AIE clang). PEANO_INSTALL_DIR wins; otherwise fall back to the
-    # Ryzen-AI conda env, which is where the installer puts it.
+    # Peano (the AIE clang). PEANO_INSTALL_DIR wins; otherwise point at the
+    # Ryzen-AI conda env, which is where that installer puts it.
+    #
+    # Be aware this override is usually INERT, and knowing that saves an hour of
+    # confusion: IRON's _resolve_peano_dir() only accepts a directory that also
+    # contains opt, and the Ryzen-AI copy ships clang/ld.lld without opt or llc.
+    # So it gets rejected and the pip llvm-aie package is used instead -- one
+    # directory serving clang, opt, llc and aiecc's --peano alike. Measured on
+    # this machine: with both this patch and PEANO_INSTALL_DIR aimed at the conda
+    # peano (clang 20), the resolver still returns site-packages/llvm-aie
+    # (clang 21), which is what the shipped kernels were built with.
     import aie.utils.config as aie_config
     _peano = os.environ.get('PEANO_INSTALL_DIR') or \
         r'C:\ProgramData\miniforge3\envs\ryzen-ai-1.7.1\Lib\site-packages\win64.o\tools\peano'
