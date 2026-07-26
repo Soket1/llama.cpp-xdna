@@ -2438,6 +2438,11 @@ static bool ensure_compiled(ggml_backend_xdna_context * ctx,
         std::ifstream xf(xclbin_path);
         std::ifstream inf(insts_path);
         if (xf.good() && inf.good()) {
+            // Populate the positive cache HERE too, not just after a real compile
+            // below. On any run where the bundle is already on disk (the normal
+            // case) this is the only path taken, so without this insert the cache
+            // above never fills and every dispatch re-opens both files.
+            ctx->kernel_compile_succeeded.insert(cache_key);
             return true;
         }
     }
