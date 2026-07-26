@@ -89,17 +89,28 @@ if os.name == 'nt':
 
 
 def get_device_cols(requested_cols: int) -> int:
-    """Safely get the number of columns on the current device, with a fallback."""
-    if os.name == 'nt':
-        return 8 # Strix Point / Ryzen AI 300
+    """Number of AIE columns on the current device.
+
+    Callers use this as a GUARD -- they compile for ``requested_cols`` and only
+    check that the device is at least that wide. Reporting a number larger than
+    the hardware really has therefore does not silently build a wider kernel; it
+    disables the guard, and the mismatch surfaces later as an obscure load or
+    dispatch failure instead.
+
+    Windows used to short-circuit to a hardcoded 8 (Strix / Ryzen AI 300), which
+    did exactly that on a 4-column XDNA 1 part. The detection below works fine on
+    Windows -- verified returning NPU2 cols=8 on Strix -- so there is no reason
+    for the shortcut. If detection genuinely fails we fall back to the requested
+    value, which keeps the guard neutral rather than wrongly permissive.
+    """
     try:
         import aie.utils as aie_utils
         dev = aie_utils.get_current_device()
         if dev is not None:
-            print(f"DEBUG: detected hardware cols={dev.cols}")
             return dev.cols
     except Exception as e:
-        print(f"DEBUG: hardware detection failed: {e}")
+        print(f"DEBUG: hardware detection failed ({e}); "
+              f"assuming the requested {requested_cols} columns")
     return requested_cols
 
 
