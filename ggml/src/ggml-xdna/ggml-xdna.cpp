@@ -9116,7 +9116,7 @@ static std::vector<xdna_flowkv_group> xdna_plan_flowkv(
         for (int i = 0; i < n; i++) {
             struct ggml_tensor * node = cgraph->nodes[i];
             fprintf(stderr, "    [%3d] %-12s %-25s", i, ggml_op_name(node->op),
-                node->name ? node->name : "(null)");
+                node->name);
             if (node->op == GGML_OP_MUL_MAT) {
                 fprintf(stderr, "  K=%lld N=%lld M=%lld",
                     (long long)node->src[0]->ne[0],
@@ -10635,7 +10635,7 @@ static void xdna_plan_layer_fused(
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 const struct ggml_tensor * node = cgraph->nodes[i];
                 fprintf(stderr, "  node[%d]: op=%d (%s), name=%s\n",
-                        i, node->op, ggml_op_name(node->op), node->name ? node->name : "null");
+                        i, node->op, ggml_op_name(node->op), node->name);
                 switch (node->op) {
                     case GGML_OP_MUL_MAT:  n_mulmat++;   break;
                     case GGML_OP_SOFT_MAX: n_softmax++;  break;
@@ -10729,7 +10729,7 @@ static void xdna_plan_layer_fused(
             const int scan_end = std::min(q_idx + 60, cgraph->n_nodes);
             if (dbg) {
                 fprintf(stderr, "ggml-xdna plan debug: scan SwiGLU for q_idx=%d name=%s, scan_end=%d\n",
-                        q_idx, cgraph->nodes[q_idx]->name ? cgraph->nodes[q_idx]->name : "null", scan_end);
+                        q_idx, cgraph->nodes[q_idx]->name, scan_end);
             }
             for (int j = q_idx + 1; j < scan_end; j++) {
                 if (cgraph->nodes[j]->op != GGML_OP_GLU) continue;
@@ -10744,9 +10744,9 @@ static void xdna_plan_layer_fused(
                 }
                 if (dbg) {
                     fprintf(stderr, "ggml-xdna plan debug: j-2 op=%d (%s), j-1 op=%d (%s), j+1 op=%d (%s)\n",
-                            cgraph->nodes[j-2]->op, cgraph->nodes[j-2]->name ? cgraph->nodes[j-2]->name : "null",
-                            cgraph->nodes[j-1]->op, cgraph->nodes[j-1]->name ? cgraph->nodes[j-1]->name : "null",
-                            cgraph->nodes[j+1]->op, cgraph->nodes[j+1]->name ? cgraph->nodes[j+1]->name : "null");
+                            cgraph->nodes[j-2]->op, cgraph->nodes[j-2]->name,
+                            cgraph->nodes[j-1]->op, cgraph->nodes[j-1]->name,
+                            cgraph->nodes[j+1]->op, cgraph->nodes[j+1]->name);
                 }
                 if (cgraph->nodes[j-2]->op != GGML_OP_MUL_MAT) continue;
                 if (cgraph->nodes[j-1]->op != GGML_OP_MUL_MAT) continue;
@@ -10778,8 +10778,11 @@ static void xdna_plan_layer_fused(
         int o_proj_idx = -1, add_attn_idx = -1, norm_ffn_idx = -1, add_ffn_idx = -1;
         const struct ggml_tensor * w_o = nullptr;
         for (int j = q_idx + 1; j < gate_idx; j++) {
+            // ggml_tensor::name is a char array, never a pointer, so a null
+            // check on it is always true. Dropped: strstr already returns null
+            // for the empty name, which is the case that check looked like it
+            // was guarding.
             if (cgraph->nodes[j]->op == GGML_OP_MUL_MAT &&
-                cgraph->nodes[j]->name &&
                 strstr(cgraph->nodes[j]->name, "attn_out")) {
                 o_proj_idx = j;
                 w_o = cgraph->nodes[j]->src[0];
@@ -17313,7 +17316,7 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
         for (int si = 0; si < n; si++) {
             struct ggml_tensor * nd = cgraph->nodes[si];
             if ((nd->op == GGML_OP_CONT || nd->op == GGML_OP_RESHAPE) &&
-                nd->name && strstr(nd->name, "kqv_out")) { kqv_out_idx = si; break; }
+                strstr(nd->name, "kqv_out")) { kqv_out_idx = si; break; }
         }
         if (kqv_out_idx >= 0) {
             int softmax_idx = -1, qk_mm_idx = -1;
@@ -19303,7 +19306,7 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
         // NPU result. If output matches → FlowKV computes correctly.
         if ((flowkv_decode_enabled || front_attn_active) && flowkv_poc_valid &&
             (node->op == GGML_OP_CONT || node->op == GGML_OP_RESHAPE) &&
-            node->name && strstr(node->name, "kqv_out")) {
+            strstr(node->name, "kqv_out")) {
 
             if (front_attn_active) {
                 struct ggml_tensor * kqv_out = node->src[0];
