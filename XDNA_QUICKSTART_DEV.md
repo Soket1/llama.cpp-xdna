@@ -92,35 +92,47 @@ source /opt/xilinx/xrt/setup.sh
 xrt-smi examine
 ```
 
-### IRON (AMD NPU Operator Library)
+### IRON (библиотека NPU-операторов)
 
-Нужен **только для компиляции кернелов** (xclbin). Не нужен для запуска с кешем.
+Нужен **только для компиляции кернелов** (xclbin). Для запуска с готовым кешем не нужен —
+собранные кернелы лежат в `npu_kernels_win_8col/` прямо в репозитории.
+
+⚠️ Нужен **наш форк**, а не upstream. В `amd/iron` нет ~70 операторов, которые здесь
+используются (`decode_layer_f3best`, `decode_ffn16_2mm`, `flowkv_decode` и остальные), —
+с upstream первый же NPU-диспатч упадёт с ImportError.
 
 ```bash
-git clone https://github.com/amd/IRON.git
-cd IRON
+git clone --branch devel https://github.com/Soket1/IRON-windows.git
+cd IRON-windows
 pip install -e .
-
-# Зависимости
 pip install numpy
 ```
+
+IRON-windows намеренно лежит вне этого репозитория (он в `.gitignore`, не submodule):
+это отдельная история изменений поверх `amd/iron`. Клонируйте его рядом.
 
 ### Windows
 
 ```powershell
 # 1. NPU Driver — через Windows Update или AMD Support
-# 2. XRT: https://github.com/amd/xdna-driver/releases
+# 2. AMD XRT Windows SDK — каталог с include\ и lib\ (внутренний ...\xrt_sdk\xrt).
+#    В github.com/amd/xdna-driver релизов НЕТ, туда ходить бесполезно.
 # 3. Visual Studio 2022 Build Tools (C++ Desktop + CMake tools)
 # 4. Python 3.10+ (для compile.py)
 ```
+
+⚠️ **Тулчейн раздвоен, и это не опечатка.** Кернельный `clang` берётся из peano в
+conda-окружении Ryzen AI, а `opt`/`llc` для aiecc — из pip-пакета `llvm-aie`
+(в conda-копии они вырезаны, IRON это молча детектит и делает fallback). Установка
+только по `requirements.txt` даёт лишь pip-половину; такая конфигурация не проверялась.
 
 ## Сборка
 
 ### Linux
 
 ```bash
-git clone --branch ggml-xdna https://github.com/albiol2004/llama.cpp.git
-cd llama.cpp
+git clone --branch ggml-xdna https://github.com/Soket1/llama.cpp-xdna.git
+cd llama.cpp-xdna
 
 source /opt/xilinx/xrt/setup.sh
 
@@ -131,21 +143,32 @@ cmake --build build --config Release -j$(nproc)
 ### Windows
 
 ```powershell
-git clone --branch ggml-xdna https://github.com/albiol2004/llama.cpp.git
-cd llama.cpp
+git clone --branch ggml-xdna https://github.com/Soket1/llama.cpp-xdna.git
+cd llama.cpp-xdna
+
+$env:XILINX_XRT = "C:\path\to\xrt_sdk\xrt"
 
 # Developer PowerShell for VS 2022:
-cmake -B build -DGGML_XDNA=ON
+cmake -B build -DGGML_XDNA=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release
 ```
+
+⚠️ `XILINX_XRT` — переменная **этапа конфигурации**. Оставленная в окружении при запуске,
+она заставляет XRT искать по ней `xrt_core.dll` (который лежит в пакете драйвера, а не в SDK),
+и компиляция кернелов падает с кодом 1 и полностью пустым выводом. Поэтому `compile.py`
+для собственного поиска использует отдельную `XDNA_XRT_SDK_DIR`.
 
 ### Кастомные пути к XRT
 
 ```bash
 cmake -B build -DGGML_XDNA=ON \
   -DXRT_INCLUDE_DIR=/custom/path/include \
-  -DXRT_CORE_LIB=/custom/path/lib/libxrt_core.so
+  -DXRT_COREUTIL_LIB=/custom/path/lib/libxrt_coreutil.so
 ```
+
+Линкуется только `xrt_coreutil`. Переменной `XRT_CORE_LIB` больше нет: в Windows SDK
+импортной библиотеки `xrt_core` нет вообще, так что она была NOTFOUND даже на исправной
+установке и никем не читалась — чистая приманка для того, кто разбирает неудачную сборку.
 
 ## Запуск
 
@@ -239,19 +262,24 @@ XDNA_ENABLE_SWIGLU=1 XDNA_ENABLE_QKV=1 \
 
 ## Кеш кернелов
 
-xclbin файлы кешируются по SHA256 ключу (op, shape, dtype). Кеш хранится в:
+xclbin файлы кешируются по ключу `(op, shape, dtype, num_cols)`. По умолчанию кеш в:
 - Linux: `~/.cache/ggml-xdna/xclbin/`
 - Windows: `%LOCALAPPDATA%\ggml-xdna\xclbin\`
 
+**Готовый набор для XDNA 2 лежит в репозитории** — `npu_kernels_win_8col/` (~1 МБ, 40 файлов,
+включая слитый `decode_layer_f3best`). Чтобы бэкенд взял именно его, а не пустой кеш
+по умолчанию:
+
+```powershell
+$env:GGML_XDNA_CACHE_DIR = "$PWD\npu_kernels_win_8col"
+```
+
+Каталоги `*_build/` внутри — промежуточные файлы aiecc, они в `.gitignore` и пересоздаются
+при каждой компиляции.
+
 ```bash
-# Посмотреть размер кеша
-du -sh ~/.cache/ggml-xdna/xclbin/
-
-# Очистить (перекомпилирует при следующем запуске)
+# Очистить (перекомпилирует при следующем запуске — нужен полный тулчейн)
 rm -rf ~/.cache/ggml-xdna/xclbin/
-
-# Перенести кеш на другой диск
-export GGML_XDNA_CACHE_DIR=/mnt/fast/ssd/ggml-xdna-cache
 ```
 
 ## Compile.py
@@ -267,7 +295,13 @@ python compile.py swiglu-decode --embedding-dim 2048 --hidden-dim 5632 --num-aie
 
 # Ручная компиляция QKV
 python compile.py qkv --embedding-dim 2048 --q-dim 2048 --k-dim 512 --v-dim 512 --num-aie-columns 8
+
+# Слитый decode-слой (тот самый быстрый путь), геометрия Llama-3.2-1B
+python compile.py decode-layer-f3best --embed-dim 2048 --hidden-dim 8192 \
+  --head-dim 64 --num-kv-heads 8 --attn-group 4 --seq-len 256 --group-size 32
 ```
+
+`compile.py --help` печатает полный список подкоманд (их около тридцати).
 
 ## Квантизация
 
@@ -283,35 +317,44 @@ python compile.py qkv --embedding-dim 2048 --q-dim 2048 --k-dim 512 --v-dim 512 
 
 | Ограничение | Описание | Обходной путь |
 |-------------|----------|---------------|
-| Decode ~9 t/s | Host-side dispatch overhead | Ожидается улучшение с runlist batching |
-| Attention на NPU 0.5x CPU | Dispatch overhead > compute gain | Использовать CPU для attention |
-| head_dim=64 only | MHA kernel hardcoded | Использовать модели с head_dim=64 |
-| Min seq_len 256 для prefill | IRON GEMM tile constraint | Меньше → CPU fallback |
-| Python runtime | compile.py при первом запуске | Предкомпилировать кеш |
+| Быстрый путь только 1B/Q4_0 | `decode_layer_f3best` написан под геометрию Llama-3.2-1B (E=2048, H=8192, head_dim=64, GQA 4:1) | другая модель → пооперационный путь |
+| XDNA 1 на Windows не поддержан | `compile.py: get_device_cols()` безусловно возвращает 8 колонок без детекции | нужна детекция под 4-колоночный Phoenix/Hawk Point |
+| Prefill медленнее CPU | 100 vs 192 т/с на 1B Q4_0 | выигрыш только в decode |
+| Контекст ≤256 | окно StreamingLLM в диспатче; при NCHUNK≥4 ломается последняя q-голова | известный баг codegen value-тайла, отложен |
+| lm_head только на CPU | перенос на NPU перемерен: 28.5 → 23.0 т/с (140 МБ словаря холодными каждый токен) | путь закрыт |
+| Python в рантайме | compile.py при первой встрече новой shape | использовать кеш из репозитория |
 
 ## Структура кода
 
 ```
 ggml/src/ggml-xdna/
-├── ggml-xdna.cpp       # C++ бэкенд (9901 строк)
+├── ggml-xdna.cpp       # C++ бэкенд (~19 400 строк)
 │   ├── xdna_kernel_entry    # Кеш кернелов
-│   ├── xdna_swiglu_entry    # Fused SwiGLU
-│   ├── xdna_qkv_entry       # QKV projection
-│   ├── xdna_attention_prefill_entry  # Attention
-│   ├── graph_compute()      # Главный scheduler
+│   ├── graph_compute()      # Главный диспетчер + f3best LOOP
 │   └── ggml_backend_xdna_*  # ggml backend API
-├── compile.py          # Python мост к IRON (2386 строк)
+├── compile.py          # Python мост к IRON (~3 300 строк)
 ├── CMakeLists.txt      # Сборка (ищет XRT)
-├── tests/              # 15 тестов
-│   ├── test_compile.py
-│   ├── test_dispatch.py
-│   ├── test_swiglu.py
-│   ├── test_qkv.py
-│   └── ...
+├── tests/
 └── tools/
-    └── xrt_trace_to_chrome.py  # Профилирование
+    ├── correctness_test.py    # ГЛАВНЫЙ харнесс: пресеты, token-match, --bench
+    ├── xclbin_replay.cpp      # автономный прогон xclbin
+    ├── xclbin_switch_cost.cpp # замер стоимости переключения xclbin
+    ├── xrt_async_spike.cpp    # замер async-диспатча XRT
+    └── xrt_trace_to_chrome.py # профилирование
 ```
+
+### correctness_test.py
+
+Точка входа для любой проверки — раньше ручного запуска `llama-cli`.
+
+```powershell
+python ggml\src\ggml-xdna\tools\correctness_test.py --list          # тесты и пресеты
+python ggml\src\ggml-xdna\tools\correctness_test.py paris_short_q4_0_f3best_loop
+python ggml\src\ggml-xdna\tools\correctness_test.py --bench --bench-only "f3best LOOP"
+```
+
+Пути к тулчейну заданы в `BASE_ENV` в начале файла — под свою машину правьте там.
 
 ---
 
-*Последнее обновление: 2026-05-02*
+*Последнее обновление: 2026-07-26*

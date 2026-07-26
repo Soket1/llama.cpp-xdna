@@ -1,270 +1,125 @@
-# Запуск ИИ-моделей на NPU от AMD
+# Запуск LLM на NPU AMD (ggml-xdna)
 
-Ваш ноутбук с процессором AMD Ryzen AI содержит **NPU** — специальный чип для ИИ. Это руководство поможет запустить языковую модель прямо на нём, без видеокарты.
+Форк llama.cpp с бэкендом для NPU AMD XDNA. Этот файл описывает **то, что реально проверено на железе**, а не то, что архитектурно возможно.
 
-> **Что вы получите:** ИИ-ассистент, работающий локально на вашем ноутбуке. Никаких данных не уходит в интернет. Работает от батареи.
+> Для разработчиков (пересборка кернелов, внутренности, отладка): [XDNA_QUICKSTART_DEV.md](./XDNA_QUICKSTART_DEV.md)
 
-## Быстрый старт (3 шага)
+## Честная область применимости
 
-### Шаг 1: Проверьте что ваш ноутбук подходит
+Быстрый путь — это **один слитый decode-кернел** (`decode_layer_f3best`), написанный под конкретную геометрию модели. Он включается, только если совпало всё:
 
-Откройте **Диспетчер устройств** (Windows) или терминал (Linux) и найдите NPU:
+| Требование | Значение | Если не совпало |
+|---|---|---|
+| NPU | XDNA 2, 8 колонок (Ryzen AI 300 / Strix, Strix Halo, Krackan) | XDNA 1 (Ryzen 7040/8040) на Windows **не поддержан**: `compile.py` жёстко берёт 8 колонок без детекции |
+| Модель | Llama-3.2-1B Instruct | другая геометрия → откат на пооперационный путь или CPU |
+| Квантизация | Q4_0 | Q4_K_M/Q8_0/BF16 → пооперационный путь |
+| ОС | Windows 11 | на Linux бэкенд собирается, но весь этот путь там не проверялся |
 
-**Windows:**
-```
-Диспетчер устройств → Системные устройства → AMD NPU / XDNA Device
-```
+Всё остальное (другие модели, другие размеры) деградирует до отдельных GEMV-диспатчей или до CPU — это работает, но выигрыша по скорости не даёт.
 
-**Linux:**
-```bash
-xrt-smi examine
-```
+## Измеренная скорость
 
-Если NPU есть — всё хорошо, продолжайте. Если нет — [см. раздел "Нет NPU"](#нет-npu-в-диспетчере-устройств).
+Ryzen AI 9 365, Llama-3.2-1B-Instruct Q4_0, промпт 64 токена, медиана двух прогонов:
 
-### Шаг 2: Установите программу
+| Путь | decode | prefill |
+|---|---|---|
+| Только CPU | 10.6 т/с | **191.6 т/с** |
+| NPU (f3best LOOP) | **29.0 т/с** | 100.3 т/с |
 
-**Windows:**
+**Генерация на NPU в 2.7× быстрее, обработка промпта — примерно вдвое медленнее.** Выигрыш здесь именно в decode; для длинных промптов с коротким ответом NPU проиграет. Плюс NPU потребляет заметно меньше энергии, что и есть основной смысл на ноутбуке.
+
+Для сравнения: закрытый FastFlowLM на том же железе и той же модели даёт ~51 т/с. Разрыв не закрыт.
+
+## Требования
+
+- **NPU-драйвер** — через Windows Update или AMD Support. Проверить: Диспетчер устройств → Системные устройства → NPU Compute Accelerator Device.
+- **AMD XRT Windows SDK** — нужен каталог с `include/` и `lib/` (в поставке это внутренний `...\xrt_sdk\xrt`). Идёт в составе пакета AMD для разработки под NPU.
+  ⚠️ В `github.com/amd/xdna-driver` релизов нет — прошлые версии этого документа отправляли туда напрасно.
+- **Visual Studio 2022 Build Tools** — C++ Desktop + CMake.
+- **Visual C++ Redistributable** — https://aka.ms/vs/17/release/vc_redist.x64.exe
+
+Python и AIE-тулчейн для запуска **не нужны**: собранные кернелы лежат в репозитории (`npu_kernels_win_8col/`, ~1 МБ). Они понадобятся, только если вы меняете кернелы или запускаете другую модель — см. DEV-руководство.
+
+## Сборка
+
 ```powershell
-# 1. Скачайте и установите Visual C++ Redistributable:
-#    https://aka.ms/vs/17/release/vc_redist.x64.exe
+git clone --branch ggml-xdna https://github.com/Soket1/llama.cpp-xdna.git
+cd llama.cpp-xdna
 
-# 2. Скачайте XRT с: https://github.com/amd/xdna-driver/releases
+# Каталог XRT, в котором лежат include\ и lib\ — подставьте свой
+$env:XILINX_XRT = "C:\path\to\xrt_sdk\xrt"
 
-# 3. Склонируйте и соберите:
-git clone --branch ggml-xdna https://github.com/albiol2004/llama.cpp.git
-cd llama.cpp
-cmake -B build -DGGML_XDNA=ON
+cmake -B build -DGGML_XDNA=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release
 ```
 
-**Linux:**
-```bash
-# 1. Убедитесь что ядро >= 6.14:
-uname -r
+> ⚠️ **`XILINX_XRT` нужен только на этапе `cmake`.** Если оставить её в окружении при запуске, XRT начнёт искать по ней `xrt_core.dll` (а он лежит в пакете драйвера, не в SDK), и компиляция кернелов упадёт с кодом 1 **вообще без сообщений**. Убирайте её после сборки.
 
-# 2. Настройте XRT:
-source /opt/xilinx/xrt/setup.sh
+Если XRT не найден, CMake теперь сам напишет, что и куда прописать.
 
-# 3. Склонируйте и соберите:
-git clone --branch ggml-xdna https://github.com/albiol2004/llama.cpp.git
-cd llama.cpp
-cmake -B build -DGGML_XDNA=ON
-cmake --build build --config Release -j$(nproc)
+## Запуск
+
+Модель: возьмите GGUF Llama-3.2-1B-Instruct и получите Q4_0 через `llama-quantize` (мы тестируем именно на такой сборке файла).
+
+```powershell
+# Кернелы из репозитория
+$env:GGML_XDNA_CACHE_DIR = "$PWD\npu_kernels_win_8col"
+
+# Быстрый путь: слитый decode-слой, 16 слоёв в одном вызове бэкенда
+$env:XDNA_ENABLE_GEMV=1; $env:XDNA_ENABLE_SWIGLU=1; $env:XDNA_ENABLE_QKV=1
+$env:XDNA_ENABLE_DECODE_BATCH=1; $env:XDNA_ENABLE_TRANSFORMER_BLOCK=1
+$env:XDNA_ENABLE_FLOWKV_DECODE=1; $env:XDNA_ENABLE_RMS_NORM=1
+$env:XDNA_ENABLE_GEMV_INT4=1; $env:XDNA_ENABLE_SWIGLU_INT4=1
+$env:XDNA_ENABLE_FUSED_LAYER=1; $env:XDNA_LAYER_FUSED=1
+$env:XDNA_ENABLE_LAYER_F3BEST=1; $env:XDNA_ATTN_SUPPORTS=1
+$env:XDNA_LAYER_F3BEST_LIVE=1; $env:XDNA_F3BEST_LOOP=1
+
+.\build\bin\Release\llama-cli.exe -m models\llama-3.2-1b-instruct-Q4_0.gguf `
+    -p "What is the capital of France?" -n 64 -c 256 -ngl 100 --no-mmap -fa off --single-turn
 ```
 
-### Шаг 3: Запустите модель
+`--single-turn` — иначе llama-cli уйдёт в интерактивный чат.
 
-```bash
-# Windows
-.\build\bin\Release\llama-cli.exe -hf ggml-org/gemma-3-1b-it-GGUF -p "Привет, как дела?" -n 100
+⚠️ **`-fa off` обязателен.** Проверено на этой сборке: с `-fa on` слитый слой не
+диспатчится вообще (в stderr нет строки `[f3best-LOOP] dispatched 16 layers in ONE call`),
+и вы молча получаете обычный CPU/пооперационный путь. Наличие этой строки — самый простой
+признак, что быстрый путь включился.
 
-# Linux
-./build/bin/llama-cli -hf ggml-org/gemma-3-1b-it-GGUF -p "Привет, как дела?" -n 100
+Отдельный короткий запуск покажет скорость ниже табличной (у нас ~12 т/с на 48 токенов):
+в неё попадают загрузка модели и холодный первый проход. Устоявшиеся числа снимайте
+бенчмарком харнесса — он делает повторный прогон и берёт медиану.
+
+Тот же набор переменных лежит пресетом `npu_f3best_loop` в `ggml/src/ggml-xdna/tools/correctness_test.py` — оттуда его удобно копировать, он же используется для проверок.
+
+### Проверить, что всё сошлось
+
+```powershell
+python ggml\src\ggml-xdna\tools\correctness_test.py paris_short_q4_0_f3best_loop
 ```
 
-Модель скачается автоматически (~1 ГБ), затем вы увидите ответ.
+Тест прогоняет одну и ту же генерацию на CPU и на NPU и требует совпадения токенов. PASS означает, что NPU-путь активен и считает правильно.
 
-> **Первый запуск** занимает 2-5 минут — программа подготавливает файлы для вашего NPU. Второй запуск — секунды.
-
----
-
-## Какие модели подходят
-
-### Маленькие (1-3 параметра) — только NPU
-
-| Модель | Размер | Скорость | Для чего |
-|--------|--------|----------|----------|
-| Gemma 3 1B | ~1 ГБ | ~9 токенов/с | Простые вопросы, диалог |
-| Qwen3 0.6B | ~0.5 ГБ | ~9 токенов/с | Быстрые ответы |
-
-```bash
-# Gemma 3 1B — хороший баланс качества и скорости
-.\build\bin\Release\llama-cli.exe -hf ggml-org/gemma-3-1b-it-GGUF
-```
-
-### Средние (7-8 параметров) — NPU + процессор
-
-| Модель | Размер | Скорость | Для чего |
-|--------|--------|----------|----------|
-| Llama 3 8B | ~5 ГБ | ~5 токенов/с | Качественные ответы |
-| Qwen3 8B | ~5 ГБ | ~5 токенов/с | Многоязычный ассистент |
-
-```bash
-# Llama 3 8B — высокое качество, но медленнее
-.\build\bin\Release\llama-cli.exe -hf bartowski/Meta-Llama-3-8B-Instruct-GGUF
-```
-
-> **Совет:** Начните с Gemma 3 1B. Если качество не устраивает — переходите на 8B.
-
----
-
-## Что происходит под капотом
-
-Ваш Ryzen AI процессор содержит два вычислителя:
-
-- **CPU** (процессор) — универсальный, работает с любой моделью
-- **NPU** (нейропроцессор) — специализированный, экономит батарею
-
-Программа автоматически распределяет работу:
-- **Математические операции** (умножение матриц) → **NPU** (быстро и экономно)
-- **Остальное** → **CPU** (гибко и универсально)
-
-Маленькие модели целиком помещаются на NPU. Большие — частично на NPU, частично на CPU.
-
----
-
-## Оптимизации
-
-По умолчанию программа использует NPU только для базовых операций. Можно включить больше:
-
-### Простые оптимизации (рекомендуется)
-
-```bash
-# Windows PowerShell
-$env:XDNA_ENABLE_SWIGLU=1
-$env:XDNA_ENABLE_QKV=1
-
-# Linux
-export XDNA_ENABLE_SWIGLU=1
-export XDNA_ENABLE_QKV=1
-```
-
-**Что это делает:**
-- `XDNA_ENABLE_SWIGLU` — отправляет больше работы на NPU (экономит батарею)
-- `XDNA_ENABLE_QKV` — группирует операции для более быстрого выполнения
-
-### Продвинутые оптимизации
-
-```bash
-# Все оптимизации сразу (для экспериментов)
-$env:XDNA_ENABLE_SWIGLU=1       # Больше работы на NPU
-$env:XDNA_ENABLE_QKV=1          # Группировка операций
-$env:XDNA_ENABLE_SWIGLU_PREFILL=1  # Быстрая обработка длинных текстов
-$env:XDNA_ENABLE_ATTENTION_PREFILL=1  # Внимание на NPU
-$env:XDNA_ENABLE_TRANSFORMER_BLOCK=1  # Полный слой на NPU
-```
-
-> **Примечание:** Продвинутые оптимизации могут быть нестабильными. Если модель выдаёт мусор — уберите их.
-
----
-
-## Запуск веб-сервера
-
-Можно запустить как локальный сервер и общаться через браузер:
-
-```bash
-# Windows
-.\build\bin\Release\llama-server.exe -hf ggml-org/gemma-3-1b-it-GGUF
-
-# Linux
-./build/bin/llama-server -hf ggml-org/gemma-3-1b-it-GGUF
-```
-
-Откройте в браузере: **http://localhost:8080**
-
----
+Бенчмарк: `python ggml\src\ggml-xdna\tools\correctness_test.py --bench --bench-only "f3best LOOP"`
 
 ## Диагностика
 
-### Модель не запускается
+**`XRT not found` на этапе cmake** — не задан `XILINX_XRT`, либо он указывает на архив целиком вместо внутреннего `xrt_sdk\xrt`. Сообщение об ошибке называет обе переменные и нужный каталог.
 
-**Ошибка: "XRT not found"**
-```bash
-# Windows — переустановите XRT с: https://github.com/amd/xdna-driver/releases
+**Компиляция кернела падает с кодом 1 и пустым выводом** — почти наверняка `XILINX_XRT` остался в окружении. Уберите (`Remove-Item Env:XILINX_XRT`).
 
-# Linux:
-source /opt/xilinx/xrt/setup.sh
-```
+**Скорость как у CPU** — NPU-путь не активировался. Смотрите stderr: если нет строки
+`[f3best-LOOP] dispatched 16 layers in ONE call`, слитый слой не задействован. Причины по
+убыванию вероятности: забыт `-fa off`; не та модель/квантизация (нужны Llama-3.2-1B + Q4_0);
+не задан `GGML_XDNA_CACHE_DIR`; выставлен не весь набор переменных. Проверьте тестом
+`correctness_test.py`.
 
-**Ошибка: "No device found"**
-```bash
-# Windows: обновите драйвер через Windows Update
-# Linux:
-sudo modprobe amdxdna
-xrt-smi examine
-```
+**Модель выдаёт мусор** — снимите NPU-переменные (`Remove-Item Env:XDNA_*`) и сравните с CPU.
 
-**Ошибка: "VCRUNTIME140.dll not found"**
-```
-Установите: https://aka.ms/vs/17/release/vc_redist.x64.exe
-```
+## Что дальше
 
-### Модель работает медленно
-
-**Первый запуск** — это нормально. Программа компилирует специальные файлы для вашего NPU. Займёт 2-5 минут.
-
-**Последующие запуски** — файлы сохраняются в кеш:
-- Windows: `%LOCALAPPDATA%\ggml-xdna\xclbin\`
-- Linux: `~/.cache/ggml-xdna/xclbin/`
-
-**~9 токенов/с** — это нормальная скорость для NPU. Для сравнения: GPU выдаёт 30+ токенов/с, но потребляет в 10 раз больше энергии.
-
-### Модель выдаёт мусор
-
-Уберите оптимизации:
-```bash
-# Windows
-Remove-Item Env:\XDNA_ENABLE_*
-
-# Linux
-unset XDNA_ENABLE_SWIGLU XDNA_ENABLE_QKV XDNA_ENABLE_SWIGLU_PREFILL
-```
+- Внутренности, пересборка кернелов, полный список переменных → [XDNA_QUICKSTART_DEV.md](./XDNA_QUICKSTART_DEV.md)
+- Разбор архитектуры референсной реализации → `FFLM_REVERSE_ENGINEERING.md`
 
 ---
 
-## Частые вопросы
-
-### Это безопасно? Данные уходят в интернет?
-
-Нет. Всё работает локально на вашем ноутбуке. Никакие данные не покидают устройство.
-
-### Сколько места нужно на диске?
-
-- Программа: ~500 МБ
-- Маленькая модель (1B): ~1 ГБ
-- Большая модель (8B): ~5 ГБ
-- Кеш NPU кернелов: ~100 МБ на модель
-
-### Работает ли от батареи?
-
-Да. NPU потребляет ~5 Вт (против ~50 Вт у GPU). Ноутбук проработает несколько часов с запущенной моделью.
-
-### Можно ли использовать GPU одновременно?
-
-Да. Программа автоматически распределяет работу между NPU и CPU. Если у вас есть дискретная GPU — можно использовать её отдельно (но не через этот бэкенд).
-
-### Какая модель лучше всего?
-
-Начните с **Gemma 3 1B** — быстрая, компактная, хорошее качество. Если нужно больше — **Qwen3 8B**.
-
----
-
-## Подробная информация
-
-### Поддерживаемые процессоры
-
-| Поколение | Чипы | NPU |
-|-----------|------|-----|
-| Ryzen 7040 | Phoenix (7840U, 7840HS, etc.) | XDNA 1 |
-| Ryzen 8040 | Hawk Point (8840U, 8845HS, etc.) | XDNA 1 |
-| Ryzen AI 300 | Strix (AI 9 365, AI 9 HX 370, etc.) | XDNA 2 |
-| Ryzen AI Max | Strix Halo (AI Max+ 395, etc.) | XDNA 2 |
-| Ryzen AI 200 | Krackan Point | XDNA 2 |
-
-### Поддерживаемые системы
-
-| Система | Статус |
-|---------|--------|
-| Windows 11 | ✅ Основная платформа |
-| Linux (ядро 6.14+) | ✅ Поддерживается |
-| macOS | ❌ Нет NPU от AMD |
-
-### Подробный технический гайд
-
-Для разработчиков: [XDNA_QUICKSTART_DEV.md](./XDNA_QUICKSTART_DEV.md)
-
----
-
-*Последнее обновление: 2026-05-02*
-*Источник: [albiol2004/llama.cpp@ggml-xdna](https://github.com/albiol2004/llama.cpp/tree/ggml-xdna)*
+*Источник: [Soket1/llama.cpp-xdna@ggml-xdna](https://github.com/Soket1/llama.cpp-xdna/tree/ggml-xdna). Числа перемерены 2026-07-26 на Ryzen AI 9 365.*

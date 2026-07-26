@@ -1,8 +1,15 @@
 # ggml-xdna Optimization Plan
 
-> Based on analysis of [albiol2004/llama.cpp@ggml-xdna](https://github.com/albiol2004/llama.cpp/tree/ggml-xdna)
+> ⚠️ **OUTDATED — kept for history.** This plan was written against the April 2026
+> ~9 t/s state and most of it has since been superseded or disproven by measurement
+> (decode is now 29 t/s through the fused `decode_layer_f3best`). Do not use it as a
+> roadmap. Current instructions: [XDNA_QUICKSTART.md](./XDNA_QUICKSTART.md) and
+> [XDNA_QUICKSTART_DEV.md](./XDNA_QUICKSTART_DEV.md).
+>
+> Based on analysis of [albiol2004/llama.cpp@ggml-xdna](https://github.com/albiol2004/llama.cpp/tree/ggml-xdna),
+> the fork this work branched from.
 > Issue: [ggml-org/llama.cpp#21725](https://github.com/ggml-org/llama.cpp/issues/21725)
-> Last commit: 2026-04-21 — "9tk/s first decode impl"
+> Last commit of that baseline: 2026-04-21 — "9tk/s first decode impl"
 
 ## Current State
 

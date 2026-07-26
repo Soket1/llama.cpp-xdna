@@ -1,9 +1,13 @@
 # ggml-xdna — Tracker
 
-> План оптимизации: [XDNA_OPTIMIZATION_PLAN.md](./XDNA_OPTIMIZATION_PLAN.md)
+> ⚠️ **Исторический документ (состояние на апрель 2026, ~9 т/с).** Он фиксирует
+> отправную точку, а не текущее положение дел: decode сейчас 29 т/с через слитый
+> `decode_layer_f3best`. Актуальные инструкции — [XDNA_QUICKSTART.md](./XDNA_QUICKSTART.md)
+> и [XDNA_QUICKSTART_DEV.md](./XDNA_QUICKSTART_DEV.md).
+>
 > Issue: [ggml-org/llama.cpp#21725](https://github.com/ggml-org/llama.cpp/issues/21725)
-> Форк: [albiol2004/llama.cpp@ggml-xdna](https://github.com/albiol2004/llama.cpp/tree/ggml-xdna)
-> Последний коммит: 2026-04-21 — "9tk/s first decode impl"
+> Исходный форк, от которого отпочковалась работа: [albiol2004/llama.cpp@ggml-xdna](https://github.com/albiol2004/llama.cpp/tree/ggml-xdna)
+> Здесь: [Soket1/llama.cpp-xdna@ggml-xdna](https://github.com/Soket1/llama.cpp-xdna/tree/ggml-xdna)
 
 ---
 
