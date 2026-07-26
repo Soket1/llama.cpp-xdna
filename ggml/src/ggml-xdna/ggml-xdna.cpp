@@ -19224,7 +19224,18 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
         // ggml_backend_xdna_rms_norm() itself gates on the env var and the
         // node shape/dtype/eps; on any rejection it returns false and the node
         // accumulates into the next CPU-delegated range.
-        if (rms_norm_enabled && node->op == GGML_OP_RMS_NORM) {
+        //
+        // Suppressed while the f3best loop is armed, and it is worth knowing
+        // why: this kernel runs on a ONE-column hardware context while the
+        // fused layer runs on eight. Dispatching it between tokens forces a
+        // context switch, and the next f3best dispatch pays for switching
+        // back. Measured on llama-3.2-1B Q4_0: layer 0 costs 3159 us against
+        // 1105 for its neighbours, and disabling this one dispatch collapses
+        // that gap to 86 us -- 33.67 -> 36.73 t/s at n=192, +9%. The RMSNorm
+        // it would compute is cheap on CPU and, for layer 0, was recomputed
+        // there anyway by the KV-prefix delegate.
+        const bool f3best_loop_armed = f3best_enabled && !layer_fused_plan.matches.empty();
+        if (rms_norm_enabled && !f3best_loop_armed && node->op == GGML_OP_RMS_NORM) {
             if (cpu_run_start >= 0) {
                 ggml_status s = xdna_delegate_range(ctx, cgraph, cpu_run_start, i);
                 if (s != GGML_STATUS_SUCCESS) return s;
