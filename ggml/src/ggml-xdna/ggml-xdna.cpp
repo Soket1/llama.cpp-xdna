@@ -14140,6 +14140,18 @@ static xrt::bo * tblock_prefill_warm_gain(
 // ----------------------------------------------------------------------------
 static void tblock_prefill_bulk_prewarm(ggml_backend_xdna_context * ctx,
                                         const struct ggml_cgraph * cgraph) {
+    // Only prefill graphs can produce a match: every candidate is discarded
+    // below unless seq_len >= 256. A decode graph carries one token, so the
+    // matcher below runs on all ~33 RMS_NORM nodes and throws every result
+    // away -- once per token, forever. Scanning the token dimension first
+    // costs one pass over the nodes and no matcher calls at all.
+    int64_t max_tokens = 0;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const int64_t t = cgraph->nodes[i]->ne[1];
+        if (t > max_tokens) max_tokens = t;
+    }
+    if (max_tokens < 256) return;
+
     std::vector<xdna_transformer_block_match> matches;
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor * node = cgraph->nodes[i];
@@ -16173,6 +16185,13 @@ static bool ensure_rms_norm_compiled(ggml_backend_xdna_context * ctx,
                                      bool weighted) {
     if (!xdna_env_enabled("XDNA_ENABLE_RMS_NORM")) return false;
 
+    // Positive cache, same as ensure_compiled: without it every dispatch
+    // re-opens both bundle files, and on a warm disk that is the only path
+    // ever taken. Two ifstream opens per dispatch, twice per token.
+    if (ctx->kernel_compile_succeeded.count(cache_key)) {
+        return true;
+    }
+
     const std::string bundle_dir = ctx->cache_dir + "\\" + cache_key;
 
     static const bool dbg = getenv("XDNA_DEBUG") != NULL;
@@ -16184,6 +16203,7 @@ static bool ensure_rms_norm_compiled(ggml_backend_xdna_context * ctx,
         if (dbg) {
             fprintf(stderr, "ggml-xdna: found precompiled rms_norm in cache\n");
         }
+        ctx->kernel_compile_succeeded.insert(cache_key);
         return true;
     }
 
@@ -17353,13 +17373,8 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
     // without a dual-hook. PROBE mode (default): compare vs CPU l_out, NO skip.
     // XDNA_ENABLE_LAYER_F3BEST=1 arms it; XDNA_LAYER_F3BEST_SKIP=1 commits to skip.
     static const bool f3best_enabled = xdna_env_enabled("XDNA_ENABLE_LAYER_F3BEST");
-    std::unordered_map<int, int> f3best_addffn_to_match;
-    if (f3best_enabled) {
-        for (size_t mi = 0; mi < layer_fused_plan.matches.size(); mi++) {
-            const xdna_layer_fused_match & m = layer_fused_plan.matches[mi];
-            if (m.add_ffn_idx >= 0) f3best_addffn_to_match[m.add_ffn_idx] = (int)mi;
-        }
-    }
+    // (An add_ffn_idx -> match index map used to be built here every token and
+    //  was never read anywhere. Removed.)
 
     // Pre-scan for decode GEMV batching. Identifies standalone MUL_MAT M=1
     // nodes eligible for runlist batching (gated by XDNA_ENABLE_DECODE_BATCH).
