@@ -1435,8 +1435,16 @@ static std::string make_cache_key(xdna_op_kind op_kind,
         // carried in XR for shorter contexts. _mc suffix forces regen past the broken xclbin;
         // _preq/_vexp add flowkv score density cuts; _vreg holds the flowkv value
         // accumulator in registers across the position loop (same numerics, -17.6us/layer).
-        snprintf(buf, sizeof(buf), "decode_layer_f3best_K%lld_H%lld_sl256_d64_ag4_kv8_g32_mc_preq_vexp_vreg_dq8_qp",
-                 (long long)K, (long long)N);
+        // F3BEST_FFN_DIV probe suffix. env-read so the probe gets a separate xclbin
+        // without recompile; DIV=1 (default) produces the bare key.
+        const char * ffn_div = getenv("F3BEST_FFN_DIV");
+        if (ffn_div && strcmp(ffn_div, "1") != 0) {
+            snprintf(buf, sizeof(buf), "decode_layer_f3best_K%lld_H%lld_sl256_d64_ag4_kv8_g32_mc_preq_vexp_vreg_dq8_qp_d%s",
+                     (long long)K, (long long)N, ffn_div);
+        } else {
+            snprintf(buf, sizeof(buf), "decode_layer_f3best_K%lld_H%lld_sl256_d64_ag4_kv8_g32_mc_preq_vexp_vreg_dq8_qp",
+                     (long long)K, (long long)N);
+        }
     } else {
         snprintf(buf, sizeof(buf), "gemm_%lldx%lldx%lld_%s_%dcol",
                  (long long)M, (long long)K, (long long)N, dtype_in, num_cols);
@@ -4977,8 +4985,9 @@ static bool ggml_backend_xdna_decode_layer_f3best(
             const uint8_t * dd = (const uint8_t *)down_w->data;
             for (int64_t h = 0; h < NH; h++) {
                 uint8_t * hd = A + (size_t)h * WT_BYTES; size_t off = 0;
-                f3b::pack_gemv(qd + (size_t)h*256*RS, 256, E, (int)M, (int)group_size, PACKED, hd+off); off += 64*PACKED;
-                f3b::pack_gemv(od + (size_t)h*256*RS, 256, E, (int)M, (int)group_size, PACKED, hd+off); off += 64*PACKED;
+                // #131B: column-major broadcast layout for Q/O (was row-major dot-product)
+                f3b::pack_bcast(qd + (size_t)h*256*RS, 256, E, E, 0, (int)group_size, PACKED, hd+off); off += 64*PACKED;
+                f3b::pack_bcast(od + (size_t)h*256*RS, 256, E, E, 0, (int)group_size, PACKED, hd+off); off += 64*PACKED;
                 f3b::pack_bcast(gd + (size_t)h*H8*RS, H8, E, E, 0, (int)group_size, PACKED, hd+off); off += 256*PACKED;
                 f3b::pack_bcast(ud + (size_t)h*H8*RS, H8, E, E, 0, (int)group_size, PACKED, hd+off); off += 256*PACKED;
                 f3b::pack_bcast(dd, E, H8, HH, h*H8, (int)group_size, PACKED, hd+off); off += 256*PACKED;
