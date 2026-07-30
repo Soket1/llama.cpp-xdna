@@ -1152,7 +1152,7 @@ EVAL_TPS_RE = re.compile(
 BENCH_REPEATS = 2          # 1 warm-up + 1 measured; first run includes any
                            # inline xclbin compile, the second is the warm rate.
 BENCH_PROMPT = "What is the capital of France? Explain in detail."
-BENCH_N_PREDICT = 64
+BENCH_N_PREDICT = 192
 
 
 @dataclass
@@ -1172,7 +1172,10 @@ def build_bench_configs() -> list[BenchConfig]:
         BenchConfig(label="NPU INT4 QKV fused", preset="npu_int4_qkv_fused", model=MODEL_Q4_0),
         BenchConfig(label="NPU Phase B fused", preset="npu_phase_b",      model=MODEL_Q4_0),
         BenchConfig(label="NPU Layer Fused Live", preset="npu_layer_fused_live", model=MODEL_Q4_0),
-        BenchConfig(label="NPU f3best LOOP",   preset="npu_f3best_loop",  model=MODEL_Q4_0),
+        BenchConfig(label="NPU f3best LOOP",   preset="npu_f3best_loop",  model=MODEL_Q4_0_VOCABQ4),
+        # vocabQ4 model (token_embd Q4_0) with CPU lm_head — cheaper vocab
+        # projection than Q6_K, ~+2 t/s vs standard.
+        BenchConfig(label="NPU f3best LOOP vocabQ4", preset="npu_f3best_loop", model=MODEL_Q4_0_VOCABQ4),
         # #77: lm_head on NPU. vocabQ4 model + its own CPU baseline for a fair
         # (same-weights) t/s and token-match comparison.
         BenchConfig(label="CPU Q4_0 vocabQ4",  preset="cpu_baseline",         model=MODEL_Q4_0_VOCABQ4),
@@ -1271,6 +1274,11 @@ def run_bench_one(cfg: BenchConfig, mode: str) -> tuple[float, float]:
     m = matches[-1]
     prompt_tps = float(m.group(1))
     decode_tps = float(m.group(2))
+    # Dump per-layer or glue timings from stderr when env probes are active.
+    if os.environ.get("XDNA_F3BEST_TIME") or os.environ.get("XDNA_F3BEST_GLUETIME"):
+        for ln in result.stderr.splitlines():
+            if "f3best-" in ln:
+                print(f"    [stderr] {ln.strip()}")
     return decode_tps, prompt_tps
 
 
