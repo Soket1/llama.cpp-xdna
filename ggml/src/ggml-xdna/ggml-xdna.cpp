@@ -1438,12 +1438,14 @@ static std::string make_cache_key(xdna_op_kind op_kind,
         // F3BEST_FFN_DIV probe suffix. env-read so the probe gets a separate xclbin
         // without recompile; DIV=1 (default) produces the bare key.
         const char * ffn_div = getenv("F3BEST_FFN_DIV");
+        const char * decouple = getenv("F3BEST_MT_DECOUPLE");
+        const char * dc_suffix = (decouple && decouple[0] != '\0') ? "_decouple" : "";
         if (ffn_div && strcmp(ffn_div, "1") != 0) {
-            snprintf(buf, sizeof(buf), "decode_layer_f3best_K%lld_H%lld_sl256_d64_ag4_kv8_g32_mc_preq_vexp_vreg_dq8_qp_d%s",
-                     (long long)K, (long long)N, ffn_div);
+            snprintf(buf, sizeof(buf), "decode_layer_f3best_K%lld_H%lld_sl256_d64_ag4_kv8_g32_mc_preq_vexp_vreg_dq8_qp_d%s%s",
+                     (long long)K, (long long)N, ffn_div, dc_suffix);
         } else {
-            snprintf(buf, sizeof(buf), "decode_layer_f3best_K%lld_H%lld_sl256_d64_ag4_kv8_g32_mc_preq_vexp_vreg_dq8_qp",
-                     (long long)K, (long long)N);
+            snprintf(buf, sizeof(buf), "decode_layer_f3best_K%lld_H%lld_sl256_d64_ag4_kv8_g32_mc_preq_vexp_vreg_dq8_qp%s",
+                     (long long)K, (long long)N, dc_suffix);
         }
     } else {
         snprintf(buf, sizeof(buf), "gemm_%lldx%lldx%lld_%s_%dcol",
