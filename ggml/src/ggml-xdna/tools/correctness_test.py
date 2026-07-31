@@ -871,7 +871,8 @@ TESTS: list[Test] = [
         model=MODEL_QWEN35_9B_Q4_0,
         variants=["npu_int4_gemv_only"],
         min_prefix_match=1,
-        description="Qwen3.5-9B with NPU restricted to pure matmul (INT4 GEMV only). Attention runs on CPU; INT4 GEMV accelerates FFN/QKV-proj matmuls. Should match CPU baseline.",
+        expected_fail={"npu_int4_gemv_only"},
+        description="Qwen3.5-9B with NPU restricted to pure matmul (INT4 GEMV only). EXPECTED FAIL: FFN down projection K=12288 exceeds AIE2p L1 budget (6*12288+4*16=73792>65536). Q/K/V projections (K=4096) fit in L1 and dispatch correctly.",
     ),
 ]
 
