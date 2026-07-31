@@ -864,7 +864,9 @@ def compile_gemm(M: int, K: int, N: int, dtype_in: str, dtype_out: str,
     compiled_xclbin = build_dir / op.xclbin_artifact.filename
     compiled_insts = build_dir / op.insts_artifact.filename
 
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    outdir = os.path.dirname(output_path)
+    if outdir:
+        os.makedirs(outdir, exist_ok=True)
     shutil.copy2(str(compiled_xclbin), output_path)
 
     # Also copy the insts file alongside the xclbin (same name, .insts extension)
@@ -906,7 +908,9 @@ def compile_gemv(N: int, K: int, dtype_in: str, dtype_out: str,
     compiled_xclbin = build_dir / op.xclbin_artifact.filename
     compiled_insts = build_dir / op.insts_artifact.filename
 
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    outdir = os.path.dirname(output_path)
+    if outdir:
+        os.makedirs(outdir, exist_ok=True)
     shutil.copy2(str(compiled_xclbin), output_path)
     insts_output = output_path.replace(".xclbin", ".insts")
     shutil.copy2(str(compiled_insts), insts_output)
@@ -954,7 +958,9 @@ def compile_fused_dequant_gemv(N: int, K: int, num_aie_columns: int,
     compiled_xclbin = build_dir / op.xclbin_artifact.filename
     compiled_insts = build_dir / op.insts_artifact.filename
 
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    outdir = os.path.dirname(output_path)
+    if outdir:
+        os.makedirs(outdir, exist_ok=True)
     shutil.copy2(str(compiled_xclbin), output_path)
     insts_output = output_path.replace(".xclbin", ".insts")
     shutil.copy2(str(compiled_insts), insts_output)
@@ -1004,7 +1010,9 @@ def compile_fused_dequant_gemv_v3(N: int, K: int, m_batch: int,
     compiled_xclbin = build_dir / op.xclbin_artifact.filename
     compiled_insts  = build_dir / op.insts_artifact.filename
 
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    outdir = os.path.dirname(output_path)
+    if outdir:
+        os.makedirs(outdir, exist_ok=True)
     shutil.copy2(str(compiled_xclbin), output_path)
     insts_output = output_path.replace(".xclbin", ".insts")
     shutil.copy2(str(compiled_insts), insts_output)
@@ -1047,7 +1055,9 @@ def compile_fused_dequant_gemv_v2(N: int, K: int, num_aie_columns: int,
     compiled_xclbin = build_dir / op.xclbin_artifact.filename
     compiled_insts = build_dir / op.insts_artifact.filename
 
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    outdir = os.path.dirname(output_path)
+    if outdir:
+        os.makedirs(outdir, exist_ok=True)
     shutil.copy2(str(compiled_xclbin), output_path)
     insts_output = output_path.replace(".xclbin", ".insts")
     shutil.copy2(str(compiled_insts), insts_output)
@@ -1091,7 +1101,9 @@ def compile_decode_qkv16(embed_dim: int, qkv_dim: int,
     compiled_xclbin = build_dir / op.xclbin_artifact.filename
     compiled_insts = build_dir / op.insts_artifact.filename
 
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    outdir = os.path.dirname(output_path)
+    if outdir:
+        os.makedirs(outdir, exist_ok=True)
     shutil.copy2(str(compiled_xclbin), output_path)
     insts_output = output_path.replace(".xclbin", ".insts")
     shutil.copy2(str(compiled_insts), insts_output)
@@ -1139,7 +1151,9 @@ def compile_decode_ffn16_2mm(embed_dim: int, hidden_dim: int,
     compiled_xclbin = build_dir / op.xclbin_artifact.filename
     compiled_insts = build_dir / op.insts_artifact.filename
 
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    outdir = os.path.dirname(output_path)
+    if outdir:
+        os.makedirs(outdir, exist_ok=True)
     shutil.copy2(str(compiled_xclbin), output_path)
     insts_output = output_path.replace(".xclbin", ".insts")
     shutil.copy2(str(compiled_insts), insts_output)
@@ -1181,7 +1195,9 @@ def compile_decode_front_attn(embed_dim: int, head_dim: int, group_size: int,
     compiled_xclbin = build_dir / op.xclbin_artifact.filename
     compiled_insts = build_dir / op.insts_artifact.filename
 
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    outdir = os.path.dirname(output_path)
+    if outdir:
+        os.makedirs(outdir, exist_ok=True)
     shutil.copy2(str(compiled_xclbin), output_path)
     insts_output = output_path.replace(".xclbin", ".insts")
     shutil.copy2(str(compiled_insts), insts_output)
@@ -1213,7 +1229,9 @@ def compile_decode_back_mono(embed_dim: int, hidden_dim: int, group_size: int,
     compiled_xclbin = build_dir / op.xclbin_artifact.filename
     compiled_insts = build_dir / op.insts_artifact.filename
 
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    outdir = os.path.dirname(output_path)
+    if outdir:
+        os.makedirs(outdir, exist_ok=True)
     shutil.copy2(str(compiled_xclbin), output_path)
     insts_output = output_path.replace(".xclbin", ".insts")
     shutil.copy2(str(compiled_insts), insts_output)
@@ -1262,7 +1280,9 @@ def compile_decode_layer_f3best(embed_dim: int, hidden_dim: int, group_size: int
     compiled_xclbin = build_dir / op.xclbin_artifact.filename
     compiled_insts = build_dir / op.insts_artifact.filename
 
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    outdir = os.path.dirname(output_path)
+    if outdir:
+        os.makedirs(outdir, exist_ok=True)
     shutil.copy2(str(compiled_xclbin), output_path)
     insts_output = output_path.replace(".xclbin", ".insts")
     shutil.copy2(str(compiled_insts), insts_output)

@@ -2601,7 +2601,8 @@ static bool ensure_compiled(ggml_backend_xdna_context * ctx,
 
     int ret = system(cmd);
     if (ret != 0) {
-        GGML_LOG_ERROR("ggml-xdna: compilation failed (exit code %d)\n", ret);
+        GGML_LOG_ERROR("ggml-xdna: compilation failed (exit code %d) for --out %s\n",
+                       ret, xclbin_path.c_str());
         ctx->kernel_compile_failed.insert(cache_key);
         return false;
     }
@@ -2610,7 +2611,8 @@ static bool ensure_compiled(ggml_backend_xdna_context * ctx,
     std::ifstream xf(xclbin_path);
     std::ifstream inf(insts_path);
     if (!xf.good() || !inf.good()) {
-        GGML_LOG_ERROR("ggml-xdna: compilation succeeded but output files missing\n");
+        GGML_LOG_ERROR("ggml-xdna: compilation exit 0 but files missing: %s / %s\n",
+                       xclbin_path.c_str(), insts_path.c_str());
         ctx->kernel_compile_failed.insert(cache_key);
         return false;
     }
