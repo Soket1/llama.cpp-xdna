@@ -1370,6 +1370,11 @@ static std::vector<char> read_binary_file(const std::string & path) {
     f.seekg(0);
     std::vector<char> data(size);
     f.read(data.data(), size);
+    if (f.gcount() != (std::streamsize)size) {
+        GGML_LOG_ERROR("ggml-xdna: short read on %s: got %lld of %llu bytes\n",
+                       path.c_str(), (long long)f.gcount(), (unsigned long long)size);
+        return {};
+    }
     return data;
 }
 
