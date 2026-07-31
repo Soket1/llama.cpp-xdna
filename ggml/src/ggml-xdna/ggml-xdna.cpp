@@ -2943,16 +2943,23 @@ static void ggml_backend_xdna_mul_mat_gemv_int4(ggml_backend_xdna_context * ctx,
     }
 
     // L1 budget pre-check: reject shapes that can never fit in AIE2p 64KB L1.
-    // Mirrors the inequality in compile.py:select_gemv_tiles().
-    // 6*K + 4*tile_out <= 65536, where tile_out = N / num_cols.
+    // Mirrors select_gemv_tiles() in compile.py exactly.
+    // tile_size_output = first of {16,8,4} that divides N/num_cols.
+    // B+C = K*2 + 2*tile_out*2.  L1 budget for A (double-buffered) = 65536 - bc_bytes.
+    // Smallest valid tile_in=1 needs 2*1*K*2 = 4K bytes.  So: 4K <= 65536 - 2K - 4*tile_out.
+    // → 6*K + 4*tile_out <= 65536.
     {
-        const int64_t tile_out = N / num_cols;
-        if (6 * K + 4 * tile_out > 65536) {
+        const int64_t per_col = N / num_cols;
+        int64_t tile_out = 0;
+        for (int64_t tso : {16LL, 8LL, 4LL}) {
+            if (tso <= per_col && per_col % tso == 0) { tile_out = tso; break; }
+        }
+        if (tile_out == 0 || 6 * K + 4 * tile_out > 65536) {
             GGML_LOG_ERROR("ggml-xdna: INT4 GEMV shape K=%lld N=%lld exceeds L1 budget "
                            "(6*%lld + 4*%lld = %lld > 65536), falling back to CPU\n",
                            (long long)K, (long long)N,
-                           (long long)K, (long long)tile_out,
-                           (long long)(6 * K + 4 * tile_out));
+                           (long long)K, (long long)(tile_out ? tile_out : per_col),
+                           (long long)(6 * K + 4 * (tile_out ? tile_out : per_col)));
             return;
         }
     }
