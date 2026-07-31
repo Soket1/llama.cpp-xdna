@@ -2671,8 +2671,26 @@ static xdna_kernel_entry * get_or_load_kernel(ggml_backend_xdna_context * ctx,
         entry.K = K;
         entry.N = N;
 
-        // Load xclbin
-        entry.xclbin = xrt::xclbin(xclbin_path);
+        // Load xclbin (with SEH retry — XRT 2.21.0 has ~30% cold-load crash
+        // on complex xclbins via STATUS_STACK_BUFFER_OVERRUN).
+        bool xclbin_ok = false;
+        for (int xrt_retry = 0; xrt_retry < 3; xrt_retry++) {
+            __try {
+                entry.xclbin = xrt::xclbin(xclbin_path);
+                xclbin_ok = true;
+            } __except(GetExceptionCode() == STATUS_STACK_BUFFER_OVERRUN
+                       ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+                if (xrt_retry < 2) {
+                    fprintf(stderr, "ggml-xdna: xrt::xclbin crashed (STATUS_STACK_BUFFER_OVERRUN), retrying...\n");
+                    Sleep(100);
+                }
+            }
+            if (xclbin_ok) break;
+        }
+        if (!xclbin_ok) {
+            GGML_LOG_ERROR("ggml-xdna: xrt::xclbin crashed 3 times, giving up\n");
+            return nullptr;
+        }
         ctx->device.register_xclbin(entry.xclbin);
         auto uuid = entry.xclbin.get_uuid();
         entry.hw_ctx = xrt::hw_context(ctx->device, uuid);
