@@ -1259,7 +1259,8 @@ def compile_decode_layer_f3best(embed_dim: int, hidden_dim: int, group_size: int
     from iron.operators.decode_layer_f3best.op import AIEDecodeLayerF3Best
     from iron.common.context import AIEContext
 
-    build_root = os.path.join(os.path.dirname(output_path) or ".", "layer_f3best_build")
+    stem = os.path.splitext(os.path.basename(output_path))[0]
+    build_root = os.path.join(os.path.dirname(output_path) or ".", f"layer_f3best_build_{stem}")
     os.makedirs(build_root, exist_ok=True)
 
     op = AIEDecodeLayerF3Best(
