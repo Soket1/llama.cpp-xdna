@@ -1440,12 +1440,14 @@ static std::string make_cache_key(xdna_op_kind op_kind,
         const char * ffn_div = getenv("F3BEST_FFN_DIV");
         const char * decouple = getenv("F3BEST_MT_DECOUPLE");
         const char * dc_suffix = (decouple && decouple[0] != '\0') ? "_decouple" : "";
+        const char * triple_b = getenv("F3BEST_TRIPLE_B");
+        const char * tb_suffix = (!triple_b || triple_b[0] != '0') ? "_tb" : "";
         if (ffn_div && strcmp(ffn_div, "1") != 0) {
-            snprintf(buf, sizeof(buf), "decode_layer_f3best_K%lld_H%lld_sl256_d64_ag4_kv8_g32_mc_preq_vexp_vreg_dq8_qp_d%s%s",
-                     (long long)K, (long long)N, ffn_div, dc_suffix);
+            snprintf(buf, sizeof(buf), "decode_layer_f3best_K%lld_H%lld_sl256_d64_ag4_kv8_g32_mc_preq_vexp_vreg_dq8_qp_d%s%s%s",
+                     (long long)K, (long long)N, ffn_div, dc_suffix, tb_suffix);
         } else {
-            snprintf(buf, sizeof(buf), "decode_layer_f3best_K%lld_H%lld_sl256_d64_ag4_kv8_g32_mc_preq_vexp_vreg_dq8_qp%s",
-                     (long long)K, (long long)N, dc_suffix);
+            snprintf(buf, sizeof(buf), "decode_layer_f3best_K%lld_H%lld_sl256_d64_ag4_kv8_g32_mc_preq_vexp_vreg_dq8_qp%s%s",
+                     (long long)K, (long long)N, dc_suffix, tb_suffix);
         }
     } else {
         snprintf(buf, sizeof(buf), "gemm_%lldx%lldx%lld_%s_%dcol",
