@@ -2942,6 +2942,21 @@ static void ggml_backend_xdna_mul_mat_gemv_int4(ggml_backend_xdna_context * ctx,
         return;
     }
 
+    // L1 budget pre-check: reject shapes that can never fit in AIE2p 64KB L1.
+    // Mirrors the inequality in compile.py:select_gemv_tiles().
+    // 6*K + 4*tile_out <= 65536, where tile_out = N / num_cols.
+    {
+        const int64_t tile_out = N / num_cols;
+        if (6 * K + 4 * tile_out > 65536) {
+            GGML_LOG_ERROR("ggml-xdna: INT4 GEMV shape K=%lld N=%lld exceeds L1 budget "
+                           "(6*%lld + 4*%lld = %lld > 65536), falling back to CPU\n",
+                           (long long)K, (long long)N,
+                           (long long)K, (long long)tile_out,
+                           (long long)(6 * K + 4 * tile_out));
+            return;
+        }
+    }
+
     const bool _bd = xdna_submit_breakdown::on();
     std::chrono::steady_clock::time_point _bdA, _bdB, _bdC;
     if (_bd) _bdA = std::chrono::steady_clock::now();
