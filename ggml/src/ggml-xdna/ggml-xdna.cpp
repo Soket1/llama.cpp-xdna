@@ -59,13 +59,10 @@ static const char * xdna_python_cmd() {
 }
 
 // Platform-specific null redirect suffix for system() calls.
-// Suppresses compile.py stdout/stderr to avoid polluting llama-cli output.
+// Returns empty: compile.py errors must be visible for diagnostics.
+// The --quiet flag already suppresses normal output on success.
 static const char * xdna_null_redirect() {
-#ifdef _WIN32
-    return " > NUL 2>&1";
-#else
-    return " > /dev/null 2>&1";
-#endif
+    return "";
 }
 
 // Session-wide buffer-traffic counters (behind XDNA_DEBUG). These measure
