@@ -2689,11 +2689,20 @@ static xdna_kernel_entry * get_or_load_kernel(ggml_backend_xdna_context * ctx,
         fprintf(stderr, " key=%s\n", cache_key.c_str());
         fflush(stderr);
 
-        // Load instructions
+        // Load instructions (with self-consistency check — .insts files
+        // embed their own size at offset 0x0C as a uint32).
         entry.insts = read_binary_file(insts_path);
         if (entry.insts.empty()) {
             GGML_LOG_ERROR("ggml-xdna: failed to read insts file: %s\n", insts_path.c_str());
             return nullptr;
+        }
+        if (entry.insts.size() >= 16) {
+            uint32_t embedded_size = *(const uint32_t *)(entry.insts.data() + 0x0C);
+            if (embedded_size != (uint32_t)entry.insts.size()) {
+                GGML_LOG_ERROR("ggml-xdna: insts file %s corrupt: embedded size=%u actual=%zu\n",
+                               insts_path.c_str(), embedded_size, entry.insts.size());
+                return nullptr;
+            }
         }
 
         // Create instruction buffer object
