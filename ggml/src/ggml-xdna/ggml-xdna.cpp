@@ -2705,13 +2705,10 @@ static xdna_kernel_entry * get_or_load_kernel(ggml_backend_xdna_context * ctx,
             }
         }
 
-        // Create instruction buffer object on IPU memory group (0).
-        // group_id(1)=DDR triggers ~30% STATUS_STACK_BUFFER_OVERRUN in XRT
-        // 2.21.0 when combined with cacheable (AMD 000034524: cacheable BO
-        // is not supported for AIE DDR groups on Windows XRT).
+        // Create instruction buffer object
         entry.insts_bo = xrt::bo(ctx->device, entry.insts.size(),
                                   xrt::bo::flags::cacheable,
-                                  entry.kernel.group_id(0));  // IPU group, not DDR
+                                  entry.kernel.group_id(1));
         entry.insts_bo.write(entry.insts.data());
         entry.insts_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
