@@ -141,4 +141,40 @@ static inline void pack_qo_bcast(const uint8_t * q4_0_src, int64_t n_rows, int64
     pack_bcast(q4_0_src, n_rows, K_full, K_full, 0, group_size, pad_to, tiles_out);
 }
 
+// Pack ONE broadcast-GEMV tile: rows [block*N : (block+1)*N) x columns [chunk*KC : (chunk+1)*KC).
+// Used for interleaved K/V weight packing where we need single-tile granularity.
+// q4_0_src points to the first row of the block (already offset).
+static inline void pack_bcast_one_tile(const uint8_t * q4_0_src, int64_t K_full, int64_t k_off,
+                                        int group_size, int block_idx, int chunk_idx, uint8_t * tile_out) {
+    const int N = 32, KC = 256;
+    const int64_t num_groups_full = K_full / group_size;
+    const size_t  row_stride  = (size_t)num_groups_full * 18;
+    const int64_t g_off = k_off / group_size;
+    const int     sg_per_chunk = KC / group_size;          // 8
+    auto nib = [&](int64_t row, int64_t kcol) -> uint8_t { // row is relative to block start
+        int64_t g = (k_off + kcol) / group_size; int within = (int)((k_off + kcol) % group_size);
+        const uint8_t * qs = q4_0_src + (size_t)row * row_stride + (size_t)g * 18 + 2;
+        uint8_t v = (within < 16) ? (qs[within] & 0x0F) : ((qs[within - 16] >> 4) & 0x0F);
+        return (uint8_t)((v - 8) & 0x0F);
+    };
+    int64_t c0 = chunk_idx * KC;
+    uint8_t * wdst = tile_out;
+    for (int c = 0; c < KC; c++) {
+        for (int k = 0; k < N / 2; k++) {
+            uint8_t lo = nib(2*k,     c0 + c);
+            uint8_t hi = nib(2*k + 1, c0 + c);
+            *wdst++ = (uint8_t)(lo | (hi << 4));
+        }
+    }
+    uint16_t * sdst = (uint16_t *)(tile_out + (size_t)KC * (N / 2));
+    for (int kg = 0; kg < sg_per_chunk; kg++) {
+        int64_t g = g_off + chunk_idx * sg_per_chunk + kg;
+        for (int r = 0; r < N; r++) {
+            uint16_t fp16;
+            memcpy(&fp16, q4_0_src + (size_t)r * row_stride + (size_t)g * 18, 2);
+            *sdst++ = fp16_to_bf16(fp16);
+        }
+    }
+}
+
 }  // namespace f3b

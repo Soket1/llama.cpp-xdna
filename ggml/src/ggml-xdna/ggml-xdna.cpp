@@ -1472,10 +1472,10 @@ static std::string make_cache_key(xdna_op_kind op_kind,
         const char * handasm_rr = getenv("F3BEST_HANDASM_RR");
         const char * rr_suffix = (handasm_rr && handasm_rr[0] != '\0') ? "_rr" : "";
         if (ffn_div && strcmp(ffn_div, "1") != 0) {
-            snprintf(buf, sizeof(buf), "decode_layer_f3best_K%lld_H%lld_sl256_d64_ag4_kv8_g32_mc_preq_vexp_vreg_dq8_qp_mxp_ub_kv_d%s%s%s%s",
+            snprintf(buf, sizeof(buf), "decode_layer_f3best_K%lld_H%lld_sl256_d64_ag4_kv8_g32_mc_preq_vexp_vreg_dq8_qp_mxp_ub_kvi_d%s%s%s%s",
                      (long long)K, (long long)N, ffn_div, dc_suffix, tb_suffix, rr_suffix);
         } else {
-            snprintf(buf, sizeof(buf), "decode_layer_f3best_K%lld_H%lld_sl256_d64_ag4_kv8_g32_mc_preq_vexp_vreg_dq8_qp_mxp_ub_kv%s%s%s",
+            snprintf(buf, sizeof(buf), "decode_layer_f3best_K%lld_H%lld_sl256_d64_ag4_kv8_g32_mc_preq_vexp_vreg_dq8_qp_mxp_ub_kvi%s%s%s",
                      (long long)K, (long long)N, dc_suffix, tb_suffix, rr_suffix);
         }
     } else {
@@ -5098,9 +5098,14 @@ static bool ggml_backend_xdna_decode_layer_f3best(
                 uint8_t * hd = A + (size_t)h * WT_BYTES; size_t off = 0;
                 // #131B: column-major broadcast layout for Q/O (was row-major dot-product)
                 f3b::pack_bcast(qd + (size_t)h*256*RS, 256, E, E, 0, (int)group_size, PACKED, hd+off); off += 64*PACKED;
-                // K/V: one KV head per center tile, KV_M=128 rows, 32 tiles each
-                f3b::pack_bcast(kd + (size_t)h*KV_M*RS, (int)KV_M, E, E, 0, (int)group_size, PACKED, hd+off); off += (KV_M/M)*PACKED;
-                f3b::pack_bcast(vd + (size_t)h*KV_M*RS, (int)KV_M, E, E, 0, (int)group_size, PACKED, hd+off); off += (KV_M/M)*PACKED;
+                // K/V interleaved: one tile at a time, K0,V0,K1,V1,...,K31,V31
+                // Broadcast packing: 32-row blocks, 256-col chunks
+                for (int64_t b = 0; b < KV_M / 32; b++) {
+                    for (int64_t c = 0; c < E / 256; c++) {
+                        f3b::pack_bcast_one_tile(kd + (size_t)(h*KV_M + b*32)*RS, E, 0, (int)group_size, (int)b, (int)c, hd+off); off += PACKED;
+                        f3b::pack_bcast_one_tile(vd + (size_t)(h*KV_M + b*32)*RS, E, 0, (int)group_size, (int)b, (int)c, hd+off); off += PACKED;
+                    }
+                }
                 f3b::pack_bcast(od + (size_t)h*256*RS, 256, E, E, 0, (int)group_size, PACKED, hd+off); off += 64*PACKED;
                 f3b::pack_bcast(gd + (size_t)h*H8*RS, H8, E, E, 0, (int)group_size, PACKED, hd+off); off += 256*PACKED;
                 f3b::pack_bcast(ud + (size_t)h*H8*RS, H8, E, E, 0, (int)group_size, PACKED, hd+off); off += 256*PACKED;
