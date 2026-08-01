@@ -1276,8 +1276,22 @@ struct ggml_backend_xdna_context {
         } else {
 #ifdef _WIN32
             compile_script = "ggml\\src\\ggml-xdna\\compile.py";
+            // If CWD is a build subdirectory (cmake build, etc.), the relative
+            // path above won't resolve. Fall back to one directory up.
+            {
+                std::ifstream probe(compile_script);
+                if (!probe.good()) {
+                    compile_script = "..\\ggml\\src\\ggml-xdna\\compile.py";
+                }
+            }
 #else
             compile_script = "ggml/src/ggml-xdna/compile.py";
+            {
+                std::ifstream probe(compile_script);
+                if (!probe.good()) {
+                    compile_script = "../ggml/src/ggml-xdna/compile.py";
+                }
+            }
 #endif
         }
 
