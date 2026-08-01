@@ -44,9 +44,6 @@ if (-not (Test-Path $Model)) {
 }
 
 $cache = Join-Path $root "npu_kernels_win_8col"
-if (-not (Test-Path (Join-Path $cache "decode_layer_f3best_K2048_H8192_sl256_d64_ag4_kv8_g32_mc_preq_vexp_vreg_dq8_qp.xclbin"))) {
-    throw "В $cache нет слитого decode-кернела. Каталог должен приехать вместе с репозиторием."
-}
 
 # XILINX_XRT нужна только на этапе cmake. Оставленная в окружении, она заставляет XRT
 # искать по ней xrt_core.dll и роняет компиляцию кернелов без единой строки вывода.
@@ -74,6 +71,20 @@ $flags = @(
     "XDNA_LAYER_F3BEST_LIVE", "XDNA_F3BEST_LOOP"
 )
 foreach ($f in $flags) { Set-Item -Path "Env:$f" -Value "1" }
+# Эти флаги намеренно без префикса XDNA_: их напрямую читает f3best emitter и
+# backend при построении ключа xclbin.
+$env:F3BEST_MT_DECOUPLE = "1"
+$env:F3BEST_TRIPLE_B = "1"
+
+# Keep this key aligned with ggml-xdna.cpp::make_cache_key. Failing before the
+# run is intentional: a different f3best variant may exist but is unsafe to use
+# under this production topology.
+$f3bestKey = "decode_layer_f3best_K2048_H8192_sl256_d64_ag4_kv8_g32_mc_preq_vexp_vreg_dq8_qp_mxp_ub_kvi_decouple_tb"
+$f3bestXclbin = Join-Path $cache "$f3bestKey.xclbin"
+$f3bestInsts = Join-Path $cache "$f3bestKey.insts"
+if (-not (Test-Path $f3bestXclbin) -or -not (Test-Path $f3bestInsts)) {
+    throw "В $cache нет активного слитого decode-кернела ($f3bestKey.xclbin/.insts). Каталог должен приехать вместе с репозиторием."
+}
 
 # -fa off обязателен: с включённым flash-attention слитый слой не диспатчится вовсе.
 $args = @(

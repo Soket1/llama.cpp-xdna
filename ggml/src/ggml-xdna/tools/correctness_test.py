@@ -244,8 +244,8 @@ PRESETS: dict[str, dict[str, str]] = {
         "XDNA_ATTN_SUPPORTS":            "1",
         "XDNA_LAYER_F3BEST_LIVE":        "1",
         "XDNA_F3BEST_LOOP":              "1",
-        "XDNA_F3BEST_MT_DECOUPLE":       "1",
-        "XDNA_F3BEST_TRIPLE_B":          "1",
+        "F3BEST_MT_DECOUPLE":            "1",
+        "F3BEST_TRIPLE_B":               "1",
     },
     "npu_f3best_loop_lmhead": {
         # #77: f3best unified loop + vocab projection (lm_head) on NPU. Requires
@@ -266,6 +266,8 @@ PRESETS: dict[str, dict[str, str]] = {
         "XDNA_ATTN_SUPPORTS":            "1",
         "XDNA_LAYER_F3BEST_LIVE":        "1",
         "XDNA_F3BEST_LOOP":              "1",
+        "F3BEST_MT_DECOUPLE":            "1",
+        "F3BEST_TRIPLE_B":               "1",
         "XDNA_ENABLE_LMHEAD_NPU":        "1",
     },
     "npu_layer_fused_live": {
@@ -1278,7 +1280,7 @@ def run_bench_one(cfg: BenchConfig, mode: str) -> tuple[float, float]:
     prompt_tps = float(m.group(1))
     decode_tps = float(m.group(2))
     # Dump per-layer or glue timings from stderr when env probes are active.
-    if os.environ.get("XDNA_F3BEST_TIME") or os.environ.get("XDNA_F3BEST_GLUETIME"):
+    if env.get("XDNA_F3BEST_TIME") or env.get("XDNA_F3BEST_GLUETIME"):
         for ln in result.stderr.splitlines():
             if "f3best-" in ln:
                 print(f"    [stderr] {ln.strip()}")
@@ -1287,10 +1289,9 @@ def run_bench_one(cfg: BenchConfig, mode: str) -> tuple[float, float]:
 
 # ── Pre-bench diagnostic for f3best presets ──────────────────────────────
 def _check_f3best_health(preset, model):
-    """Run a 1-token GLUETIME probe to detect per-op fallback or stale xclbin."""
+    """Run a warning-only GLUETIME probe before benchmarking an f3best config."""
     if "f3best" not in preset:
         return
-    import os as _os
     env = build_env(preset)
     env["XDNA_F3BEST_GLUETIME"] = "1"
     args = [
@@ -1300,40 +1301,67 @@ def _check_f3best_health(preset, model):
     ]
     try:
         r = subprocess.run(args, env=env, capture_output=True, text=True, timeout=90)
-    except Exception:
-        print("    [DIAG] f3best health probe timed out (ok if cold compile)")
+    except subprocess.TimeoutExpired:
+        print("    [DIAG] WARN health probe timed out (cold compile may take longer); continuing")
         return
+    except OSError as e:
+        print(f"    [DIAG] WARN health probe could not start: {e}; continuing")
+        return
+
+    if r.returncode != 0:
+        print(f"    [DIAG] WARN health probe exited {r.returncode}; continuing")
+        if r.stderr:
+            print(f"    [DIAG] stderr: {r.stderr[-500:].strip()}")
+
+    saw_gluetime = False
+    active_key = None
     for ln in r.stderr.splitlines():
-        if "gluetime" in ln.lower():
-            parts = ln.split()
-            npu_us = None
-            for p in parts:
-                if p.startswith("npu="):
-                    npu_us = int(p.split("=")[1])
-            if npu_us is not None:
-                npu_per_layer = npu_us / 16
-                if npu_per_layer < 100:
-                    print(f"    [DIAG] WARN PER-OP FALLBACK: npu={npu_us}us ({npu_per_layer:.0f}us/layer) -- f3best NOT active!")
-                elif npu_per_layer > 2000:
-                    print(f"    [DIAG] WARN DMA TIMEOUT: npu={npu_us}us ({npu_per_layer:.0f}us/layer) -- weight stream mismatch?")
-                else:
-                    print(f"    [DIAG] OK f3best active: npu={npu_us}us ({npu_per_layer:.0f}us/layer)")
-                break
-    # Check xclbin freshness vs emitter
-    import glob as _glob, os.path as _osp
-    cache_dir = _os.environ.get("GGML_XDNA_CACHE_DIR", REPO_ROOT / "npu_kernels_win_8col")
-    xclbins = _glob.glob(str(cache_dir) + "/decode_layer_f3best_*.xclbin")
+        loaded = re.search(r"loaded kernel for (decode_layer_f3best_\S+)", ln)
+        if loaded:
+            active_key = loaded.group(1)
+        if "gluetime" not in ln.lower():
+            continue
+        saw_gluetime = True
+        npu_us = None
+        for p in ln.split():
+            if p.startswith("npu="):
+                try:
+                    npu_us = int(p.split("=", 1)[1])
+                except ValueError:
+                    print(f"    [DIAG] WARN malformed GLUETIME field: {p!r}")
+        if npu_us is not None:
+            npu_per_layer = npu_us / 16
+            if npu_per_layer < 100:
+                print(f"    [DIAG] WARN PER-OP FALLBACK: npu={npu_us}us ({npu_per_layer:.0f}us/layer) -- f3best NOT active!")
+            elif npu_per_layer > 2000:
+                print(f"    [DIAG] WARN DMA TIMEOUT: npu={npu_us}us ({npu_per_layer:.0f}us/layer) -- weight stream mismatch?")
+            else:
+                print(f"    [DIAG] OK f3best active: npu={npu_us}us ({npu_per_layer:.0f}us/layer)")
+    if not saw_gluetime:
+        print("    [DIAG] WARN no GLUETIME diagnostic from health probe; continuing")
+
+    # Validate the exact key the probe actually loaded. This remains accurate
+    # across evolving cache-key suffixes and a locally older llama-cli binary.
+    if active_key is None:
+        print("    [DIAG] WARN no active f3best xclbin key in health probe; continuing")
+        return
+    cache_dir = Path(env.get("GGML_XDNA_CACHE_DIR", REPO_ROOT / "npu_kernels_win_8col"))
+    xclbin = cache_dir / f"{active_key}.xclbin"
+    insts = cache_dir / f"{active_key}.insts"
     emitter = REPO_ROOT / "IRON-windows" / "iron" / "operators" / "decode_layer_f3best" / "f3best_emit.py"
-    if xclbins and _osp.exists(emitter):
-        xclbin_mtime = _osp.getmtime(xclbins[0])
-        emitter_mtime = _osp.getmtime(emitter)
+    if not xclbin.exists() or not insts.exists():
+        missing = ", ".join(str(path.name) for path in (xclbin, insts) if not path.exists())
+        print(f"    [DIAG] WARN ACTIVE XCLBIN MISSING: {missing}; continuing")
+    elif emitter.exists():
+        xclbin_mtime = xclbin.stat().st_mtime
+        emitter_mtime = emitter.stat().st_mtime
         if emitter_mtime > xclbin_mtime + 300:   # 5-min tolerance for build time
             age_hours = (emitter_mtime - xclbin_mtime) / 3600
-            print(f"    [DIAG] WARN STALE XCLBIN: emitter newer by {age_hours:.1f}h -- needs recompile!")
+            print(f"    [DIAG] WARN STALE ACTIVE XCLBIN: emitter newer by {age_hours:.1f}h -- needs recompile!")
         else:
-            print(f"    [DIAG] OK xclbin fresh ({len(xclbins)} file(s))")
-    elif not xclbins:
-        print(f"    [DIAG] WARN NO XCLBIN -- will compile on first run")
+            print(f"    [DIAG] OK active xclbin fresh ({xclbin.name})")
+    else:
+        print(f"    [DIAG] OK active xclbin present ({xclbin.name})")
 
 
 def run_bench_lookup(preset: str, model: Path, draft_max: int = 8,
@@ -1431,9 +1459,12 @@ def run_bench(mode: str, model: str = "llama", only: str | None = None) -> int:
 
     print(f"\n=== bench [{mode}]: prompt={BENCH_PROMPT!r} n_predict={BENCH_N_PREDICT} repeats={BENCH_REPEATS} ===\n")
     rows: list[tuple[str, list[float], list[float]]] = []
-    if configs and "f3best" in configs[0].preset:
-        _check_f3best_health(configs[0].preset, configs[0].model)
+    health_checked: set[tuple[str, Path]] = set()
     for cfg in configs:
+        health_key = (cfg.preset, cfg.model)
+        if "f3best" in cfg.preset and health_key not in health_checked:
+            _check_f3best_health(cfg.preset, cfg.model)
+            health_checked.add(health_key)
         decodes: list[float] = []
         prompts: list[float] = []
         for rep in range(BENCH_REPEATS):
@@ -1448,25 +1479,28 @@ def run_bench(mode: str, model: str = "llama", only: str | None = None) -> int:
             prompts.append(p)
         rows.append((cfg.label, decodes, prompts))
 
-    # Pick the median (= second of two runs once warm cache settles).
-    def median(xs: list[float]) -> float:
-        xs2 = [x for x in xs if x == x]    # drop NaNs
-        if not xs2: return float("nan")
-        xs2.sort()
-        return xs2[len(xs2) // 2]
+    # BENCH_REPEATS=2 means first run warms persistent caches and the second is measured.
+    # This deliberately reports the settled rate, not a statistical median.
+    def settled_rate(xs: list[float]) -> float:
+        if len(xs) >= 2 and xs[1] == xs[1]:
+            return xs[1]
+        for x in reversed(xs):
+            if x == x:                     # drop NaNs, preserving run order
+                return x
+        return float("nan")
 
-    print(f"\n--- {mode} mode, median across {BENCH_REPEATS} runs ---")
+    print(f"\n--- {mode} mode, warm-rate (second run after warm-up) ---")
     print(f"  {'config':24s}  {'decode t/s':>11s}  {'prompt t/s':>11s}")
     print(f"  {'-'*24}  {'-'*11}  {'-'*11}")
     for label, decodes, prompts in rows:
-        print(f"  {label:24s}  {median(decodes):11.2f}  {median(prompts):11.2f}")
+        print(f"  {label:24s}  {settled_rate(decodes):11.2f}  {settled_rate(prompts):11.2f}")
 
     # N-gram lookup bench: shows spec-dec speedup without draft model.
     # The n-gram block re-benches a fixed preset set and its baseline comes from rows[0],
     # which is meaningless once the caller narrowed the configs. Skip it under --bench-only.
     if model == "llama" and mode == "single" and not only:
         lookup_configs = build_bench_configs_lookup()
-        baseline_tps = median([d for _, decodes, _ in rows[:1] for d in decodes]) or 0
+        baseline_tps = settled_rate([d for _, decodes, _ in rows[:1] for d in decodes]) or 0
         print(f"\n--- n-gram lookup spec-dec (repetitive prompt, baseline~{baseline_tps:.1f} t/s) ---")
         print(f"  {'config':30s}  {'decode t/s':>11s}  {'accept%':>8s}  {'speedup':>8s}")
         print(f"  {'-'*30}  {'-'*11}  {'-'*8}  {'-'*8}")
