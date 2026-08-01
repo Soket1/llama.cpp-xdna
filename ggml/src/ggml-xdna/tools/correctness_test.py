@@ -244,6 +244,8 @@ PRESETS: dict[str, dict[str, str]] = {
         "XDNA_ATTN_SUPPORTS":            "1",
         "XDNA_LAYER_F3BEST_LIVE":        "1",
         "XDNA_F3BEST_LOOP":              "1",
+        "XDNA_F3BEST_MT_DECOUPLE":       "1",
+        "XDNA_F3BEST_TRIPLE_B":          "1",
     },
     "npu_f3best_loop_lmhead": {
         # #77: f3best unified loop + vocab projection (lm_head) on NPU. Requires
