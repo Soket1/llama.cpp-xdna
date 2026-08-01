@@ -204,6 +204,9 @@ struct xdna_kernel_entry {
     // 16 layers, with per-layer txn offset patching. Keeps arg5 constant (BO
     // identity) while patching per-layer offset in the insts DDR_PATCH ops.
     std::unique_ptr<xrt::bo> unified_weight_bo;
+    // DDR_PATCH: ONE run object reused across ALL 16 layers. Arg 7 (KV) is
+    // rebound per layer; all other args (including weight BO) are constant.
+    std::unique_ptr<xrt::run> f3best_unified_run;
     std::unordered_map<const void*, int> f3best_layer_slot;
     std::vector<char> txn_template;
     int f3best_layer_count = 0;
@@ -5364,6 +5367,18 @@ static bool ggml_backend_xdna_decode_layer_f3best(
                 entry->shared_run = std::make_unique<xrt::run>(entry->kernel);
                 run_p = entry->shared_run.get();
             } else { run_p = entry->shared_run.get(); _fresh = false; _rebind_w = true; _rebind_kv = true; }
+        } else if (f3b_ddr_patch) {
+            // DDR_PATCH: ONE unified run for ALL layers. All args except KV
+            // (arg 7) are shared. Create once; rebind KV per layer.
+            if (!entry->f3best_unified_run) {
+                entry->f3best_unified_run = std::make_unique<xrt::run>(entry->kernel);
+                run_p = entry->f3best_unified_run.get();
+                // _fresh stays true → bind all args on first use
+            } else {
+                run_p = entry->f3best_unified_run.get();
+                _fresh = false;
+                _rebind_kv = true;
+            }
         } else if (f3b_reuse) {
             auto rit = entry->run_cache_map.find(q_w->data);
             if (rit != entry->run_cache_map.end()) { run_p = rit->second.get(); _fresh = false; }
@@ -5401,7 +5416,7 @@ static bool ggml_backend_xdna_decode_layer_f3best(
         {
             static const int f3b_loopn = []{ const char* e = getenv("XDNA_F3BEST_LOOPPROBE");
                 return e ? atoi(e) : 0; }();
-            if (f3b_loopn > 0) {
+            if (!f3b_ddr_patch && f3b_loopn > 0) {
                 if (!entry->shared_weight_bo) {
                     entry->shared_weight_bo = std::make_unique<xrt::bo>(
                         ctx->device, (size_t)NH * WT_BYTES, xrt::bo::flags::host_only,
@@ -5434,7 +5449,7 @@ static bool ggml_backend_xdna_decode_layer_f3best(
         // NPU cost (not recoverable by priming).
         static const bool f3b_warm2 = xdna_env_enabled("XDNA_F3BEST_WARM2");
         double _w_d1 = 0.0, _w_gap = 0.0;
-        if (f3b_warm2) {
+        if (!f3b_ddr_patch && f3b_warm2) {
             run.start(); run.wait();
             _w_d1 = std::chrono::duration<double, std::micro>(
                 std::chrono::steady_clock::now() - _f3_t1).count();
