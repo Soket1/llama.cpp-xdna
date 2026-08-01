@@ -1285,6 +1285,57 @@ def run_bench_one(cfg: BenchConfig, mode: str) -> tuple[float, float]:
     return decode_tps, prompt_tps
 
 
+# ── Pre-bench diagnostic for f3best presets ──────────────────────────────
+def _check_f3best_health(preset, model):
+    """Run a 1-token GLUETIME probe to detect per-op fallback or stale xclbin."""
+    if "f3best" not in preset:
+        return
+    import os as _os
+    env = build_env(preset)
+    env["XDNA_F3BEST_GLUETIME"] = "1"
+    args = [
+        str(LLAMA_CLI), "-m", str(model), "-n", "4", "-c", "512",
+        "-ngl", "100", "--no-mmap", "-fa", "off", "--temp", "0", "-s", "42",
+        "-p", "Paris", "--single-turn",
+    ]
+    try:
+        r = subprocess.run(args, env=env, capture_output=True, text=True, timeout=90)
+    except Exception:
+        print("    [DIAG] f3best health probe timed out (ok if cold compile)")
+        return
+    for ln in r.stderr.splitlines():
+        if "gluetime" in ln.lower():
+            parts = ln.split()
+            npu_us = None
+            for p in parts:
+                if p.startswith("npu="):
+                    npu_us = int(p.split("=")[1])
+            if npu_us is not None:
+                npu_per_layer = npu_us / 16
+                if npu_per_layer < 100:
+                    print(f"    [DIAG] WARN PER-OP FALLBACK: npu={npu_us}us ({npu_per_layer:.0f}us/layer) -- f3best NOT active!")
+                elif npu_per_layer > 2000:
+                    print(f"    [DIAG] WARN DMA TIMEOUT: npu={npu_us}us ({npu_per_layer:.0f}us/layer) -- weight stream mismatch?")
+                else:
+                    print(f"    [DIAG] OK f3best active: npu={npu_us}us ({npu_per_layer:.0f}us/layer)")
+                break
+    # Check xclbin freshness vs emitter
+    import glob as _glob, os.path as _osp
+    cache_dir = _os.environ.get("GGML_XDNA_CACHE_DIR", REPO_ROOT / "npu_kernels_win_8col")
+    xclbins = _glob.glob(str(cache_dir) + "/decode_layer_f3best_*.xclbin")
+    emitter = REPO_ROOT / "IRON-windows" / "iron" / "operators" / "decode_layer_f3best" / "f3best_emit.py"
+    if xclbins and _osp.exists(emitter):
+        xclbin_mtime = _osp.getmtime(xclbins[0])
+        emitter_mtime = _osp.getmtime(emitter)
+        if emitter_mtime > xclbin_mtime + 300:   # 5-min tolerance for build time
+            age_hours = (emitter_mtime - xclbin_mtime) / 3600
+            print(f"    [DIAG] WARN STALE XCLBIN: emitter newer by {age_hours:.1f}h -- needs recompile!")
+        else:
+            print(f"    [DIAG] OK xclbin fresh ({len(xclbins)} file(s))")
+    elif not xclbins:
+        print(f"    [DIAG] WARN NO XCLBIN -- will compile on first run")
+
+
 def run_bench_lookup(preset: str, model: Path, draft_max: int = 8,
                      prompt: str = None) -> tuple[float, float, float]:
     """Run llama-lookup.exe and return (decode_tps, accept_pct, n_drafted).
@@ -1380,6 +1431,8 @@ def run_bench(mode: str, model: str = "llama", only: str | None = None) -> int:
 
     print(f"\n=== bench [{mode}]: prompt={BENCH_PROMPT!r} n_predict={BENCH_N_PREDICT} repeats={BENCH_REPEATS} ===\n")
     rows: list[tuple[str, list[float], list[float]]] = []
+    if configs and "f3best" in configs[0].preset:
+        _check_f3best_health(configs[0].preset, configs[0].model)
     for cfg in configs:
         decodes: list[float] = []
         prompts: list[float] = []
