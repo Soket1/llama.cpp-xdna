@@ -200,6 +200,14 @@ struct xdna_kernel_entry {
     // repeating the SAME run object; this tests whether re-patching one run in place keeps
     // every layer warm (the reachable ~30 t/s path if BO-switch is not the cold cause).
     std::unique_ptr<xrt::run> shared_run;
+    // DDR_PATCH mode (XDNA_F3BEST_DDR_PATCH): ONE unified weight BO for all
+    // 16 layers, with per-layer txn offset patching. Keeps arg5 constant (BO
+    // identity) while patching per-layer offset in the insts DDR_PATCH ops.
+    std::unique_ptr<xrt::bo> unified_weight_bo;
+    std::unordered_map<const void*, int> f3best_layer_slot;
+    std::vector<char> txn_template;
+    int f3best_layer_count = 0;
+    bool f3best_ddr_patch_ready = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -4886,6 +4894,36 @@ static inline double xdna_elapsed_us(std::chrono::steady_clock::time_point a,
     return std::chrono::duration<double, std::micro>(b - a).count();
 }
 
+// Patch DDR_PATCH offset fields in a txn blob. Returns number of ops patched.
+static int patch_txn_ddr_offsets(std::vector<char>& txn, int target_argidx, int64_t layer_offset) {
+    // Opcode -> byte offset of the 4-byte size field within the op
+    static const int SIZE_OFF[0x84] = {
+        [0]=20, [1]=12, [2]=12, [3]=24, [4]=24,
+        [0x81]=4  // DDR_PATCH
+    };
+    int patched = 0;
+    size_t pc = 16;  // skip 16-byte XAie_TxnHeader
+    while (pc + 8 < txn.size()) {
+        uint8_t opcode = (uint8_t)txn[pc];
+        if (opcode >= sizeof(SIZE_OFF)/sizeof(SIZE_OFF[0])) break;
+        int sz_off = SIZE_OFF[opcode];
+        if (sz_off == 0) break;
+        uint32_t opsize = *(const uint32_t*)(txn.data() + pc + sz_off);
+        if (opsize == 0 || pc + opsize > txn.size()) break;
+        if (opcode == 0x81 && opsize >= 48) {
+            uint64_t argidx = *(const uint64_t*)(txn.data() + pc + 32);
+            if (argidx == (uint64_t)target_argidx) {
+                uint64_t old_off = *(const uint64_t*)(txn.data() + pc + 40);
+                uint64_t new_off = old_off + (uint64_t)layer_offset;
+                memcpy(txn.data() + pc + 40, &new_off, 8);
+                patched++;
+            }
+        }
+        pc += opsize;
+    }
+    return patched;
+}
+
 static bool ggml_backend_xdna_decode_layer_f3best(
         ggml_backend_xdna_context * ctx,
         struct ggml_tensor * out_dst,
@@ -5054,11 +5092,62 @@ static bool ggml_backend_xdna_decode_layer_f3best(
         // drops ~3.15ms→~1.1ms (XDNA_F3BEST_TIME). Default OFF = per-layer BO.
         static const bool f3b_subbuf = xdna_env_enabled("XDNA_F3BEST_SUBBUF");
         static const bool f3b_onebo  = xdna_env_enabled("XDNA_F3BEST_ONEBO");
+        static const bool f3b_ddr_patch = xdna_env_enabled("XDNA_F3BEST_DDR_PATCH");
         const int F3B_MAX_LAYERS = 16;   // llama-3.2-1B geometry (guarded above)
         xrt::bo * a_weights = nullptr;
         {
             std::lock_guard<std::mutex> lock(*entry->b_bo_mutex);
-            if (f3b_onebo) {
+            if (f3b_ddr_patch) {
+                // DDR_PATCH mode: ONE unified weight BO, patch txn offsets per layer.
+                // One-time setup: allocate unified BO + snapshot txn template.
+                if (!entry->f3best_ddr_patch_ready) {
+                    if (!entry->unified_weight_bo) {
+                        const size_t total_wt = (size_t)F3B_MAX_LAYERS * NH * WT_BYTES;
+                        entry->unified_weight_bo = std::make_unique<xrt::bo>(
+                            ctx->device, total_wt, xrt::bo::flags::host_only,
+                            entry->kernel.group_id(5));
+                        fprintf(stderr, "ggml-xdna: [f3best-ddrpatch] unified BO %zuMB\n",
+                                total_wt >> 20);
+                        fflush(stderr);
+                    }
+                    if (entry->txn_template.empty()) {
+                        entry->txn_template.assign(entry->insts.begin(), entry->insts.end());
+                        // Verify: count DDR_PATCH ops with argidx=2
+                        int n = patch_txn_ddr_offsets(entry->txn_template, 2, 0);
+                        fprintf(stderr, "ggml-xdna: [f3best-ddrpatch] txn template %zuB, %d DDR_PATCH(argidx=2)\n",
+                                entry->txn_template.size(), n);
+                        fflush(stderr);
+                        // Restore template (verification modified offsets in place)
+                        entry->txn_template.assign(entry->insts.begin(), entry->insts.end());
+                    }
+                    entry->f3best_ddr_patch_ready = true;
+                }
+                // Per-layer: assign slot + pack weights into unified BO
+                int layer_idx;
+                auto it = entry->f3best_layer_slot.find(q_w->data);
+                if (it != entry->f3best_layer_slot.end()) {
+                    layer_idx = it->second;
+                } else {
+                    layer_idx = entry->f3best_layer_count++;
+                    entry->f3best_layer_slot[q_w->data] = layer_idx;
+                    uint8_t* base = (uint8_t*)entry->unified_weight_bo->map<void*>();
+                    pack_weights(base + (size_t)layer_idx * NH * WT_BYTES);
+                    entry->unified_weight_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                    fprintf(stderr, "ggml-xdna: [f3best-ddrpatch] layer %d weights packed+synced\n", layer_idx);
+                    fflush(stderr);
+                }
+                // Per-dispatch: patch txn offsets for this layer
+                std::vector<char> layer_txn = entry->txn_template;
+                int n = patch_txn_ddr_offsets(layer_txn, 2, (int64_t)layer_idx * NH * WT_BYTES);
+                if (n != 8) {
+                    fprintf(stderr, "ggml-xdna: [f3best-ddrpatch] WARNING: patched %d ops (expected 8)\n", n);
+                    fflush(stderr);
+                }
+                // Write patched txn to shared insts_bo (sequential dispatch, no contention)
+                entry->insts_bo.write(layer_txn.data());
+                entry->insts_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                a_weights = entry->unified_weight_bo.get();
+            } else if (f3b_onebo) {
                 // ISOLATION (timing-only, garbage output): every layer binds the
                 // SAME BO. If start+wait drops to ~1.1ms, BO-identity is the warm
                 // lever → DDR_PATCH-into-one-BO is viable. If it stays ~3.1ms, the
