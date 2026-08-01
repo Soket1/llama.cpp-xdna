@@ -4978,9 +4978,9 @@ static bool ggml_backend_xdna_decode_layer_f3best(
 
     const int64_t H8  = hidden / NH;                 // 1024
     const int64_t HH  = hidden;                       // 8192
-    const int64_t KV_M = 64;                          // K/V outputs per head (one KV head: head_dim=64)
+    const int64_t KV_M = 128;  // K/V outputs per head (H8/NH = 1024/8 = 128)
     const size_t  PACKED   = (size_t)M * E / 2 + (size_t)M * (E / group_size) * 2;  // 4608
-    const int64_t WT_TILES = 928;
+    const int64_t WT_TILES = 960;
     const size_t  WT_BYTES = (size_t)WT_TILES * PACKED;
     const size_t  RS       = (size_t)(E / group_size) * 18;   // 1152 (full E-row Q4_0)
     const size_t  WO_BYTES = 2359296;                 // unused arg3 placeholder
@@ -5098,9 +5098,9 @@ static bool ggml_backend_xdna_decode_layer_f3best(
                 uint8_t * hd = A + (size_t)h * WT_BYTES; size_t off = 0;
                 // #131B: column-major broadcast layout for Q/O (was row-major dot-product)
                 f3b::pack_bcast(qd + (size_t)h*256*RS, 256, E, E, 0, (int)group_size, PACKED, hd+off); off += 64*PACKED;
-                // K/V: one KV head per center tile, head_dim=64 rows, 16 tiles each
-                f3b::pack_bcast(kd + (size_t)h*head_dim*RS, head_dim, E, E, 0, (int)group_size, PACKED, hd+off); off += 16*PACKED;
-                f3b::pack_bcast(vd + (size_t)h*head_dim*RS, head_dim, E, E, 0, (int)group_size, PACKED, hd+off); off += 16*PACKED;
+                // K/V: one KV head per center tile, KV_M=128 rows, 32 tiles each
+                f3b::pack_bcast(kd + (size_t)h*KV_M*RS, (int)KV_M, E, E, 0, (int)group_size, PACKED, hd+off); off += (KV_M/M)*PACKED;
+                f3b::pack_bcast(vd + (size_t)h*KV_M*RS, (int)KV_M, E, E, 0, (int)group_size, PACKED, hd+off); off += (KV_M/M)*PACKED;
                 f3b::pack_bcast(od + (size_t)h*256*RS, 256, E, E, 0, (int)group_size, PACKED, hd+off); off += 64*PACKED;
                 f3b::pack_bcast(gd + (size_t)h*H8*RS, H8, E, E, 0, (int)group_size, PACKED, hd+off); off += 256*PACKED;
                 f3b::pack_bcast(ud + (size_t)h*H8*RS, H8, E, E, 0, (int)group_size, PACKED, hd+off); off += 256*PACKED;
