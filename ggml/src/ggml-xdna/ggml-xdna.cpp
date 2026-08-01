@@ -1472,10 +1472,10 @@ static std::string make_cache_key(xdna_op_kind op_kind,
         const char * handasm_rr = getenv("F3BEST_HANDASM_RR");
         const char * rr_suffix = (handasm_rr && handasm_rr[0] != '\0') ? "_rr" : "";
         if (ffn_div && strcmp(ffn_div, "1") != 0) {
-            snprintf(buf, sizeof(buf), "decode_layer_f3best_K%lld_H%lld_sl256_d64_ag4_kv8_g32_mc_preq_vexp_vreg_dq8_qp_mxp_ub_d%s%s%s%s",
+            snprintf(buf, sizeof(buf), "decode_layer_f3best_K%lld_H%lld_sl256_d64_ag4_kv8_g32_mc_preq_vexp_vreg_dq8_qp_mxp_ub_kv_d%s%s%s%s",
                      (long long)K, (long long)N, ffn_div, dc_suffix, tb_suffix, rr_suffix);
         } else {
-            snprintf(buf, sizeof(buf), "decode_layer_f3best_K%lld_H%lld_sl256_d64_ag4_kv8_g32_mc_preq_vexp_vreg_dq8_qp_mxp_ub%s%s%s",
+            snprintf(buf, sizeof(buf), "decode_layer_f3best_K%lld_H%lld_sl256_d64_ag4_kv8_g32_mc_preq_vexp_vreg_dq8_qp_mxp_ub_kv%s%s%s",
                      (long long)K, (long long)N, dc_suffix, tb_suffix, rr_suffix);
         }
     } else {
@@ -4865,13 +4865,14 @@ static bool ggml_backend_xdna_decode_front_attn(
 }
 
 // ── decode_layer_f3best (P6.4d-3): whole fused decode layer in ONE dispatch ──
-// Q-GEMV+RoPE -> spatial-8 attention (KV host-supplied) -> O-proj -> +resid ->
-// ffn_norm(gain) -> FFN, all on-chip. Output BO = [NH FFN partials | s] where
+// Q+K+V-GEMV+RoPE -> spatial-8 attention (KV host-supplied) -> O-proj -> +resid ->
+// ffn_norm(gain) -> FFN, all on-chip. Output BO = [NH*(P|K|V) | s] where
 // s = O_proj+resid; the final layer output is s + sum(partials), formed here.
 // Weight packing is f3best_pack.h (byte-verified vs the Python reference).
+// Weight stream: [Wq|Wk|Wv|Wo|gate|up|down] = 928 tiles/head.
 //   input_snap : attn-normed layer input, f32 [E]
 //   resid      : layer input residual (pre-attn-norm), f32 [E]
-//   q/o/gate/up/down_w : Q4_0 weights; ffn_gain : ffn_norm.weight (f32/f16, [E])
+//   q/k/v/o/gate/up/down_w : Q4_0 weights; ffn_gain : ffn_norm.weight (f32/f16, [E])
 //   k_perm/v_perm : KV cache [head_dim, seq, kv_heads]; rope_node : Q RoPE source
 #include "f3best_pack.h"
 
@@ -4940,6 +4941,8 @@ static bool ggml_backend_xdna_decode_layer_f3best(
         const float * input_snap, int64_t input_E,
         const float * resid,
         const struct ggml_tensor * q_w,
+        const struct ggml_tensor * k_w,
+        const struct ggml_tensor * v_w,
         const struct ggml_tensor * o_w,
         const struct ggml_tensor * gate_w,
         const struct ggml_tensor * up_w,
@@ -4950,11 +4953,12 @@ static bool ggml_backend_xdna_decode_layer_f3best(
         const struct ggml_tensor * v_perm,
         int num_cols) {
     if (!ctx->device_valid) { fprintf(stderr, "f3best ENTER device invalid\n"); return false; }
-    if (q_w->type != GGML_TYPE_Q4_0 || o_w->type != GGML_TYPE_Q4_0 ||
+    if (q_w->type != GGML_TYPE_Q4_0 || k_w->type != GGML_TYPE_Q4_0 ||
+        v_w->type != GGML_TYPE_Q4_0 || o_w->type != GGML_TYPE_Q4_0 ||
         gate_w->type != GGML_TYPE_Q4_0 || up_w->type != GGML_TYPE_Q4_0 ||
         down_w->type != GGML_TYPE_Q4_0) {
-        fprintf(stderr, "f3best guard weight types q=%d o=%d g=%d u=%d d=%d expected=%d\n",
-                (int)q_w->type, (int)o_w->type, (int)gate_w->type, (int)up_w->type, (int)down_w->type, (int)GGML_TYPE_Q4_0);
+        fprintf(stderr, "f3best guard weight types q=%d k=%d v=%d o=%d g=%d u=%d d=%d expected=%d\n",
+                (int)q_w->type, (int)k_w->type, (int)v_w->type, (int)o_w->type, (int)gate_w->type, (int)up_w->type, (int)down_w->type, (int)GGML_TYPE_Q4_0);
         return false;
     }
     if (!input_snap || !resid || input_E <= 0) { fprintf(stderr, "f3best guard input null input=%p resid=%p E=%lld\n", (const void*)input_snap, (const void*)resid, (long long)input_E); return false; }
@@ -4974,8 +4978,9 @@ static bool ggml_backend_xdna_decode_layer_f3best(
 
     const int64_t H8  = hidden / NH;                 // 1024
     const int64_t HH  = hidden;                       // 8192
+    const int64_t KV_M = 64;                          // K/V outputs per head (one KV head: head_dim=64)
     const size_t  PACKED   = (size_t)M * E / 2 + (size_t)M * (E / group_size) * 2;  // 4608
-    const int64_t WT_TILES = 896;
+    const int64_t WT_TILES = 928;
     const size_t  WT_BYTES = (size_t)WT_TILES * PACKED;
     const size_t  RS       = (size_t)(E / group_size) * 18;   // 1152 (full E-row Q4_0)
     const size_t  WO_BYTES = 2359296;                 // unused arg3 placeholder
@@ -4983,7 +4988,8 @@ static bool ggml_backend_xdna_decode_layer_f3best(
     const int     dts      = 2;
     const int64_t XB       = E + 256 + 16;            // 2320
     const int64_t XR_ELEMS = XB + E + E;             // 6416 (x|resid|gain)
-    const size_t  OUT_ELEMS = (size_t)(NH + 1) * E;  // [8 partials | s]
+    const size_t  OUT_ELEMS = (size_t)NH * (E + 2*KV_M) + E;  // [8*(P|K|V) | s] = 19456 bf16
+    const size_t  PH_STRIDE = (size_t)(E + 2*KV_M);  // per-head output stride = 2176
 
     const std::string cache_key = make_cache_key(XDNA_OP_DECODE_LAYER_F3BEST,
                                                  seq_len, E, hidden, "uint4", num_cols);
@@ -5082,6 +5088,8 @@ static bool ggml_backend_xdna_decode_layer_f3best(
         // Pack the 5 projections' Q4_0 weights into a device buffer `A` (WT_BYTES/head).
         auto pack_weights = [&](uint8_t * A) {
             const uint8_t * qd = (const uint8_t *)q_w->data;
+            const uint8_t * kd = (const uint8_t *)k_w->data;
+            const uint8_t * vd = (const uint8_t *)v_w->data;
             const uint8_t * od = (const uint8_t *)o_w->data;
             const uint8_t * gd = (const uint8_t *)gate_w->data;
             const uint8_t * ud = (const uint8_t *)up_w->data;
@@ -5090,6 +5098,9 @@ static bool ggml_backend_xdna_decode_layer_f3best(
                 uint8_t * hd = A + (size_t)h * WT_BYTES; size_t off = 0;
                 // #131B: column-major broadcast layout for Q/O (was row-major dot-product)
                 f3b::pack_bcast(qd + (size_t)h*256*RS, 256, E, E, 0, (int)group_size, PACKED, hd+off); off += 64*PACKED;
+                // K/V: one KV head per center tile, head_dim=64 rows, 16 tiles each
+                f3b::pack_bcast(kd + (size_t)h*head_dim*RS, head_dim, E, E, 0, (int)group_size, PACKED, hd+off); off += 16*PACKED;
+                f3b::pack_bcast(vd + (size_t)h*head_dim*RS, head_dim, E, E, 0, (int)group_size, PACKED, hd+off); off += 16*PACKED;
                 f3b::pack_bcast(od + (size_t)h*256*RS, 256, E, E, 0, (int)group_size, PACKED, hd+off); off += 64*PACKED;
                 f3b::pack_bcast(gd + (size_t)h*H8*RS, H8, E, E, 0, (int)group_size, PACKED, hd+off); off += 256*PACKED;
                 f3b::pack_bcast(ud + (size_t)h*H8*RS, H8, E, E, 0, (int)group_size, PACKED, hd+off); off += 256*PACKED;
@@ -5529,7 +5540,7 @@ static bool ggml_backend_xdna_decode_layer_f3best(
         const auto _gt_red0 = std::chrono::steady_clock::now();
         const uint16_t * ob = (const uint16_t *)entry->c_bo->map<void*>();
         auto bf16f = [](uint16_t b)->float{ uint32_t u=((uint32_t)b)<<16; float v; memcpy(&v,&u,4); return v; };
-        const uint16_t * s_blk = ob + (size_t)NH * E;
+        const uint16_t * s_blk = ob + (size_t)NH * PH_STRIDE;
         float * diag_extra = nullptr;
         if (out_dst->type == GGML_TYPE_F32 && out_dst->data && out_dst->nb[0] == 99) {
             diag_extra = (float *)out_dst->data + E;  // scratch layout: final[E] | s[E] | sum_partials[E]
@@ -5538,7 +5549,7 @@ static bool ggml_backend_xdna_decode_layer_f3best(
             float * dst = (float *)out_dst->data;
             for (int64_t e = 0; e < E; e++) {
                 float ps = 0.0f;
-                for (int64_t h = 0; h < NH; h++) ps += bf16f(ob[(size_t)h*E + e]);
+                for (int64_t h = 0; h < NH; h++) ps += bf16f(ob[(size_t)h*PH_STRIDE + e]);
                 const float sv = bf16f(s_blk[e]);
                 dst[e] = sv + ps;
                 if (diag_extra) { diag_extra[e] = sv; diag_extra[E + e] = ps; }
@@ -5547,8 +5558,31 @@ static bool ggml_backend_xdna_decode_layer_f3best(
             uint16_t * dst = (uint16_t *)out_dst->data;
             for (int64_t e = 0; e < E; e++) {
                 float acc = bf16f(s_blk[e]);
-                for (int64_t h = 0; h < NH; h++) acc += bf16f(ob[(size_t)h*E + e]);
+                for (int64_t h = 0; h < NH; h++) acc += bf16f(ob[(size_t)h*PH_STRIDE + e]);
                 dst[e] = f32_to_bf16_scalar(acc);
+            }
+        }
+        // K/V readback from c_bo (NPU-computed, diagnostic).
+        static const bool f3b_npu_kv = xdna_env_enabled("XDNA_F3BEST_NPU_KV");
+        if (f3b_npu_kv) {
+            // Write NPU K/V to kv_bo for the next token's attention.
+            // Layout per head h in c_bo: [P(E) | K(KV_M) | V(KV_M)] at offset h*PH_STRIDE.
+            uint16_t * kv = (uint16_t *)kv_bo.map<void*>();
+            const int64_t write_pos = kv_full_fill ? 0 : (kv_len - 1);  // latest token position
+            for (int64_t g = 0; g < NH; g++) {
+                const uint16_t * npu_kh = ob + (size_t)g*PH_STRIDE + E;
+                const uint16_t * npu_vh = ob + (size_t)g*PH_STRIDE + E + KV_M;
+                uint16_t * kg = kv + (size_t)g * KVN;
+                uint16_t * vg = kv + (size_t)(NH + g) * KVN;
+                for (int64_t d = 0; d < KV_M; d++) {
+                    kg[(size_t)write_pos * head_dim + d] = npu_kh[d];
+                    vg[(size_t)write_pos * head_dim + d] = npu_vh[d];
+                }
+            }
+            kv_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            if (f3b_debug) {
+                fprintf(stderr, "ggml-xdna: [f3best-kv-npu] wrote K/V pos=%lld\n", (long long)write_pos);
+                fflush(stderr);
             }
         }
         if (f3b_gluetime) g_xdna_f3best_gluetime.reduce_us += xdna_elapsed_us(_gt_red0);
@@ -17719,7 +17753,7 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                 if (!(m.q_idx>=0 && m.add_ffn_idx>=m.q_idx && m.outL_tensor &&
                                       m.outL_tensor->type==GGML_TYPE_F32 && m.outL_tensor->data &&
                                       m.inpL_tensor && m.inpL_tensor->data && m.w_norm1 && m.w_norm2 &&
-                                      m.w_q && m.w_o && m.w_gate && m.w_up && m.w_down &&
+                                      m.w_q && m.w_k && m.w_v && m.w_o && m.w_gate && m.w_up && m.w_down &&
                                       m.q_rope_idx>=0 && m.pre_norm_idx>=0)) { ok_all=false; break; }
                                 struct ggml_tensor *kp=nullptr,*vp=nullptr;
                                 for (int si=m.q_idx; si<=m.add_ffn_idx; si++){ struct ggml_tensor*nd=cgraph->nodes[si];
@@ -17770,7 +17804,7 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                     if (_glue) g_xdna_f3best_gluetime.rms_us += xdna_elapsed_us(_r0);
                                     const auto _q0=std::chrono::steady_clock::now();
                                     bool ok=ggml_backend_xdna_decode_layer_f3best(ctx,L.m->outL_tensor,normed.data(),2048,inpL,
-                                        L.m->w_q,L.m->w_o,L.m->w_gate,L.m->w_up,L.m->w_down,L.m->w_norm2,
+                                        L.m->w_q,L.m->w_k,L.m->w_v,L.m->w_o,L.m->w_gate,L.m->w_up,L.m->w_down,L.m->w_norm2,
                                         cgraph->nodes[L.m->q_rope_idx],L.kp,L.vp,8);
                                     {
                                         const double _q_us = xdna_elapsed_us(_q0);
@@ -17816,7 +17850,8 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                     if (f3best_live && lf_m.add_ffn_idx >= i && lf_m.outL_tensor &&
                         lf_m.outL_tensor->type == GGML_TYPE_F32 && lf_m.outL_tensor->data &&
                         lf_m.inpL_tensor && lf_m.inpL_tensor->data && lf_m.w_norm1 &&
-                        lf_m.w_norm2 && lf_m.w_q && lf_m.w_o && lf_m.w_gate && lf_m.w_up &&
+                        lf_m.w_norm2 && lf_m.w_q && lf_m.w_k && lf_m.w_v &&
+                        lf_m.w_o && lf_m.w_gate && lf_m.w_up &&
                         lf_m.w_down && lf_m.q_rope_idx >= 0) {
                         struct ggml_tensor * k_perm = nullptr, * v_perm = nullptr;
                         for (int si = i; si <= lf_m.add_ffn_idx; si++) {
@@ -17889,7 +17924,7 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                             for (int e = 0; e < 2048; e++) normed[e] = inpL[e]*inv*gain[e];
                             const bool ok = ggml_backend_xdna_decode_layer_f3best(
                                 ctx, lf_m.outL_tensor, normed.data(), 2048, inpL,
-                                lf_m.w_q, lf_m.w_o, lf_m.w_gate, lf_m.w_up, lf_m.w_down,
+                                lf_m.w_q, lf_m.w_k, lf_m.w_v, lf_m.w_o, lf_m.w_gate, lf_m.w_up, lf_m.w_down,
                                 lf_m.w_norm2, cgraph->nodes[lf_m.q_rope_idx], k_perm, v_perm, 8);
                             if (ok) {
                                 for (int j = i; j <= lf_m.add_ffn_idx; j++) qkv_plan.skip_indices.insert(j);
@@ -17919,7 +17954,8 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                         fflush(stderr);
                     }
                     if (!f3best_skip && lf_m.add_ffn_idx >= i && lf_m.outL_tensor && lf_m.inpL_tensor &&
-                        lf_m.w_norm1 && lf_m.w_norm2 && lf_m.w_q && lf_m.w_o && lf_m.w_gate && lf_m.w_up && lf_m.w_down) {
+                        lf_m.w_norm1 && lf_m.w_norm2 && lf_m.w_q && lf_m.w_k && lf_m.w_v &&
+                        lf_m.w_o && lf_m.w_gate && lf_m.w_up && lf_m.w_down) {
                         if (cpu_run_start >= 0 && cpu_run_start < i) {
                             ggml_status s = xdna_delegate_range(ctx, cgraph, cpu_run_start, i);
                             if (s != GGML_STATUS_SUCCESS) return s;
@@ -18084,7 +18120,7 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                             fprintf(stderr, "ggml-xdna: [f3best-probe] CALL decode_layer_f3best q=%d\n", lf_m.q_idx); fflush(stderr);
                             f3_ok = ggml_backend_xdna_decode_layer_f3best(
                                 ctx, &dummy, normed.data(), 2048, inpL,
-                                lf_m.w_q, lf_m.w_o, lf_m.w_gate, lf_m.w_up, lf_m.w_down,
+                                lf_m.w_q, lf_m.w_k, lf_m.w_v, lf_m.w_o, lf_m.w_gate, lf_m.w_up, lf_m.w_down,
                                 lf_m.w_norm2, cgraph->nodes[lf_m.q_rope_idx], k_perm, v_perm,
                                 8);
                             if (f3_ok && lf_m.outL_tensor->type == GGML_TYPE_F32) {
