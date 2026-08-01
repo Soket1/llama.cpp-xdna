@@ -17791,9 +17791,13 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                 for (auto & L : plan) {
                                     // CPU KV-write prefix (attn_norm + Q/K/V-proj + rope + SET_ROWS) from the
                                     // shared residual buffer; then f3best writes outL = next layer's inpL.
+                                    // When NPU_KV=1, K/V are computed on NPU and written to kv_bo directly.
+                                    static const bool f3b_npu_kv_skip = xdna_env_enabled("XDNA_F3BEST_NPU_KV");
                                     const auto _k0=std::chrono::steady_clock::now();
-                                    ggml_status sk=xdna_delegate_range(ctx,cgraph,L.kv_lo,L.kv_hi+1);
-                                    if(sk!=GGML_STATUS_SUCCESS)return sk;
+                                    if (!f3b_npu_kv_skip) {
+                                        ggml_status sk=xdna_delegate_range(ctx,cgraph,L.kv_lo,L.kv_hi+1);
+                                        if(sk!=GGML_STATUS_SUCCESS)return sk;
+                                    }
                                     if(_looptime) _t_kv+=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-_k0).count();
                                     const auto _r0=std::chrono::steady_clock::now();
                                     const float* inpL=(const float*)L.m->inpL_tensor->data;
