@@ -4896,17 +4896,24 @@ static inline double xdna_elapsed_us(std::chrono::steady_clock::time_point a,
 
 // Patch DDR_PATCH offset fields in a txn blob. Returns number of ops patched.
 static int patch_txn_ddr_offsets(std::vector<char>& txn, int target_argidx, int64_t layer_offset) {
-    // Opcode -> byte offset of the 4-byte size field within the op
-    static const int SIZE_OFF[0x84] = {
-        [0]=20, [1]=12, [2]=12, [3]=24, [4]=24,
-        [0x81]=4  // DDR_PATCH
+    // Opcode -> byte offset of the 4-byte size field within the op.
+    // MSVC does not support designated initializers; use a simple lookup.
+    static auto txn_op_size_offset = [](uint8_t opcode) -> int {
+        switch (opcode) {
+            case 0: return 20;           // BLOCKWRITE
+            case 1: return 12;           // WRITE
+            case 2: return 12;           // MASKWRITE
+            case 3: return 24;           // MASKPOLL
+            case 4: return 24;           // CUSTOM_0
+            case 0x81: return 4;         // DDR_PATCH (CUSTOM_1)
+            default:  return 0;
+        }
     };
     int patched = 0;
     size_t pc = 16;  // skip 16-byte XAie_TxnHeader
     while (pc + 8 < txn.size()) {
         uint8_t opcode = (uint8_t)txn[pc];
-        if (opcode >= sizeof(SIZE_OFF)/sizeof(SIZE_OFF[0])) break;
-        int sz_off = SIZE_OFF[opcode];
+        int sz_off = txn_op_size_offset(opcode);
         if (sz_off == 0) break;
         uint32_t opsize = *(const uint32_t*)(txn.data() + pc + sz_off);
         if (opsize == 0 || pc + opsize > txn.size()) break;
