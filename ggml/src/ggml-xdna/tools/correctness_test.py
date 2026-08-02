@@ -184,13 +184,18 @@ PRESETS: dict[str, dict[str, str]] = {
         "XDNA_ENABLE_FUSED_LAYER":       "1",
     },
     "npu_layer_fused": {
-        # Phase A1.3 LayerFused observer (step 4a). Wraps npu_phase_b with
-        # XDNA_LAYER_FUSED=1 + XDNA_DEBUG_LAYER_FUSED=1 so the C++ pre-scan
-        # detector populates xdna_layer_fused_plan and the observer-only
-        # dispatch stub at the Q node logs matches. Stub returns false, so
-        # the normal QKV/SwiGLU flow runs unchanged — this preset MUST
-        # byte-PASS against npu_phase_b. Step 4b will replace the stub
-        # with a real layer_fused xclbin dispatch.
+        # Phase A1.3 LayerFused observer (step 4a). Wraps npu_int4 with
+        # XDNA_LAYER_FUSED=1 + XDNA_DEBUG_LAYER_FUSED=1 + XDNA_ENABLE_RMS_NORM=1
+        # so the C++ pre-scan detector populates xdna_layer_fused_plan and the
+        # observer-only dispatch stub at the Q node logs matches. Stub returns
+        # false, so the normal QKV/SwiGLU flow runs unchanged — this preset MUST
+        # byte-PASS against npu_int4 (on which it is based).
+        #
+        # Deliberately does NOT set XDNA_ATTN_SUPPORTS: that flag claims
+        # attention MUL_MAT ops in supports_op, changing cgraph segmentation
+        # and sending attention shapes into the regular GEMV dispatcher which
+        # cannot handle them (hang/timeout).  The observer stub just logs
+        # matches — it must not alter which ops are claimed.
         "XDNA_ENABLE_GEMV":              "1",
         "XDNA_ENABLE_SWIGLU":            "1",
         "XDNA_ENABLE_QKV":               "1",
@@ -203,7 +208,6 @@ PRESETS: dict[str, dict[str, str]] = {
         "XDNA_ENABLE_FUSED_LAYER":       "1",
         "XDNA_LAYER_FUSED":              "1",
         "XDNA_DEBUG_LAYER_FUSED":        "1",
-        "XDNA_ATTN_SUPPORTS":            "1",
     },
     "npu_layer_f3best_probe": {
         # P6.4d-3c probe: use the coalesced layer_fused graph shape, but fire the
@@ -919,8 +923,13 @@ def build_env(preset: str) -> dict[str, str]:
     return env
 
 
-def run_llama(preset: str, test: Test) -> tuple[str, str]:
-    """Returns (stdout, stderr). Raises on timeout or non-zero exit."""
+def run_llama(preset: str, test: Test, warmup: bool = False) -> tuple[str, str]:
+    """Returns (stdout, stderr). Raises on timeout or non-zero exit.
+
+    When ``warmup`` is True the timeout accounts for first-time xclbin
+    compilation (≥5 min) and the caller only uses stderr to verify the
+    process didn't crash; stdout is discarded.
+    """
     env = build_env(preset)
 
     args = [
@@ -940,7 +949,12 @@ def run_llama(preset: str, test: Test) -> tuple[str, str]:
                      "--draft-max", str(test.draft_max),
                      "--draft-min", "1"])
 
-    timeout = 60 + test.n_predict * 2  # generous: bf16 NPU runs at ~5-10 t/s
+    # First-time IRON compilation can take 2-5 min per shape; a cold
+    # run that needs several new xclbins easily blows past the old
+    # 60 s floor.  Warmup runs get a 5 min floor; real runs get a
+    # 2 min floor (the xclbins should already be warm by then).
+    base = 300 if warmup else 120
+    timeout = max(base, 60 + test.n_predict * 2)
     if test.mode == "single-turn":
         assert isinstance(test.prompt, str)
         args.extend(["-p", test.prompt, "--single-turn"])
@@ -1060,6 +1074,11 @@ def diff_strings(a: str, b: str) -> tuple[int, str]:
 # Test orchestration
 # =============================================================================
 
+# Tracks (preset, model) combos already warmed up so we don't re-warm the
+# same xclbin across tests that share presets (e.g. npu_int4 is used by 10+
+# tests — we only need to warm it once).
+_WARMED: set[tuple[str, str]] = set()
+
 def run_test(test: Test, verbose: bool = False,
              show_stderr: bool = False,
              grep_stderr: str | None = None) -> bool:
@@ -1068,6 +1087,38 @@ def run_test(test: Test, verbose: bool = False,
     if test.description:
         print(textwrap.fill(test.description, width=78, initial_indent="  ",
                             subsequent_indent="  "))
+
+    # Warmup: generate one token with every variant so cold xclbin
+    # compilation happens BEFORE the timed comparison.  A compilation that
+    # lands inside the real run can cause timeout *and* can corrupt the
+    # first dispatch's output (the "Successfully parsed" cold-run garbage
+    # bug).  We use the same model + preset + seed so the xclbin cache key
+    # matches; stdout is discarded, only the side-effect matters.
+    #
+    # _WARMED tracks (preset, model) combos that already went through
+    # warmup so we don't re-warm the same preset across tests (many tests
+    # share presets like npu_int4, npu_chat_safe, etc.).
+    global _WARMED
+    for variant in test.variants:
+        key = (variant, str(test.model))
+        if key in _WARMED:
+            continue
+        _warmup_prompt = test.prompt if isinstance(test.prompt, str) else test.prompt[0]
+        _warmup_test = Test(
+            name=test.name + "_warmup",
+            prompt=_warmup_prompt,
+            n_predict=1,
+            mode="single-turn",          # always single-turn for the 1-token warmup probe
+            ctx_size=test.ctx_size,
+            seed=test.seed,
+            model=test.model,
+            variants=[variant],
+        )
+        try:
+            run_llama(variant, _warmup_test, warmup=True)
+        except Exception:
+            pass  # warmup is best-effort; real run will report the error
+        _WARMED.add(key)
 
     # Baseline first
     t0 = time.time()

@@ -102,10 +102,13 @@ class TestGemvTileSelection:
         assert per_col % tile_in == 0, f"per_col={per_col} not divisible by tile_in={tile_in}"
         assert K % 64 == 0, f"K={K} not divisible by kernel_vector_size=64"
 
-    def _verify_l1_budget(self, K, tile_in, budget_bytes=32 * 1024):
+    def _verify_l1_budget(self, K, tile_in, budget_bytes=64 * 1024):
         """L1 double-buffered matrix tile must fit in core memory.
 
         Size = 2 (double-buffer) * tile_in * K * sizeof(bf16=2).
+        The 64-KiB budget matches the AIE2p L1 size used by the C++ gate in
+        xdna_shape_dispatchable_gemv(); the B+C (activation + output) overhead
+        that the C++ gate additionally accounts for is not re-checked here.
         """
         staged_bytes = 2 * tile_in * K * 2
         assert staged_bytes <= budget_bytes, (
@@ -130,9 +133,9 @@ class TestGemvTileSelection:
     # --- L1 budget: large K must clamp tile_in ---
 
     def test_large_K_clamps_tile_in(self):
-        """K=3584 with L1 budget 32KB must clamp tile_in to <= 2 (2*2*3584*2=28672)."""
+        """K=3584 with L1 budget 64KB must clamp tile_in to <= 4 (2*4*3584*2=57344)."""
         tin, _ = select_gemv_tiles(1024, 3584, 4)
-        assert tin <= 2, f"tile_in={tin} overflows L1 for K=3584"
+        assert tin <= 4, f"tile_in={tin} overflows L1 for K=3584"
         self._verify_l1_budget(3584, tin)
 
     def test_small_K_allows_larger_tile_in(self):
