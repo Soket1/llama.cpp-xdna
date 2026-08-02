@@ -1465,6 +1465,8 @@ static std::string make_cache_key(xdna_op_kind op_kind,
         // F3BEST_FFN_DIV probe suffix. env-read so the probe gets a separate xclbin
         // without recompile; DIV=1 (default) produces the bare key.
         const char * ffn_div = getenv("F3BEST_FFN_DIV");
+        const bool with_npu_kv = xdna_env_enabled("XDNA_F3BEST_NPU_KV");
+        const char * kv_abi = with_npu_kv ? "_kv" : "_nokv";
         const char * decouple = getenv("F3BEST_MT_DECOUPLE");
         const char * dc_suffix = (decouple && decouple[0] != '\0') ? "_decouple" : "";
         const char * triple_b = getenv("F3BEST_TRIPLE_B");
@@ -1472,11 +1474,11 @@ static std::string make_cache_key(xdna_op_kind op_kind,
         const char * handasm_rr = getenv("F3BEST_HANDASM_RR");
         const char * rr_suffix = (handasm_rr && handasm_rr[0] != '\0') ? "_rr" : "";
         if (ffn_div && strcmp(ffn_div, "1") != 0) {
-            snprintf(buf, sizeof(buf), "decode_layer_f3best_K%lld_H%lld_sl256_d64_ag4_kv8_g32_mc_preq_vexp_vreg_dq8_qp_mxp_ub_kv_d%s%s%s%s",
-                     (long long)K, (long long)N, ffn_div, dc_suffix, tb_suffix, rr_suffix);
+            snprintf(buf, sizeof(buf), "decode_layer_f3best_K%lld_H%lld_sl256_d64_ag4_kv8_g32_mc_preq_vexp_vreg_dq8_qp_mxp_ub%s_d%s%s%s%s",
+                     (long long)K, (long long)N, kv_abi, ffn_div, dc_suffix, tb_suffix, rr_suffix);
         } else {
-            snprintf(buf, sizeof(buf), "decode_layer_f3best_K%lld_H%lld_sl256_d64_ag4_kv8_g32_mc_preq_vexp_vreg_dq8_qp_mxp_ub_kv%s%s%s",
-                     (long long)K, (long long)N, dc_suffix, tb_suffix, rr_suffix);
+            snprintf(buf, sizeof(buf), "decode_layer_f3best_K%lld_H%lld_sl256_d64_ag4_kv8_g32_mc_preq_vexp_vreg_dq8_qp_mxp_ub%s%s%s%s",
+                     (long long)K, (long long)N, kv_abi, dc_suffix, tb_suffix, rr_suffix);
         }
     } else {
         snprintf(buf, sizeof(buf), "gemm_%lldx%lldx%lld_%s_%dcol",
@@ -2604,10 +2606,11 @@ static bool ensure_compiled(ggml_backend_xdna_context * ctx,
         // GQA + head_dim fixed for llama-3.2-1B (the emitter validates the shape).
         snprintf(cmd, sizeof(cmd),
                  "%s \"%s\" --quiet decode-layer-f3best --embed-dim %lld --hidden-dim %lld "
-                 "--group-size 32 --head-dim 64 --num-kv-heads 8 --attn-group 4 --seq-len 256 "
+                 "--group-size 32 --head-dim 64 --num-kv-heads 8 --attn-group 4 --seq-len 256 %s"
                  "--out \"%s\"%s",
                  xdna_python_cmd(), ctx->compile_script.c_str(),
                  (long long)K, (long long)N,
+                 xdna_env_enabled("XDNA_F3BEST_NPU_KV") ? "--with-npu-kv " : "",
                  xclbin_path.c_str(), xdna_null_redirect());
         fprintf(stderr, "ggml-xdna: compiling DECODE_LAYER_F3BEST E=%lld H=%lld sl=32 (first run, will be cached; runtime seq=%lld)...\n",
                       (long long)K, (long long)N, (long long)M);
@@ -4976,11 +4979,12 @@ static bool ggml_backend_xdna_decode_layer_f3best(
         num_kv != 8 || num_q != 32) { fprintf(stderr,"f3best guard geom fail E=%lld H=%lld hd=%lld ag=%lld kv=%lld q=%lld\n",(long long)E,(long long)hidden,(long long)head_dim,(long long)attn_group,(long long)num_kv,(long long)num_q); return false; }
     if (seq_len < 32) { fprintf(stderr,"f3best guard seq fail seq=%lld\n",(long long)seq_len); return false; }
 
+    const bool with_npu_kv = xdna_env_enabled("XDNA_F3BEST_NPU_KV");
     const int64_t H8  = hidden / NH;                 // 1024
     const int64_t HH  = hidden;                       // 8192
-    const int64_t KV_M = 128;  // K/V outputs per head (H8/NH = 1024/8 = 128)
+    const int64_t KV_M = with_npu_kv ? 128 : 0;
     const size_t  PACKED   = (size_t)M * E / 2 + (size_t)M * (E / group_size) * 2;  // 4608
-    const int64_t WT_TILES = 960;
+    const int64_t WT_TILES = with_npu_kv ? 960 : 896;
     const size_t  WT_BYTES = (size_t)WT_TILES * PACKED;
     const size_t  RS       = (size_t)(E / group_size) * 18;   // 1152 (full E-row Q4_0)
     const size_t  WO_BYTES = 2359296;                 // unused arg3 placeholder
@@ -4988,8 +4992,8 @@ static bool ggml_backend_xdna_decode_layer_f3best(
     const int     dts      = 2;
     const int64_t XB       = E + 256 + 16;            // 2320
     const int64_t XR_ELEMS = XB + E + E;             // 6416 (x|resid|gain)
-    const size_t  OUT_ELEMS = (size_t)NH * (E + 2*KV_M) + E;  // [8*(P|K|V) | s] = 19456 bf16
-    const size_t  PH_STRIDE = (size_t)(E + 2*KV_M);  // per-head output stride = 2176
+    const size_t  OUT_ELEMS = (size_t)NH * (E + 2*KV_M) + E;  // no-KV=18432; K/V=20480 bf16
+    const size_t  PH_STRIDE = (size_t)(E + 2*KV_M);  // no-KV=2048; K/V=2304
 
     const std::string cache_key = make_cache_key(XDNA_OP_DECODE_LAYER_F3BEST,
                                                  seq_len, E, hidden, "uint4", num_cols);
@@ -5003,6 +5007,12 @@ static bool ggml_backend_xdna_decode_layer_f3best(
         static const bool f3b_gluetime = xdna_env_enabled("XDNA_F3BEST_GLUETIME");
         static const bool f3b_debug = xdna_env_enabled("XDNA_F3BEST_DEBUG");
         if (f3b_debug) fprintf(stderr, "f3best BEFORE BO alloc cache=%s\n", cache_key.c_str());
+        static std::atomic<int> f3b_abi_log_budget{1};
+        if (f3b_abi_log_budget.fetch_sub(1) > 0) {
+            fprintf(stderr, "ggml-xdna: [f3best-abi] %s tiles=%lld out=%zu cpu_kv=%s\n",
+                    with_npu_kv ? "kv" : "nokv", (long long)WT_TILES, OUT_ELEMS,
+                    with_npu_kv ? "off" : "on");
+        }
         // BOs: out(grp3)=c_bo, XR(grp4)=a_bo, A weights(grp5)=cached, Wo dummy(grp6)=d3_bo, KV(grp7)=d4_bo.
         if (!entry->c_bo)
             entry->c_bo = std::make_unique<xrt::bo>(ctx->device, OUT_ELEMS * dts,
@@ -5098,9 +5108,11 @@ static bool ggml_backend_xdna_decode_layer_f3best(
                 uint8_t * hd = A + (size_t)h * WT_BYTES; size_t off = 0;
                 // #131B: column-major broadcast layout for Q/O (was row-major dot-product)
                 f3b::pack_bcast(qd + (size_t)h*256*RS, 256, E, E, 0, (int)group_size, PACKED, hd+off); off += 64*PACKED;
-                // K/V: one KV head per center tile, KV_M=128 rows, 32 tiles each
-                f3b::pack_bcast(kd + (size_t)h*KV_M*RS, (int)KV_M, E, E, 0, (int)group_size, PACKED, hd+off); off += (KV_M/M)*PACKED;
-                f3b::pack_bcast(vd + (size_t)h*KV_M*RS, (int)KV_M, E, E, 0, (int)group_size, PACKED, hd+off); off += (KV_M/M)*PACKED;
+                if (with_npu_kv) {
+                    // K/V: one KV head per center tile, KV_M=128 rows, 32 tiles each.
+                    f3b::pack_bcast(kd + (size_t)h*KV_M*RS, (int)KV_M, E, E, 0, (int)group_size, PACKED, hd+off); off += (KV_M/M)*PACKED;
+                    f3b::pack_bcast(vd + (size_t)h*KV_M*RS, (int)KV_M, E, E, 0, (int)group_size, PACKED, hd+off); off += (KV_M/M)*PACKED;
+                }
                 f3b::pack_bcast(od + (size_t)h*256*RS, 256, E, E, 0, (int)group_size, PACKED, hd+off); off += 64*PACKED;
                 f3b::pack_bcast(gd + (size_t)h*H8*RS, H8, E, E, 0, (int)group_size, PACKED, hd+off); off += 256*PACKED;
                 f3b::pack_bcast(ud + (size_t)h*H8*RS, H8, E, E, 0, (int)group_size, PACKED, hd+off); off += 256*PACKED;
@@ -5563,8 +5575,7 @@ static bool ggml_backend_xdna_decode_layer_f3best(
             }
         }
         // K/V readback from c_bo (NPU-computed, diagnostic).
-        static const bool f3b_npu_kv = xdna_env_enabled("XDNA_F3BEST_NPU_KV");
-        if (f3b_npu_kv) {
+        if (with_npu_kv) {
             // Write NPU K/V to kv_bo for the next token's attention.
             // Layout per head h in c_bo: [P(E) | K(KV_M) | V(KV_M)] at offset h*PH_STRIDE.
             uint16_t * kv = (uint16_t *)kv_bo.map<void*>();

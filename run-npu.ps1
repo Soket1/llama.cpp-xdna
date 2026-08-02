@@ -48,7 +48,7 @@ $cache = Join-Path $root "npu_kernels_win_8col"
 # XILINX_XRT нужна только на этапе cmake. Оставленная в окружении, она заставляет XRT
 # искать по ней xrt_core.dll и роняет компиляцию кернелов без единой строки вывода.
 if ($env:XILINX_XRT) {
-    Write-Warning "XILINX_XRT задана ($env:XILINX_XRT). Для запуска она не нужна и мешает -- убираю на время этого процесса."
+    Write-Warning "XILINX_XRT is set; it is unnecessary at runtime and interferes with kernel compilation, so clearing it for this process."
     $env:XILINX_XRT = $null
 }
 
@@ -79,7 +79,7 @@ $env:F3BEST_TRIPLE_B = "1"
 # Keep this key aligned with ggml-xdna.cpp::make_cache_key. Failing before the
 # run is intentional: a different f3best variant may exist but is unsafe to use
 # under this production topology.
-$f3bestKey = "decode_layer_f3best_K2048_H8192_sl256_d64_ag4_kv8_g32_mc_preq_vexp_vreg_dq8_qp_mxp_ub_kvi_decouple_tb"
+$f3bestKey = "decode_layer_f3best_K2048_H8192_sl256_d64_ag4_kv8_g32_mc_preq_vexp_vreg_dq8_qp_mxp_ub_nokv_decouple_tb"
 $f3bestXclbin = Join-Path $cache "$f3bestKey.xclbin"
 $f3bestInsts = Join-Path $cache "$f3bestKey.insts"
 if (-not (Test-Path $f3bestXclbin) -or -not (Test-Path $f3bestInsts)) {

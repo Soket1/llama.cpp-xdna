@@ -1241,7 +1241,7 @@ def compile_decode_back_mono(embed_dim: int, hidden_dim: int, group_size: int,
 
 def compile_decode_layer_f3best(embed_dim: int, hidden_dim: int, group_size: int,
                                 head_dim: int, num_kv_heads: int, attn_group: int,
-                                seq_len: int, output_path: str) -> str:
+                                seq_len: int, output_path: str, with_npu_kv: bool = False) -> str:
     """Compile the full fused decode layer (F3-best, one dispatch, below IRON).
 
     8 phase-blind center tiles time-mux Q-GEMV+RoPE -> O-proj -> FFN on one weight
@@ -1255,6 +1255,7 @@ def compile_decode_layer_f3best(embed_dim: int, hidden_dim: int, group_size: int
         group_size: Q4_0 group (32). head_dim: attention head dim (64).
         num_kv_heads: GQA kv heads (8). attn_group: q-heads per kv (4).
         seq_len: KV-cache length (32). output_path: .xclbin path; .insts alongside.
+        with_npu_kv: Compile the K/V-projection ABI; otherwise emit production no-K/V.
     """
     from iron.operators.decode_layer_f3best.op import AIEDecodeLayerF3Best
     from iron.common.context import AIEContext
@@ -1272,6 +1273,7 @@ def compile_decode_layer_f3best(embed_dim: int, hidden_dim: int, group_size: int
         num_kv_heads=num_kv_heads,
         m_input=4,
         seq_len=seq_len,
+        with_npu_kv=with_npu_kv,
         context=AIEContext(build_dir=build_root),
     )
     op.compile()
@@ -3157,6 +3159,8 @@ def main():
     f3best_parser.add_argument("--num-kv-heads", type=int, default=8)
     f3best_parser.add_argument("--attn-group", type=int, default=4)
     f3best_parser.add_argument("--seq-len", type=int, default=32)
+    f3best_parser.add_argument("--with-npu-kv", action="store_true",
+                               help="Compile the expanded K/V-projection ABI")
     f3best_parser.add_argument("--out", type=str, required=True,
                                help="Output xclbin path; matching .insts alongside")
 
@@ -3569,7 +3573,7 @@ def main():
         path = compile_decode_layer_f3best(
             args.embed_dim, args.hidden_dim, args.group_size,
             args.head_dim, args.num_kv_heads, args.attn_group,
-            args.seq_len, args.out,
+            args.seq_len, args.out, args.with_npu_kv,
         )
         if not args.quiet:
             print(path)
