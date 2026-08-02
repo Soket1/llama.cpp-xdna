@@ -20700,11 +20700,10 @@ static bool xdna_shape_dispatchable(int64_t M, int64_t K, int64_t N) {
     return m_ok && k_ok && n_ok;
 }
 
-// GEMV (M=1 decode) dispatchability. IRON GEMV constraints:
-//   K % kernel_vector_size == 0  (default 64)
-//   N % num_cols == 0, per_col = N/num_cols >= 8, (per_col % tile_out) == 0 for
-//   some tile_out <= per_col. With the candidate set in compile.py
-//   select_gemv_tiles, any per_col >= 8 with per_col a power-of-two multiple works.
+// GEMV (M=1 decode) dispatchability. In addition to the shape constraints,
+// this must mirror compile.py::select_gemv_tiles() L1 feasibility. graph_compute
+// hands a true result to a void NPU dispatcher, so a shape that can only fail
+// after that handoff would otherwise skip the established CPU range fallback.
 // Same vocab-proj N cap applies (BD-overflow territory).
 static bool xdna_shape_dispatchable_gemv(int64_t K, int64_t N) {
     // Either bf16 GEMV (XDNA_ENABLE_GEMV) or INT4 GEMV (XDNA_ENABLE_GEMV_INT4)
@@ -20745,7 +20744,43 @@ static bool xdna_shape_dispatchable_gemv(int64_t K, int64_t N) {
         if (lmhead_npu && N == 128256) return true;
         return false;
     }
-    return true;
+
+    // Keep this aligned with compile.py::select_gemv_tiles(). A tile holds one
+    // activation vector, a double-buffered output, and a double-buffered
+    // matrix fragment in the 64-KiB AIE2p L1. Reject before graph_compute
+    // assigns this node to the void NPU dispatcher so the normal CPU range
+    // fallback owns and writes dst instead.
+    int64_t tile_out = 0;
+    for (int64_t candidate : {2048LL, 1024LL, 512LL, 256LL, 128LL, 64LL,
+                              32LL, 16LL, 8LL, 4LL, 2LL, 1LL}) {
+        if (candidate <= per_col && per_col % candidate == 0) {
+            tile_out = candidate;
+            break;
+        }
+    }
+    GGML_ASSERT(tile_out > 0);
+
+    constexpr int64_t l1_budget_bytes = 64 * 1024;
+    constexpr int64_t bf16_bytes = 2;
+    const int64_t bc_bytes = K * bf16_bytes + 2 * tile_out * bf16_bytes;
+    if (bc_bytes >= l1_budget_bytes) {
+        if (dbg) fprintf(stderr, "ggml-xdna: gemv reject: K=%lld N=%lld B+C=%lld exceeds L1\n",
+                         (long long) K, (long long) N, (long long) bc_bytes);
+        return false;
+    }
+
+    const int64_t max_tile_in =
+        (l1_budget_bytes - bc_bytes) / (2 * K * bf16_bytes);
+    for (int64_t candidate : {8LL, 4LL, 2LL, 1LL}) {
+        if (candidate <= tile_out && candidate <= max_tile_in &&
+            tile_out % candidate == 0 && per_col % candidate == 0) {
+            return true;
+        }
+    }
+
+    if (dbg) fprintf(stderr, "ggml-xdna: gemv reject: K=%lld N=%lld has no L1-fitting tile\n",
+                     (long long) K, (long long) N);
+    return false;
 }
 
 static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {

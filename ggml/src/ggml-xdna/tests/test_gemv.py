@@ -147,6 +147,12 @@ class TestGemvTileSelection:
         tin, _ = select_gemv_tiles(1024, K, 4)
         self._verify_l1_budget(K, tin)
 
+    @pytest.mark.parametrize("num_cols", [4, 8])
+    def test_qwen_ffn_down_exceeds_l1(self, num_cols):
+        """Qwen3.5-9B FFN down must stay on CPU: no GEMV tile fits L1."""
+        with pytest.raises(ValueError, match="Cannot find tile_size_input"):
+            select_gemv_tiles(4096, 12288, num_cols)
+
     # --- Column counts ---
 
     @pytest.mark.parametrize("num_cols", [1, 2, 4, 8])

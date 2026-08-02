@@ -246,6 +246,7 @@ PRESETS: dict[str, dict[str, str]] = {
         "XDNA_F3BEST_LOOP":              "1",
         "F3BEST_MT_DECOUPLE":            "1",
         "F3BEST_TRIPLE_B":               "1",
+        "F3BEST_HANDASM_RR":             "1",
     },
     "npu_f3best_loop_kv": {
         # Diagnostic K/V-capable f3best ABI: NPU K/V output replaces the CPU delegate.
@@ -896,8 +897,7 @@ TESTS: list[Test] = [
         model=MODEL_QWEN35_9B_Q4_0,
         variants=["npu_int4_gemv_only"],
         min_prefix_match=1,
-        expected_fail={"npu_int4_gemv_only"},
-        description="Qwen3.5-9B with NPU restricted to pure matmul (INT4 GEMV only). EXPECTED FAIL: FFN down projection K=12288 exceeds AIE2p L1 budget (6*12288+4*16=73792>65536). Q/K/V projections (K=4096) fit in L1 and dispatch correctly.",
+        description="Qwen3.5-9B with NPU restricted to pure matmul (INT4 GEMV only). Compatible Q4_0 GEMVs (Q/K/V, FFN gate/up) dispatch on NPU; the K=12288 FFN down projection is intentionally delegated to CPU because it exceeds AIE2p L1 budget — a pre-dispatch gate in xdna_shape_dispatchable_gemv rejects shapes without a legal L1-fitting tile before ownership transfers to NPU.",
     ),
 ]
 
