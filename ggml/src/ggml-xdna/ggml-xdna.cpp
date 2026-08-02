@@ -29,6 +29,9 @@
 #endif
 #include <windows.h>
 #include <malloc.h>
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
 #define __restrict__ __restrict
 #define aligned_alloc(align, size) _aligned_malloc(size, align)
 #define free(ptr) _aligned_free(ptr)
@@ -5559,6 +5562,37 @@ static bool ggml_backend_xdna_decode_layer_f3best(
         }
         if (out_dst->type == GGML_TYPE_F32) {
             float * dst = (float *)out_dst->data;
+#ifdef __AVX2__
+            // SIMD bf16 reduce: 8 elements per iteration.
+            // bf16→f32 = _mm256_cvtepu16_epi32 + _mm256_slli_epi32(..., 16).
+            // Accumulate partial[h][e..e+7] across NH heads, add s[e..e+7].
+            int64_t e = 0;
+            for (; e + 8 <= E; e += 8) {
+                __m256 ps = _mm256_setzero_ps();
+                for (int64_t h = 0; h < NH; h++) {
+                    __m128i bf16_8 = _mm_loadu_si128((const __m128i*)(ob + (size_t)h*PH_STRIDE + e));
+                    __m256i u32_8 = _mm256_cvtepu16_epi32(bf16_8);
+                    ps = _mm256_add_ps(ps, _mm256_castsi256_ps(_mm256_slli_epi32(u32_8, 16)));
+                }
+                __m128i s_8 = _mm_loadu_si128((const __m128i*)(s_blk + e));
+                __m256i s_u32 = _mm256_cvtepu16_epi32(s_8);
+                __m256 sv = _mm256_castsi256_ps(_mm256_slli_epi32(s_u32, 16));
+                __m256 result = _mm256_add_ps(ps, sv);
+                _mm256_storeu_ps(dst + e, result);
+                if (diag_extra) {
+                    _mm256_storeu_ps(diag_extra + e, sv);
+                    _mm256_storeu_ps(diag_extra + E + e, ps);
+                }
+            }
+            // scalar tail
+            for (; e < E; e++) {
+                float ps = 0.0f;
+                for (int64_t h = 0; h < NH; h++) ps += bf16f(ob[(size_t)h*PH_STRIDE + e]);
+                const float sv = bf16f(s_blk[e]);
+                dst[e] = sv + ps;
+                if (diag_extra) { diag_extra[e] = sv; diag_extra[E + e] = ps; }
+            }
+#else
             for (int64_t e = 0; e < E; e++) {
                 float ps = 0.0f;
                 for (int64_t h = 0; h < NH; h++) ps += bf16f(ob[(size_t)h*PH_STRIDE + e]);
@@ -5566,13 +5600,43 @@ static bool ggml_backend_xdna_decode_layer_f3best(
                 dst[e] = sv + ps;
                 if (diag_extra) { diag_extra[e] = sv; diag_extra[E + e] = ps; }
             }
+#endif
         } else {
             uint16_t * dst = (uint16_t *)out_dst->data;
+#ifdef __AVX2__
+            // Same SIMD accumulation in f32, then scalar conversion back to bf16.
+            // f32→bf16 via the scalar helper (no AVX512-BF16 requirement).
+            int64_t e = 0;
+            for (; e + 8 <= E; e += 8) {
+                __m256 acc = _mm256_setzero_ps();
+                // s_blk contribution
+                {
+                    __m128i s_8 = _mm_loadu_si128((const __m128i*)(s_blk + e));
+                    __m256i s_u32 = _mm256_cvtepu16_epi32(s_8);
+                    acc = _mm256_castsi256_ps(_mm256_slli_epi32(s_u32, 16));
+                }
+                for (int64_t h = 0; h < NH; h++) {
+                    __m128i bf16_8 = _mm_loadu_si128((const __m128i*)(ob + (size_t)h*PH_STRIDE + e));
+                    __m256i u32_8 = _mm256_cvtepu16_epi32(bf16_8);
+                    acc = _mm256_add_ps(acc, _mm256_castsi256_ps(_mm256_slli_epi32(u32_8, 16)));
+                }
+                float tmp[8];
+                _mm256_storeu_ps(tmp, acc);
+                for (int i = 0; i < 8; i++) dst[e + i] = f32_to_bf16_scalar(tmp[i]);
+            }
+            // scalar tail
+            for (; e < E; e++) {
+                float acc = bf16f(s_blk[e]);
+                for (int64_t h = 0; h < NH; h++) acc += bf16f(ob[(size_t)h*PH_STRIDE + e]);
+                dst[e] = f32_to_bf16_scalar(acc);
+            }
+#else
             for (int64_t e = 0; e < E; e++) {
                 float acc = bf16f(s_blk[e]);
                 for (int64_t h = 0; h < NH; h++) acc += bf16f(ob[(size_t)h*PH_STRIDE + e]);
                 dst[e] = f32_to_bf16_scalar(acc);
             }
+#endif
         }
         // K/V readback from c_bo (NPU-computed, diagnostic).
         if (with_npu_kv) {
