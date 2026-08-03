@@ -777,6 +777,17 @@ TESTS: list[Test] = [
         description="f3best no-KV and K/V ABI token-match vs CPU: 16 layers in one backend call.",
     ),
     Test(
+        name="paris_short_3b_q4_0_f3best_loop",
+        prompt="What is the capital of France?",
+        n_predict=16,
+        mode="single-turn",
+        model=MODEL_LLAMA_3B_Q4_0,
+        variants=["npu_f3best_loop_norr"],
+        min_prefix_match=1,
+        description="3B f3best no-RR (#155): head_dim=128, attn_group=3. Diagnostic for #186 — "
+                    "whether f3best dispatches (LIVE/LOOP markers) or silently falls back to per-op.",
+    ),
+    Test(
         name="paris_short_q4_0_phase_b",
         prompt="What is the capital of France?",
         n_predict=12,
