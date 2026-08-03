@@ -1,0 +1,31 @@
+
+Loading model... 
+
+
+в–„в–„ в–„в–„
+в–€в–€ в–€в–€
+в–€в–€ в–€в–€  в–Ђв–Ђв–€в–„ в–€в–€в–€в–„в–€в–€в–€в–„  в–Ђв–Ђв–€в–„    в–„в–€в–€в–€в–€ в–€в–€в–€в–€в–„ в–€в–€в–€в–€в–„
+в–€в–€ в–€в–€ в–„в–€в–Ђв–€в–€ в–€в–€ в–€в–€ в–€в–€ в–„в–€в–Ђв–€в–€    в–€в–€    в–€в–€ в–€в–€ в–€в–€ в–€в–€
+в–€в–€ в–€в–€ в–Ђв–€в–„в–€в–€ в–€в–€ в–€в–€ в–€в–€ в–Ђв–€в–„в–€в–€ в–€в–€ в–Ђв–€в–€в–€в–€ в–€в–€в–€в–€в–Ђ в–€в–€в–€в–€в–Ђ
+                                    в–€в–€    в–€в–€
+                                    в–Ђв–Ђ    в–Ђв–Ђ
+
+build      : b9181-ab9eae048
+model      : llama-3.2-1b-instruct-Q4_0-vocabQ4.gguf
+modalities : text
+
+available commands:
+  /exit or Ctrl+C     stop or exit
+  /regen              regenerate the last response
+  /clear              clear the chat history
+  /read <file>        add a text file
+  /glob <pattern>     add text files using globbing pattern
+
+
+> What is the capital of France? Explain in detail.
+
+The dralah warrantargasence Curtishaularrantetrainencvhed clock clock clock reconРґ clockillian lah laholuteudicunic lahhaularrant couificate clockappings clockuЕџ clock Concearrantemocllll clockarcyencvimidhed dim Penaltyrechillianfellhaulainty lahк№Њм§Ђaintybianencv expansencv cen SecondsЩ†Ш§Щ† Batch lahlicatellll clockarseГ­cardon clockР»СЊ clock lah Imperillianidesificate imperancesesper lahincerainty imperrech pitsardon clock busarrantimidillianideschal clockaintyhed clocktleesperР»СЊllll clocklicityDONimidfellledgerideslicityillian grate lah-fitenziearcyarcyervillehaularrantynth thouBEGIN herselfбї¶ CurtisР»СЊimiters clock StraitpatchillianancedoliobianBrown.rs clockllll clockhaultrackedllll clockhideBrownardon reconleys plhaulardon clockfelllingen clockaintylingen clock Manualrech clockfellENCEardon clock imperencvardonlicityificantly themselvesarrantencvBOToluteleysBOTencvfellfellhaulillianimidfellardonieceshedfellledgerBOTimidarrant
+
+[ Prompt: 92.8 t/s | Generation: 41.4 t/s ]
+
+Exiting...

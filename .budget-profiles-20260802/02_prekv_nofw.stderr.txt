@@ -1,0 +1,247 @@
+ggml-xdna: XRT device initialized
+ggml-xdna: using 4 AIE columns
+supports_op: claim attention MUL_MAT src0=[64,512,8] src1=[64,1,32] type0=1 type1=0 (kind=Q@K^T)
+supports_op: claim attention MUL_MAT src0=[512,64,8] src1=[512,1,32] type0=1 type1=0 (kind=scores@V)
+supports_op: claim attention MUL_MAT src0=[64,512,8] src1=[64,1,32] type0=1 type1=0 (kind=Q@K^T)
+supports_op: claim attention MUL_MAT src0=[512,64,8] src1=[512,1,32] type0=1 type1=0 (kind=scores@V)
+supports_op: claim attention MUL_MAT src0=[64,512,8] src1=[64,1,32] type0=1 type1=0 (kind=Q@K^T)
+supports_op: claim attention MUL_MAT src0=[512,64,8] src1=[512,1,32] type0=1 type1=0 (kind=scores@V)
+supports_op: claim attention MUL_MAT src0=[64,512,8] src1=[64,1,32] type0=1 type1=0 (kind=Q@K^T)
+supports_op: claim attention MUL_MAT src0=[512,64,8] src1=[512,1,32] type0=1 type1=0 (kind=scores@V)
+ggml-xdna: XRT device initialized
+ggml-xdna: using 4 AIE columns
+ggml-xdna: compiling INT4 GEMV v2 K=2048 N=2048 (first run, will be cached)...
+[AIECC-RESOLVE] Using: C:\Python313\Lib\site-packages\mlir_aie\bin\aiecc.exe (size=109754880)
+[AIECC-RESOLVE] Using: C:\Python313\Lib\site-packages\mlir_aie\bin\aiecc.exe (size=109754880)
+[AIECC-RUN] command=['C:\\Python313\\Lib\\site-packages\\llvm-aie\\bin\\clang.exe', '-O2', '-std=c++20', '--target=aie2p-none-unknown-elf', '-Wno-parentheses', '-Wno-attributes', '-Wno-macro-redefined', '-Wno-empty-body', '-Wno-missing-template-arg-list-after-template-kw', '-IC:\\Python313\\Lib\\site-packages\\mlir_aie\\include', '-IC:\\Python313\\Lib\\site-packages\\mlir_aie\\aie_runtime_lib\\AIE2P', '-includeC:\\llama.cpp-xdna\\IRON-windows\\aie_kernels\\aie_platform_shim.h', '-isystem', 'C:\\Python313\\Lib\\site-packages\\llvm-aie\\include\\aie2p-none-unknown-elf\\c++\\v1', '-isystem', 'C:\\Python313\\Lib\\site-packages\\llvm-aie\\include\\c++\\v1', '-DDIM_K=2048', '-DGROUP_SIZE=32', '-c', 'C:\\llama.cpp-xdna\\IRON-windows\\aie_kernels\\aie2p\\fused_dequant_gemv_v2.cc', '-o', 'C:\\llama.cpp-xdna\\.bisect-prekv\\build\\fused_dequant_gemv_v2_2048k_g32.o']
+warning: No memory bank assigned to load in function 'fused_dequant_matvec_v2_bf16', block 'for.body11.i': renamable $x3, renamable $p6 = VLD_x_pstm_nrm_imm_pseudo killed renamable $p6(tied-def 1), 64 :: (load (<32 x s16>) from %ir.b_ptr.0115.i, !tbaa !17, !alias.scope !5, !noalias !33)[AIECC-RUN] command=['C:\\Python313\\Lib\\site-packages\\mlir_aie\\bin\\aiecc.exe', '-v', '-j1', '--no-compile-host', '--no-xchesscc', '--no-xbridge', '--peano', 'C:\\Python313\\Lib\\site-packages\\llvm-aie', '--dynamic-objFifos', '--aie-generate-xclbin', '--xclbin-name=C:\\llama.cpp-xdna\\.bisect-prekv\\build\\fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.xclbin', '--xclbin-kernel-name=MLIR_AIE', '--aie-generate-npu-insts', '--npu-insts-name=C:\\llama.cpp-xdna\\.bisect-prekv\\build\\fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.bin', 'C:\\llama.cpp-xdna\\.bisect-prekv\\build\\fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir']
+ggml-xdna: compilation complete, cached at C:\llama.cpp-xdna\.bisect-prekv\npu_kernels_win_8col\gemv_int4_v2_K2048_N2048_4col_g32.xclbin
+ggml-xdna: GEMM kernel group_ids: [0]=15859711 [1]=15794177 [2]=15859711 [3]=15794176 [4]=15794176 [5]=15794176 [6]=15794176 [7]=15794176 [8]=ERR key=gemv_int4_v2_K2048_N2048_4col_g32
+ggml-xdna: loaded kernel for gemv_int4_v2_K2048_N2048_4col_g32
+ggml-xdna: warm int4 weight K=2048 N=2048 m_in=4 type=Q4_0 weight=blk.0.attn_q.weight addr=0x15000 mod64K=0x5000 (1 cached)
+ggml-xdna: compiling INT4 GEMV v2 K=2048 N=512 (first run, will be cached)...
+[AIECC-RESOLVE] Using: C:\Python313\Lib\site-packages\mlir_aie\bin\aiecc.exe (size=109754880)
+[AIECC-RESOLVE] Using: C:\Python313\Lib\site-packages\mlir_aie\bin\aiecc.exe (size=109754880)
+[AIECC-RUN] command=['C:\\Python313\\Lib\\site-packages\\mlir_aie\\bin\\aiecc.exe', '-v', '-j1', '--no-compile-host', '--no-xchesscc', '--no-xbridge', '--peano', 'C:\\Python313\\Lib\\site-packages\\llvm-aie', '--dynamic-objFifos', '--aie-generate-xclbin', '--xclbin-name=C:\\llama.cpp-xdna\\.bisect-prekv\\build\\fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.xclbin', '--xclbin-kernel-name=MLIR_AIE', '--aie-generate-npu-insts', '--npu-insts-name=C:\\llama.cpp-xdna\\.bisect-prekv\\build\\fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.bin', 'C:\\llama.cpp-xdna\\.bisect-prekv\\build\\fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir']
+ggml-xdna: compilation complete, cached at C:\llama.cpp-xdna\.bisect-prekv\npu_kernels_win_8col\gemv_int4_v2_K2048_N512_4col_g32.xclbin
+ggml-xdna: GEMM kernel group_ids: [0]=15925247 [1]=15859713 [2]=15925247 [3]=15859712 [4]=15859712 [5]=15859712 [6]=15859712 [7]=15859712 [8]=ERR key=gemv_int4_v2_K2048_N512_4col_g32
+ggml-xdna: loaded kernel for gemv_int4_v2_K2048_N512_4col_g32
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.0.attn_v.weight addr=0x25b000 mod64K=0xb000 (1 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.0.attn_k.weight addr=0x2ed000 mod64K=0xd000 (2 cached)
+ggml-xdna: warm int4 weight K=2048 N=2048 m_in=4 type=Q4_0 weight=blk.1.attn_q.weight addr=0x37f000 mod64K=0xf000 (2 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.1.attn_v.weight addr=0x5c1000 mod64K=0x1000 (3 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.1.attn_k.weight addr=0x653000 mod64K=0x3000 (4 cached)
+ggml-xdna: warm int4 weight K=2048 N=2048 m_in=4 type=Q4_0 weight=blk.2.attn_q.weight addr=0x6e5000 mod64K=0x5000 (3 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.2.attn_v.weight addr=0x925000 mod64K=0x5000 (5 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.2.attn_k.weight addr=0x9b5000 mod64K=0x5000 (6 cached)
+ggml-xdna: warm int4 weight K=2048 N=2048 m_in=4 type=Q4_0 weight=blk.3.attn_q.weight addr=0xa47000 mod64K=0x7000 (4 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.3.attn_v.weight addr=0xc87000 mod64K=0x7000 (7 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.3.attn_k.weight addr=0xd17000 mod64K=0x7000 (8 cached)
+ggml-xdna: warm int4 weight K=2048 N=2048 m_in=4 type=Q4_0 weight=blk.4.attn_q.weight addr=0xda7000 mod64K=0x7000 (5 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.4.attn_v.weight addr=0xfe7000 mod64K=0x7000 (9 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.4.attn_k.weight addr=0x1077000 mod64K=0x7000 (10 cached)
+ggml-xdna: warm int4 weight K=2048 N=2048 m_in=4 type=Q4_0 weight=blk.5.attn_q.weight addr=0x1107000 mod64K=0x7000 (6 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.5.attn_v.weight addr=0x1347000 mod64K=0x7000 (11 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.5.attn_k.weight addr=0x13d7000 mod64K=0x7000 (12 cached)
+ggml-xdna: warm int4 weight K=2048 N=2048 m_in=4 type=Q4_0 weight=blk.6.attn_q.weight addr=0x1467000 mod64K=0x7000 (7 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.6.attn_v.weight addr=0x16a7000 mod64K=0x7000 (13 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.6.attn_k.weight addr=0x1737000 mod64K=0x7000 (14 cached)
+ggml-xdna: warm int4 weight K=2048 N=2048 m_in=4 type=Q4_0 weight=blk.7.attn_q.weight addr=0x17c7000 mod64K=0x7000 (8 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.7.attn_v.weight addr=0x1a07000 mod64K=0x7000 (15 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.7.attn_k.weight addr=0x1a97000 mod64K=0x7000 (16 cached)
+ggml-xdna: warm int4 weight K=2048 N=2048 m_in=4 type=Q4_0 weight=blk.8.attn_q.weight addr=0x1b27000 mod64K=0x7000 (9 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.8.attn_v.weight addr=0x1d67000 mod64K=0x7000 (17 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.8.attn_k.weight addr=0x1df7000 mod64K=0x7000 (18 cached)
+ggml-xdna: warm int4 weight K=2048 N=2048 m_in=4 type=Q4_0 weight=blk.9.attn_q.weight addr=0x1e87000 mod64K=0x7000 (10 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.9.attn_v.weight addr=0x20c7000 mod64K=0x7000 (19 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.9.attn_k.weight addr=0x2157000 mod64K=0x7000 (20 cached)
+ggml-xdna: warm int4 weight K=2048 N=2048 m_in=4 type=Q4_0 weight=blk.10.attn_q.weight addr=0x21e7000 mod64K=0x7000 (11 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.10.attn_v.weight addr=0x2427000 mod64K=0x7000 (21 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.10.attn_k.weight addr=0x24b7000 mod64K=0x7000 (22 cached)
+ggml-xdna: warm int4 weight K=2048 N=2048 m_in=4 type=Q4_0 weight=blk.11.attn_q.weight addr=0x2547000 mod64K=0x7000 (12 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.11.attn_v.weight addr=0x2787000 mod64K=0x7000 (23 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.11.attn_k.weight addr=0x2817000 mod64K=0x7000 (24 cached)
+ggml-xdna: warm int4 weight K=2048 N=2048 m_in=4 type=Q4_0 weight=blk.12.attn_q.weight addr=0x28a7000 mod64K=0x7000 (13 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.12.attn_v.weight addr=0x2ae7000 mod64K=0x7000 (25 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.12.attn_k.weight addr=0x2b77000 mod64K=0x7000 (26 cached)
+ggml-xdna: warm int4 weight K=2048 N=2048 m_in=4 type=Q4_0 weight=blk.13.attn_q.weight addr=0x2c07000 mod64K=0x7000 (14 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.13.attn_v.weight addr=0x2e47000 mod64K=0x7000 (27 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.13.attn_k.weight addr=0x2ed7000 mod64K=0x7000 (28 cached)
+ggml-xdna: warm int4 weight K=2048 N=2048 m_in=4 type=Q4_0 weight=blk.14.attn_q.weight addr=0x2f67000 mod64K=0x7000 (15 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.14.attn_v.weight addr=0x31a7000 mod64K=0x7000 (29 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.14.attn_k.weight addr=0x3237000 mod64K=0x7000 (30 cached)
+ggml-xdna: warm int4 weight K=2048 N=2048 m_in=4 type=Q4_0 weight=blk.15.attn_q.weight addr=0x32c7000 mod64K=0x7000 (16 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.15.attn_v.weight addr=0x3507000 mod64K=0x7000 (31 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.15.attn_k.weight addr=0x3597000 mod64K=0x7000 (32 cached)
+ggml-xdna: compiling SwiGLU decode INT4 K=2048 N=8192 g=32 (first run, will be cached)...
+[AIECC-RESOLVE] Using: C:\Python313\Lib\site-packages\mlir_aie\bin\aiecc.exe (size=109754880)
+[AIECC-RESOLVE] Using: C:\Python313\Lib\site-packages\mlir_aie\bin\aiecc.exe (size=109754880)
+[AIECC-RUN] command=['C:\\Python313\\Lib\\site-packages\\llvm-aie\\bin\\clang.exe', '-O2', '-std=c++20', '--target=aie2p-none-unknown-elf', '-Wno-parentheses', '-Wno-attributes', '-Wno-macro-redefined', '-Wno-empty-body', '-Wno-missing-template-arg-list-after-template-kw', '-IC:\\Python313\\Lib\\site-packages\\mlir_aie\\include', '-IC:\\Python313\\Lib\\site-packages\\mlir_aie\\aie_runtime_lib\\AIE2P', '-includeC:\\llama.cpp-xdna\\IRON-windows\\aie_kernels\\aie_platform_shim.h', '-isystem', 'C:\\Python313\\Lib\\site-packages\\llvm-aie\\include\\aie2p-none-unknown-elf\\c++\\v1', '-isystem', 'C:\\Python313\\Lib\\site-packages\\llvm-aie\\include\\c++\\v1', '-DDIM_K=8192', '-DGROUP_SIZE=32', '-c', 'C:\\llama.cpp-xdna\\IRON-windows\\aie_kernels\\aie2p\\fused_dequant_gemv_v2.cc', '-o', 'C:\\llama.cpp-xdna\\.bisect-prekv\\build\\fused_dequant_gemv_v2_8192k_g32.o']
+warning: No memory bank assigned to load in function 'fused_dequant_matvec_v2_bf16', block 'for.body11.i': renamable $x3, renamable $p6 = VLD_x_pstm_nrm_imm_pseudo killed renamable $p6(tied-def 1), 64 :: (load (<32 x s16>) from %ir.b_ptr.0115.i, !tbaa !17, !alias.scope !5, !noalias !33)[AIECC-RUN] command=['C:\\Python313\\Lib\\site-packages\\llvm-aie\\bin\\clang.exe', '-O2', '-std=c++20', '--target=aie2p-none-unknown-elf', '-Wno-parentheses', '-Wno-attributes', '-Wno-macro-redefined', '-Wno-empty-body', '-Wno-missing-template-arg-list-after-template-kw', '-IC:\\Python313\\Lib\\site-packages\\mlir_aie\\include', '-IC:\\Python313\\Lib\\site-packages\\mlir_aie\\aie_runtime_lib\\AIE2P', '-includeC:\\llama.cpp-xdna\\IRON-windows\\aie_kernels\\aie_platform_shim.h', '-isystem', 'C:\\Python313\\Lib\\site-packages\\llvm-aie\\include\\aie2p-none-unknown-elf\\c++\\v1', '-isystem', 'C:\\Python313\\Lib\\site-packages\\llvm-aie\\include\\c++\\v1', '-DDIM_K=2048', '-DGROUP_SIZE=32', '-DM_OUTPUT_MAX=2048', '-c', 'C:\\llama.cpp-xdna\\IRON-windows\\aie_kernels\\aie2p\\dual_fused_dequant_gemv_silu_mul.cc', '-o', 'C:\\llama.cpp-xdna\\.bisect-prekv\\build\\dual_fused_dequant_gemv_silu_mul_2048k_g32.o']
+warning: No memory bank assigned to load in function 'dual_fused_dequant_gemv_bf16', block 'for.body11.i': renamable $wh1, renamable $p4 = VLD_128_pstm_nrm_imm_pseudo killed renamable $p4(tied-def 1), 16 :: (load (<4 x s32>) from %ir.row_weights.085.i, !tbaa !17, !alias.scope !2, !noalias !16)[AIECC-RUN] command=['C:\\Python313\\Lib\\site-packages\\mlir_aie\\bin\\aiecc.exe', '-v', '-j1', '--no-compile-host', '--no-xchesscc', '--no-xbridge', '--peano', 'C:\\Python313\\Lib\\site-packages\\llvm-aie', '--dynamic-objFifos', '--xclbin-instance-name=swiglu_fused_int4', '--xclbin-kernel-id=0x911', '--aie-generate-xclbin', '--xclbin-name=C:\\llama.cpp-xdna\\.bisect-prekv\\build\\swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.xclbin', '--xclbin-kernel-name=swiglu_fused_int4', '--aie-generate-npu-insts', '--npu-insts-name=C:\\llama.cpp-xdna\\.bisect-prekv\\build\\swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.bin', 'C:\\llama.cpp-xdna\\.bisect-prekv\\build\\swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir']
+[AIECC-RUN] command=['C:\\Python313\\Lib\\site-packages\\mlir_aie\\bin\\aiecc.exe', '-v', '-j1', '--no-compile-host', '--no-xchesscc', '--no-xbridge', '--peano', 'C:\\Python313\\Lib\\site-packages\\llvm-aie', '--dynamic-objFifos', '--no-compile', '--aie-generate-npu-insts', '--npu-insts-name=C:\\llama.cpp-xdna\\.bisect-prekv\\build\\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.bin', 'C:\\llama.cpp-xdna\\.bisect-prekv\\build\\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir']
+<unknown>:0: warning: Failed to allocate buffer: "A_L3L1_0_cons_buff_0" with size: 18432 bytes.
+<unknown>:0: note: see current operation: %A_L3L1_0_cons_buff_0 = aie.buffer(%tile_2_2) {sym_name = "A_L3L1_0_cons_buff_0"} : memref<18432xui8> 
+C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir:3:17: warning: Not all requested buffers fit in the available memory.
+
+    %tile_2_2 = aie.tile(2, 2)
+                ^
+C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir:3:17: note: see current operation: %tile_2_2 = aie.tile(2, 2) {controller_id = #aie.packet_info<pkt_type = 0, pkt_id = 27>}
+C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir:3:17: note: Current configuration of buffers in bank(s) : MemoryMap:
+		(stack) 	: 0x0-0x3FF 	(1024 bytes)
+	bank : 0	0x0-0x3FFF
+	bank : 1	0x4000-0x7FFF
+	bank : 2	0x8000-0xBFFF
+	bank : 3	0xC000-0xFFFF
+
+C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir:3:17: warning: Bank-aware allocation failed, trying basic sequential allocation.
+    %tile_2_2 = aie.tile(2, 2)
+                ^
+C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir:3:17: note: see current operation: %tile_2_2 = aie.tile(2, 2) {controller_id = #aie.packet_info<pkt_type = 0, pkt_id = 27>}
+<unknown>:0: warning: Failed to allocate buffer: "A_L3L1_1_cons_buff_0" with size: 18432 bytes.
+<unknown>:0: note: see current operation: %A_L3L1_1_cons_buff_0 = aie.buffer(%tile_3_2) {sym_name = "A_L3L1_1_cons_buff_0"} : memref<18432xui8> 
+C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir:4:17: warning: Not all requested buffers fit in the available memory.
+
+    %tile_3_2 = aie.tile(3, 2)
+                ^
+C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir:4:17: note: see current operation: %tile_3_2 = aie.tile(3, 2) {controller_id = #aie.packet_info<pkt_type = 0, pkt_id = 27>}
+C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir:4:17: note: Current configuration of buffers in bank(s) : MemoryMap:
+		(stack) 	: 0x0-0x3FF 	(1024 bytes)
+	bank : 0	0x0-0x3FFF
+	bank : 1	0x4000-0x7FFF
+	bank : 2	0x8000-0xBFFF
+	bank : 3	0xC000-0xFFFF
+
+C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir:4:17: warning: Bank-aware allocation failed, trying basic sequential allocation.
+    %tile_3_2 = aie.tile(3, 2)
+                ^
+C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir:4:17: note: see current operation: %tile_3_2 = aie.tile(3, 2) {controller_id = #aie.packet_info<pkt_type = 0, pkt_id = 27>}
+<unknown>:0: warning: Failed to allocate buffer: "A_L3L1_2_cons_buff_0" with size: 18432 bytes.
+<unknown>:0: note: see current operation: %A_L3L1_2_cons_buff_0 = aie.buffer(%tile_4_2) {sym_name = "A_L3L1_2_cons_buff_0"} : memref<18432xui8> 
+C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir:5:17: warning: Not all requested buffers fit in the available memory.
+
+    %tile_4_2 = aie.tile(4, 2)
+                ^
+C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir:5:17: note: see current operation: %tile_4_2 = aie.tile(4, 2) {controller_id = #aie.packet_info<pkt_type = 0, pkt_id = 27>}
+C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir:5:17: note: Current configuration of buffers in bank(s) : MemoryMap:
+		(stack) 	: 0x0-0x3FF 	(1024 bytes)
+	bank : 0	0x0-0x3FFF
+	bank : 1	0x4000-0x7FFF
+	bank : 2	0x8000-0xBFFF
+	bank : 3	0xC000-0xFFFF
+
+C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir:5:17: warning: Bank-aware allocation failed, trying basic sequential allocation.
+    %tile_4_2 = aie.tile(4, 2)
+                ^
+C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir:5:17: note: see current operation: %tile_4_2 = aie.tile(4, 2) {controller_id = #aie.packet_info<pkt_type = 0, pkt_id = 27>}
+<unknown>:0: warning: Failed to allocate buffer: "A_L3L1_3_cons_buff_0" with size: 18432 bytes.
+<unknown>:0: note: see current operation: %A_L3L1_3_cons_buff_0 = aie.buffer(%tile_5_2) {sym_name = "A_L3L1_3_cons_buff_0"} : memref<18432xui8> 
+C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir:6:17: warning: Not all requested buffers fit in the available memory.
+
+    %tile_5_2 = aie.tile(5, 2)
+                ^
+C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir:6:17: note: see current operation: %tile_5_2 = aie.tile(5, 2) {controller_id = #aie.packet_info<pkt_type = 0, pkt_id = 27>}
+C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir:6:17: note: Current configuration of buffers in bank(s) : MemoryMap:
+		(stack) 	: 0x0-0x3FF 	(1024 bytes)
+	bank : 0	0x0-0x3FFF
+	bank : 1	0x4000-0x7FFF
+	bank : 2	0x8000-0xBFFF
+	bank : 3	0xC000-0xFFFF
+
+C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir:6:17: warning: Bank-aware allocation failed, trying basic sequential allocation.
+    %tile_5_2 = aie.tile(5, 2)
+                ^
+C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir:6:17: note: see current operation: %tile_5_2 = aie.tile(5, 2) {controller_id = #aie.packet_info<pkt_type = 0, pkt_id = 27>}
+[AIECC-RUN] command=['C:\\Python313\\Lib\\site-packages\\mlir_aie\\bin\\aiecc.exe', '-v', '-j1', '--no-compile-host', '--no-xchesscc', '--no-xbridge', '--peano', 'C:\\Python313\\Lib\\site-packages\\llvm-aie', '--dynamic-objFifos', '--xclbin-instance-name=swiglu_gemv_2_int4', '--xclbin-kernel-id=0x912', '--aie-generate-xclbin', '--xclbin-name=C:\\llama.cpp-xdna\\.bisect-prekv\\build\\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.xclbin', '--xclbin-kernel-name=swiglu_gemv_2_int4', '--xclbin-input=C:\\llama.cpp-xdna\\.bisect-prekv\\build\\swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.xclbin', 'C:\\llama.cpp-xdna\\.bisect-prekv\\build\\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir']
+<unknown>:0: warning: Failed to allocate buffer: "A_L3L1_0_cons_buff_0" with size: 18432 bytes.
+<unknown>:0: note: see current operation: %A_L3L1_0_cons_buff_0 = aie.buffer(%tile_2_2) {sym_name = "A_L3L1_0_cons_buff_0"} : memref<18432xui8> 
+C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir:3:17: warning: Not all requested buffers fit in the available memory.
+
+    %tile_2_2 = aie.tile(2, 2)
+                ^
+C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir:3:17: note: see current operation: %tile_2_2 = aie.tile(2, 2) {controller_id = #aie.packet_info<pkt_type = 0, pkt_id = 27>}
+C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir:3:17: note: Current configuration of buffers in bank(s) : MemoryMap:
+		(stack) 	: 0x0-0x3FF 	(1024 bytes)
+	bank : 0	0x0-0x3FFF
+	bank : 1	0x4000-0x7FFF
+	bank : 2	0x8000-0xBFFF
+	bank : 3	0xC000-0xFFFF
+
+C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir:3:17: warning: Bank-aware allocation failed, trying basic sequential allocation.
+    %tile_2_2 = aie.tile(2, 2)
+                ^
+C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir:3:17: note: see current operation: %tile_2_2 = aie.tile(2, 2) {controller_id = #aie.packet_info<pkt_type = 0, pkt_id = 27>}
+<unknown>:0: warning: Failed to allocate buffer: "A_L3L1_1_cons_buff_0" with size: 18432 bytes.
+<unknown>:0: note: see current operation: %A_L3L1_1_cons_buff_0 = aie.buffer(%tile_3_2) {sym_name = "A_L3L1_1_cons_buff_0"} : memref<18432xui8> 
+C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir:4:17: warning: Not all requested buffers fit in the available memory.
+
+    %tile_3_2 = aie.tile(3, 2)
+                ^
+C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir:4:17: note: see current operation: %tile_3_2 = aie.tile(3, 2) {controller_id = #aie.packet_info<pkt_type = 0, pkt_id = 27>}
+C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir:4:17: note: Current configuration of buffers in bank(s) : MemoryMap:
+		(stack) 	: 0x0-0x3FF 	(1024 bytes)
+	bank : 0	0x0-0x3FFF
+	bank : 1	0x4000-0x7FFF
+	bank : 2	0x8000-0xBFFF
+	bank : 3	0xC000-0xFFFF
+
+C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir:4:17: warning: Bank-aware allocation failed, trying basic sequential allocation.
+    %tile_3_2 = aie.tile(3, 2)
+                ^
+C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir:4:17: note: see current operation: %tile_3_2 = aie.tile(3, 2) {controller_id = #aie.packet_info<pkt_type = 0, pkt_id = 27>}
+<unknown>:0: warning: Failed to allocate buffer: "A_L3L1_2_cons_buff_0" with size: 18432 bytes.
+<unknown>:0: note: see current operation: %A_L3L1_2_cons_buff_0 = aie.buffer(%tile_4_2) {sym_name = "A_L3L1_2_cons_buff_0"} : memref<18432xui8> 
+C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir:5:17: warning: Not all requested buffers fit in the available memory.
+
+    %tile_4_2 = aie.tile(4, 2)
+                ^
+C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir:5:17: note: see current operation: %tile_4_2 = aie.tile(4, 2) {controller_id = #aie.packet_info<pkt_type = 0, pkt_id = 27>}
+C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir:5:17: note: Current configuration of buffers in bank(s) : MemoryMap:
+		(stack) 	: 0x0-0x3FF 	(1024 bytes)
+	bank : 0	0x0-0x3FFF
+	bank : 1	0x4000-0x7FFF
+	bank : 2	0x8000-0xBFFF
+	bank : 3	0xC000-0xFFFF
+
+C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir:5:17: warning: Bank-aware allocation failed, trying basic sequential allocation.
+    %tile_4_2 = aie.tile(4, 2)
+                ^
+C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir:5:17: note: see current operation: %tile_4_2 = aie.tile(4, 2) {controller_id = #aie.packet_info<pkt_type = 0, pkt_id = 27>}
+<unknown>:0: warning: Failed to allocate buffer: "A_L3L1_3_cons_buff_0" with size: 18432 bytes.
+<unknown>:0: note: see current operation: %A_L3L1_3_cons_buff_0 = aie.buffer(%tile_5_2) {sym_name = "A_L3L1_3_cons_buff_0"} : memref<18432xui8> 
+C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir:6:17: warning: Not all requested buffers fit in the available memory.
+
+    %tile_5_2 = aie.tile(5, 2)
+                ^
+C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir:6:17: note: see current operation: %tile_5_2 = aie.tile(5, 2) {controller_id = #aie.packet_info<pkt_type = 0, pkt_id = 27>}
+C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir:6:17: note: Current configuration of buffers in bank(s) : MemoryMap:
+		(stack) 	: 0x0-0x3FF 	(1024 bytes)
+	bank : 0	0x0-0x3FFF
+	bank : 1	0x4000-0x7FFF
+	bank : 2	0x8000-0xBFFF
+	bank : 3	0xC000-0xFFFF
+
+C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir:6:17: warning: Bank-aware allocation failed, trying basic sequential allocation.
+    %tile_5_2 = aie.tile(5, 2)
+                ^
+C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir:6:17: note: see current operation: %tile_5_2 = aie.tile(5, 2) {controller_id = #aie.packet_info<pkt_type = 0, pkt_id = 27>}
+ggml-xdna: SwiGLU compilation complete, cached at C:\llama.cpp-xdna\.bisect-prekv\npu_kernels_win_8col\swiglu_decode_int4_v2_K2048_N8192_4col_g32
+ggml-xdna: loaded SwiGLU kernel bundle for swiglu_decode_int4_v2_K2048_N8192_4col_g32 (2 kernels)
+ggml-xdna: warm int4 swiglu fused K=2048 N=8192 tsi=8 (1 cached)
+ggml-xdna: warm int4 swiglu down K=8192 N=2048 tsi=4 (1 cached)
+ggml-xdna: loaded RMSNorm kernel for rms_norm_S2048_bf16_1c1ch_t2048
+ggml-xdna: GEMM kernel group_ids: [0]=16121855 [1]=16056321 [2]=16121855 [3]=16056320 [4]=16056320 [5]=16056320 [6]=16056320 [7]=16056320 [8]=ERR key=decode_layer_f3best_K2048_H8192_sl256_d64_ag4_kv8_g32_mc_preq_vexp_vreg_dq8_qp_mxp_ub_decouple_tb
+ggml-xdna: loaded kernel for decode_layer_f3best_K2048_H8192_sl256_d64_ag4_kv8_g32_mc_preq_vexp_vreg_dq8_qp_mxp_ub_decouple_tb
+ggml-xdna: [f3best-gluetime] token: layers=16 f3wall=506876 host=486090 acct=500869 rms=51 xr=118 xrsync=11 w=473626 kvzero=2781 kvcopy=2497 kvsync=103 runprep=688 npu=20786 outsync=66 reduce=144 us
+ggml-xdna: [f3best-LOOP] dispatched 16 layers in ONE call
+ggml-xdna: [f3best-gluetime] token: layers=16 f3wall=16151 host=715 acct=15982 rms=36 xr=78 xrsync=8 w=6 kvzero=114 kvcopy=91 kvsync=84 runprep=5 npu=15436 outsync=23 reduce=100 us
+ggml-xdna: [f3best-LOOP] dispatched 16 layers in ONE call
+ggml-xdna: [f3best-gluetime] token: layers=16 f3wall=15920 host=580 acct=15792 rms=30 xr=70 xrsync=7 w=5 kvzero=78 kvcopy=75 kvsync=77 runprep=5 npu=15340 outsync=22 reduce=83 us
+ggml-xdna: [f3best-gluetime] token: layers=16 f3wall=16247 host=759 acct=16043 rms=39 xr=87 xrsync=8 w=8 kvzero=88 kvcopy=102 kvsync=88 runprep=5 npu=15488 outsync=29 reduce=101 us
+ggml-xdna: [f3best-gluetime] token: layers=16 f3wall=15938 host=685 acct=15751 rms=33 xr=76 xrsync=10 w=7 kvzero=87 kvcopy=86 kvsync=78 runprep=5 npu=15253 outsync=22 reduce=94 us
+ggml-xdna: [f3best-gluetime] token: layers=16 f3wall=16048 host=624 acct=15903 rms=32 xr=75 xrsync=7 w=6 kvzero=81 kvcopy=85 kvsync=77 runprep=4 npu=15425 outsync=20 reduce=91 us
+ggml-xdna: [f3best-gluetime] token: layers=16 f3wall=15992 host=639 acct=15844 rms=31 xr=74 xrsync=7 w=6 kvzero=83 kvcopy=94 kvsync=78 runprep=4 npu=15353 outsync=20 reduce=94 us
+ggml-xdna: [f3best-gluetime] token: layers=16 f3wall=16260 host=724 acct=16086 rms=34 xr=82 xrsync=10 w=7 kvzero=92 kvcopy=99 kvsync=90 runprep=7 npu=15536 outsync=32 reduce=98 us
+llama_memory_breakdown_print: | memory breakdown [MiB] | total    free    self   model   context   compute    unaccounted |
+llama_memory_breakdown_print: |   - XDNA (XDNA NPU)    | 14140 = 14140 + (   0 =     0 +       0 +       0) +           0 |
+llama_memory_breakdown_print: |   - Host               |                  1085 =   804 +      16 +     265                |

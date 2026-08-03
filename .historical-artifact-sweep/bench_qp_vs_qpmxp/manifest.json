@@ -1,0 +1,20 @@
+{
+  "qp_tb": {
+    "root": "C:\\llama.cpp-xdna\\.historical-artifact-sweep\\qp-tb-source",
+    "key": "decode_layer_f3best_K2048_H8192_sl256_d64_ag4_kv8_g32_mc_preq_vexp_vreg_dq8_qp_tb",
+    "xclbin_sha256": "204926a57e3b25df1a2ea5fbb9148561189f3508b090f64f080beb0198541bc0",
+    "xclbin_bytes": 212591,
+    "insts_sha256": "1a7d92c9f71c5bad315de1ef524ab43a08207763e2a152676a545ba948335482",
+    "toggles": {
+      "F3BEST_TRIPLE_B": "1"
+    }
+  },
+  "qpmxp_tb": {
+    "root": "C:\\llama.cpp-xdna\\.historical-artifact-sweep\\qpmxp-tb-source",
+    "key": "decode_layer_f3best_K2048_H8192_sl256_d64_ag4_kv8_g32_mc_preq_vexp_vreg_dq8_qp_mxp_tb",
+    "xclbin_sha256": "4954819c3e69de9335e52f291ac223d579db8ef731915097e9f661114274857a",
+    "xclbin_bytes": 212591,
+    "insts_sha256": "1a7d92c9f71c5bad315de1ef524ab43a08207763e2a152676a545ba948335482",
+    "toggles": {}
+  }
+}

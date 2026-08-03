@@ -1,0 +1,6 @@
+1	current	prompt=110.20	decode=43.60	glue=8	fw=0
+2	prekv	prompt=109.30	decode=43.30	glue=8	fw=0
+3	current	prompt=109.40	decode=43.50	glue=8	fw=0
+4	prekv	prompt=107.60	decode=43.30	glue=8	fw=0
+5	current	prompt=108.00	decode=43.50	glue=8	fw=0
+6	prekv	prompt=107.00	decode=43.30	glue=8	fw=0

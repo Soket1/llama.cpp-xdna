@@ -1,0 +1,15 @@
+01	ffndiv1_r1	llama-cli	FFN_DIV=1	decode=41.40 t/s	layers=16 f3wall=15930 host=715 acct=15772 rms=38 xr=72 xrsync=7 w=6 kvzero=88 kvcopy=106 kvsync=103 runprep=4 npu=15123 outsync=16 reduce=106
+02	ffndiv1_r2	llama-cli	FFN_DIV=1	decode=44.10 t/s	layers=16 f3wall=15452 host=658 acct=15307 rms=35 xr=69 xrsync=7 w=5 kvzero=87 kvcopy=95 kvsync=98 runprep=5 npu=14791 outsync=18 reduce=93
+03	ffndiv1_r3	llama-cli	FFN_DIV=1	decode=44.00 t/s	layers=16 f3wall=15664 host=603 acct=15531 rms=31 xr=68 xrsync=7 w=6 kvzero=78 kvcopy=95 kvsync=82 runprep=5 npu=15010 outsync=16 reduce=87
+04	ffndiv2_r1	llama-cli	FFN_DIV=2	decode=55.00 t/s	layers=16 f3wall=11025 host=643 acct=10901 rms=35 xr=66 xrsync=7 w=6 kvzero=90 kvcopy=103 kvsync=88 runprep=4 npu=10420 outsync=16 reduce=100
+05	ffndiv2_r2	llama-cli	FFN_DIV=2	decode=55.10 t/s	layers=16 f3wall=10973 host=615 acct=10844 rms=31 xr=67 xrsync=7 w=6 kvzero=82 kvcopy=86 kvsync=88 runprep=4 npu=10387 outsync=14 reduce=83
+06	ffndiv2_r3	llama-cli	FFN_DIV=2	decode=55.30 t/s	layers=16 f3wall=10968 host=524 acct=10841 rms=27 xr=62 xrsync=6 w=5 kvzero=69 kvcopy=79 kvsync=76 runprep=4 npu=10410 outsync=14 reduce=78
+07	ffndiv4_r1	llama-cli	FFN_DIV=4	decode=61.60 t/s	layers=16 f3wall=8782 host=559 acct=8668 rms=29 xr=62 xrsync=6 w=5 kvzero=69 kvcopy=84 kvsync=87 runprep=4 npu=8183 outsync=10 reduce=80
+08	ffndiv4_r2	llama-cli	FFN_DIV=4	decode=62.40 t/s	layers=16 f3wall=8869 host=575 acct=8752 rms=31 xr=66 xrsync=6 w=5 kvzero=73 kvcopy=87 kvsync=89 runprep=5 npu=8285 outsync=11 reduce=85
+09	ffndiv4_r3	llama-cli	FFN_DIV=4	decode=62.20 t/s	layers=16 f3wall=8888 host=576 acct=8747 rms=31 xr=66 xrsync=6 w=6 kvzero=74 kvcopy=88 kvsync=75 runprep=4 npu=8298 outsync=13 reduce=87
+10	baseline	replay	{}	990.2 us
+11	stub_qkv	replay	{'F3BEST_STUB_QKV': '1'}	1005.1 us
+12	stub_oproj	replay	{'F3BEST_STUB_OPROJ': '1'}	979.5 us
+13	stub_ffn	replay	{'F3BEST_STUB_FFN': '1'}	1002.9 us
+14	stub_nm	replay	{'F3BEST_STUB_NM': '1'}	ERROR: rc=1
+15	stub_value	replay	{'F3BEST_FKV_DEFS': 'FLOWKV_VALUE_STUB'}	934.6 us

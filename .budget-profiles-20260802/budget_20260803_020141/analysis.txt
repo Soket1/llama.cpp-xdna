@@ -1,0 +1,17 @@
+--- FFN_DIV slope/intercept ---
+  FFN_DIV=1: 44.00 t/s = 22727 us/tok, WT_TILES=896, WT_MB=33.03
+  FFN_DIV=2: 55.10 t/s = 18149 us/tok, WT_TILES=512, WT_MB=18.87
+  FFN_DIV=4: 62.20 t/s = 16077 us/tok, WT_TILES=320, WT_MB=11.80
+  Slope: 314.65 us/MB  ->  Bandwidth: 3.18 GB/s
+  Intercept: 12303 us/token  (769 us/layer)
+  Intercept @44.3 t/s (22573 us/tok): 54.5% of token
+  FFN_DIV=1 GLUETIME npu=15123 us
+  FFN_DIV=2 GLUETIME npu=10420 us
+  FFN_DIV=4 GLUETIME npu=8183 us
+
+--- Stub decomposition (standalone replay) ---
+  baseline: 990.2 us/dispatch
+  stub_qkv: 1005.1 us  (delta=-14.9 us = -1.5%)
+  stub_oproj: 979.5 us  (delta=10.7 us = 1.1%)
+  stub_ffn: 1002.9 us  (delta=-12.7 us = -1.3%)
+  stub_value: 934.6 us  (delta=55.6 us = 5.6%)

@@ -1,0 +1,31 @@
+
+Loading model... 
+
+
+в–„в–„ в–„в–„
+в–€в–€ в–€в–€
+в–€в–€ в–€в–€  в–Ђв–Ђв–€в–„ в–€в–€в–€в–„в–€в–€в–€в–„  в–Ђв–Ђв–€в–„    в–„в–€в–€в–€в–€ в–€в–€в–€в–€в–„ в–€в–€в–€в–€в–„
+в–€в–€ в–€в–€ в–„в–€в–Ђв–€в–€ в–€в–€ в–€в–€ в–€в–€ в–„в–€в–Ђв–€в–€    в–€в–€    в–€в–€ в–€в–€ в–€в–€ в–€в–€
+в–€в–€ в–€в–€ в–Ђв–€в–„в–€в–€ в–€в–€ в–€в–€ в–€в–€ в–Ђв–€в–„в–€в–€ в–€в–€ в–Ђв–€в–€в–€в–€ в–€в–€в–€в–€в–Ђ в–€в–€в–€в–€в–Ђ
+                                    в–€в–€    в–€в–€
+                                    в–Ђв–Ђ    в–Ђв–Ђ
+
+build      : b9180-f6ad15d1f
+model      : llama-3.2-1b-instruct-Q4_0-vocabQ4.gguf
+modalities : text
+
+available commands:
+  /exit or Ctrl+C     stop or exit
+  /regen              regenerate the last response
+  /clear              clear the chat history
+  /read <file>        add a text file
+  /glob <pattern>     add text files using globbing pattern
+
+
+> What is the capital of France? Explain in detail.
+
+The draardon clocklicity clocktruncate Revelimid purposesoutineardon clock clock clockГ­carcyardon clock Centerstle Withdrawardon clockaintyrech clock CurtisarcyMessarcytrackedaintybian ConcefellENCEichelillianlingen clockuthorances impolute themselves clocklicityENCEaintyArrayOfllll.rsances impl clocklicity simplyolute alb pitsillianarry clock Penardon clock imper trainers expansimiters clockarra personallyencvillianolutelingen.rs clockardon reconillianlicate Curtislicityimid(BuildContextidesassage clockР»СЊaintyhaultleardon clockР»СЊ clockardon clockardon clockencv Curtisillian purposeslecesper Ley RevelfellardonР»СЊ clockaintyencvhaularrantillian pl Straitfelllicityancesuthor everythingР»СЊ clockilliankeit cen gu Reveluthorrettyarcyarrantimidificaterechidestleencvillianimid Batch.rsarrant Manuelarrantainty Mane lah lah Manueldadlicity pitsReducer everythingllll clockbrownhaulhide clockhaul Manuelhaulhaul personally Leyfellhaul Manuel dra imper warranthaulfell herselfichel(BuildContexthaul Penalty personallyassageillian herselfesperhaul
+
+[ Prompt: 106.3 t/s | Generation: 44.8 t/s ]
+
+Exiting...

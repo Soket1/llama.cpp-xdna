@@ -1,0 +1,31 @@
+
+Loading model... 
+
+
+в–„в–„ в–„в–„
+в–€в–€ в–€в–€
+в–€в–€ в–€в–€  в–Ђв–Ђв–€в–„ в–€в–€в–€в–„в–€в–€в–€в–„  в–Ђв–Ђв–€в–„    в–„в–€в–€в–€в–€ в–€в–€в–€в–€в–„ в–€в–€в–€в–€в–„
+в–€в–€ в–€в–€ в–„в–€в–Ђв–€в–€ в–€в–€ в–€в–€ в–€в–€ в–„в–€в–Ђв–€в–€    в–€в–€    в–€в–€ в–€в–€ в–€в–€ в–€в–€
+в–€в–€ в–€в–€ в–Ђв–€в–„в–€в–€ в–€в–€ в–€в–€ в–€в–€ в–Ђв–€в–„в–€в–€ в–€в–€ в–Ђв–€в–€в–€в–€ в–€в–€в–€в–€в–Ђ в–€в–€в–€в–€в–Ђ
+                                    в–€в–€    в–€в–€
+                                    в–Ђв–Ђ    в–Ђв–Ђ
+
+build      : b9148-71d62733a
+model      : llama-3.2-1b-instruct-Q4_0-vocabQ4.gguf
+modalities : text
+
+available commands:
+  /exit or Ctrl+C     stop or exit
+  /regen              regenerate the last response
+  /clear              clear the chat history
+  /read <file>        add a text file
+  /glob <pattern>     add text files using globbing pattern
+
+
+> What is the capital of France? Explain in detail.
+
+The so so long long so so so far far so far long second second second longataratar not just long long ~ ~ so just so sound sound sound sound sound sound sound ret ret IP de deataratarataratarataratar de de retatar de de de deatarataratar de deataratarataratar de de de de myself myself de de de st myself myself myself de de de myself myself myself de de deatar myself myself de de de myself myself myself myself myself de myself myself myself myself de de Es-St de de de de de de de deynchynchynchynchynchynchynchynchynchynchynchynch de de de   de de sound sound sound sound them them them built built built built built sound sound sound sound sound de de de sound sound sound sound sound sound sound sound sound sound sound sound sound Lo-p-p-p-p-p-p-p-p-p-p-p-p-pynchynchynchynchynchynchynchynchynch N-p-p-p
+
+[ Prompt: 89.8 t/s | Generation: 17.8 t/s ]
+
+Exiting...

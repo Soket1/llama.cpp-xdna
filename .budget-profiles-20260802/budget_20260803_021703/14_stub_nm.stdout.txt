@@ -1,0 +1,94 @@
+[stub] nm hub stub enabled (O+resid add and RMSNorm skipped)
+[bcast] layer_fused_bcast_kc256.o + unified_bcast compiled
+[kernels] relay+concat+flowkv(MAX_CHUNK=256) built; gemv/rope/oproj copied
+[audit] O-FOLD F3BEST REAL: real gguf layer-0 Wq/Wo/gate/up/down; A=896 tiles [Wq64|Wo64|gate256|up256|down256] ; shim MM2S A8+x1+resid1+Klo/Khi/Vlo/Vhi4=14 ; S2MM P8 ; MemTiles jA/jB/Klo/Khi/Vlo/Vhi/oJ/oK=8/8
+[emit] MLIR 170991 bytes, 36 tiles
+[gguf] real layer-0 weights loaded (Wq/Wo/gate/up/down + ffn_norm gain)
+    Successfully parsed input file: C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir
+    Resource allocation pipeline completed successfully
+    Routing pipeline completed successfully
+    LLVM lowering pipeline completed successfully for core (2, 2)
+    C:\Python313\Lib\site-packages\llvm-aie\bin\clang -O2 --target=aie2p-none-unknown-elf -fuse-ld=C:\Python313\Lib\site-packages\llvm-aie\bin\ld.lld ofold8_f3best_real.mlir.prj\main_core_2_2.o -Wl,--gc-sections -Wl,--orphan-handling=error -Wl,-T,C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_2_2.ld.script -o C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_2_2.elf
+    LLVM lowering pipeline completed successfully for core (3, 2)
+    C:\Python313\Lib\site-packages\llvm-aie\bin\clang -O2 --target=aie2p-none-unknown-elf -fuse-ld=C:\Python313\Lib\site-packages\llvm-aie\bin\ld.lld ofold8_f3best_real.mlir.prj\main_core_3_2.o -Wl,--gc-sections -Wl,--orphan-handling=error -Wl,-T,C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_3_2.ld.script -o C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_3_2.elf
+    LLVM lowering pipeline completed successfully for core (4, 2)
+    C:\Python313\Lib\site-packages\llvm-aie\bin\clang -O2 --target=aie2p-none-unknown-elf -fuse-ld=C:\Python313\Lib\site-packages\llvm-aie\bin\ld.lld ofold8_f3best_real.mlir.prj\main_core_4_2.o -Wl,--gc-sections -Wl,--orphan-handling=error -Wl,-T,C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_4_2.ld.script -o C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_4_2.elf
+    LLVM lowering pipeline completed successfully for core (5, 2)
+    C:\Python313\Lib\site-packages\llvm-aie\bin\clang -O2 --target=aie2p-none-unknown-elf -fuse-ld=C:\Python313\Lib\site-packages\llvm-aie\bin\ld.lld ofold8_f3best_real.mlir.prj\main_core_5_2.o -Wl,--gc-sections -Wl,--orphan-handling=error -Wl,-T,C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_5_2.ld.script -o C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_5_2.elf
+    LLVM lowering pipeline completed successfully for core (2, 3)
+    C:\Python313\Lib\site-packages\llvm-aie\bin\clang -O2 --target=aie2p-none-unknown-elf -fuse-ld=C:\Python313\Lib\site-packages\llvm-aie\bin\ld.lld ofold8_f3best_real.mlir.prj\main_core_2_3.o -Wl,--gc-sections -Wl,--orphan-handling=error -Wl,-T,C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_2_3.ld.script -o C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_2_3.elf
+    LLVM lowering pipeline completed successfully for core (3, 3)
+    C:\Python313\Lib\site-packages\llvm-aie\bin\clang -O2 --target=aie2p-none-unknown-elf -fuse-ld=C:\Python313\Lib\site-packages\llvm-aie\bin\ld.lld ofold8_f3best_real.mlir.prj\main_core_3_3.o -Wl,--gc-sections -Wl,--orphan-handling=error -Wl,-T,C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_3_3.ld.script -o C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_3_3.elf
+    LLVM lowering pipeline completed successfully for core (4, 3)
+    C:\Python313\Lib\site-packages\llvm-aie\bin\clang -O2 --target=aie2p-none-unknown-elf -fuse-ld=C:\Python313\Lib\site-packages\llvm-aie\bin\ld.lld ofold8_f3best_real.mlir.prj\main_core_4_3.o -Wl,--gc-sections -Wl,--orphan-handling=error -Wl,-T,C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_4_3.ld.script -o C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_4_3.elf
+    LLVM lowering pipeline completed successfully for core (5, 3)
+    C:\Python313\Lib\site-packages\llvm-aie\bin\clang -O2 --target=aie2p-none-unknown-elf -fuse-ld=C:\Python313\Lib\site-packages\llvm-aie\bin\ld.lld ofold8_f3best_real.mlir.prj\main_core_5_3.o -Wl,--gc-sections -Wl,--orphan-handling=error -Wl,-T,C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_5_3.ld.script -o C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_5_3.elf
+    LLVM lowering pipeline completed successfully for core (0, 2)
+    C:\Python313\Lib\site-packages\llvm-aie\bin\clang -O2 --target=aie2p-none-unknown-elf -fuse-ld=C:\Python313\Lib\site-packages\llvm-aie\bin\ld.lld ofold8_f3best_real.mlir.prj\main_core_0_2.o -Wl,--gc-sections -Wl,--orphan-handling=error -Wl,-T,C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_0_2.ld.script -o C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_0_2.elf
+    LLVM lowering pipeline completed successfully for core (1, 2)
+    C:\Python313\Lib\site-packages\llvm-aie\bin\clang -O2 --target=aie2p-none-unknown-elf -fuse-ld=C:\Python313\Lib\site-packages\llvm-aie\bin\ld.lld ofold8_f3best_real.mlir.prj\main_core_1_2.o -Wl,--gc-sections -Wl,--orphan-handling=error -Wl,-T,C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_1_2.ld.script -o C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_1_2.elf
+    LLVM lowering pipeline completed successfully for core (6, 2)
+    C:\Python313\Lib\site-packages\llvm-aie\bin\clang -O2 --target=aie2p-none-unknown-elf -fuse-ld=C:\Python313\Lib\site-packages\llvm-aie\bin\ld.lld ofold8_f3best_real.mlir.prj\main_core_6_2.o -Wl,--gc-sections -Wl,--orphan-handling=error -Wl,-T,C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_6_2.ld.script -o C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_6_2.elf
+    LLVM lowering pipeline completed successfully for core (7, 2)
+    C:\Python313\Lib\site-packages\llvm-aie\bin\clang -O2 --target=aie2p-none-unknown-elf -fuse-ld=C:\Python313\Lib\site-packages\llvm-aie\bin\ld.lld ofold8_f3best_real.mlir.prj\main_core_7_2.o -Wl,--gc-sections -Wl,--orphan-handling=error -Wl,-T,C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_7_2.ld.script -o C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_7_2.elf
+    LLVM lowering pipeline completed successfully for core (0, 3)
+    C:\Python313\Lib\site-packages\llvm-aie\bin\clang -O2 --target=aie2p-none-unknown-elf -fuse-ld=C:\Python313\Lib\site-packages\llvm-aie\bin\ld.lld ofold8_f3best_real.mlir.prj\main_core_0_3.o -Wl,--gc-sections -Wl,--orphan-handling=error -Wl,-T,C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_0_3.ld.script -o C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_0_3.elf
+    LLVM lowering pipeline completed successfully for core (1, 3)
+    C:\Python313\Lib\site-packages\llvm-aie\bin\clang -O2 --target=aie2p-none-unknown-elf -fuse-ld=C:\Python313\Lib\site-packages\llvm-aie\bin\ld.lld ofold8_f3best_real.mlir.prj\main_core_1_3.o -Wl,--gc-sections -Wl,--orphan-handling=error -Wl,-T,C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_1_3.ld.script -o C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_1_3.elf
+    LLVM lowering pipeline completed successfully for core (6, 3)
+    C:\Python313\Lib\site-packages\llvm-aie\bin\clang -O2 --target=aie2p-none-unknown-elf -fuse-ld=C:\Python313\Lib\site-packages\llvm-aie\bin\ld.lld ofold8_f3best_real.mlir.prj\main_core_6_3.o -Wl,--gc-sections -Wl,--orphan-handling=error -Wl,-T,C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_6_3.ld.script -o C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_6_3.elf
+    LLVM lowering pipeline completed successfully for core (7, 3)
+    C:\Python313\Lib\site-packages\llvm-aie\bin\clang -O2 --target=aie2p-none-unknown-elf -fuse-ld=C:\Python313\Lib\site-packages\llvm-aie\bin\ld.lld ofold8_f3best_real.mlir.prj\main_core_7_3.o -Wl,--gc-sections -Wl,--orphan-handling=error -Wl,-T,C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_7_3.ld.script -o C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_7_3.elf
+    LLVM lowering pipeline completed successfully for core (0, 4)
+    C:\Python313\Lib\site-packages\llvm-aie\bin\clang -O2 --target=aie2p-none-unknown-elf -fuse-ld=C:\Python313\Lib\site-packages\llvm-aie\bin\ld.lld ofold8_f3best_real.mlir.prj\main_core_0_4.o -Wl,--gc-sections -Wl,--orphan-handling=error -Wl,-T,C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_0_4.ld.script -o C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_0_4.elf
+    LLVM lowering pipeline completed successfully for core (1, 4)
+    C:\Python313\Lib\site-packages\llvm-aie\bin\clang -O2 --target=aie2p-none-unknown-elf -fuse-ld=C:\Python313\Lib\site-packages\llvm-aie\bin\ld.lld ofold8_f3best_real.mlir.prj\main_core_1_4.o -Wl,--gc-sections -Wl,--orphan-handling=error -Wl,-T,C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_1_4.ld.script -o C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_1_4.elf
+    LLVM lowering pipeline completed successfully for core (6, 4)
+    C:\Python313\Lib\site-packages\llvm-aie\bin\clang -O2 --target=aie2p-none-unknown-elf -fuse-ld=C:\Python313\Lib\site-packages\llvm-aie\bin\ld.lld ofold8_f3best_real.mlir.prj\main_core_6_4.o -Wl,--gc-sections -Wl,--orphan-handling=error -Wl,-T,C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_6_4.ld.script -o C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_6_4.elf
+    LLVM lowering pipeline completed successfully for core (7, 4)
+    C:\Python313\Lib\site-packages\llvm-aie\bin\clang -O2 --target=aie2p-none-unknown-elf -fuse-ld=C:\Python313\Lib\site-packages\llvm-aie\bin\ld.lld ofold8_f3best_real.mlir.prj\main_core_7_4.o -Wl,--gc-sections -Wl,--orphan-handling=error -Wl,-T,C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_7_4.ld.script -o C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_7_4.elf
+    LLVM lowering pipeline completed successfully for core (0, 5)
+    C:\Python313\Lib\site-packages\llvm-aie\bin\clang -O2 --target=aie2p-none-unknown-elf -fuse-ld=C:\Python313\Lib\site-packages\llvm-aie\bin\ld.lld ofold8_f3best_real.mlir.prj\main_core_0_5.o -Wl,--gc-sections -Wl,--orphan-handling=error -Wl,-T,C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_0_5.ld.script -o C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_0_5.elf
+    LLVM lowering pipeline completed successfully for core (1, 5)
+    C:\Python313\Lib\site-packages\llvm-aie\bin\clang -O2 --target=aie2p-none-unknown-elf -fuse-ld=C:\Python313\Lib\site-packages\llvm-aie\bin\ld.lld ofold8_f3best_real.mlir.prj\main_core_1_5.o -Wl,--gc-sections -Wl,--orphan-handling=error -Wl,-T,C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_1_5.ld.script -o C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_1_5.elf
+    LLVM lowering pipeline completed successfully for core (6, 5)
+    C:\Python313\Lib\site-packages\llvm-aie\bin\clang -O2 --target=aie2p-none-unknown-elf -fuse-ld=C:\Python313\Lib\site-packages\llvm-aie\bin\ld.lld ofold8_f3best_real.mlir.prj\main_core_6_5.o -Wl,--gc-sections -Wl,--orphan-handling=error -Wl,-T,C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_6_5.ld.script -o C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_6_5.elf
+    LLVM lowering pipeline completed successfully for core (7, 5)
+    C:\Python313\Lib\site-packages\llvm-aie\bin\clang -O2 --target=aie2p-none-unknown-elf -fuse-ld=C:\Python313\Lib\site-packages\llvm-aie\bin\ld.lld ofold8_f3best_real.mlir.prj\main_core_7_5.o -Wl,--gc-sections -Wl,--orphan-handling=error -Wl,-T,C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_7_5.ld.script -o C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_7_5.elf
+    LLVM lowering pipeline completed successfully for core (2, 4)
+    C:\Python313\Lib\site-packages\llvm-aie\bin\clang -O2 --target=aie2p-none-unknown-elf -fuse-ld=C:\Python313\Lib\site-packages\llvm-aie\bin\ld.lld ofold8_f3best_real.mlir.prj\main_core_2_4.o -Wl,--gc-sections -Wl,--orphan-handling=error -Wl,-T,C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_2_4.ld.script -o C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_2_4.elf
+    LLVM lowering pipeline completed successfully for core (3, 4)
+    C:\Python313\Lib\site-packages\llvm-aie\bin\clang -O2 --target=aie2p-none-unknown-elf -fuse-ld=C:\Python313\Lib\site-packages\llvm-aie\bin\ld.lld ofold8_f3best_real.mlir.prj\main_core_3_4.o -Wl,--gc-sections -Wl,--orphan-handling=error -Wl,-T,C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_3_4.ld.script -o C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_3_4.elf
+    LLVM lowering pipeline completed successfully for core (4, 4)
+    C:\Python313\Lib\site-packages\llvm-aie\bin\clang -O2 --target=aie2p-none-unknown-elf -fuse-ld=C:\Python313\Lib\site-packages\llvm-aie\bin\ld.lld ofold8_f3best_real.mlir.prj\main_core_4_4.o -Wl,--gc-sections -Wl,--orphan-handling=error -Wl,-T,C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_4_4.ld.script -o C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_4_4.elf
+    LLVM lowering pipeline completed successfully for core (5, 4)
+    C:\Python313\Lib\site-packages\llvm-aie\bin\clang -O2 --target=aie2p-none-unknown-elf -fuse-ld=C:\Python313\Lib\site-packages\llvm-aie\bin\ld.lld ofold8_f3best_real.mlir.prj\main_core_5_4.o -Wl,--gc-sections -Wl,--orphan-handling=error -Wl,-T,C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_5_4.ld.script -o C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir.prj\main_core_5_4.elf
+    NPU lowering pipeline completed successfully
+    [INFO]   : Bootimage generated successfully
+    Section: 'MEM_TOPOLOGY'(6) was successfully added.
+    Section: 'AIE_PARTITION'(32) was successfully added.
+    Successfully wrote (172479 bytes) to the output file: C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.xclbin
+    Compilation completed successfully
+    C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir:2857:16: warning: Failed to allocate buffer: "Klo_buf" with size: 131072 bytes.
+    C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir:29:12: warning: Bank-aware allocation failed, trying basic sequential allocation.
+    C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir:2919:16: warning: Failed to allocate buffer: "Khi_buf" with size: 131072 bytes.
+    C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir:30:12: warning: Bank-aware allocation failed, trying basic sequential allocation.
+    C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir:2981:16: warning: Failed to allocate buffer: "Vlo_buf" with size: 131072 bytes.
+    C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir:31:12: warning: Bank-aware allocation failed, trying basic sequential allocation.
+    C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir:3043:16: warning: Failed to allocate buffer: "Vhi_buf" with size: 131072 bytes.
+    C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir:32:12: warning: Bank-aware allocation failed, trying basic sequential allocation.
+[compile] xclbin=172479B insts=3172B
+    replay: first dispatch state=4 (COMPLETED) in 3126 us
+    replay: 60 iters total 60725 us = 1012.1 us/dispatch (988.06 dispatch/s)
+  Pf 0 rel_L2=nan
+  Pf 1 rel_L2=nan
+  Pf 2 rel_L2=nan
+  Pf 3 rel_L2=nan
+  Pf 4 rel_L2=nan
+  Pf 5 rel_L2=nan
+  Pf 6 rel_L2=nan
+  Pf 7 rel_L2=nan
+  s (attn-resid) rel_L2=1.00000   FINAL layer-out rel_L2=nan
+  [absnorm] |s_npu|=0.0000 |s_ref|=2.6017 |diff|=2.6017  |O_part_npu(sum)|=nan
+[ofold8_f3best_real] worst rel_L2=1.00000
+=== ofold8_f3best_real FAIL ===

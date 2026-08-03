@@ -1,0 +1,74 @@
+[kernels] relay+concat+flowkv(MAX_CHUNK=256) built; gemv/rope/oproj copied
+[audit] O-FOLD F3BEST REAL: real gguf layer-0 Wq/Wo/gate/up/down; A=896 tiles [Wq64|Wo64|gate256|up256|down256] ; shim MM2S A8+x1+resid1+Klo/Khi/Vlo/Vhi4=14 ; S2MM P8 ; MemTiles jA/jB/Klo/Khi/Vlo/Vhi/oJ/oK=8/8
+[emit] MLIR 170991 bytes, 36 tiles
+[gguf] real layer-0 weights loaded (Wq/Wo/gate/up/down + ffn_norm gain)
+    Successfully parsed input file: C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir
+    Resource allocation pipeline completed successfully
+    Routing pipeline completed successfully
+    LLVM lowering pipeline completed successfully for core (2, 2)
+    C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir:2857:16: warning: Failed to allocate buffer: "Klo_buf" with size: 131072 bytes.
+    C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir:29:12: warning: Bank-aware allocation failed, trying basic sequential allocation.
+    C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir:2919:16: warning: Failed to allocate buffer: "Khi_buf" with size: 131072 bytes.
+    C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir:30:12: warning: Bank-aware allocation failed, trying basic sequential allocation.
+    C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir:2981:16: warning: Failed to allocate buffer: "Vlo_buf" with size: 131072 bytes.
+    C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir:31:12: warning: Bank-aware allocation failed, trying basic sequential allocation.
+    C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir:3043:16: warning: Failed to allocate buffer: "Vhi_buf" with size: 131072 bytes.
+    C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir:32:12: warning: Bank-aware allocation failed, trying basic sequential allocation.
+    Error: could not copy C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\layer_fused_bcast_kc256.o to ofold8_f3best_real.mlir.prj\layer_fused_bcast_kc256-7bfbf4.o: no such file or directory
+    Compilation failed
+=== ofold8_f3best_real: AIECC FAILED rc=1 ===
+	bank : 0	0x0-0xFFFF
+	bank : 1	0x10000-0x1FFFF
+	bank : 2	0x20000-0x2FFFF
+	bank : 3	0x30000-0x3FFFF
+	bank : 4	0x40000-0x4FFFF
+	bank : 5	0x50000-0x5FFFF
+	bank : 6	0x60000-0x6FFFF
+	bank : 7	0x70000-0x7FFFF
+
+C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir:31:12: warning: Bank-aware allocation failed, trying basic sequential allocation.
+    %Vlo = aie.tile(6, 1)
+           ^
+C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir:31:12: note: see current operation: %mem_tile_6_1 = aie.tile(6, 1) {controller_id = #aie.packet_info<pkt_type = 0, pkt_id = 26>}
+C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir:3043:16: warning: Failed to allocate buffer: "Vhi_buf" with size: 131072 bytes.
+    %Vhi_buf = aie.buffer(%Vhi) {sym_name = "Vhi_buf"} : memref<65536xbf16>
+               ^
+C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir:3043:16: note: see current operation: %Vhi_buf = aie.buffer(%mem_tile_7_1) {sym_name = "Vhi_buf"} : memref<65536xbf16> 
+C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir:32:12: warning: Not all requested buffers fit in the available memory.
+
+    %Vhi = aie.tile(7, 1)
+           ^
+C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir:32:12: note: see current operation: %mem_tile_7_1 = aie.tile(7, 1) {controller_id = #aie.packet_info<pkt_type = 0, pkt_id = 26>}
+C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir:32:12: note: Current configuration of buffers in bank(s) : MemoryMap:
+(no stack allocated)
+	bank : 0	0x0-0xFFFF
+	bank : 1	0x10000-0x1FFFF
+	bank : 2	0x20000-0x2FFFF
+	bank : 3	0x30000-0x3FFFF
+	bank : 4	0x40000-0x4FFFF
+	bank : 5	0x50000-0x5FFFF
+	bank : 6	0x60000-0x6FFFF
+	bank : 7	0x70000-0x7FFFF
+
+C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir:32:12: warning: Bank-aware allocation failed, trying basic sequential allocation.
+    %Vhi = aie.tile(7, 1)
+           ^
+C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir:32:12: note: see current operation: %mem_tile_7_1 = aie.tile(7, 1) {controller_id = #aie.packet_info<pkt_type = 0, pkt_id = 26>}
+C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir:57:5: warning: func 'layer_fused_down_v2_x4_bf16' has link_with but is never called from any core; its .o file will not be linked
+    func.func private @layer_fused_down_v2_x4_bf16(i32, i32, i32, memref<4608xi8>, memref<2320xbf16>) attributes {link_with = "layer_fused_relay.o"}
+    ^
+C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir:57:5: note: see current operation: func.func private @layer_fused_down_v2_x4_bf16(i32, i32, i32, memref<4608xi8>, memref<2320xbf16>) attributes {link_with = "layer_fused_relay.o"}
+C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir:51:5: warning: func 'layer_fused_gate_up_bf16' has link_with but is never called from any core; its .o file will not be linked
+    func.func private @layer_fused_gate_up_bf16(i32, i32, memref<4608xi8>, memref<2320xbf16>, i32) attributes {link_with = "layer_fused_relay.o"}
+    ^
+C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir:51:5: note: see current operation: func.func private @layer_fused_gate_up_bf16(i32, i32, memref<4608xi8>, memref<2320xbf16>, i32) attributes {link_with = "layer_fused_relay.o"}
+C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir:49:5: warning: func 'fused_dequant_matvec_v2_bf16' has link_with but is never called from any core; its .o file will not be linked
+    func.func private @fused_dequant_matvec_v2_bf16(i32, i32, memref<4608xi8>, memref<2320xbf16>, memref<322xbf16>) attributes {link_with = "fused_dequant_gemv_v2_signed_2048k_g32.o"}
+    ^
+C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir:49:5: note: see current operation: func.func private @fused_dequant_matvec_v2_bf16(i32, i32, memref<4608xi8>, memref<2320xbf16>, memref<322xbf16>) attributes {link_with = "fused_dequant_gemv_v2_signed_2048k_g32.o"}
+C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir:59:5: warning: func 'oproj_matvec_v2_bf16' has link_with but is never called from any core; its .o file will not be linked
+    func.func private @oproj_matvec_v2_bf16(i32, i32, memref<4608xi8>, memref<2320xbf16>, memref<2048xbf16>) attributes {link_with = "fused_dequant_gemv_v2_oproj_signed_2048k_g32.o"}
+    ^
+C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\ofold8_f3best_real.mlir:59:5: note: see current operation: func.func private @oproj_matvec_v2_bf16(i32, i32, memref<4608xi8>, memref<2320xbf16>, memref<2048xbf16>) attributes {link_with = "fused_dequant_gemv_v2_oproj_signed_2048k_g32.o"}
+Error: could not copy C:\llama.cpp-xdna\dev_notes\track_a_build\ofold8_f3best_real_build\layer_fused_bcast_kc256.o to ofold8_f3best_real.mlir.prj\layer_fused_bcast_kc256-7bfbf4.o: no such file or directory
+Compilation failed

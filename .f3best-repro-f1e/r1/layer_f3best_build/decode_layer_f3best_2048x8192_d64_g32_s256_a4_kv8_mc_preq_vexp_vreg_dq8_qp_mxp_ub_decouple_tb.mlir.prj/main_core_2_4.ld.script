@@ -1,0 +1,96 @@
+
+MEMORY
+{
+   program (RX) : ORIGIN = 0, LENGTH = 0x0020000
+   data (!RX) : ORIGIN = 0x71400, LENGTH = 0xEC00
+}
+ENTRY(__start)
+SECTIONS
+{
+  . = 0x0;
+  .text : {
+     /* the __start symbol has to come at address zero. */
+     *crt0.o(.text*)
+     _ctors_start = .;
+     _init_array_start = .;
+     KEEP(SORT(*.init_array))
+     _ctors_end = .;
+     _init_array_end = .;
+     _dtors_start = .;
+     _dtors_end = .;
+     *(.text*)
+  } > program
+  .data : {
+     *(.data*)
+     *(.rodata*)
+  } > data
+  .comment : {
+     *(.comment*)
+  }
+  .symtab : {
+     *(.symtab)
+  }
+  .shstrtab : {
+     *(.shstrtab)
+  }
+  .strtab : {
+     *(.strtab)
+  }
+  .stack_sizes : {
+     *(.stack_sizes)
+  }
+
+. = 0x70000;
+_sp_start_value_DM_stack = .;
+. += 0x400; /* stack */
+. = 0x41620;
+c4_A0 = .;
+. += 0x1200;
+. = 0x45220;
+c4_A1 = .;
+. += 0x1200;
+. = 0x40400;
+c4_B0 = .;
+. += 0x1220;
+. = 0x44000;
+c4_B1 = .;
+. += 0x1220;
+. = 0x48000;
+c4_B2 = .;
+. += 0x1220;
+. = 0x4A220;
+c4_Q = .;
+. += 0x284;
+. = 0x49220;
+c4_O = .;
+. += 0x1000;
+. = 0x4C000;
+c4_P = .;
+. += 0x1220;
+. = 0x4D220;
+c4_gate = .;
+. += 0x800;
+. = 0x42820;
+c4_up = .;
+. += 0x800;
+. = 0x46420;
+c4_silu = .;
+. += 0x800;
+. = 0x4DA20;
+c4_uni_partial = .;
+. += 0x80;
+. = 0x58000;
+va1_Iv = .;
+. += 0x410;
+. = 0x54000;
+va1_V = .;
+. += 0x4000;
+. = 0x5C000;
+va1_Of = .;
+. += 0x200;
+. = 0x70400;
+rl_A = .;
+. += 0x1000;
+  .bss : { *(.bss*) } > data
+}
+PROVIDE(main = core_2_4);

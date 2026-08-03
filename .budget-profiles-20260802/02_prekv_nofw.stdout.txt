@@ -1,0 +1,442 @@
+Successfully parsed input file: C:\llama.cpp-xdna\.bisect-prekv\build\fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir
+Using temporary directory: fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj
+Starting AIE compilation in directory: fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj
+  Device 'main' with 4 core(s)
+Found 1 AIE device(s)
+Detected target architecture for device main: AIE2p
+Detected AIE target: AIE2p
+Running resource allocation pipeline in-memory (alloc-scheme=)
+Resource allocation pipeline completed successfully
+Wrote module with addresses to: fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj\input_with_addresses.mlir
+Running routing pipeline in-memory
+Routing pipeline completed successfully
+
+Processing device: main
+Compiling 4 core(s) sequentially
+Compiling core (2, 2)
+Running LLVM lowering pipeline in-memory for core (2, 2)
+LLVM lowering pipeline completed successfully for core (2, 2)
+Generated LLVM IR: fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj\main_core_2_2.ll
+Generated linker script: fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj\main_core_2_2.ld.script
+Discovered Peano installation: C:\Python313\Lib\site-packages\llvm-aie
+C:\Python313\Lib\site-packages\llvm-aie\bin\opt --passes=default<O1> -inline-threshold=10 -S fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj\main_core_2_2.peanohack.ll -o fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj\main_core_2_2.opt.ll
+C:\Python313\Lib\site-packages\llvm-aie\bin\llc fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj\main_core_2_2.opt.ll -O2 --march=aie2p --function-sections --filetype=obj -o fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj\main_core_2_2.o
+Copied external object: C:\llama.cpp-xdna\.bisect-prekv\build\fused_dequant_gemv_v2_2048k_g32.o -> fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj\fused_dequant_gemv_v2_2048k_g32.o
+C:\Python313\Lib\site-packages\llvm-aie\bin\clang -O2 --target=aie2p-none-unknown-elf -fuse-ld=C:\Python313\Lib\site-packages\llvm-aie\bin\ld.lld fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj\main_core_2_2.o -Wl,--gc-sections -Wl,--orphan-handling=error -Wl,-T,C:\llama.cpp-xdna\.bisect-prekv\build\fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj\main_core_2_2.ld.script -o C:\llama.cpp-xdna\.bisect-prekv\build\fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj\main_core_2_2.elf
+Generated ELF: C:\llama.cpp-xdna\.bisect-prekv\build\fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj\main_core_2_2.elf
+Compiling core (3, 2)
+Running LLVM lowering pipeline in-memory for core (3, 2)
+LLVM lowering pipeline completed successfully for core (3, 2)
+Generated LLVM IR: fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj\main_core_3_2.ll
+Generated linker script: fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj\main_core_3_2.ld.script
+C:\Python313\Lib\site-packages\llvm-aie\bin\opt --passes=default<O1> -inline-threshold=10 -S fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj\main_core_3_2.peanohack.ll -o fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj\main_core_3_2.opt.ll
+C:\Python313\Lib\site-packages\llvm-aie\bin\llc fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj\main_core_3_2.opt.ll -O2 --march=aie2p --function-sections --filetype=obj -o fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj\main_core_3_2.o
+Copied external object: C:\llama.cpp-xdna\.bisect-prekv\build\fused_dequant_gemv_v2_2048k_g32.o -> fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj\fused_dequant_gemv_v2_2048k_g32.o
+C:\Python313\Lib\site-packages\llvm-aie\bin\clang -O2 --target=aie2p-none-unknown-elf -fuse-ld=C:\Python313\Lib\site-packages\llvm-aie\bin\ld.lld fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj\main_core_3_2.o -Wl,--gc-sections -Wl,--orphan-handling=error -Wl,-T,C:\llama.cpp-xdna\.bisect-prekv\build\fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj\main_core_3_2.ld.script -o C:\llama.cpp-xdna\.bisect-prekv\build\fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj\main_core_3_2.elf
+Generated ELF: C:\llama.cpp-xdna\.bisect-prekv\build\fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj\main_core_3_2.elf
+Compiling core (4, 2)
+Running LLVM lowering pipeline in-memory for core (4, 2)
+LLVM lowering pipeline completed successfully for core (4, 2)
+Generated LLVM IR: fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj\main_core_4_2.ll
+Generated linker script: fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj\main_core_4_2.ld.script
+C:\Python313\Lib\site-packages\llvm-aie\bin\opt --passes=default<O1> -inline-threshold=10 -S fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj\main_core_4_2.peanohack.ll -o fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj\main_core_4_2.opt.ll
+C:\Python313\Lib\site-packages\llvm-aie\bin\llc fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj\main_core_4_2.opt.ll -O2 --march=aie2p --function-sections --filetype=obj -o fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj\main_core_4_2.o
+Copied external object: C:\llama.cpp-xdna\.bisect-prekv\build\fused_dequant_gemv_v2_2048k_g32.o -> fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj\fused_dequant_gemv_v2_2048k_g32.o
+C:\Python313\Lib\site-packages\llvm-aie\bin\clang -O2 --target=aie2p-none-unknown-elf -fuse-ld=C:\Python313\Lib\site-packages\llvm-aie\bin\ld.lld fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj\main_core_4_2.o -Wl,--gc-sections -Wl,--orphan-handling=error -Wl,-T,C:\llama.cpp-xdna\.bisect-prekv\build\fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj\main_core_4_2.ld.script -o C:\llama.cpp-xdna\.bisect-prekv\build\fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj\main_core_4_2.elf
+Generated ELF: C:\llama.cpp-xdna\.bisect-prekv\build\fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj\main_core_4_2.elf
+Compiling core (5, 2)
+Running LLVM lowering pipeline in-memory for core (5, 2)
+LLVM lowering pipeline completed successfully for core (5, 2)
+Generated LLVM IR: fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj\main_core_5_2.ll
+Generated linker script: fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj\main_core_5_2.ld.script
+C:\Python313\Lib\site-packages\llvm-aie\bin\opt --passes=default<O1> -inline-threshold=10 -S fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj\main_core_5_2.peanohack.ll -o fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj\main_core_5_2.opt.ll
+C:\Python313\Lib\site-packages\llvm-aie\bin\llc fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj\main_core_5_2.opt.ll -O2 --march=aie2p --function-sections --filetype=obj -o fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj\main_core_5_2.o
+Copied external object: C:\llama.cpp-xdna\.bisect-prekv\build\fused_dequant_gemv_v2_2048k_g32.o -> fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj\fused_dequant_gemv_v2_2048k_g32.o
+C:\Python313\Lib\site-packages\llvm-aie\bin\clang -O2 --target=aie2p-none-unknown-elf -fuse-ld=C:\Python313\Lib\site-packages\llvm-aie\bin\ld.lld fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj\main_core_5_2.o -Wl,--gc-sections -Wl,--orphan-handling=error -Wl,-T,C:\llama.cpp-xdna\.bisect-prekv\build\fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj\main_core_5_2.ld.script -o C:\llama.cpp-xdna\.bisect-prekv\build\fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj\main_core_5_2.elf
+Generated ELF: C:\llama.cpp-xdna\.bisect-prekv\build\fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj\main_core_5_2.elf
+Updating module with ELF paths for device: main
+Generating NPU instructions for device: main
+Running NPU lowering pipeline in-memory
+NPU lowering pipeline completed successfully
+Generating NPU instructions for sequence: sequence -> C:\llama.cpp-xdna\.bisect-prekv\build\fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.bin
+Wrote 408 instructions to: C:\llama.cpp-xdna\.bisect-prekv\build\fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.bin
+Generating CDO artifacts for device: main
+Generated JSON metadata files in: fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj
+Generated CDO files in: fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj
+C:\Python313\Lib\site-packages\mlir_aie\bin\bootgen.exe -arch versal -image fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj\main_design.bif -o fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj\main.pdi -w
+
+
+****** Bootgen v2023.2
+  **** Build date : Mar 31 2026-05:09:04
+    ** Copyright 1986-2022 Xilinx, Inc. All Rights Reserved.
+    ** Copyright 2022-2023 Advanced Micro Devices, Inc. All Rights Reserved.
+
+
+[INFO]   : Bootimage generated successfully
+
+Generated PDI: fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj\main.pdi
+Generating xclbin for device: main
+C:\Users\Kuhnya\Downloads\xrt_windows_sdk\xrt_sdk\xrt\xclbinutil.exe --add-replace-section MEM_TOPOLOGY:JSON:fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj\main_mem_topology.json --add-kernel fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj\main_kernels.json --add-replace-section AIE_PARTITION:JSON:fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj\main_aie_partition.json --force --output C:\llama.cpp-xdna\.bisect-prekv\build\fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.xclbin
+XRT Build Version: 2.21.0 (HEAD)
+       Build Date: 2026-02-23 13:36:06
+          Hash ID: 4eb1f4392a012b4e6eca759762389c612537f7c7
+Creating a default 'in-memory' xclbin image.
+
+Section: 'MEM_TOPOLOGY'(6) was successfully added.
+Size   : 88 bytes
+Format : JSON
+File   : 'fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj\main_mem_topology.json'
+
+Section: 'AIE_PARTITION'(32) was successfully added.
+Size   : 13736 bytes
+Format : JSON
+File   : 'fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.mlir.prj\main_aie_partition.json'
+Info: Embedded Metadata section is missing project.platform.device.core element, adding it.
+Successfully wrote (19769 bytes) to the output file: C:\llama.cpp-xdna\.bisect-prekv\build\fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.xclbin
+Leaving xclbinutil.
+Generated xclbin: C:\llama.cpp-xdna\.bisect-prekv\build\fused_dequant_gemv_v2_2048x2048_4tsi_512tso_4col_g32.xclbin
+Compilation completed successfully
+Successfully parsed input file: C:\llama.cpp-xdna\.bisect-prekv\build\fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir
+Using temporary directory: fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj
+Starting AIE compilation in directory: fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj
+  Device 'main' with 4 core(s)
+Found 1 AIE device(s)
+Detected target architecture for device main: AIE2p
+Detected AIE target: AIE2p
+Running resource allocation pipeline in-memory (alloc-scheme=)
+Resource allocation pipeline completed successfully
+Wrote module with addresses to: fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj\input_with_addresses.mlir
+Running routing pipeline in-memory
+Routing pipeline completed successfully
+
+Processing device: main
+Compiling 4 core(s) sequentially
+Compiling core (2, 2)
+Running LLVM lowering pipeline in-memory for core (2, 2)
+LLVM lowering pipeline completed successfully for core (2, 2)
+Generated LLVM IR: fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj\main_core_2_2.ll
+Generated linker script: fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj\main_core_2_2.ld.script
+Discovered Peano installation: C:\Python313\Lib\site-packages\llvm-aie
+C:\Python313\Lib\site-packages\llvm-aie\bin\opt --passes=default<O1> -inline-threshold=10 -S fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj\main_core_2_2.peanohack.ll -o fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj\main_core_2_2.opt.ll
+C:\Python313\Lib\site-packages\llvm-aie\bin\llc fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj\main_core_2_2.opt.ll -O2 --march=aie2p --function-sections --filetype=obj -o fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj\main_core_2_2.o
+Copied external object: C:\llama.cpp-xdna\.bisect-prekv\build\fused_dequant_gemv_v2_2048k_g32.o -> fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj\fused_dequant_gemv_v2_2048k_g32.o
+C:\Python313\Lib\site-packages\llvm-aie\bin\clang -O2 --target=aie2p-none-unknown-elf -fuse-ld=C:\Python313\Lib\site-packages\llvm-aie\bin\ld.lld fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj\main_core_2_2.o -Wl,--gc-sections -Wl,--orphan-handling=error -Wl,-T,C:\llama.cpp-xdna\.bisect-prekv\build\fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj\main_core_2_2.ld.script -o C:\llama.cpp-xdna\.bisect-prekv\build\fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj\main_core_2_2.elf
+Generated ELF: C:\llama.cpp-xdna\.bisect-prekv\build\fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj\main_core_2_2.elf
+Compiling core (3, 2)
+Running LLVM lowering pipeline in-memory for core (3, 2)
+LLVM lowering pipeline completed successfully for core (3, 2)
+Generated LLVM IR: fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj\main_core_3_2.ll
+Generated linker script: fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj\main_core_3_2.ld.script
+C:\Python313\Lib\site-packages\llvm-aie\bin\opt --passes=default<O1> -inline-threshold=10 -S fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj\main_core_3_2.peanohack.ll -o fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj\main_core_3_2.opt.ll
+C:\Python313\Lib\site-packages\llvm-aie\bin\llc fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj\main_core_3_2.opt.ll -O2 --march=aie2p --function-sections --filetype=obj -o fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj\main_core_3_2.o
+Copied external object: C:\llama.cpp-xdna\.bisect-prekv\build\fused_dequant_gemv_v2_2048k_g32.o -> fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj\fused_dequant_gemv_v2_2048k_g32.o
+C:\Python313\Lib\site-packages\llvm-aie\bin\clang -O2 --target=aie2p-none-unknown-elf -fuse-ld=C:\Python313\Lib\site-packages\llvm-aie\bin\ld.lld fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj\main_core_3_2.o -Wl,--gc-sections -Wl,--orphan-handling=error -Wl,-T,C:\llama.cpp-xdna\.bisect-prekv\build\fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj\main_core_3_2.ld.script -o C:\llama.cpp-xdna\.bisect-prekv\build\fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj\main_core_3_2.elf
+Generated ELF: C:\llama.cpp-xdna\.bisect-prekv\build\fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj\main_core_3_2.elf
+Compiling core (4, 2)
+Running LLVM lowering pipeline in-memory for core (4, 2)
+LLVM lowering pipeline completed successfully for core (4, 2)
+Generated LLVM IR: fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj\main_core_4_2.ll
+Generated linker script: fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj\main_core_4_2.ld.script
+C:\Python313\Lib\site-packages\llvm-aie\bin\opt --passes=default<O1> -inline-threshold=10 -S fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj\main_core_4_2.peanohack.ll -o fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj\main_core_4_2.opt.ll
+C:\Python313\Lib\site-packages\llvm-aie\bin\llc fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj\main_core_4_2.opt.ll -O2 --march=aie2p --function-sections --filetype=obj -o fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj\main_core_4_2.o
+Copied external object: C:\llama.cpp-xdna\.bisect-prekv\build\fused_dequant_gemv_v2_2048k_g32.o -> fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj\fused_dequant_gemv_v2_2048k_g32.o
+C:\Python313\Lib\site-packages\llvm-aie\bin\clang -O2 --target=aie2p-none-unknown-elf -fuse-ld=C:\Python313\Lib\site-packages\llvm-aie\bin\ld.lld fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj\main_core_4_2.o -Wl,--gc-sections -Wl,--orphan-handling=error -Wl,-T,C:\llama.cpp-xdna\.bisect-prekv\build\fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj\main_core_4_2.ld.script -o C:\llama.cpp-xdna\.bisect-prekv\build\fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj\main_core_4_2.elf
+Generated ELF: C:\llama.cpp-xdna\.bisect-prekv\build\fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj\main_core_4_2.elf
+Compiling core (5, 2)
+Running LLVM lowering pipeline in-memory for core (5, 2)
+LLVM lowering pipeline completed successfully for core (5, 2)
+Generated LLVM IR: fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj\main_core_5_2.ll
+Generated linker script: fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj\main_core_5_2.ld.script
+C:\Python313\Lib\site-packages\llvm-aie\bin\opt --passes=default<O1> -inline-threshold=10 -S fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj\main_core_5_2.peanohack.ll -o fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj\main_core_5_2.opt.ll
+C:\Python313\Lib\site-packages\llvm-aie\bin\llc fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj\main_core_5_2.opt.ll -O2 --march=aie2p --function-sections --filetype=obj -o fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj\main_core_5_2.o
+Copied external object: C:\llama.cpp-xdna\.bisect-prekv\build\fused_dequant_gemv_v2_2048k_g32.o -> fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj\fused_dequant_gemv_v2_2048k_g32.o
+C:\Python313\Lib\site-packages\llvm-aie\bin\clang -O2 --target=aie2p-none-unknown-elf -fuse-ld=C:\Python313\Lib\site-packages\llvm-aie\bin\ld.lld fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj\main_core_5_2.o -Wl,--gc-sections -Wl,--orphan-handling=error -Wl,-T,C:\llama.cpp-xdna\.bisect-prekv\build\fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj\main_core_5_2.ld.script -o C:\llama.cpp-xdna\.bisect-prekv\build\fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj\main_core_5_2.elf
+Generated ELF: C:\llama.cpp-xdna\.bisect-prekv\build\fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj\main_core_5_2.elf
+Updating module with ELF paths for device: main
+Generating NPU instructions for device: main
+Running NPU lowering pipeline in-memory
+NPU lowering pipeline completed successfully
+Generating NPU instructions for sequence: sequence -> C:\llama.cpp-xdna\.bisect-prekv\build\fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.bin
+Wrote 408 instructions to: C:\llama.cpp-xdna\.bisect-prekv\build\fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.bin
+Generating CDO artifacts for device: main
+Generated JSON metadata files in: fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj
+Generated CDO files in: fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj
+C:\Python313\Lib\site-packages\mlir_aie\bin\bootgen.exe -arch versal -image fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj\main_design.bif -o fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj\main.pdi -w
+
+
+****** Bootgen v2023.2
+  **** Build date : Mar 31 2026-05:09:04
+    ** Copyright 1986-2022 Xilinx, Inc. All Rights Reserved.
+    ** Copyright 2022-2023 Advanced Micro Devices, Inc. All Rights Reserved.
+
+
+[INFO]   : Bootimage generated successfully
+
+Generated PDI: fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj\main.pdi
+Generating xclbin for device: main
+C:\Users\Kuhnya\Downloads\xrt_windows_sdk\xrt_sdk\xrt\xclbinutil.exe --add-replace-section MEM_TOPOLOGY:JSON:fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj\main_mem_topology.json --add-kernel fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj\main_kernels.json --add-replace-section AIE_PARTITION:JSON:fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj\main_aie_partition.json --force --output C:\llama.cpp-xdna\.bisect-prekv\build\fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.xclbin
+XRT Build Version: 2.21.0 (HEAD)
+       Build Date: 2026-02-23 13:36:06
+          Hash ID: 4eb1f4392a012b4e6eca759762389c612537f7c7
+Creating a default 'in-memory' xclbin image.
+
+Section: 'MEM_TOPOLOGY'(6) was successfully added.
+Size   : 88 bytes
+Format : JSON
+File   : 'fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj\main_mem_topology.json'
+
+Section: 'AIE_PARTITION'(32) was successfully added.
+Size   : 13736 bytes
+Format : JSON
+File   : 'fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.mlir.prj\main_aie_partition.json'
+Info: Embedded Metadata section is missing project.platform.device.core element, adding it.
+Successfully wrote (19769 bytes) to the output file: C:\llama.cpp-xdna\.bisect-prekv\build\fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.xclbin
+Leaving xclbinutil.
+Generated xclbin: C:\llama.cpp-xdna\.bisect-prekv\build\fused_dequant_gemv_v2_512x2048_4tsi_128tso_4col_g32.xclbin
+Compilation completed successfully
+Successfully parsed input file: C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir
+Using temporary directory: swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj
+Starting AIE compilation in directory: swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj
+  Device 'main' with 4 core(s)
+Found 1 AIE device(s)
+Detected target architecture for device main: AIE2p
+Detected AIE target: AIE2p
+Running resource allocation pipeline in-memory (alloc-scheme=)
+Resource allocation pipeline completed successfully
+Wrote module with addresses to: swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj\input_with_addresses.mlir
+Running routing pipeline in-memory
+Routing pipeline completed successfully
+
+Processing device: main
+Compiling 4 core(s) sequentially
+Compiling core (0, 2)
+Running LLVM lowering pipeline in-memory for core (0, 2)
+LLVM lowering pipeline completed successfully for core (0, 2)
+Generated LLVM IR: swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj\main_core_0_2.ll
+Generated linker script: swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj\main_core_0_2.ld.script
+Discovered Peano installation: C:\Python313\Lib\site-packages\llvm-aie
+C:\Python313\Lib\site-packages\llvm-aie\bin\opt --passes=default<O1> -inline-threshold=10 -S swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj\main_core_0_2.peanohack.ll -o swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj\main_core_0_2.opt.ll
+C:\Python313\Lib\site-packages\llvm-aie\bin\llc swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj\main_core_0_2.opt.ll -O2 --march=aie2p --function-sections --filetype=obj -o swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj\main_core_0_2.o
+Copied external object: C:\llama.cpp-xdna\.bisect-prekv\build\dual_fused_dequant_gemv_silu_mul_2048k_g32.o -> swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj\dual_fused_dequant_gemv_silu_mul_2048k_g32.o
+C:\Python313\Lib\site-packages\llvm-aie\bin\clang -O2 --target=aie2p-none-unknown-elf -fuse-ld=C:\Python313\Lib\site-packages\llvm-aie\bin\ld.lld swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj\main_core_0_2.o -Wl,--gc-sections -Wl,--orphan-handling=error -Wl,-T,C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj\main_core_0_2.ld.script -o C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj\main_core_0_2.elf
+Generated ELF: C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj\main_core_0_2.elf
+Compiling core (0, 3)
+Running LLVM lowering pipeline in-memory for core (0, 3)
+LLVM lowering pipeline completed successfully for core (0, 3)
+Generated LLVM IR: swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj\main_core_0_3.ll
+Generated linker script: swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj\main_core_0_3.ld.script
+C:\Python313\Lib\site-packages\llvm-aie\bin\opt --passes=default<O1> -inline-threshold=10 -S swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj\main_core_0_3.peanohack.ll -o swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj\main_core_0_3.opt.ll
+C:\Python313\Lib\site-packages\llvm-aie\bin\llc swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj\main_core_0_3.opt.ll -O2 --march=aie2p --function-sections --filetype=obj -o swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj\main_core_0_3.o
+Copied external object: C:\llama.cpp-xdna\.bisect-prekv\build\dual_fused_dequant_gemv_silu_mul_2048k_g32.o -> swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj\dual_fused_dequant_gemv_silu_mul_2048k_g32.o
+C:\Python313\Lib\site-packages\llvm-aie\bin\clang -O2 --target=aie2p-none-unknown-elf -fuse-ld=C:\Python313\Lib\site-packages\llvm-aie\bin\ld.lld swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj\main_core_0_3.o -Wl,--gc-sections -Wl,--orphan-handling=error -Wl,-T,C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj\main_core_0_3.ld.script -o C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj\main_core_0_3.elf
+Generated ELF: C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj\main_core_0_3.elf
+Compiling core (0, 4)
+Running LLVM lowering pipeline in-memory for core (0, 4)
+LLVM lowering pipeline completed successfully for core (0, 4)
+Generated LLVM IR: swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj\main_core_0_4.ll
+Generated linker script: swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj\main_core_0_4.ld.script
+C:\Python313\Lib\site-packages\llvm-aie\bin\opt --passes=default<O1> -inline-threshold=10 -S swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj\main_core_0_4.peanohack.ll -o swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj\main_core_0_4.opt.ll
+C:\Python313\Lib\site-packages\llvm-aie\bin\llc swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj\main_core_0_4.opt.ll -O2 --march=aie2p --function-sections --filetype=obj -o swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj\main_core_0_4.o
+Copied external object: C:\llama.cpp-xdna\.bisect-prekv\build\dual_fused_dequant_gemv_silu_mul_2048k_g32.o -> swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj\dual_fused_dequant_gemv_silu_mul_2048k_g32.o
+C:\Python313\Lib\site-packages\llvm-aie\bin\clang -O2 --target=aie2p-none-unknown-elf -fuse-ld=C:\Python313\Lib\site-packages\llvm-aie\bin\ld.lld swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj\main_core_0_4.o -Wl,--gc-sections -Wl,--orphan-handling=error -Wl,-T,C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj\main_core_0_4.ld.script -o C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj\main_core_0_4.elf
+Generated ELF: C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj\main_core_0_4.elf
+Compiling core (0, 5)
+Running LLVM lowering pipeline in-memory for core (0, 5)
+LLVM lowering pipeline completed successfully for core (0, 5)
+Generated LLVM IR: swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj\main_core_0_5.ll
+Generated linker script: swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj\main_core_0_5.ld.script
+C:\Python313\Lib\site-packages\llvm-aie\bin\opt --passes=default<O1> -inline-threshold=10 -S swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj\main_core_0_5.peanohack.ll -o swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj\main_core_0_5.opt.ll
+C:\Python313\Lib\site-packages\llvm-aie\bin\llc swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj\main_core_0_5.opt.ll -O2 --march=aie2p --function-sections --filetype=obj -o swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj\main_core_0_5.o
+Copied external object: C:\llama.cpp-xdna\.bisect-prekv\build\dual_fused_dequant_gemv_silu_mul_2048k_g32.o -> swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj\dual_fused_dequant_gemv_silu_mul_2048k_g32.o
+C:\Python313\Lib\site-packages\llvm-aie\bin\clang -O2 --target=aie2p-none-unknown-elf -fuse-ld=C:\Python313\Lib\site-packages\llvm-aie\bin\ld.lld swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj\main_core_0_5.o -Wl,--gc-sections -Wl,--orphan-handling=error -Wl,-T,C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj\main_core_0_5.ld.script -o C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj\main_core_0_5.elf
+Generated ELF: C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj\main_core_0_5.elf
+Updating module with ELF paths for device: main
+Generating NPU instructions for device: main
+Running NPU lowering pipeline in-memory
+NPU lowering pipeline completed successfully
+Generating NPU instructions for sequence: sequence -> C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.bin
+Wrote 408 instructions to: C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.bin
+Generating CDO artifacts for device: main
+Generated JSON metadata files in: swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj
+Generated CDO files in: swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj
+C:\Python313\Lib\site-packages\mlir_aie\bin\bootgen.exe -arch versal -image swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj\main_design.bif -o swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj\main.pdi -w
+
+
+****** Bootgen v2023.2
+  **** Build date : Mar 31 2026-05:09:04
+    ** Copyright 1986-2022 Xilinx, Inc. All Rights Reserved.
+    ** Copyright 2022-2023 Advanced Micro Devices, Inc. All Rights Reserved.
+
+
+[INFO]   : Bootimage generated successfully
+
+Generated PDI: swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj\main.pdi
+Generating xclbin for device: main
+C:\Users\Kuhnya\Downloads\xrt_windows_sdk\xrt_sdk\xrt\xclbinutil.exe --add-replace-section MEM_TOPOLOGY:JSON:swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj\main_mem_topology.json --add-kernel swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj\main_kernels.json --add-replace-section AIE_PARTITION:JSON:swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj\main_aie_partition.json --force --output C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.xclbin
+XRT Build Version: 2.21.0 (HEAD)
+       Build Date: 2026-02-23 13:36:06
+          Hash ID: 4eb1f4392a012b4e6eca759762389c612537f7c7
+Creating a default 'in-memory' xclbin image.
+
+Section: 'MEM_TOPOLOGY'(6) was successfully added.
+Size   : 88 bytes
+Format : JSON
+File   : 'swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj\main_mem_topology.json'
+
+Section: 'AIE_PARTITION'(32) was successfully added.
+Size   : 48840 bytes
+Format : JSON
+File   : 'swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.mlir.prj\main_aie_partition.json'
+Info: Embedded Metadata section is missing project.platform.device.core element, adding it.
+Successfully wrote (54916 bytes) to the output file: C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.xclbin
+Leaving xclbinutil.
+Generated xclbin: C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.xclbin
+Compilation completed successfully
+Successfully parsed input file: C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir
+Using temporary directory: swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj
+Starting AIE compilation in directory: swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj
+  Device 'main' with 4 core(s)
+Found 1 AIE device(s)
+Detected target architecture for device main: AIE2p
+Detected AIE target: AIE2p
+Running resource allocation pipeline in-memory (alloc-scheme=)
+Resource allocation pipeline completed successfully
+Running routing pipeline in-memory
+Routing pipeline completed successfully
+
+Processing device: main
+Compiling 4 core(s) sequentially
+Generating NPU instructions for device: main
+Running NPU lowering pipeline in-memory
+NPU lowering pipeline completed successfully
+Generating NPU instructions for sequence: sequence -> C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.bin
+Wrote 408 instructions to: C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.bin
+Compilation completed successfully
+Successfully parsed input file: C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir
+Using temporary directory: swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj
+Starting AIE compilation in directory: swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj
+  Device 'main' with 4 core(s)
+Found 1 AIE device(s)
+Detected target architecture for device main: AIE2p
+Detected AIE target: AIE2p
+Running resource allocation pipeline in-memory (alloc-scheme=)
+Resource allocation pipeline completed successfully
+Wrote module with addresses to: swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj\input_with_addresses.mlir
+Running routing pipeline in-memory
+Routing pipeline completed successfully
+
+Processing device: main
+Compiling 4 core(s) sequentially
+Compiling core (2, 2)
+Running LLVM lowering pipeline in-memory for core (2, 2)
+LLVM lowering pipeline completed successfully for core (2, 2)
+Generated LLVM IR: swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj\main_core_2_2.ll
+Generated linker script: swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj\main_core_2_2.ld.script
+Discovered Peano installation: C:\Python313\Lib\site-packages\llvm-aie
+C:\Python313\Lib\site-packages\llvm-aie\bin\opt --passes=default<O1> -inline-threshold=10 -S swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj\main_core_2_2.peanohack.ll -o swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj\main_core_2_2.opt.ll
+C:\Python313\Lib\site-packages\llvm-aie\bin\llc swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj\main_core_2_2.opt.ll -O2 --march=aie2p --function-sections --filetype=obj -o swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj\main_core_2_2.o
+Copied external object: C:\llama.cpp-xdna\.bisect-prekv\build\fused_dequant_gemv_v2_8192k_g32.o -> swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj\fused_dequant_gemv_v2_8192k_g32.o
+C:\Python313\Lib\site-packages\llvm-aie\bin\clang -O2 --target=aie2p-none-unknown-elf -fuse-ld=C:\Python313\Lib\site-packages\llvm-aie\bin\ld.lld swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj\main_core_2_2.o -Wl,--gc-sections -Wl,--orphan-handling=error -Wl,-T,C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj\main_core_2_2.ld.script -o C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj\main_core_2_2.elf
+Generated ELF: C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj\main_core_2_2.elf
+Compiling core (3, 2)
+Running LLVM lowering pipeline in-memory for core (3, 2)
+LLVM lowering pipeline completed successfully for core (3, 2)
+Generated LLVM IR: swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj\main_core_3_2.ll
+Generated linker script: swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj\main_core_3_2.ld.script
+C:\Python313\Lib\site-packages\llvm-aie\bin\opt --passes=default<O1> -inline-threshold=10 -S swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj\main_core_3_2.peanohack.ll -o swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj\main_core_3_2.opt.ll
+C:\Python313\Lib\site-packages\llvm-aie\bin\llc swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj\main_core_3_2.opt.ll -O2 --march=aie2p --function-sections --filetype=obj -o swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj\main_core_3_2.o
+Copied external object: C:\llama.cpp-xdna\.bisect-prekv\build\fused_dequant_gemv_v2_8192k_g32.o -> swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj\fused_dequant_gemv_v2_8192k_g32.o
+C:\Python313\Lib\site-packages\llvm-aie\bin\clang -O2 --target=aie2p-none-unknown-elf -fuse-ld=C:\Python313\Lib\site-packages\llvm-aie\bin\ld.lld swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj\main_core_3_2.o -Wl,--gc-sections -Wl,--orphan-handling=error -Wl,-T,C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj\main_core_3_2.ld.script -o C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj\main_core_3_2.elf
+Generated ELF: C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj\main_core_3_2.elf
+Compiling core (4, 2)
+Running LLVM lowering pipeline in-memory for core (4, 2)
+LLVM lowering pipeline completed successfully for core (4, 2)
+Generated LLVM IR: swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj\main_core_4_2.ll
+Generated linker script: swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj\main_core_4_2.ld.script
+C:\Python313\Lib\site-packages\llvm-aie\bin\opt --passes=default<O1> -inline-threshold=10 -S swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj\main_core_4_2.peanohack.ll -o swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj\main_core_4_2.opt.ll
+C:\Python313\Lib\site-packages\llvm-aie\bin\llc swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj\main_core_4_2.opt.ll -O2 --march=aie2p --function-sections --filetype=obj -o swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj\main_core_4_2.o
+Copied external object: C:\llama.cpp-xdna\.bisect-prekv\build\fused_dequant_gemv_v2_8192k_g32.o -> swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj\fused_dequant_gemv_v2_8192k_g32.o
+C:\Python313\Lib\site-packages\llvm-aie\bin\clang -O2 --target=aie2p-none-unknown-elf -fuse-ld=C:\Python313\Lib\site-packages\llvm-aie\bin\ld.lld swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj\main_core_4_2.o -Wl,--gc-sections -Wl,--orphan-handling=error -Wl,-T,C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj\main_core_4_2.ld.script -o C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj\main_core_4_2.elf
+Generated ELF: C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj\main_core_4_2.elf
+Compiling core (5, 2)
+Running LLVM lowering pipeline in-memory for core (5, 2)
+LLVM lowering pipeline completed successfully for core (5, 2)
+Generated LLVM IR: swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj\main_core_5_2.ll
+Generated linker script: swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj\main_core_5_2.ld.script
+C:\Python313\Lib\site-packages\llvm-aie\bin\opt --passes=default<O1> -inline-threshold=10 -S swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj\main_core_5_2.peanohack.ll -o swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj\main_core_5_2.opt.ll
+C:\Python313\Lib\site-packages\llvm-aie\bin\llc swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj\main_core_5_2.opt.ll -O2 --march=aie2p --function-sections --filetype=obj -o swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj\main_core_5_2.o
+Copied external object: C:\llama.cpp-xdna\.bisect-prekv\build\fused_dequant_gemv_v2_8192k_g32.o -> swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj\fused_dequant_gemv_v2_8192k_g32.o
+C:\Python313\Lib\site-packages\llvm-aie\bin\clang -O2 --target=aie2p-none-unknown-elf -fuse-ld=C:\Python313\Lib\site-packages\llvm-aie\bin\ld.lld swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj\main_core_5_2.o -Wl,--gc-sections -Wl,--orphan-handling=error -Wl,-T,C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj\main_core_5_2.ld.script -o C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj\main_core_5_2.elf
+Generated ELF: C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj\main_core_5_2.elf
+Updating module with ELF paths for device: main
+Generating CDO artifacts for device: main
+Generated JSON metadata files in: swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj
+Generated CDO files in: swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj
+C:\Python313\Lib\site-packages\mlir_aie\bin\bootgen.exe -arch versal -image swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj\main_design.bif -o swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj\main.pdi -w
+
+
+****** Bootgen v2023.2
+  **** Build date : Mar 31 2026-05:09:04
+    ** Copyright 1986-2022 Xilinx, Inc. All Rights Reserved.
+    ** Copyright 2022-2023 Advanced Micro Devices, Inc. All Rights Reserved.
+
+
+[INFO]   : Bootimage generated successfully
+
+Generated PDI: swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj\main.pdi
+Generating xclbin for device: main
+Extending existing xclbin: C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.xclbin
+C:\Users\Kuhnya\Downloads\xrt_windows_sdk\xrt_sdk\xrt\xclbinutil.exe --dump-section AIE_PARTITION:JSON:swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj\input_aie_partition.json --force --quiet --input C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.xclbin
+Extracted partition from input xclbin: swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj\input_aie_partition.json
+Merged partition JSON: swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj\main_merged_partition.json
+C:\Users\Kuhnya\Downloads\xrt_windows_sdk\xrt_sdk\xrt\xclbinutil.exe --input C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.xclbin --add-kernel swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj\main_kernels.json --add-replace-section AIE_PARTITION:JSON:swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj\main_merged_partition.json --force --output C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.xclbin
+XRT Build Version: 2.21.0 (HEAD)
+       Build Date: 2026-02-23 13:36:06
+          Hash ID: 4eb1f4392a012b4e6eca759762389c612537f7c7
+Reading xclbin file into memory.  File: C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_fused_8192x2048_8tsi_2048tso_4col_g32.xclbin
+
+Section 'AIE_PARTITION'(32) was successfully removed
+
+Section: 'AIE_PARTITION'(32) was successfully added.
+Size   : 62368 bytes
+Format : JSON
+File   : 'swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.mlir.prj\main_merged_partition.json'
+
+Section 'GROUP_TOPOLOGY'(26) was successfully removed
+
+Section 'GROUP_CONNECTIVITY'(27) was successfully removed
+Successfully wrote (71271 bytes) to the output file: C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.xclbin
+Leaving xclbinutil.
+Generated xclbin: C:\llama.cpp-xdna\.bisect-prekv\build\swiglu_decode_int4_gemv_2_2048x8192_4tsi_512tso_4col_g32.xclbin
+Compilation completed successfully
+
+Loading model... 
+
+
+в–„в–„ в–„в–„
+в–€в–€ в–€в–€
+в–€в–€ в–€в–€  в–Ђв–Ђв–€в–„ в–€в–€в–€в–„в–€в–€в–€в–„  в–Ђв–Ђв–€в–„    в–„в–€в–€в–€в–€ в–€в–€в–€в–€в–„ в–€в–€в–€в–€в–„
+в–€в–€ в–€в–€ в–„в–€в–Ђв–€в–€ в–€в–€ в–€в–€ в–€в–€ в–„в–€в–Ђв–€в–€    в–€в–€    в–€в–€ в–€в–€ в–€в–€ в–€в–€
+в–€в–€ в–€в–€ в–Ђв–€в–„в–€в–€ в–€в–€ в–€в–€ в–€в–€ в–Ђв–€в–„в–€в–€ в–€в–€ в–Ђв–€в–€в–€в–€ в–€в–€в–€в–€в–Ђ в–€в–€в–€в–€в–Ђ
+                                    в–€в–€    в–€в–€
+                                    в–Ђв–Ђ    в–Ђв–Ђ
+
+build      : b9173-2c9592426
+model      : llama-3.2-1b-instruct-Q4_0-vocabQ4.gguf
+modalities : text
+
+available commands:
+  /exit or Ctrl+C     stop or exit
+  /regen              regenerate the last response
+  /clear              clear the chat history
+  /read <file>        add a text file
+  /glob <pattern>     add text files using globbing pattern
+
+
+> What is the capital of France? Explain in detail.
+
+The???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+
+[ Prompt: 109.3 t/s | Generation: 43.3 t/s ]
+
+Exiting...

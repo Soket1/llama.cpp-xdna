@@ -1,0 +1,15 @@
+01	ffndiv1_r1	llama-cli	FFN_DIV=1	decode=43.90 t/s	layers=16 f3wall=15638 host=642 acct=15485 rms=35 xr=73 xrsync=8 w=6 kvzero=86 kvcopy=95 kvsync=82 runprep=4 npu=15041 outsync=17 reduce=95
+02	ffndiv1_r2	llama-cli	FFN_DIV=1	ERROR: crash after 3 attempts
+03	ffndiv1_r3	llama-cli	FFN_DIV=1	decode=43.70 t/s	layers=16 f3wall=15302 host=648 acct=15154 rms=37 xr=66 xrsync=7 w=5 kvzero=90 kvcopy=104 kvsync=92 runprep=4 npu=14650 outsync=15 reduce=110
+04	ffndiv2_r1	llama-cli	FFN_DIV=2	decode=55.80 t/s	layers=16 f3wall=11064 host=586 acct=10942 rms=32 xr=63 xrsync=6 w=5 kvzero=78 kvcopy=91 kvsync=82 runprep=4 npu=10479 outsync=14 reduce=88
+05	ffndiv2_r2	llama-cli	FFN_DIV=2	decode=55.00 t/s	layers=16 f3wall=11334 host=593 acct=11203 rms=31 xr=64 xrsync=6 w=6 kvzero=76 kvcopy=87 kvsync=86 runprep=5 npu=10711 outsync=16 reduce=83
+06	ffndiv2_r3	llama-cli	FFN_DIV=2	decode=55.30 t/s	layers=16 f3wall=10920 host=529 acct=10800 rms=28 xr=61 xrsync=5 w=6 kvzero=72 kvcopy=81 kvsync=82 runprep=4 npu=10362 outsync=13 reduce=78
+07	ffndiv4_r1	llama-cli	FFN_DIV=4	decode=62.80 t/s	layers=16 f3wall=8740 host=510 acct=8631 rms=28 xr=59 xrsync=6 w=4 kvzero=70 kvcopy=80 kvsync=82 runprep=4 npu=8203 outsync=10 reduce=80
+08	ffndiv4_r2	llama-cli	FFN_DIV=4	decode=62.60 t/s	layers=16 f3wall=8715 host=520 acct=8628 rms=28 xr=57 xrsync=6 w=6 kvzero=72 kvcopy=80 kvsync=82 runprep=4 npu=8234 outsync=11 reduce=78
+09	ffndiv4_r3	llama-cli	FFN_DIV=4	decode=62.90 t/s	layers=16 f3wall=8607 host=501 acct=8520 rms=28 xr=59 xrsync=5 w=4 kvzero=68 kvcopy=78 kvsync=83 runprep=4 npu=8106 outsync=9 reduce=76
+10	baseline	replay	{}	985.5 us
+11	stub_qkv	replay	{'F3BEST_STUB_QKV': '1'}	996.8 us
+12	stub_oproj	replay	{'F3BEST_STUB_OPROJ': '1'}	979.0 us
+13	stub_ffn	replay	{'F3BEST_STUB_FFN': '1'}	1025.5 us
+14	stub_nm	replay	{'F3BEST_STUB_NM': '1'}	1012.1 us
+15	stub_value	replay	{'F3BEST_FKV_DEFS': 'FLOWKV_VALUE_STUB'}	943.6 us

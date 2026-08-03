@@ -1,0 +1,14 @@
+C:\llama.cpp-xdna\dev_notes\track_a_build\build_ofold8_f3best_real.py:610: RuntimeWarning: invalid value encountered in subtract
+  rel = np.linalg.norm(p - p_refs[h]) / (np.linalg.norm(p_refs[h]) + 1e-12)
+C:\Python313\Lib\site-packages\numpy\linalg\_linalg.py:2767: RuntimeWarning: overflow encountered in dot
+  sqnorm = x.dot(x)
+C:\llama.cpp-xdna\dev_notes\track_a_build\build_ofold8_f3best_real.py:615: RuntimeWarning: invalid value encountered in subtract
+  s_rel = np.linalg.norm(s_npu - s) / (np.linalg.norm(s) + 1e-12)
+C:\llama.cpp-xdna\dev_notes\track_a_build\build_ofold8_f3best_real.py:675: RuntimeWarning: invalid value encountered in add
+  final_npu = s_npu + sum(allp[h * E:(h + 1) * E] for h in range(NH))
+C:\Python313\Lib\site-packages\numpy\linalg\_linalg.py:2767: RuntimeWarning: invalid value encountered in dot
+  sqnorm = x.dot(x)
+C:\llama.cpp-xdna\dev_notes\track_a_build\build_ofold8_f3best_real.py:680: RuntimeWarning: invalid value encountered in subtract
+  float(np.linalg.norm(s_npu - s)),
+C:\llama.cpp-xdna\dev_notes\track_a_build\build_ofold8_f3best_real.py:681: RuntimeWarning: invalid value encountered in add
+  float(np.linalg.norm(sum(allp[h*E:(h+1)*E] for h in range(NH))))))

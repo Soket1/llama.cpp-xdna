@@ -75,11 +75,12 @@ foreach ($f in $flags) { Set-Item -Path "Env:$f" -Value "1" }
 # backend при построении ключа xclbin.
 $env:F3BEST_MT_DECOUPLE = "1"
 $env:F3BEST_TRIPLE_B = "1"
+$env:F3BEST_HANDASM_RR = "1"
 
 # Keep this key aligned with ggml-xdna.cpp::make_cache_key. Failing before the
 # run is intentional: a different f3best variant may exist but is unsafe to use
 # under this production topology.
-$f3bestKey = "decode_layer_f3best_K2048_H8192_sl256_d64_ag4_kv8_g32_mc_preq_vexp_vreg_dq8_qp_mxp_ub_nokv_decouple_tb"
+$f3bestKey = "decode_layer_f3best_K2048_H8192_sl256_d64_ag4_kv8_g32_mc_preq_vexp_vreg_dq8_qp_mxp_ub_nokv_decouple_tb_rr"
 $f3bestXclbin = Join-Path $cache "$f3bestKey.xclbin"
 $f3bestInsts = Join-Path $cache "$f3bestKey.insts"
 if (-not (Test-Path $f3bestXclbin) -or -not (Test-Path $f3bestInsts)) {

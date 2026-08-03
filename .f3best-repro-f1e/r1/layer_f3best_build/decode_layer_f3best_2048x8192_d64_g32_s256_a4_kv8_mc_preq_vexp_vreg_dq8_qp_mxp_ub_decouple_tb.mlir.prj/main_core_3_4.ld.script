@@ -1,0 +1,90 @@
+
+MEMORY
+{
+   program (RX) : ORIGIN = 0, LENGTH = 0x0020000
+   data (!RX) : ORIGIN = 0x71400, LENGTH = 0xEC00
+}
+ENTRY(__start)
+SECTIONS
+{
+  . = 0x0;
+  .text : {
+     /* the __start symbol has to come at address zero. */
+     *crt0.o(.text*)
+     _ctors_start = .;
+     _init_array_start = .;
+     KEEP(SORT(*.init_array))
+     _ctors_end = .;
+     _init_array_end = .;
+     _dtors_start = .;
+     _dtors_end = .;
+     *(.text*)
+  } > program
+  .data : {
+     *(.data*)
+     *(.rodata*)
+  } > data
+  .comment : {
+     *(.comment*)
+  }
+  .symtab : {
+     *(.symtab)
+  }
+  .shstrtab : {
+     *(.shstrtab)
+  }
+  .strtab : {
+     *(.strtab)
+  }
+  .stack_sizes : {
+     *(.stack_sizes)
+  }
+
+. = 0x70000;
+_sp_start_value_DM_stack = .;
+. += 0x400; /* stack */
+. = 0x41620;
+c5_A0 = .;
+. += 0x1200;
+. = 0x45220;
+c5_A1 = .;
+. += 0x1200;
+. = 0x40400;
+c5_B0 = .;
+. += 0x1220;
+. = 0x44000;
+c5_B1 = .;
+. += 0x1220;
+. = 0x48000;
+c5_B2 = .;
+. += 0x1220;
+. = 0x4A220;
+c5_Q = .;
+. += 0x284;
+. = 0x49220;
+c5_O = .;
+. += 0x1000;
+. = 0x4C000;
+c5_P = .;
+. += 0x1220;
+. = 0x4D220;
+c5_gate = .;
+. += 0x800;
+. = 0x42820;
+c5_up = .;
+. += 0x800;
+. = 0x46420;
+c5_silu = .;
+. += 0x800;
+. = 0x4DA20;
+c5_uni_partial = .;
+. += 0x80;
+. = 0x50400;
+rl_A = .;
+. += 0x1000;
+. = 0x70400;
+op_O = .;
+. += 0x1000;
+  .bss : { *(.bss*) } > data
+}
+PROVIDE(main = core_3_4);

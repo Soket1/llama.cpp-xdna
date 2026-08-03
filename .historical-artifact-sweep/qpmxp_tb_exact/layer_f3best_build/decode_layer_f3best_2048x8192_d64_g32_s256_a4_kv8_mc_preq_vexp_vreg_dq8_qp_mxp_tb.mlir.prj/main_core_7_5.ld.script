@@ -1,0 +1,79 @@
+
+MEMORY
+{
+   program (RX) : ORIGIN = 0, LENGTH = 0x0020000
+   data (!RX) : ORIGIN = 0x7C200, LENGTH = 0x3E00
+}
+ENTRY(__start)
+SECTIONS
+{
+  . = 0x0;
+  .text : {
+     /* the __start symbol has to come at address zero. */
+     *crt0.o(.text*)
+     _ctors_start = .;
+     _init_array_start = .;
+     KEEP(SORT(*.init_array))
+     _ctors_end = .;
+     _init_array_end = .;
+     _dtors_start = .;
+     _dtors_end = .;
+     *(.text*)
+  } > program
+  .data : {
+     *(.data*)
+     *(.rodata*)
+  } > data
+  .comment : {
+     *(.comment*)
+  }
+  .symtab : {
+     *(.symtab)
+  }
+  .shstrtab : {
+     *(.shstrtab)
+  }
+  .strtab : {
+     *(.strtab)
+  }
+  .stack_sizes : {
+     *(.stack_sizes)
+  }
+
+. = 0x70000;
+_sp_start_value_DM_stack = .;
+. += 0x400; /* stack */
+. = 0x48000;
+va3_Iv = .;
+. += 0x410;
+. = 0x44000;
+va3_V = .;
+. += 0x4000;
+. = 0x4C000;
+va3_Of = .;
+. += 0x200;
+. = 0x58000;
+va6_Iv = .;
+. += 0x410;
+. = 0x54000;
+va6_V = .;
+. += 0x4000;
+. = 0x5C000;
+va6_Of = .;
+. += 0x200;
+/* No tile with memory exists to the north. */
+. = 0x60000;
+. += 0x10000;
+. = 0x78000;
+va7_Iv = .;
+. += 0x410;
+. = 0x74000;
+va7_V = .;
+. += 0x4000;
+. = 0x7C000;
+va7_Of = .;
+. += 0x200;
+  .bss : { *(.bss*) } > data
+}
+INPUT(decode_layer_f3best_2048x8192_d64_g32_s256_a4_kv8_mc_preq_vexp_vreg_dq8_qp_mxp_tb.mlir.prj\flowkv_64d_h4_c256.o)
+PROVIDE(main = core_7_5);

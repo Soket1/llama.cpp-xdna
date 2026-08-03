@@ -1,0 +1,281 @@
+ggml-xdna: XRT device initialized
+ggml-xdna: using 4 AIE columns
+supports_op: claim attention MUL_MAT src0=[64,512,8] src1=[64,1,32] type0=1 type1=0 (kind=Q@K^T)
+supports_op: claim attention MUL_MAT src0=[512,64,8] src1=[512,1,32] type0=1 type1=0 (kind=scores@V)
+supports_op: claim attention MUL_MAT src0=[64,512,8] src1=[64,1,32] type0=1 type1=0 (kind=Q@K^T)
+supports_op: claim attention MUL_MAT src0=[512,64,8] src1=[512,1,32] type0=1 type1=0 (kind=scores@V)
+supports_op: claim attention MUL_MAT src0=[64,512,8] src1=[64,1,32] type0=1 type1=0 (kind=Q@K^T)
+supports_op: claim attention MUL_MAT src0=[512,64,8] src1=[512,1,32] type0=1 type1=0 (kind=scores@V)
+supports_op: claim attention MUL_MAT src0=[64,512,8] src1=[64,1,32] type0=1 type1=0 (kind=Q@K^T)
+supports_op: claim attention MUL_MAT src0=[512,64,8] src1=[512,1,32] type0=1 type1=0 (kind=scores@V)
+ggml-xdna: XRT device initialized
+ggml-xdna: using 4 AIE columns
+ggml-xdna: [fw-prof:split] call=0 split=0/2 backend=CPU nodes=1 inputs=0 copy_wait=0us copy_submit=0us copy_bytes=0 enqueue=19us sync_wait=0us cb_sync=0us event=0us sync=off first=GET_ROWS:embd last=GET_ROWS:embd max_mulmat_ne0=0 likely_lm_head=0
+ggml-xdna: [fw-prof:copy-input] call=0 split=1/2 input=0/6 name=embd bytes=16384 flags=0x10 usage=other input_backend=CPU split_backend=XDNA route=fallback-sync input_cpy=XDNA#embd#0
+ggml-xdna: [fw-prof:copy-input] call=0 split=1/2 input=1/6 name=leaf_5 bytes=8 flags=0x1 usage=other input_backend=CPU split_backend=XDNA route=user-sync input_cpy=XDNA#leaf_5#0
+ggml-xdna: [fw-prof:copy-input] call=0 split=1/2 input=2/6 name=leaf_9 bytes=16 flags=0x1 usage=other input_backend=CPU split_backend=XDNA route=user-sync input_cpy=XDNA#leaf_9#0
+ggml-xdna: [fw-prof:copy-input] call=0 split=1/2 input=3/6 name=leaf_11 bytes=8192 flags=0x1 usage=other input_backend=CPU split_backend=XDNA route=user-sync input_cpy=XDNA#leaf_11#0
+ggml-xdna: [fw-prof:copy-input] call=0 split=1/2 input=4/6 name=attn_inp_kq_mask bytes=2048 flags=0x1 usage=other input_backend=CPU split_backend=XDNA route=user-sync input_cpy=XDNA#attn_inp_kq_mask#0
+ggml-xdna: [fw-prof:copy-input] call=0 split=1/2 input=5/6 name=leaf_183 bytes=4 flags=0x1 usage=other input_backend=CPU split_backend=XDNA route=user-sync input_cpy=XDNA#leaf_183#0
+ggml-xdna: GEMM kernel group_ids: [0]=12910591 [1]=12845057 [2]=12910591 [3]=12845056 [4]=12845056 [5]=12845056 [6]=12845056 [7]=12845056 [8]=ERR key=gemv_int4_v2_K2048_N2048_4col_g32
+ggml-xdna: loaded kernel for gemv_int4_v2_K2048_N2048_4col_g32
+ggml-xdna: warm int4 weight K=2048 N=2048 m_in=4 type=Q4_0 weight=blk.0.attn_q.weight addr=0x15000 mod64K=0x5000 (1 cached)
+ggml-xdna: GEMM kernel group_ids: [0]=12976127 [1]=12910593 [2]=12976127 [3]=12910592 [4]=12910592 [5]=12910592 [6]=12910592 [7]=12910592 [8]=ERR key=gemv_int4_v2_K2048_N512_4col_g32
+ggml-xdna: loaded kernel for gemv_int4_v2_K2048_N512_4col_g32
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.0.attn_v.weight addr=0x25b000 mod64K=0xb000 (1 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.0.attn_k.weight addr=0x2ed000 mod64K=0xd000 (2 cached)
+ggml-xdna: warm int4 weight K=2048 N=2048 m_in=4 type=Q4_0 weight=blk.1.attn_q.weight addr=0x37f000 mod64K=0xf000 (2 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.1.attn_v.weight addr=0x5c1000 mod64K=0x1000 (3 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.1.attn_k.weight addr=0x653000 mod64K=0x3000 (4 cached)
+ggml-xdna: warm int4 weight K=2048 N=2048 m_in=4 type=Q4_0 weight=blk.2.attn_q.weight addr=0x6e5000 mod64K=0x5000 (3 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.2.attn_v.weight addr=0x925000 mod64K=0x5000 (5 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.2.attn_k.weight addr=0x9b5000 mod64K=0x5000 (6 cached)
+ggml-xdna: warm int4 weight K=2048 N=2048 m_in=4 type=Q4_0 weight=blk.3.attn_q.weight addr=0xa47000 mod64K=0x7000 (4 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.3.attn_v.weight addr=0xc87000 mod64K=0x7000 (7 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.3.attn_k.weight addr=0xd17000 mod64K=0x7000 (8 cached)
+ggml-xdna: warm int4 weight K=2048 N=2048 m_in=4 type=Q4_0 weight=blk.4.attn_q.weight addr=0xda7000 mod64K=0x7000 (5 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.4.attn_v.weight addr=0xfe7000 mod64K=0x7000 (9 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.4.attn_k.weight addr=0x1077000 mod64K=0x7000 (10 cached)
+ggml-xdna: warm int4 weight K=2048 N=2048 m_in=4 type=Q4_0 weight=blk.5.attn_q.weight addr=0x1107000 mod64K=0x7000 (6 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.5.attn_v.weight addr=0x1347000 mod64K=0x7000 (11 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.5.attn_k.weight addr=0x13d7000 mod64K=0x7000 (12 cached)
+ggml-xdna: warm int4 weight K=2048 N=2048 m_in=4 type=Q4_0 weight=blk.6.attn_q.weight addr=0x1467000 mod64K=0x7000 (7 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.6.attn_v.weight addr=0x16a7000 mod64K=0x7000 (13 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.6.attn_k.weight addr=0x1737000 mod64K=0x7000 (14 cached)
+ggml-xdna: warm int4 weight K=2048 N=2048 m_in=4 type=Q4_0 weight=blk.7.attn_q.weight addr=0x17c7000 mod64K=0x7000 (8 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.7.attn_v.weight addr=0x1a07000 mod64K=0x7000 (15 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.7.attn_k.weight addr=0x1a97000 mod64K=0x7000 (16 cached)
+ggml-xdna: warm int4 weight K=2048 N=2048 m_in=4 type=Q4_0 weight=blk.8.attn_q.weight addr=0x1b27000 mod64K=0x7000 (9 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.8.attn_v.weight addr=0x1d67000 mod64K=0x7000 (17 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.8.attn_k.weight addr=0x1df7000 mod64K=0x7000 (18 cached)
+ggml-xdna: warm int4 weight K=2048 N=2048 m_in=4 type=Q4_0 weight=blk.9.attn_q.weight addr=0x1e87000 mod64K=0x7000 (10 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.9.attn_v.weight addr=0x20c7000 mod64K=0x7000 (19 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.9.attn_k.weight addr=0x2157000 mod64K=0x7000 (20 cached)
+ggml-xdna: warm int4 weight K=2048 N=2048 m_in=4 type=Q4_0 weight=blk.10.attn_q.weight addr=0x21e7000 mod64K=0x7000 (11 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.10.attn_v.weight addr=0x2427000 mod64K=0x7000 (21 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.10.attn_k.weight addr=0x24b7000 mod64K=0x7000 (22 cached)
+ggml-xdna: warm int4 weight K=2048 N=2048 m_in=4 type=Q4_0 weight=blk.11.attn_q.weight addr=0x2547000 mod64K=0x7000 (12 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.11.attn_v.weight addr=0x2787000 mod64K=0x7000 (23 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.11.attn_k.weight addr=0x2817000 mod64K=0x7000 (24 cached)
+ggml-xdna: warm int4 weight K=2048 N=2048 m_in=4 type=Q4_0 weight=blk.12.attn_q.weight addr=0x28a7000 mod64K=0x7000 (13 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.12.attn_v.weight addr=0x2ae7000 mod64K=0x7000 (25 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.12.attn_k.weight addr=0x2b77000 mod64K=0x7000 (26 cached)
+ggml-xdna: warm int4 weight K=2048 N=2048 m_in=4 type=Q4_0 weight=blk.13.attn_q.weight addr=0x2c07000 mod64K=0x7000 (14 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.13.attn_v.weight addr=0x2e47000 mod64K=0x7000 (27 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.13.attn_k.weight addr=0x2ed7000 mod64K=0x7000 (28 cached)
+ggml-xdna: warm int4 weight K=2048 N=2048 m_in=4 type=Q4_0 weight=blk.14.attn_q.weight addr=0x2f67000 mod64K=0x7000 (15 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.14.attn_v.weight addr=0x31a7000 mod64K=0x7000 (29 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.14.attn_k.weight addr=0x3237000 mod64K=0x7000 (30 cached)
+ggml-xdna: warm int4 weight K=2048 N=2048 m_in=4 type=Q4_0 weight=blk.15.attn_q.weight addr=0x32c7000 mod64K=0x7000 (16 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.15.attn_v.weight addr=0x3507000 mod64K=0x7000 (31 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.15.attn_k.weight addr=0x3597000 mod64K=0x7000 (32 cached)
+ggml-xdna: loaded SwiGLU kernel bundle for swiglu_decode_int4_v2_K2048_N8192_4col_g32 (2 kernels)
+ggml-xdna: warm int4 swiglu fused K=2048 N=8192 tsi=8 (1 cached)
+ggml-xdna: warm int4 swiglu down K=8192 N=2048 tsi=4 (1 cached)
+ggml-xdna: [fw-prof:split] call=0 split=1/2 backend=XDNA nodes=581 inputs=6 copy_wait=0us copy_submit=10us copy_bytes=26652 enqueue=330810us sync_wait=0us cb_sync=0us event=0us sync=off first=RMS_NORM:norm-0 last=MUL_MAT:result_output max_mulmat_ne0=128256 likely_lm_head=1
+ggml-xdna: [fw-prof:sched] call=1 nodes=582 splits=2 reused=1 total=330936us alloc=0us compute_splits=330935us copy_wait=0us copy_submit=10us copy_bytes=26652 enqueue=330829us sync_wait=0us cb_sync=0us event=0us status=0
+ggml-xdna: [fw-prof:split] call=1 split=0/2 backend=CPU nodes=1 inputs=0 copy_wait=0us copy_submit=0us copy_bytes=0 enqueue=8us sync_wait=0us cb_sync=0us event=0us sync=off first=GET_ROWS:embd last=GET_ROWS:embd max_mulmat_ne0=0 likely_lm_head=0
+ggml-xdna: [fw-prof:copy-input] call=1 split=1/2 input=0/6 name=embd bytes=16384 flags=0x10 usage=other input_backend=CPU split_backend=XDNA route=fallback-sync input_cpy=XDNA#embd#0
+ggml-xdna: [fw-prof:copy-input] call=1 split=1/2 input=1/6 name=leaf_5 bytes=8 flags=0x1 usage=other input_backend=CPU split_backend=XDNA route=user-sync input_cpy=XDNA#leaf_5#0
+ggml-xdna: [fw-prof:copy-input] call=1 split=1/2 input=2/6 name=leaf_9 bytes=16 flags=0x1 usage=other input_backend=CPU split_backend=XDNA route=user-sync input_cpy=XDNA#leaf_9#0
+ggml-xdna: [fw-prof:copy-input] call=1 split=1/2 input=3/6 name=leaf_11 bytes=8192 flags=0x1 usage=other input_backend=CPU split_backend=XDNA route=user-sync input_cpy=XDNA#leaf_11#0
+ggml-xdna: [fw-prof:copy-input] call=1 split=1/2 input=4/6 name=attn_inp_kq_mask bytes=2048 flags=0x1 usage=other input_backend=CPU split_backend=XDNA route=user-sync input_cpy=XDNA#attn_inp_kq_mask#0
+ggml-xdna: [fw-prof:copy-input] call=1 split=1/2 input=5/6 name=leaf_183 bytes=4 flags=0x1 usage=other input_backend=CPU split_backend=XDNA route=user-sync input_cpy=XDNA#leaf_183#0
+ggml-xdna: [fw-prof:split] call=1 split=1/2 backend=XDNA nodes=581 inputs=6 copy_wait=0us copy_submit=4us copy_bytes=26652 enqueue=63866us sync_wait=0us cb_sync=0us event=0us sync=off first=RMS_NORM:norm-0 last=MUL_MAT:result_output max_mulmat_ne0=128256 likely_lm_head=1
+ggml-xdna: [fw-prof:sched] call=2 nodes=582 splits=2 reused=1 total=63982us alloc=0us compute_splits=63982us copy_wait=0us copy_submit=4us copy_bytes=26652 enqueue=63874us sync_wait=0us cb_sync=0us event=0us status=0
+ggml-xdna: [fw-prof:split] call=2 split=0/2 backend=CPU nodes=1 inputs=0 copy_wait=0us copy_submit=0us copy_bytes=0 enqueue=86us sync_wait=0us cb_sync=0us event=0us sync=off first=GET_ROWS:embd last=GET_ROWS:embd max_mulmat_ne0=0 likely_lm_head=0
+ggml-xdna: [fw-prof:copy-input] call=2 split=1/2 input=0/6 name=embd bytes=376832 flags=0x10 usage=other input_backend=CPU split_backend=XDNA route=fallback-sync input_cpy=XDNA#embd#0
+ggml-xdna: [fw-prof:copy-input] call=2 split=1/2 input=1/6 name=leaf_5 bytes=184 flags=0x1 usage=other input_backend=CPU split_backend=XDNA route=user-sync input_cpy=XDNA#leaf_5#0
+ggml-xdna: [fw-prof:copy-input] call=2 split=1/2 input=2/6 name=leaf_9 bytes=368 flags=0x1 usage=other input_backend=CPU split_backend=XDNA route=user-sync input_cpy=XDNA#leaf_9#0
+ggml-xdna: [fw-prof:copy-input] call=2 split=1/2 input=3/6 name=leaf_11 bytes=188416 flags=0x1 usage=other input_backend=CPU split_backend=XDNA route=user-sync input_cpy=XDNA#leaf_11#0
+ggml-xdna: [fw-prof:copy-input] call=2 split=1/2 input=4/6 name=attn_inp_kq_mask bytes=47104 flags=0x1 usage=other input_backend=CPU split_backend=XDNA route=user-sync input_cpy=XDNA#attn_inp_kq_mask#0
+ggml-xdna: [fw-prof:copy-input] call=2 split=1/2 input=5/6 name=leaf_183 bytes=4 flags=0x1 usage=other input_backend=CPU split_backend=XDNA route=user-sync input_cpy=XDNA#leaf_183#0
+ggml-xdna: loaded RMSNorm kernel for rms_norm_S2048_bf16_1c1ch_t2048
+ggml-xdna: [fw-prof:split] call=2 split=1/2 backend=XDNA nodes=581 inputs=6 copy_wait=0us copy_submit=66us copy_bytes=612908 enqueue=560826us sync_wait=0us cb_sync=0us event=0us sync=off first=RMS_NORM:norm-0 last=MUL_MAT:result_output max_mulmat_ne0=128256 likely_lm_head=1
+ggml-xdna: [fw-prof:sched] call=3 nodes=582 splits=2 reused=1 total=561091us alloc=0us compute_splits=561090us copy_wait=0us copy_submit=66us copy_bytes=612908 enqueue=560912us sync_wait=0us cb_sync=0us event=0us status=0
+ggml-xdna: [fw-prof:sample-api] apply_call=1 candidates=128256 apply=9us avg_apply=0.4us accept_calls=276 avg_accept=0.2us
+ggml-xdna: [fw-prof:sample-api] apply_call=2 candidates=128256 apply=0us avg_apply=0.2us accept_calls=276 avg_accept=0.2us
+ggml-xdna: [fw-prof:sample-api] apply_call=3 candidates=128256 apply=0us avg_apply=0.1us accept_calls=276 avg_accept=0.2us
+ggml-xdna: [fw-prof:sample-api] apply_call=4 candidates=40 apply=58us avg_apply=14.7us accept_calls=276 avg_accept=0.2us
+ggml-xdna: [fw-prof:sample-api] apply_call=5 candidates=40 apply=0us avg_apply=11.7us accept_calls=276 avg_accept=0.2us
+ggml-xdna: [fw-prof:sample-api] apply_call=6 candidates=1 apply=3us avg_apply=10.2us accept_calls=276 avg_accept=0.2us
+ggml-xdna: [fw-prof:sample-api] apply_call=7 candidates=1 apply=1us avg_apply=8.9us accept_calls=276 avg_accept=0.2us
+ggml-xdna: [fw-prof:sample-api] apply_call=8 candidates=1 apply=0us avg_apply=7.8us accept_calls=276 avg_accept=0.2us
+ggml-xdna: [fw-prof:split] call=3 split=0/2 backend=CPU nodes=1 inputs=0 copy_wait=0us copy_submit=0us copy_bytes=0 enqueue=15us sync_wait=0us cb_sync=0us event=0us sync=off first=GET_ROWS:embd last=GET_ROWS:embd max_mulmat_ne0=0 likely_lm_head=0
+ggml-xdna: [fw-prof:copy-input] call=3 split=1/2 input=0/6 name=embd bytes=8192 flags=0x10 usage=other input_backend=CPU split_backend=XDNA route=fallback-sync input_cpy=XDNA#embd#0
+ggml-xdna: [fw-prof:copy-input] call=3 split=1/2 input=1/6 name=leaf_5 bytes=4 flags=0x1 usage=other input_backend=CPU split_backend=XDNA route=user-sync input_cpy=XDNA#leaf_5#0
+ggml-xdna: [fw-prof:copy-input] call=3 split=1/2 input=2/6 name=leaf_9 bytes=8 flags=0x1 usage=other input_backend=CPU split_backend=XDNA route=user-sync input_cpy=XDNA#leaf_9#0
+ggml-xdna: [fw-prof:copy-input] call=3 split=1/2 input=3/6 name=leaf_11 bytes=4096 flags=0x1 usage=other input_backend=CPU split_backend=XDNA route=user-sync input_cpy=XDNA#leaf_11#0
+ggml-xdna: [fw-prof:copy-input] call=3 split=1/2 input=4/6 name=attn_inp_kq_mask bytes=1024 flags=0x1 usage=other input_backend=CPU split_backend=XDNA route=user-sync input_cpy=XDNA#attn_inp_kq_mask#0
+ggml-xdna: [fw-prof:copy-input] call=3 split=1/2 input=5/6 name=leaf_183 bytes=4 flags=0x1 usage=other input_backend=CPU split_backend=XDNA route=user-sync input_cpy=XDNA#leaf_183#0
+ggml-xdna: GEMM kernel group_ids: [0]=13172735 [1]=13107201 [2]=13172735 [3]=13107200 [4]=13107200 [5]=13107200 [6]=13107200 [7]=13107200 [8]=ERR key=decode_layer_f3best_K2048_H8192_sl256_d64_ag4_kv8_g32_mc_preq_vexp_vreg_dq8_qp_mxp_ub_nokv_decouple_tb
+ggml-xdna: loaded kernel for decode_layer_f3best_K2048_H8192_sl256_d64_ag4_kv8_g32_mc_preq_vexp_vreg_dq8_qp_mxp_ub_nokv_decouple_tb
+ggml-xdna: [f3best-abi] nokv tiles=896 out=18432 cpu_kv=on
+ggml-xdna: [f3best-gluetime] token: layers=16 f3wall=550745 host=530457 acct=527431 rms=45 xr=102 xrsync=11 w=501495 kvzero=1945 kvcopy=2660 kvsync=104 runprep=600 npu=20288 outsync=58 reduce=122 us
+ggml-xdna: [f3best-LOOP] dispatched 16 layers in ONE call
+ggml-xdna: [fw-prof:split] call=3 split=1/2 backend=XDNA nodes=581 inputs=6 copy_wait=0us copy_submit=3us copy_bytes=13328 enqueue=556310us sync_wait=0us cb_sync=0us event=0us sync=off first=RMS_NORM:norm-0 last=MUL_MAT:result_output max_mulmat_ne0=128256 likely_lm_head=1
+ggml-xdna: [fw-prof:sched] call=4 nodes=582 splits=2 reused=1 total=556429us alloc=0us compute_splits=556429us copy_wait=0us copy_submit=3us copy_bytes=13328 enqueue=556325us sync_wait=0us cb_sync=0us event=0us status=0
+ggml-xdna: [fw-prof:split] call=4 split=0/2 backend=CPU nodes=1 inputs=0 copy_wait=0us copy_submit=0us copy_bytes=0 enqueue=11us sync_wait=0us cb_sync=0us event=0us sync=off first=GET_ROWS:embd last=GET_ROWS:embd max_mulmat_ne0=0 likely_lm_head=0
+ggml-xdna: [fw-prof:copy-input] call=4 split=1/2 input=0/6 name=embd bytes=8192 flags=0x10 usage=other input_backend=CPU split_backend=XDNA route=fallback-sync input_cpy=XDNA#embd#0
+ggml-xdna: [fw-prof:copy-input] call=4 split=1/2 input=1/6 name=leaf_5 bytes=4 flags=0x1 usage=other input_backend=CPU split_backend=XDNA route=user-sync input_cpy=XDNA#leaf_5#0
+ggml-xdna: [fw-prof:copy-input] call=4 split=1/2 input=2/6 name=leaf_9 bytes=8 flags=0x1 usage=other input_backend=CPU split_backend=XDNA route=user-sync input_cpy=XDNA#leaf_9#0
+ggml-xdna: [fw-prof:copy-input] call=4 split=1/2 input=3/6 name=leaf_11 bytes=4096 flags=0x1 usage=other input_backend=CPU split_backend=XDNA route=user-sync input_cpy=XDNA#leaf_11#0
+ggml-xdna: [fw-prof:copy-input] call=4 split=1/2 input=4/6 name=attn_inp_kq_mask bytes=1024 flags=0x1 usage=other input_backend=CPU split_backend=XDNA route=user-sync input_cpy=XDNA#attn_inp_kq_mask#0
+ggml-xdna: [fw-prof:copy-input] call=4 split=1/2 input=5/6 name=leaf_183 bytes=4 flags=0x1 usage=other input_backend=CPU split_backend=XDNA route=user-sync input_cpy=XDNA#leaf_183#0
+ggml-xdna: [f3best-gluetime] token: layers=16 f3wall=15656 host=619 acct=15492 rms=29 xr=67 xrsync=9 w=6 kvzero=78 kvcopy=84 kvsync=79 runprep=4 npu=15037 outsync=16 reduce=84 us
+ggml-xdna: [f3best-LOOP] dispatched 16 layers in ONE call
+ggml-xdna: [fw-prof:split] call=4 split=1/2 backend=XDNA nodes=581 inputs=6 copy_wait=0us copy_submit=3us copy_bytes=13328 enqueue=20992us sync_wait=0us cb_sync=0us event=0us sync=off first=RMS_NORM:norm-0 last=MUL_MAT:result_output max_mulmat_ne0=128256 likely_lm_head=1
+ggml-xdna: [fw-prof:sched] call=5 nodes=582 splits=2 reused=1 total=21091us alloc=0us compute_splits=21090us copy_wait=0us copy_submit=3us copy_bytes=13328 enqueue=21003us sync_wait=0us cb_sync=0us event=0us status=0
+ggml-xdna: [fw-prof:split] call=5 split=0/2 backend=CPU nodes=1 inputs=0 copy_wait=0us copy_submit=0us copy_bytes=0 enqueue=6us sync_wait=0us cb_sync=0us event=0us sync=off first=GET_ROWS:embd last=GET_ROWS:embd max_mulmat_ne0=0 likely_lm_head=0
+ggml-xdna: [fw-prof:copy-input] call=5 split=1/2 input=0/6 name=embd bytes=8192 flags=0x10 usage=other input_backend=CPU split_backend=XDNA route=fallback-sync input_cpy=XDNA#embd#0
+ggml-xdna: [fw-prof:copy-input] call=5 split=1/2 input=1/6 name=leaf_5 bytes=4 flags=0x1 usage=other input_backend=CPU split_backend=XDNA route=user-sync input_cpy=XDNA#leaf_5#0
+ggml-xdna: [fw-prof:copy-input] call=5 split=1/2 input=2/6 name=leaf_9 bytes=8 flags=0x1 usage=other input_backend=CPU split_backend=XDNA route=user-sync input_cpy=XDNA#leaf_9#0
+ggml-xdna: [fw-prof:copy-input] call=5 split=1/2 input=3/6 name=leaf_11 bytes=4096 flags=0x1 usage=other input_backend=CPU split_backend=XDNA route=user-sync input_cpy=XDNA#leaf_11#0
+ggml-xdna: [fw-prof:copy-input] call=5 split=1/2 input=4/6 name=attn_inp_kq_mask bytes=1024 flags=0x1 usage=other input_backend=CPU split_backend=XDNA route=user-sync input_cpy=XDNA#attn_inp_kq_mask#0
+ggml-xdna: [fw-prof:copy-input] call=5 split=1/2 input=5/6 name=leaf_183 bytes=4 flags=0x1 usage=other input_backend=CPU split_backend=XDNA route=user-sync input_cpy=XDNA#leaf_183#0
+ggml-xdna: [f3best-gluetime] token: layers=16 f3wall=15842 host=518 acct=15716 rms=24 xr=57 xrsync=6 w=5 kvzero=67 kvcopy=76 kvsync=71 runprep=4 npu=15323 outsync=10 reduce=73 us
+ggml-xdna: [fw-prof:split] call=5 split=1/2 backend=XDNA nodes=581 inputs=6 copy_wait=0us copy_submit=3us copy_bytes=13328 enqueue=20267us sync_wait=0us cb_sync=0us event=0us sync=off first=RMS_NORM:norm-0 last=MUL_MAT:result_output max_mulmat_ne0=128256 likely_lm_head=1
+ggml-xdna: [fw-prof:sched] call=6 nodes=582 splits=2 reused=1 total=20349us alloc=0us compute_splits=20348us copy_wait=0us copy_submit=3us copy_bytes=13328 enqueue=20274us sync_wait=0us cb_sync=0us event=0us status=0
+ggml-xdna: [fw-prof:split] call=6 split=0/2 backend=CPU nodes=1 inputs=0 copy_wait=0us copy_submit=0us copy_bytes=0 enqueue=8us sync_wait=0us cb_sync=0us event=0us sync=off first=GET_ROWS:embd last=GET_ROWS:embd max_mulmat_ne0=0 likely_lm_head=0
+ggml-xdna: [fw-prof:copy-input] call=6 split=1/2 input=0/6 name=embd bytes=8192 flags=0x10 usage=other input_backend=CPU split_backend=XDNA route=fallback-sync input_cpy=XDNA#embd#0
+ggml-xdna: [fw-prof:copy-input] call=6 split=1/2 input=1/6 name=leaf_5 bytes=4 flags=0x1 usage=other input_backend=CPU split_backend=XDNA route=user-sync input_cpy=XDNA#leaf_5#0
+ggml-xdna: [fw-prof:copy-input] call=6 split=1/2 input=2/6 name=leaf_9 bytes=8 flags=0x1 usage=other input_backend=CPU split_backend=XDNA route=user-sync input_cpy=XDNA#leaf_9#0
+ggml-xdna: [fw-prof:copy-input] call=6 split=1/2 input=3/6 name=leaf_11 bytes=4096 flags=0x1 usage=other input_backend=CPU split_backend=XDNA route=user-sync input_cpy=XDNA#leaf_11#0
+ggml-xdna: [fw-prof:copy-input] call=6 split=1/2 input=4/6 name=attn_inp_kq_mask bytes=1024 flags=0x1 usage=other input_backend=CPU split_backend=XDNA route=user-sync input_cpy=XDNA#attn_inp_kq_mask#0
+ggml-xdna: [fw-prof:copy-input] call=6 split=1/2 input=5/6 name=leaf_183 bytes=4 flags=0x1 usage=other input_backend=CPU split_backend=XDNA route=user-sync input_cpy=XDNA#leaf_183#0
+ggml-xdna: [f3best-gluetime] token: layers=16 f3wall=15851 host=646 acct=15660 rms=31 xr=66 xrsync=7 w=6 kvzero=75 kvcopy=90 kvsync=75 runprep=4 npu=15205 outsync=17 reduce=82 us
+ggml-xdna: [fw-prof:split] call=6 split=1/2 backend=XDNA nodes=581 inputs=6 copy_wait=0us copy_submit=3us copy_bytes=13328 enqueue=20440us sync_wait=0us cb_sync=0us event=0us sync=off first=RMS_NORM:norm-0 last=MUL_MAT:result_output max_mulmat_ne0=128256 likely_lm_head=1
+ggml-xdna: [fw-prof:sched] call=7 nodes=582 splits=2 reused=1 total=20516us alloc=0us compute_splits=20516us copy_wait=0us copy_submit=3us copy_bytes=13328 enqueue=20448us sync_wait=0us cb_sync=0us event=0us status=0
+ggml-xdna: [fw-prof:sample-api] apply_call=50 candidates=40 apply=1us avg_apply=10.5us accept_calls=300 avg_accept=0.2us
+ggml-xdna: [fw-prof] sampler_api apply_calls=50 avg_apply=0.011ms avg_candidates=38500.1 accept_calls=300 avg_accept=0.000ms
+ggml-xdna: [fw-prof:split] call=7 split=0/2 backend=CPU nodes=1 inputs=0 copy_wait=0us copy_submit=0us copy_bytes=0 enqueue=8us sync_wait=0us cb_sync=0us event=0us sync=off first=GET_ROWS:embd last=GET_ROWS:embd max_mulmat_ne0=0 likely_lm_head=0
+ggml-xdna: [fw-prof:copy-input] call=7 split=1/2 input=0/6 name=embd bytes=8192 flags=0x10 usage=other input_backend=CPU split_backend=XDNA route=fallback-sync input_cpy=XDNA#embd#0
+ggml-xdna: [fw-prof:copy-input] call=7 split=1/2 input=1/6 name=leaf_5 bytes=4 flags=0x1 usage=other input_backend=CPU split_backend=XDNA route=user-sync input_cpy=XDNA#leaf_5#0
+ggml-xdna: [fw-prof:copy-input] call=7 split=1/2 input=2/6 name=leaf_9 bytes=8 flags=0x1 usage=other input_backend=CPU split_backend=XDNA route=user-sync input_cpy=XDNA#leaf_9#0
+ggml-xdna: [fw-prof:copy-input] call=7 split=1/2 input=3/6 name=leaf_11 bytes=4096 flags=0x1 usage=other input_backend=CPU split_backend=XDNA route=user-sync input_cpy=XDNA#leaf_11#0
+ggml-xdna: [fw-prof:copy-input] call=7 split=1/2 input=4/6 name=attn_inp_kq_mask bytes=1024 flags=0x1 usage=other input_backend=CPU split_backend=XDNA route=user-sync input_cpy=XDNA#attn_inp_kq_mask#0
+ggml-xdna: [fw-prof:copy-input] call=7 split=1/2 input=5/6 name=leaf_183 bytes=4 flags=0x1 usage=other input_backend=CPU split_backend=XDNA route=user-sync input_cpy=XDNA#leaf_183#0
+ggml-xdna: [f3best-gluetime] token: layers=16 f3wall=15686 host=627 acct=15524 rms=34 xr=67 xrsync=10 w=6 kvzero=80 kvcopy=87 kvsync=77 runprep=4 npu=15058 outsync=15 reduce=85 us
+ggml-xdna: [fw-prof:split] call=7 split=1/2 backend=XDNA nodes=581 inputs=6 copy_wait=0us copy_submit=3us copy_bytes=13328 enqueue=20571us sync_wait=0us cb_sync=0us event=0us sync=off first=RMS_NORM:norm-0 last=MUL_MAT:result_output max_mulmat_ne0=128256 likely_lm_head=1
+ggml-xdna: [fw-prof:sched] call=8 nodes=582 splits=2 reused=1 total=20652us alloc=0us compute_splits=20651us copy_wait=0us copy_submit=3us copy_bytes=13328 enqueue=20579us sync_wait=0us cb_sync=0us event=0us status=0
+ggml-xdna: [f3best-gluetime] token: layers=16 f3wall=15798 host=613 acct=15637 rms=37 xr=64 xrsync=9 w=6 kvzero=73 kvcopy=87 kvsync=78 runprep=5 npu=15185 outsync=13 reduce=80 us
+ggml-xdna: [f3best-gluetime] token: layers=16 f3wall=15648 host=560 acct=15514 rms=30 xr=61 xrsync=6 w=5 kvzero=73 kvcopy=80 kvsync=74 runprep=3 npu=15088 outsync=13 reduce=79 us
+ggml-xdna: [f3best-gluetime] token: layers=16 f3wall=15684 host=644 acct=15521 rms=29 xr=68 xrsync=8 w=6 kvzero=86 kvcopy=109 kvsync=77 runprep=4 npu=15039 outsync=17 reduce=79 us
+ggml-xdna: [fw-prof:sample-api] apply_call=100 candidates=128256 apply=0us avg_apply=9.1us accept_calls=330 avg_accept=0.2us
+ggml-xdna: [fw-prof] sampler_api apply_calls=100 avg_apply=0.009ms avg_candidates=35938.1 accept_calls=330 avg_accept=0.000ms
+ggml-xdna: [fw-prof:sample-api] apply_call=150 candidates=40 apply=1us avg_apply=8.3us accept_calls=354 avg_accept=0.2us
+ggml-xdna: [fw-prof] sampler_api apply_calls=150 avg_apply=0.008ms avg_candidates=35938.9 accept_calls=354 avg_accept=0.000ms
+ggml-xdna: [fw-prof:sample-api] apply_call=200 candidates=128256 apply=0us avg_apply=8.3us accept_calls=384 avg_accept=0.2us
+ggml-xdna: [fw-prof] sampler_api apply_calls=200 avg_apply=0.008ms avg_candidates=35939.3 accept_calls=384 avg_accept=0.000ms
+ggml-xdna: [fw-prof:sample-api] apply_call=250 candidates=40 apply=0us avg_apply=8.0us accept_calls=408 avg_accept=0.2us
+ggml-xdna: [fw-prof] sampler_api apply_calls=250 avg_apply=0.008ms avg_candidates=35426.7 accept_calls=408 avg_accept=0.000ms
+ggml-xdna: [fw-prof:sample-api] apply_call=300 candidates=128256 apply=0us avg_apply=8.4us accept_calls=438 avg_accept=0.2us
+ggml-xdna: [fw-prof] sampler_api apply_calls=300 avg_apply=0.008ms avg_candidates=35939.7 accept_calls=438 avg_accept=0.000ms
+ggml-xdna: [fw-prof:sample-api] apply_call=350 candidates=40 apply=0us avg_apply=8.7us accept_calls=462 avg_accept=0.2us
+ggml-xdna: [fw-prof] sampler_api apply_calls=350 avg_apply=0.009ms avg_candidates=35207.1 accept_calls=462 avg_accept=0.000ms
+ggml-xdna: [fw-prof:sample-api] apply_call=400 candidates=40 apply=33us avg_apply=8.6us accept_calls=492 avg_accept=0.2us
+ggml-xdna: [fw-prof] sampler_api apply_calls=400 avg_apply=0.009ms avg_candidates=35619.4 accept_calls=492 avg_accept=0.000ms
+ggml-xdna: [fw-prof:sample-api] apply_call=450 candidates=40 apply=1us avg_apply=8.7us accept_calls=516 avg_accept=0.2us
+ggml-xdna: [fw-prof] sampler_api apply_calls=450 avg_apply=0.009ms avg_candidates=35085.2 accept_calls=516 avg_accept=0.000ms
+ggml-xdna: [fw-prof:sample-api] apply_call=500 candidates=40 apply=0us avg_apply=9.0us accept_calls=546 avg_accept=0.2us
+ggml-xdna: [fw-prof] sampler_api apply_calls=500 avg_apply=0.009ms avg_candidates=35427.1 accept_calls=546 avg_accept=0.000ms
+ggml-xdna: [fw-prof:sched] call=50 nodes=582 splits=2 reused=1 total=20746us alloc=0us compute_splits=20745us copy_wait=0us copy_submit=3us copy_bytes=13328 enqueue=20739us sync_wait=0us cb_sync=0us event=0us status=0
+ggml-xdna: [fw-prof] sched calls=50 avg_total=49.076ms avg_alloc=0.000ms avg_compute_splits=49.076ms avg_copy_wait=0.000ms avg_copy_submit=0.004ms avg_enqueue=49.054ms avg_sync_wait=0.000ms avg_cb_sync=0.000ms avg_event=0.000ms avg_nodes=582.0 avg_splits=2.00 copy_MB=0.025/call copies=6.00/call reused=50/50 sync=off
+ggml-xdna: [fw-prof] tensor_copy calls=300 bytes=1.233MB total=0.167ms avg=0.6us h2d=300 d2h=0 dev=0 slow=0
+ggml-xdna: [fw-prof:split] call=50 split=0/2 backend=CPU nodes=1 inputs=0 copy_wait=0us copy_submit=0us copy_bytes=0 enqueue=7us sync_wait=0us cb_sync=0us event=0us sync=off first=GET_ROWS:embd last=GET_ROWS:embd max_mulmat_ne0=0 likely_lm_head=0
+ggml-xdna: [fw-prof:copy-input] call=50 split=1/2 input=0/6 name=embd bytes=8192 flags=0x10 usage=other input_backend=CPU split_backend=XDNA route=fallback-sync input_cpy=XDNA#embd#0
+ggml-xdna: [fw-prof:copy-input] call=50 split=1/2 input=1/6 name=leaf_5 bytes=4 flags=0x1 usage=other input_backend=CPU split_backend=XDNA route=user-sync input_cpy=XDNA#leaf_5#0
+ggml-xdna: [fw-prof:copy-input] call=50 split=1/2 input=2/6 name=leaf_9 bytes=8 flags=0x1 usage=other input_backend=CPU split_backend=XDNA route=user-sync input_cpy=XDNA#leaf_9#0
+ggml-xdna: [fw-prof:copy-input] call=50 split=1/2 input=3/6 name=leaf_11 bytes=4096 flags=0x1 usage=other input_backend=CPU split_backend=XDNA route=user-sync input_cpy=XDNA#leaf_11#0
+ggml-xdna: [fw-prof:copy-input] call=50 split=1/2 input=4/6 name=attn_inp_kq_mask bytes=1024 flags=0x1 usage=other input_backend=CPU split_backend=XDNA route=user-sync input_cpy=XDNA#attn_inp_kq_mask#0
+ggml-xdna: [fw-prof:copy-input] call=50 split=1/2 input=5/6 name=leaf_183 bytes=4 flags=0x1 usage=other input_backend=CPU split_backend=XDNA route=user-sync input_cpy=XDNA#leaf_183#0
+ggml-xdna: [fw-prof:split] call=50 split=1/2 backend=XDNA nodes=581 inputs=6 copy_wait=0us copy_submit=3us copy_bytes=13328 enqueue=20641us sync_wait=0us cb_sync=0us event=0us sync=off first=RMS_NORM:norm-0 last=MUL_MAT:result_output max_mulmat_ne0=128256 likely_lm_head=1
+ggml-xdna: [fw-prof:sample-api] apply_call=550 candidates=40 apply=42us avg_apply=9.2us accept_calls=570 avg_accept=0.2us
+ggml-xdna: [fw-prof] sampler_api apply_calls=550 avg_apply=0.009ms avg_candidates=35007.6 accept_calls=570 avg_accept=0.000ms
+ggml-xdna: [fw-prof:sample-api] apply_call=600 candidates=40 apply=1us avg_apply=9.1us accept_calls=600 avg_accept=0.2us
+ggml-xdna: [fw-prof] sampler_api apply_calls=600 avg_apply=0.009ms avg_candidates=35299.0 accept_calls=600 avg_accept=0.000ms
+ggml-xdna: [fw-prof:sample-api] apply_call=650 candidates=128256 apply=0us avg_apply=9.3us accept_calls=630 avg_accept=0.2us
+ggml-xdna: [fw-prof] sampler_api apply_calls=650 avg_apply=0.009ms avg_candidates=35151.1 accept_calls=630 avg_accept=0.000ms
+ggml-xdna: [fw-prof:sample-api] apply_call=700 candidates=40 apply=1us avg_apply=9.3us accept_calls=654 avg_accept=0.2us
+ggml-xdna: [fw-prof] sampler_api apply_calls=700 avg_apply=0.009ms avg_candidates=35207.5 accept_calls=654 avg_accept=0.000ms
+ggml-xdna: [fw-prof:sample-api] apply_call=750 candidates=128256 apply=0us avg_apply=9.3us accept_calls=684 avg_accept=0.2us
+ggml-xdna: [fw-prof] sampler_api apply_calls=750 avg_apply=0.009ms avg_candidates=35256.3 accept_calls=684 avg_accept=0.000ms
+ggml-xdna: [fw-prof:sample-api] apply_call=800 candidates=40 apply=0us avg_apply=9.4us accept_calls=708 avg_accept=0.2us
+ggml-xdna: [fw-prof] sampler_api apply_calls=800 avg_apply=0.009ms avg_candidates=35138.8 accept_calls=708 avg_accept=0.000ms
+ggml-xdna: [fw-prof:sample-api] apply_call=850 candidates=128256 apply=0us avg_apply=9.4us accept_calls=738 avg_accept=0.2us
+ggml-xdna: [fw-prof] sampler_api apply_calls=850 avg_apply=0.009ms avg_candidates=35336.8 accept_calls=738 avg_accept=0.000ms
+ggml-xdna: [fw-prof:sample-api] apply_call=900 candidates=40 apply=0us avg_apply=9.3us accept_calls=762 avg_accept=0.2us
+ggml-xdna: [fw-prof] sampler_api apply_calls=900 avg_apply=0.009ms avg_candidates=35085.4 accept_calls=762 avg_accept=0.000ms
+ggml-xdna: [fw-prof:sample-api] apply_call=950 candidates=40 apply=32us avg_apply=9.4us accept_calls=792 avg_accept=0.2us
+ggml-xdna: [fw-prof] sampler_api apply_calls=950 avg_apply=0.009ms avg_candidates=35265.4 accept_calls=792 avg_accept=0.000ms
+ggml-xdna: [fw-prof:sample-api] apply_call=1000 candidates=40 apply=1us avg_apply=9.4us accept_calls=816 avg_accept=0.2us
+ggml-xdna: [fw-prof] sampler_api apply_calls=1000 avg_apply=0.009ms avg_candidates=35042.7 accept_calls=816 avg_accept=0.000ms
+ggml-xdna: [fw-prof:sample-api] apply_call=1050 candidates=40 apply=0us avg_apply=9.4us accept_calls=846 avg_accept=0.2us
+ggml-xdna: [fw-prof] sampler_api apply_calls=1050 avg_apply=0.009ms avg_candidates=35207.6 accept_calls=846 avg_accept=0.000ms
+ggml-xdna: [fw-prof:sched] call=100 nodes=582 splits=2 reused=1 total=20166us alloc=0us compute_splits=20166us copy_wait=0us copy_submit=3us copy_bytes=13328 enqueue=20159us sync_wait=0us cb_sync=0us event=0us status=0
+ggml-xdna: [fw-prof] sched calls=100 avg_total=34.982ms avg_alloc=0.000ms avg_compute_splits=34.982ms avg_copy_wait=0.000ms avg_copy_submit=0.004ms avg_enqueue=34.967ms avg_sync_wait=0.000ms avg_cb_sync=0.000ms avg_event=0.000ms avg_nodes=582.0 avg_splits=2.00 copy_MB=0.019/call copies=6.00/call reused=100/100 sync=off
+ggml-xdna: [fw-prof] tensor_copy calls=600 bytes=1.868MB total=0.263ms avg=0.4us h2d=600 d2h=0 dev=0 slow=0
+ggml-xdna: [fw-prof:split] call=100 split=0/2 backend=CPU nodes=1 inputs=0 copy_wait=0us copy_submit=0us copy_bytes=0 enqueue=8us sync_wait=0us cb_sync=0us event=0us sync=off first=GET_ROWS:embd last=GET_ROWS:embd max_mulmat_ne0=0 likely_lm_head=0
+ggml-xdna: [fw-prof:copy-input] call=100 split=1/2 input=0/6 name=embd bytes=8192 flags=0x10 usage=other input_backend=CPU split_backend=XDNA route=fallback-sync input_cpy=XDNA#embd#0
+ggml-xdna: [fw-prof:copy-input] call=100 split=1/2 input=1/6 name=leaf_5 bytes=4 flags=0x1 usage=other input_backend=CPU split_backend=XDNA route=user-sync input_cpy=XDNA#leaf_5#0
+ggml-xdna: [fw-prof:copy-input] call=100 split=1/2 input=2/6 name=leaf_9 bytes=8 flags=0x1 usage=other input_backend=CPU split_backend=XDNA route=user-sync input_cpy=XDNA#leaf_9#0
+ggml-xdna: [fw-prof:copy-input] call=100 split=1/2 input=3/6 name=leaf_11 bytes=4096 flags=0x1 usage=other input_backend=CPU split_backend=XDNA route=user-sync input_cpy=XDNA#leaf_11#0
+ggml-xdna: [fw-prof:copy-input] call=100 split=1/2 input=4/6 name=attn_inp_kq_mask bytes=1024 flags=0x1 usage=other input_backend=CPU split_backend=XDNA route=user-sync input_cpy=XDNA#attn_inp_kq_mask#0
+ggml-xdna: [fw-prof:copy-input] call=100 split=1/2 input=5/6 name=leaf_183 bytes=4 flags=0x1 usage=other input_backend=CPU split_backend=XDNA route=user-sync input_cpy=XDNA#leaf_183#0
+ggml-xdna: [fw-prof:split] call=100 split=1/2 backend=XDNA nodes=581 inputs=6 copy_wait=0us copy_submit=3us copy_bytes=13328 enqueue=20468us sync_wait=0us cb_sync=0us event=0us sync=off first=RMS_NORM:norm-0 last=MUL_MAT:result_output max_mulmat_ne0=128256 likely_lm_head=1
+ggml-xdna: [fw-prof:sample-api] apply_call=1100 candidates=40 apply=39us avg_apply=9.4us accept_calls=870 avg_accept=0.1us
+ggml-xdna: [fw-prof] sampler_api apply_calls=1100 avg_apply=0.009ms avg_candidates=35007.8 accept_calls=870 avg_accept=0.000ms
+ggml-xdna: [fw-prof:sample-api] apply_call=1150 candidates=40 apply=1us avg_apply=9.3us accept_calls=900 avg_accept=0.1us
+ggml-xdna: [fw-prof] sampler_api apply_calls=1150 avg_apply=0.009ms avg_candidates=35159.8 accept_calls=900 avg_accept=0.000ms
+ggml-xdna: [fw-prof:sample-api] apply_call=1200 candidates=128256 apply=0us avg_apply=9.3us accept_calls=930 avg_accept=0.1us
+ggml-xdna: [fw-prof] sampler_api apply_calls=1200 avg_apply=0.009ms avg_candidates=35085.5 accept_calls=930 avg_accept=0.000ms
+ggml-xdna: [fw-prof:sample-api] apply_call=1250 candidates=40 apply=1us avg_apply=9.3us accept_calls=954 avg_accept=0.1us
+ggml-xdna: [fw-prof] sampler_api apply_calls=1250 avg_apply=0.009ms avg_candidates=35119.7 accept_calls=954 avg_accept=0.000ms
+ggml-xdna: [fw-prof:sample-api] apply_call=1300 candidates=128256 apply=0us avg_apply=9.3us accept_calls=984 avg_accept=0.1us
+ggml-xdna: [fw-prof] sampler_api apply_calls=1300 avg_apply=0.009ms avg_candidates=35151.3 accept_calls=984 avg_accept=0.000ms
+ggml-xdna: [fw-prof:sample-api] apply_call=1350 candidates=40 apply=0us avg_apply=9.2us accept_calls=1008 avg_accept=0.1us
+ggml-xdna: [fw-prof] sampler_api apply_calls=1350 avg_apply=0.009ms avg_candidates=35085.5 accept_calls=1008 avg_accept=0.000ms
+ggml-xdna: [fw-prof:sample-api] apply_call=1400 candidates=128256 apply=0us avg_apply=9.2us accept_calls=1038 avg_accept=0.1us
+ggml-xdna: [fw-prof] sampler_api apply_calls=1400 avg_apply=0.009ms avg_candidates=35207.7 accept_calls=1038 avg_accept=0.000ms
+ggml-xdna: [fw-prof:sample-api] apply_call=1450 candidates=40 apply=0us avg_apply=9.2us accept_calls=1062 avg_accept=0.1us
+ggml-xdna: [fw-prof] sampler_api apply_calls=1450 avg_apply=0.009ms avg_candidates=35056.1 accept_calls=1062 avg_accept=0.000ms
+ggml-xdna: [fw-prof:sample-api] apply_call=1500 candidates=40 apply=81us avg_apply=9.2us accept_calls=1092 avg_accept=0.1us
+ggml-xdna: [fw-prof] sampler_api apply_calls=1500 avg_apply=0.009ms avg_candidates=35171.0 accept_calls=1092 avg_accept=0.000ms
+ggml-xdna: [fw-prof:sample-api] apply_call=1550 candidates=40 apply=1us avg_apply=9.2us accept_calls=1116 avg_accept=0.1us
+ggml-xdna: [fw-prof] sampler_api apply_calls=1550 avg_apply=0.009ms avg_candidates=35030.4 accept_calls=1116 avg_accept=0.000ms
+ggml-xdna: [fw-prof:sample-api] apply_call=1600 candidates=40 apply=0us avg_apply=9.2us accept_calls=1146 avg_accept=0.1us
+ggml-xdna: [fw-prof] sampler_api apply_calls=1600 avg_apply=0.009ms avg_candidates=35139.0 accept_calls=1146 avg_accept=0.000ms
+ggml-xdna: [fw-prof:sched] call=150 nodes=582 splits=2 reused=1 total=20139us alloc=0us compute_splits=20139us copy_wait=0us copy_submit=2us copy_bytes=13328 enqueue=20133us sync_wait=0us cb_sync=0us event=0us status=0
+ggml-xdna: [fw-prof] sched calls=150 avg_total=30.161ms avg_alloc=0.000ms avg_compute_splits=30.160ms avg_copy_wait=0.000ms avg_copy_submit=0.003ms avg_enqueue=30.148ms avg_sync_wait=0.000ms avg_cb_sync=0.000ms avg_event=0.000ms avg_nodes=582.0 avg_splits=2.00 copy_MB=0.017/call copies=6.00/call reused=150/150 sync=off
+ggml-xdna: [fw-prof] tensor_copy calls=900 bytes=2.504MB total=0.349ms avg=0.4us h2d=900 d2h=0 dev=0 slow=0
+ggml-xdna: [fw-prof:split] call=150 split=0/2 backend=CPU nodes=1 inputs=0 copy_wait=0us copy_submit=0us copy_bytes=0 enqueue=6us sync_wait=0us cb_sync=0us event=0us sync=off first=GET_ROWS:embd last=GET_ROWS:embd max_mulmat_ne0=0 likely_lm_head=0
+ggml-xdna: [fw-prof:copy-input] call=150 split=1/2 input=0/6 name=embd bytes=8192 flags=0x10 usage=other input_backend=CPU split_backend=XDNA route=fallback-sync input_cpy=XDNA#embd#0
+ggml-xdna: [fw-prof:copy-input] call=150 split=1/2 input=1/6 name=leaf_5 bytes=4 flags=0x1 usage=other input_backend=CPU split_backend=XDNA route=user-sync input_cpy=XDNA#leaf_5#0
+ggml-xdna: [fw-prof:copy-input] call=150 split=1/2 input=2/6 name=leaf_9 bytes=8 flags=0x1 usage=other input_backend=CPU split_backend=XDNA route=user-sync input_cpy=XDNA#leaf_9#0
+ggml-xdna: [fw-prof:copy-input] call=150 split=1/2 input=3/6 name=leaf_11 bytes=4096 flags=0x1 usage=other input_backend=CPU split_backend=XDNA route=user-sync input_cpy=XDNA#leaf_11#0
+ggml-xdna: [fw-prof:copy-input] call=150 split=1/2 input=4/6 name=attn_inp_kq_mask bytes=1024 flags=0x1 usage=other input_backend=CPU split_backend=XDNA route=user-sync input_cpy=XDNA#attn_inp_kq_mask#0
+ggml-xdna: [fw-prof:copy-input] call=150 split=1/2 input=5/6 name=leaf_183 bytes=4 flags=0x1 usage=other input_backend=CPU split_backend=XDNA route=user-sync input_cpy=XDNA#leaf_183#0
+ggml-xdna: [fw-prof:split] call=150 split=1/2 backend=XDNA nodes=581 inputs=6 copy_wait=0us copy_submit=3us copy_bytes=13328 enqueue=19968us sync_wait=0us cb_sync=0us event=0us sync=off first=RMS_NORM:norm-0 last=MUL_MAT:result_output max_mulmat_ne0=128256 likely_lm_head=1
+ggml-xdna: [fw-prof:sample-api] apply_call=1650 candidates=40 apply=35us avg_apply=9.2us accept_calls=1170 avg_accept=0.1us
+ggml-xdna: [fw-prof] sampler_api apply_calls=1650 avg_apply=0.009ms avg_candidates=35007.9 accept_calls=1170 avg_accept=0.000ms
+ggml-xdna: [fw-prof:sample-api] apply_call=1700 candidates=40 apply=1us avg_apply=9.1us accept_calls=1200 avg_accept=0.1us
+ggml-xdna: [fw-prof] sampler_api apply_calls=1700 avg_apply=0.009ms avg_candidates=35110.7 accept_calls=1200 avg_accept=0.000ms
+ggml-xdna: [fw-prof:sample-api] apply_call=1750 candidates=128256 apply=0us avg_apply=9.1us accept_calls=1230 avg_accept=0.1us
+ggml-xdna: [fw-prof] sampler_api apply_calls=1750 avg_apply=0.009ms avg_candidates=35061.2 accept_calls=1230 avg_accept=0.000ms
+ggml-xdna: [fw-prof:sample-api] apply_call=1800 candidates=40 apply=1us avg_apply=9.1us accept_calls=1254 avg_accept=0.1us
+ggml-xdna: [fw-prof] sampler_api apply_calls=1800 avg_apply=0.009ms avg_candidates=35085.6 accept_calls=1254 avg_accept=0.000ms
+ggml-xdna: [fw-prof:sample-api] apply_call=1850 candidates=128256 apply=0us avg_apply=9.1us accept_calls=1284 avg_accept=0.1us
+ggml-xdna: [fw-prof] sampler_api apply_calls=1850 avg_apply=0.009ms avg_candidates=35108.7 accept_calls=1284 avg_accept=0.000ms
+ggml-xdna: [fw-prof:sample-api] apply_call=1900 candidates=40 apply=0us avg_apply=9.1us accept_calls=1308 avg_accept=0.1us
+ggml-xdna: [fw-prof] sampler_api apply_calls=1900 avg_apply=0.009ms avg_candidates=35063.1 accept_calls=1308 avg_accept=0.000ms
+ggml-xdna: [fw-prof:sample-api] apply_call=1950 candidates=128256 apply=0us avg_apply=9.1us accept_calls=1338 avg_accept=0.1us
+ggml-xdna: [fw-prof] sampler_api apply_calls=1950 avg_apply=0.009ms avg_candidates=35151.3 accept_calls=1338 avg_accept=0.000ms
+ggml-xdna: [fw-prof:sample-api] apply_call=2000 candidates=40 apply=0us avg_apply=9.1us accept_calls=1362 avg_accept=0.1us
+ggml-xdna: [fw-prof] sampler_api apply_calls=2000 avg_apply=0.009ms avg_candidates=35042.9 accept_calls=1362 avg_accept=0.000ms
+ggml-xdna: [fw-prof:sample-api] apply_call=2050 candidates=40 apply=31us avg_apply=9.1us accept_calls=1392 avg_accept=0.1us
+ggml-xdna: [fw-prof] sampler_api apply_calls=2050 avg_apply=0.009ms avg_candidates=35127.3 accept_calls=1392 avg_accept=0.000ms
+ggml-xdna: [fw-prof:sample-api] apply_call=2100 candidates=40 apply=1us avg_apply=9.2us accept_calls=1416 avg_accept=0.1us
+ggml-xdna: [fw-prof] sampler_api apply_calls=2100 avg_apply=0.009ms avg_candidates=35024.5 accept_calls=1416 avg_accept=0.000ms
+llama_memory_breakdown_print: | memory breakdown [MiB] | total    free    self   model   context   compute    unaccounted |
+llama_memory_breakdown_print: |   - XDNA (XDNA NPU)    | 14140 = 14140 + (   0 =     0 +       0 +       0) +           0 |
+llama_memory_breakdown_print: |   - Host               |                  1085 =   804 +      16 +     265                |

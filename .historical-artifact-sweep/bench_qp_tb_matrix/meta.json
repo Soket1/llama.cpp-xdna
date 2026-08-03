@@ -1,0 +1,32 @@
+{
+  "root": "C:\\llama.cpp-xdna\\.bisect-pre160",
+  "exe": "C:\\llama.cpp-xdna\\.bisect-pre160\\build\\bin\\Release\\llama-cli.exe",
+  "model": "C:\\llama.cpp-xdna\\models\\llama-3.2-1b-instruct-Q4_0-vocabQ4.gguf",
+  "key": "decode_layer_f3best_K2048_H8192_sl256_d64_ag4_kv8_g32_mc_preq_vexp_vreg_dq8_qp_decouple_tb",
+  "xclbin_sha256": "7d7754e4aed38ae27bd42682f62265fe6bc0edf82031348f3b9ca2a3d3cf670d",
+  "insts_sha256": "1a7d92c9f71c5bad315de1ef524ab43a08207763e2a152676a545ba948335482",
+  "xclbin_bytes": 212879,
+  "insts_bytes": 3172,
+  "n_predict": 192,
+  "prompt": "What is the capital of France? Explain in detail.",
+  "env": {
+    "XDNA_ENABLE_GEMV": "1",
+    "XDNA_ENABLE_SWIGLU": "1",
+    "XDNA_ENABLE_QKV": "1",
+    "XDNA_ENABLE_DECODE_BATCH": "1",
+    "XDNA_ENABLE_TRANSFORMER_BLOCK": "1",
+    "XDNA_ENABLE_FLOWKV_DECODE": "1",
+    "XDNA_ENABLE_RMS_NORM": "1",
+    "XDNA_ENABLE_GEMV_INT4": "1",
+    "XDNA_ENABLE_SWIGLU_INT4": "1",
+    "XDNA_ENABLE_FUSED_LAYER": "1",
+    "XDNA_LAYER_FUSED": "1",
+    "XDNA_ENABLE_LAYER_F3BEST": "1",
+    "XDNA_ATTN_SUPPORTS": "1",
+    "XDNA_LAYER_F3BEST_LIVE": "1",
+    "XDNA_F3BEST_LOOP": "1",
+    "F3BEST_MT_DECOUPLE": "1",
+    "F3BEST_TRIPLE_B": "1",
+    "GGML_XDNA_CACHE_DIR": "C:\\llama.cpp-xdna\\.bisect-pre160\\npu_kernels_win_8col"
+  }
+}

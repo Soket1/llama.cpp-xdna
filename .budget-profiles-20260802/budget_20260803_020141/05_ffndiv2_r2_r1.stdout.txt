@@ -1,0 +1,31 @@
+
+Loading model... 
+
+
+в–„в–„ в–„в–„
+в–€в–€ в–€в–€
+в–€в–€ в–€в–€  в–Ђв–Ђв–€в–„ в–€в–€в–€в–„в–€в–€в–€в–„  в–Ђв–Ђв–€в–„    в–„в–€в–€в–€в–€ в–€в–€в–€в–€в–„ в–€в–€в–€в–€в–„
+в–€в–€ в–€в–€ в–„в–€в–Ђв–€в–€ в–€в–€ в–€в–€ в–€в–€ в–„в–€в–Ђв–€в–€    в–€в–€    в–€в–€ в–€в–€ в–€в–€ в–€в–€
+в–€в–€ в–€в–€ в–Ђв–€в–„в–€в–€ в–€в–€ в–€в–€ в–€в–€ в–Ђв–€в–„в–€в–€ в–€в–€ в–Ђв–€в–€в–€в–€ в–€в–€в–€в–€в–Ђ в–€в–€в–€в–€в–Ђ
+                                    в–€в–€    в–€в–€
+                                    в–Ђв–Ђ    в–Ђв–Ђ
+
+build      : b9181-ab9eae048
+model      : llama-3.2-1b-instruct-Q4_0-vocabQ4.gguf
+modalities : text
+
+available commands:
+  /exit or Ctrl+C     stop or exit
+  /regen              regenerate the last response
+  /clear              clear the chat history
+  /read <file>        add a text file
+  /glob <pattern>     add text files using globbing pattern
+
+
+> What is the capital of France? Explain in detail.
+
+ThearryanderucesиЎЊеЉЁ reconиЎЊеЉЁ themselvesиЎЊеЉЁynthиЎЊеЉЁander overlanderlahlahuelvetruncate-Smith reckиЎЊеЉЁ Reicharry themselvesиЎЊеЉЁиЎЊеЉЁиЎЊеЉЁ reconиЎЊеЉЁuelveventus unwantedиЎЊеЉЁ lahanderannelиЎЊеЉЁиЎЊеЉЁanderиЎЊеЉЁrietиЎЊеЉЁ dangersander themselvesиЎЊеЉЁ reconиЎЊеЉЁventus lahuelveanderectiveиЎЊеЉЁ imperanderиЎЊеЉЁиЎЊеЉЁиЎЊеЉЁ reconanderrietиЎЊеЉЁanderanderander reconArrayOfиЎЊеЉЁиЎЊеЉЁиЎЊеЉЁizmannel thoughtuelveanderuelveиЎЊеЉЁynthиЎЊеЉЁеЋљиЎЊеЉЁиЎЊеЉЁ vvuelveиЎЊеЉЁиЎЊеЉЁectiveucesanderanderanderanderиЎЊеЉЁ yourselfanderиЎЊеЉЁander sectionsarryReducersиЎЊеЉЁиЎЊеЉЁanderиЎЊеЉЁArrayOfannelogeneиЎЊеЉЁиЎЊеЉЁиЎЊеЉЁ recon dangers Buttonizmarryuelveander reconrietectiveиЎЊеЉЁandericators sectionsective overluelveanderleyarryanderиЎЊеЉЁanderиЎЊеЉЁlahriet sectionsanderlaharryanderиЎЊеЉЁиЎЊеЉЁander reconander reconanderlahizm themselvesventusиЎЊеЉЁ section CataиЎЊеЉЁanderиЎЊеЉЁanderиЎЊеЉЁander reconander recklyph sectionиЎЊеЉЁlahиЎЊеЉЁ sectionsanderиЎЊеЉЁ overl lyricander reconиЎЊеЉЁ vvander vvиЎЊеЉЁ themselves themselves unwanted vvective SPD reconizm SPDarry
+
+[ Prompt: 107.6 t/s | Generation: 55.1 t/s ]
+
+Exiting...

@@ -1,0 +1,84 @@
+ggml-xdna: XRT device initialized
+ggml-xdna: using 4 AIE columns
+supports_op: claim attention MUL_MAT src0=[64,512,8] src1=[64,1,32] type0=1 type1=0 (kind=Q@K^T)
+supports_op: claim attention MUL_MAT src0=[512,64,8] src1=[512,1,32] type0=1 type1=0 (kind=scores@V)
+supports_op: claim attention MUL_MAT src0=[64,512,8] src1=[64,1,32] type0=1 type1=0 (kind=Q@K^T)
+supports_op: claim attention MUL_MAT src0=[512,64,8] src1=[512,1,32] type0=1 type1=0 (kind=scores@V)
+supports_op: claim attention MUL_MAT src0=[64,512,8] src1=[64,1,32] type0=1 type1=0 (kind=Q@K^T)
+supports_op: claim attention MUL_MAT src0=[512,64,8] src1=[512,1,32] type0=1 type1=0 (kind=scores@V)
+supports_op: claim attention MUL_MAT src0=[64,512,8] src1=[64,1,32] type0=1 type1=0 (kind=Q@K^T)
+supports_op: claim attention MUL_MAT src0=[512,64,8] src1=[512,1,32] type0=1 type1=0 (kind=scores@V)
+ggml-xdna: XRT device initialized
+ggml-xdna: using 4 AIE columns
+ggml-xdna: GEMM kernel group_ids: [0]=1638399 [1]=1572865 [2]=1638399 [3]=1572864 [4]=1572864 [5]=1572864 [6]=1572864 [7]=1572864 [8]=ERR key=gemv_int4_v2_K2048_N2048_4col_g32
+ggml-xdna: loaded kernel for gemv_int4_v2_K2048_N2048_4col_g32
+ggml-xdna: warm int4 weight K=2048 N=2048 m_in=4 type=Q4_0 weight=blk.0.attn_q.weight addr=0x15000 mod64K=0x5000 (1 cached)
+ggml-xdna: GEMM kernel group_ids: [0]=1703935 [1]=1638401 [2]=1703935 [3]=1638400 [4]=1638400 [5]=1638400 [6]=1638400 [7]=1638400 [8]=ERR key=gemv_int4_v2_K2048_N512_4col_g32
+ggml-xdna: loaded kernel for gemv_int4_v2_K2048_N512_4col_g32
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.0.attn_v.weight addr=0x25b000 mod64K=0xb000 (1 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.0.attn_k.weight addr=0x2ed000 mod64K=0xd000 (2 cached)
+ggml-xdna: warm int4 weight K=2048 N=2048 m_in=4 type=Q4_0 weight=blk.1.attn_q.weight addr=0x37f000 mod64K=0xf000 (2 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.1.attn_v.weight addr=0x5c1000 mod64K=0x1000 (3 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.1.attn_k.weight addr=0x653000 mod64K=0x3000 (4 cached)
+ggml-xdna: warm int4 weight K=2048 N=2048 m_in=4 type=Q4_0 weight=blk.2.attn_q.weight addr=0x6e5000 mod64K=0x5000 (3 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.2.attn_v.weight addr=0x925000 mod64K=0x5000 (5 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.2.attn_k.weight addr=0x9b5000 mod64K=0x5000 (6 cached)
+ggml-xdna: warm int4 weight K=2048 N=2048 m_in=4 type=Q4_0 weight=blk.3.attn_q.weight addr=0xa47000 mod64K=0x7000 (4 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.3.attn_v.weight addr=0xc87000 mod64K=0x7000 (7 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.3.attn_k.weight addr=0xd17000 mod64K=0x7000 (8 cached)
+ggml-xdna: warm int4 weight K=2048 N=2048 m_in=4 type=Q4_0 weight=blk.4.attn_q.weight addr=0xda7000 mod64K=0x7000 (5 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.4.attn_v.weight addr=0xfe7000 mod64K=0x7000 (9 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.4.attn_k.weight addr=0x1077000 mod64K=0x7000 (10 cached)
+ggml-xdna: warm int4 weight K=2048 N=2048 m_in=4 type=Q4_0 weight=blk.5.attn_q.weight addr=0x1107000 mod64K=0x7000 (6 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.5.attn_v.weight addr=0x1347000 mod64K=0x7000 (11 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.5.attn_k.weight addr=0x13d7000 mod64K=0x7000 (12 cached)
+ggml-xdna: warm int4 weight K=2048 N=2048 m_in=4 type=Q4_0 weight=blk.6.attn_q.weight addr=0x1467000 mod64K=0x7000 (7 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.6.attn_v.weight addr=0x16a7000 mod64K=0x7000 (13 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.6.attn_k.weight addr=0x1737000 mod64K=0x7000 (14 cached)
+ggml-xdna: warm int4 weight K=2048 N=2048 m_in=4 type=Q4_0 weight=blk.7.attn_q.weight addr=0x17c7000 mod64K=0x7000 (8 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.7.attn_v.weight addr=0x1a07000 mod64K=0x7000 (15 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.7.attn_k.weight addr=0x1a97000 mod64K=0x7000 (16 cached)
+ggml-xdna: warm int4 weight K=2048 N=2048 m_in=4 type=Q4_0 weight=blk.8.attn_q.weight addr=0x1b27000 mod64K=0x7000 (9 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.8.attn_v.weight addr=0x1d67000 mod64K=0x7000 (17 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.8.attn_k.weight addr=0x1df7000 mod64K=0x7000 (18 cached)
+ggml-xdna: warm int4 weight K=2048 N=2048 m_in=4 type=Q4_0 weight=blk.9.attn_q.weight addr=0x1e87000 mod64K=0x7000 (10 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.9.attn_v.weight addr=0x20c7000 mod64K=0x7000 (19 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.9.attn_k.weight addr=0x2157000 mod64K=0x7000 (20 cached)
+ggml-xdna: warm int4 weight K=2048 N=2048 m_in=4 type=Q4_0 weight=blk.10.attn_q.weight addr=0x21e7000 mod64K=0x7000 (11 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.10.attn_v.weight addr=0x2427000 mod64K=0x7000 (21 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.10.attn_k.weight addr=0x24b7000 mod64K=0x7000 (22 cached)
+ggml-xdna: warm int4 weight K=2048 N=2048 m_in=4 type=Q4_0 weight=blk.11.attn_q.weight addr=0x2547000 mod64K=0x7000 (12 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.11.attn_v.weight addr=0x2787000 mod64K=0x7000 (23 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.11.attn_k.weight addr=0x2817000 mod64K=0x7000 (24 cached)
+ggml-xdna: warm int4 weight K=2048 N=2048 m_in=4 type=Q4_0 weight=blk.12.attn_q.weight addr=0x28a7000 mod64K=0x7000 (13 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.12.attn_v.weight addr=0x2ae7000 mod64K=0x7000 (25 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.12.attn_k.weight addr=0x2b77000 mod64K=0x7000 (26 cached)
+ggml-xdna: warm int4 weight K=2048 N=2048 m_in=4 type=Q4_0 weight=blk.13.attn_q.weight addr=0x2c07000 mod64K=0x7000 (14 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.13.attn_v.weight addr=0x2e47000 mod64K=0x7000 (27 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.13.attn_k.weight addr=0x2ed7000 mod64K=0x7000 (28 cached)
+ggml-xdna: warm int4 weight K=2048 N=2048 m_in=4 type=Q4_0 weight=blk.14.attn_q.weight addr=0x2f67000 mod64K=0x7000 (15 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.14.attn_v.weight addr=0x31a7000 mod64K=0x7000 (29 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.14.attn_k.weight addr=0x3237000 mod64K=0x7000 (30 cached)
+ggml-xdna: warm int4 weight K=2048 N=2048 m_in=4 type=Q4_0 weight=blk.15.attn_q.weight addr=0x32c7000 mod64K=0x7000 (16 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.15.attn_v.weight addr=0x3507000 mod64K=0x7000 (31 cached)
+ggml-xdna: warm int4 weight K=2048 N=512 m_in=4 type=Q4_0 weight=blk.15.attn_k.weight addr=0x3597000 mod64K=0x7000 (32 cached)
+ggml-xdna: loaded SwiGLU kernel bundle for swiglu_decode_int4_v2_K2048_N8192_4col_g32 (2 kernels)
+ggml-xdna: warm int4 swiglu fused K=2048 N=8192 tsi=8 (1 cached)
+ggml-xdna: warm int4 swiglu down K=8192 N=2048 tsi=4 (1 cached)
+ggml-xdna: loaded RMSNorm kernel for rms_norm_S2048_bf16_1c1ch_t2048
+ggml-xdna: GEMM kernel group_ids: [0]=1900543 [1]=1835009 [2]=1900543 [3]=1835008 [4]=1835008 [5]=1835008 [6]=1835008 [7]=1835008 [8]=ERR key=decode_layer_f3best_K2048_H8192_sl256_d64_ag4_kv8_g32_mc_preq_vexp_vreg_dq8_qp_mxp_ub_nokv_d2_decouple_tb_rr
+ggml-xdna: loaded kernel for decode_layer_f3best_K2048_H8192_sl256_d64_ag4_kv8_g32_mc_preq_vexp_vreg_dq8_qp_mxp_ub_nokv_d2_decouple_tb_rr
+ggml-xdna: [f3best-abi] nokv tiles=896 out=18432 cpu_kv=on
+ggml-xdna: [f3best-gluetime] token: layers=16 f3wall=500386 host=479648 acct=493045 rms=64 xr=128 xrsync=13 w=466556 kvzero=2265 kvcopy=2433 kvsync=93 runprep=505 npu=20738 outsync=93 reduce=157 us
+ggml-xdna: [f3best-LOOP] dispatched 16 layers in ONE call
+ggml-xdna: [f3best-gluetime] token: layers=16 f3wall=12257 host=621 acct=12101 rms=32 xr=65 xrsync=7 w=5 kvzero=75 kvcopy=83 kvsync=89 runprep=5 npu=11635 outsync=20 reduce=85 us
+ggml-xdna: [f3best-LOOP] dispatched 16 layers in ONE call
+ggml-xdna: [f3best-gluetime] token: layers=16 f3wall=11334 host=538 acct=11215 rms=27 xr=62 xrsync=5 w=5 kvzero=68 kvcopy=75 kvsync=85 runprep=3 npu=10795 outsync=14 reduce=76 us
+ggml-xdna: [f3best-gluetime] token: layers=16 f3wall=11464 host=593 acct=11329 rms=30 xr=64 xrsync=6 w=5 kvzero=75 kvcopy=87 kvsync=87 runprep=4 npu=10871 outsync=16 reduce=83 us
+ggml-xdna: [f3best-gluetime] token: layers=16 f3wall=11379 host=668 acct=11203 rms=32 xr=72 xrsync=7 w=6 kvzero=82 kvcopy=92 kvsync=86 runprep=4 npu=10711 outsync=23 reduce=88 us
+ggml-xdna: [f3best-gluetime] token: layers=16 f3wall=10804 host=555 acct=10681 rms=31 xr=62 xrsync=6 w=5 kvzero=72 kvcopy=80 kvsync=78 runprep=5 npu=10249 outsync=12 reduce=79 us
+ggml-xdna: [f3best-gluetime] token: layers=16 f3wall=11245 host=772 acct=11066 rms=42 xr=75 xrsync=8 w=6 kvzero=95 kvcopy=114 kvsync=109 runprep=5 npu=10473 outsync=16 reduce=122 us
+ggml-xdna: [f3best-gluetime] token: layers=16 f3wall=10794 host=574 acct=10667 rms=30 xr=62 xrsync=5 w=6 kvzero=76 kvcopy=86 kvsync=81 runprep=5 npu=10220 outsync=15 reduce=81 us
+llama_memory_breakdown_print: | memory breakdown [MiB] | total    free    self   model   context   compute    unaccounted |
+llama_memory_breakdown_print: |   - XDNA (XDNA NPU)    | 14140 = 14140 + (   0 =     0 +       0 +       0) +           0 |
+llama_memory_breakdown_print: |   - Host               |                  1085 =   804 +      16 +     265                |
