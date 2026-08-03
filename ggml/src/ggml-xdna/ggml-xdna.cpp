@@ -4977,26 +4977,30 @@ static bool ggml_backend_xdna_decode_layer_f3best(
     const int64_t num_kv    = k_perm->ne[2];
     const int64_t num_q     = q_w->ne[1] / head_dim;
     const int64_t attn_group = num_kv ? num_q / num_kv : 0;
-    // The f3best xclbin is built for the llama-3.2-1B geometry. Guard exactly.
-    if (E != 2048 || hidden != 8192 || head_dim != 64 || attn_group != 4 ||
-        num_kv != 8 || num_q != 32) { fprintf(stderr,"f3best guard geom fail E=%lld H=%lld hd=%lld ag=%lld kv=%lld q=%lld\n",(long long)E,(long long)hidden,(long long)head_dim,(long long)attn_group,(long long)num_kv,(long long)num_q); return false; }
+    // Geometry guard: E and H must divide evenly into NH tiles; attention params
+    // (head_dim, attn_group, num_kv) are fixed by the flowkv kernel (#155 for generalization).
+    if (E % NH != 0 || hidden % NH != 0) { fprintf(stderr,"f3best guard geom fail E=%lld H=%lld (must be divisible by NH=%lld)\n",(long long)E,(long long)hidden,(long long)NH); return false; }
+    if (head_dim != 64 || attn_group != 4 || num_kv != 8) { fprintf(stderr,"f3best guard attn fail hd=%lld ag=%lld kv=%lld (flowkv fixed at 64d_h4_c256)\n",(long long)head_dim,(long long)attn_group,(long long)num_kv); return false; }
     if (seq_len < 32) { fprintf(stderr,"f3best guard seq fail seq=%lld\n",(long long)seq_len); return false; }
 
     const bool with_npu_kv = xdna_env_enabled("XDNA_F3BEST_NPU_KV");
-    const int64_t H8  = hidden / NH;                 // 1024
-    const int64_t HH  = hidden;                       // 8192
+    const int64_t H8  = hidden / NH;                 // hidden per tile
+    const int64_t HH  = hidden;                       // full hidden
+    const int64_t PER_TILE = E / NH;                  // rows per tile for Q/O (256 for 1B)
     const int64_t KV_M = with_npu_kv ? 128 : 0;
-    const size_t  PACKED   = (size_t)M * E / 2 + (size_t)M * (E / group_size) * 2;  // 4608
-    const int64_t WT_TILES = with_npu_kv ? 960 : 896;
+    const size_t  PACKED   = (size_t)M * E / 2 + (size_t)M * (E / group_size) * 2;
+    const int64_t GEMV_T   = PER_TILE / M;            // weight tiles for Q/O (64 for 1B)
+    const int64_t GU_T     = H8 / M;                  // weight tiles for gate/up/down (256 for 1B)
+    const int64_t WT_TILES = with_npu_kv ? (3*GEMV_T + 3*GU_T) : (2*GEMV_T + 3*GU_T);
     const size_t  WT_BYTES = (size_t)WT_TILES * PACKED;
-    const size_t  RS       = (size_t)(E / group_size) * 18;   // 1152 (full E-row Q4_0)
-    const size_t  WO_BYTES = 2359296;                 // unused arg3 placeholder
+    const size_t  RS       = (size_t)(E / group_size) * 18;   // full E-row Q4_0
+    const size_t  WO_BYTES = (size_t)(E / M) * PACKED;  // unused arg3 placeholder
     const int64_t KVN      = 256 * head_dim;            // f3best xclbin KV window is fixed at 256 tokens
     const int     dts      = 2;
-    const int64_t XB       = E + 256 + 16;            // 2320
-    const int64_t XR_ELEMS = XB + E + E;             // 6416 (x|resid|gain)
-    const size_t  OUT_ELEMS = (size_t)NH * (E + 2*KV_M) + E;  // no-KV=18432; K/V=20480 bf16
-    const size_t  PH_STRIDE = (size_t)(E + 2*KV_M);  // no-KV=2048; K/V=2304
+    const int64_t XB       = E + 256 + 16;            // x_bundle
+    const int64_t XR_ELEMS = XB + E + E;             // x|resid|gain
+    const size_t  OUT_ELEMS = (size_t)NH * (E + 2*KV_M) + E;  // no-KV=NH*E+E; K/V=NH*(E+2*KV_M)+E
+    const size_t  PH_STRIDE = (size_t)(E + 2*KV_M);  // per-head stride in output
 
     const std::string cache_key = make_cache_key(XDNA_OP_DECODE_LAYER_F3BEST,
                                                  seq_len, E, hidden, "uint4", num_cols);
@@ -5110,16 +5114,16 @@ static bool ggml_backend_xdna_decode_layer_f3best(
             for (int64_t h = 0; h < NH; h++) {
                 uint8_t * hd = A + (size_t)h * WT_BYTES; size_t off = 0;
                 // #131B: column-major broadcast layout for Q/O (was row-major dot-product)
-                f3b::pack_bcast(qd + (size_t)h*256*RS, 256, E, E, 0, (int)group_size, PACKED, hd+off); off += 64*PACKED;
+                f3b::pack_bcast(qd + (size_t)h*PER_TILE*RS, PER_TILE, E, E, 0, (int)group_size, PACKED, hd+off); off += (size_t)GEMV_T*PACKED;
                 if (with_npu_kv) {
                     // K/V: one KV head per center tile, KV_M=128 rows, 32 tiles each.
-                    f3b::pack_bcast(kd + (size_t)h*KV_M*RS, (int)KV_M, E, E, 0, (int)group_size, PACKED, hd+off); off += (KV_M/M)*PACKED;
-                    f3b::pack_bcast(vd + (size_t)h*KV_M*RS, (int)KV_M, E, E, 0, (int)group_size, PACKED, hd+off); off += (KV_M/M)*PACKED;
+                    f3b::pack_bcast(kd + (size_t)h*KV_M*RS, (int)KV_M, E, E, 0, (int)group_size, PACKED, hd+off); off += (size_t)(KV_M/M)*PACKED;
+                    f3b::pack_bcast(vd + (size_t)h*KV_M*RS, (int)KV_M, E, E, 0, (int)group_size, PACKED, hd+off); off += (size_t)(KV_M/M)*PACKED;
                 }
-                f3b::pack_bcast(od + (size_t)h*256*RS, 256, E, E, 0, (int)group_size, PACKED, hd+off); off += 64*PACKED;
-                f3b::pack_bcast(gd + (size_t)h*H8*RS, H8, E, E, 0, (int)group_size, PACKED, hd+off); off += 256*PACKED;
-                f3b::pack_bcast(ud + (size_t)h*H8*RS, H8, E, E, 0, (int)group_size, PACKED, hd+off); off += 256*PACKED;
-                f3b::pack_bcast(dd, E, H8, HH, h*H8, (int)group_size, PACKED, hd+off); off += 256*PACKED;
+                f3b::pack_bcast(od + (size_t)h*PER_TILE*RS, PER_TILE, E, E, 0, (int)group_size, PACKED, hd+off); off += (size_t)GEMV_T*PACKED;
+                f3b::pack_bcast(gd + (size_t)h*H8*RS, H8, E, E, 0, (int)group_size, PACKED, hd+off); off += (size_t)GU_T*PACKED;
+                f3b::pack_bcast(ud + (size_t)h*H8*RS, H8, E, E, 0, (int)group_size, PACKED, hd+off); off += (size_t)GU_T*PACKED;
+                f3b::pack_bcast(dd, E, H8, HH, h*H8, (int)group_size, PACKED, hd+off); off += (size_t)GU_T*PACKED;
             }
         };
         // #35 sub-buffer test: XDNA_F3BEST_SUBBUF binds each layer's weights as a
