@@ -20891,15 +20891,20 @@ static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const s
             static const bool attn_supports_dbg =
                 xdna_env_enabled("XDNA_ATTN_SUPPORTS");
             if (attn_supports_dbg) {
-                // K=64 attention shape (Llama head_dim).
+                // Attention shape (Llama head_dim). Generalized from == 64 to
+                // xdna_head_dim_supported() {64,128,256} so 3B (HD=128) and
+                // 8B (HD=128) keep Q@K^T + SOFT_MAX + scores@V in one XDNA
+                // cgraph segment. Without this, non-1B head_dims let the
+                // scheduler split the layer into 3 segments (Q+KV | SOFT_MAX |
+                // O+FFN+GLU) and the layer_fused matcher finds 0 SwiGLU.
                 const bool is_attn_q_k_T =
                     src1->type == GGML_TYPE_F32 &&
-                    src0->ne[0] == 64 &&
+                    xdna_head_dim_supported(src0->ne[0]) &&
                     src0->ne[2] > 1;
                 // scores@V shape (after permute: src0 = V_cache view).
                 const bool is_attn_scores_v =
                     src1->type == GGML_TYPE_F32 &&
-                    src0->ne[1] == 64 &&
+                    xdna_head_dim_supported(src0->ne[1]) &&
                     src0->ne[2] > 1;
                 if (is_attn_q_k_T || is_attn_scores_v) {
                     static std::atomic<int> dbg_budget{8};
