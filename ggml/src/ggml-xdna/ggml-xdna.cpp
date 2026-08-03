@@ -1457,16 +1457,10 @@ static std::string make_cache_key(xdna_op_kind op_kind,
         snprintf(buf, sizeof(buf), "decode_back_mono_K%lld_N%lld_%dcol_g32",
                  (long long)K, (long long)N, num_cols);
     } else if (op_kind == XDNA_OP_DECODE_LAYER_F3BEST) {
-        // Full fused decode layer (attn + O-proj + FFN, one dispatch): K=embed_dim,
-        // N=hidden_dim, M=seq_len (KV-cache length, varies with context — MUST be in
-        // the key). head_dim=64, GQA (attn_group=4, num_kv_heads=8) fixed in the op.
-        // f3best raw-AIE emitter KV window is fixed at SEQ=256; attention is MULTI-CHUNK
-        // (chunk=128) — single-chunk-256 corrupted the 4th q-head (#70/#74). actual_seq is
-        // carried in XR for shorter contexts. _mc suffix forces regen past the broken xclbin;
-        // _preq/_vexp add flowkv score density cuts; _vreg holds the flowkv value
-        // accumulator in registers across the position loop (same numerics, -17.6us/layer).
-        // F3BEST_FFN_DIV probe suffix. env-read so the probe gets a separate xclbin
-        // without recompile; DIV=1 (default) produces the bare key.
+        // #155: attention params parametric — head_dim/attn_group/num_kv in cache key.
+        // num_cols encodes head_dim; M encodes attn_group (abuse existing params).
+        int64_t head_dim  = num_cols;       // overloaded: head_dim via num_cols
+        int64_t attn_group = M;             // overloaded: attn_group via M
         const char * ffn_div = getenv("F3BEST_FFN_DIV");
         const bool with_npu_kv = xdna_env_enabled("XDNA_F3BEST_NPU_KV");
         const char * kv_abi = with_npu_kv ? "_kv" : "_nokv";
@@ -1477,11 +1471,11 @@ static std::string make_cache_key(xdna_op_kind op_kind,
         const char * handasm_rr = getenv("F3BEST_HANDASM_RR");
         const char * rr_suffix = (handasm_rr && handasm_rr[0] != '\0') ? "_rr" : "";
         if (ffn_div && strcmp(ffn_div, "1") != 0) {
-            snprintf(buf, sizeof(buf), "decode_layer_f3best_K%lld_H%lld_sl256_d64_ag4_kv8_g32_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac%s_d%s%s%s%s",
-                     (long long)K, (long long)N, kv_abi, ffn_div, dc_suffix, tb_suffix, rr_suffix);
+            snprintf(buf, sizeof(buf), "decode_layer_f3best_K%lld_H%lld_sl256_d%lld_ag%lld_kv8_g32_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac%s_d%s%s%s%s",
+                     (long long)K, (long long)N, (long long)head_dim, (long long)attn_group, kv_abi, ffn_div, dc_suffix, tb_suffix, rr_suffix);
         } else {
-            snprintf(buf, sizeof(buf), "decode_layer_f3best_K%lld_H%lld_sl256_d64_ag4_kv8_g32_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac%s%s%s%s",
-                     (long long)K, (long long)N, kv_abi, dc_suffix, tb_suffix, rr_suffix);
+            snprintf(buf, sizeof(buf), "decode_layer_f3best_K%lld_H%lld_sl256_d%lld_ag%lld_kv8_g32_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac%s%s%s%s",
+                     (long long)K, (long long)N, (long long)head_dim, (long long)attn_group, kv_abi, dc_suffix, tb_suffix, rr_suffix);
         }
     } else {
         snprintf(buf, sizeof(buf), "gemm_%lldx%lldx%lld_%s_%dcol",
@@ -4978,9 +4972,8 @@ static bool ggml_backend_xdna_decode_layer_f3best(
     const int64_t num_q     = q_w->ne[1] / head_dim;
     const int64_t attn_group = num_kv ? num_q / num_kv : 0;
     // Geometry guard: E and H must divide evenly into NH tiles; attention params
-    // (head_dim, attn_group, num_kv) are fixed by the flowkv kernel (#155 for generalization).
+    // #155: attention params parametric — flowkv kernel compiled per (HD, AG, SEQ)
     if (E % NH != 0 || hidden % NH != 0) { fprintf(stderr,"f3best guard geom fail E=%lld H=%lld (must be divisible by NH=%lld)\n",(long long)E,(long long)hidden,(long long)NH); return false; }
-    if (head_dim != 64 || attn_group != 4 || num_kv != 8) { fprintf(stderr,"f3best guard attn fail hd=%lld ag=%lld kv=%lld (flowkv fixed at 64d_h4_c256)\n",(long long)head_dim,(long long)attn_group,(long long)num_kv); return false; }
     if (seq_len < 32) { fprintf(stderr,"f3best guard seq fail seq=%lld\n",(long long)seq_len); return false; }
 
     const bool with_npu_kv = xdna_env_enabled("XDNA_F3BEST_NPU_KV");
@@ -5002,8 +4995,10 @@ static bool ggml_backend_xdna_decode_layer_f3best(
     const size_t  OUT_ELEMS = (size_t)NH * (E + 2*KV_M) + E;  // no-KV=NH*E+E; K/V=NH*(E+2*KV_M)+E
     const size_t  PH_STRIDE = (size_t)(E + 2*KV_M);  // per-head stride in output
 
+    // #155: pass attention params via overloaded M=attn_group, num_cols=head_dim
+    const int fake_num_cols = (int)head_dim;  // overload head_dim through num_cols
     const std::string cache_key = make_cache_key(XDNA_OP_DECODE_LAYER_F3BEST,
-                                                 seq_len, E, hidden, "uint4", num_cols);
+                                                 attn_group, E, hidden, "uint4", fake_num_cols);
     if (!ensure_compiled(ctx, cache_key, XDNA_OP_DECODE_LAYER_F3BEST,
                          seq_len, E, hidden, "uint4", num_cols)) { fprintf(stderr,"f3best ensure_compiled failed cache=%s\n", cache_key.c_str()); return false; }
     xdna_kernel_entry * entry = get_or_load_kernel(ctx, cache_key,
