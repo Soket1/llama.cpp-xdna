@@ -17935,8 +17935,8 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                         for (int si = i; si <= lf_m.add_ffn_idx; si++) {
                             struct ggml_tensor * nd = cgraph->nodes[si];
                             if (!nd || nd->op != GGML_OP_PERMUTE) continue;
-                            if (!k_perm && nd->ne[0]==64 && nd->ne[1]>=32 && nd->ne[2]==8) k_perm = nd;
-                            else if (!v_perm && nd->ne[0]>=32 && nd->ne[1]==64 && nd->ne[2]==8) v_perm = nd;
+                            if (!k_perm && nd->ne[0]>=64 && nd->ne[1]>=32 && nd->ne[2]>=4) k_perm = nd;
+                            else if (!v_perm && nd->ne[0]>=32 && nd->ne[1]>=64 && nd->ne[2]>=4) v_perm = nd;
                         }
                         if (k_perm && v_perm) {
                             if (cpu_run_start >= 0) {   // materialize inpL + KV cache first
@@ -18042,14 +18042,15 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                         cpu_run_start = -1;
                         // Split delegate so add_attn (cpu_s) is snapshotted FRESH before the
                         // FFN delegate can reuse its buffer (ggml reuses intermediate buffers).
-                        std::vector<float> cpu_s_snap(E_model, 0.0f);
+                        const int64_t E_probe = lf_m.inpL_tensor->ne[0];
+                        std::vector<float> cpu_s_snap(E_probe, 0.0f);
                         bool have_cpu_s_snap = false;
                         if (lf_m.add_attn_idx >= i && lf_m.add_attn_idx < lf_m.add_ffn_idx) {
                             ggml_status sa = xdna_delegate_range(ctx, cgraph, i, lf_m.add_attn_idx + 1);
                             if (sa != GGML_STATUS_SUCCESS) return sa;
                             struct ggml_tensor * an = cgraph->nodes[lf_m.add_attn_idx];
-                            if (an && an->type == GGML_TYPE_F32 && an->data && an->ne[0] == E_model) {
-                                memcpy(cpu_s_snap.data(), an->data, (size_t)E_model * sizeof(float));
+                            if (an && an->type == GGML_TYPE_F32 && an->data && an->ne[0] == E_probe) {
+                                memcpy(cpu_s_snap.data(), an->data, (size_t)E_probe * sizeof(float));
                                 have_cpu_s_snap = true;
                             }
                             ggml_status sb = xdna_delegate_range(ctx, cgraph, lf_m.add_attn_idx + 1, lf_m.add_ffn_idx + 1);
