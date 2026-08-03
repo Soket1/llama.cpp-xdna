@@ -2479,7 +2479,9 @@ static bool ensure_compiled(ggml_backend_xdna_context * ctx,
                             xdna_op_kind op_kind,
                             int64_t M, int64_t K, int64_t N,
                             const char * dtype_in, int num_cols,
-                            const char * dtype_out = nullptr) {
+                            const char * dtype_out = nullptr,
+                            int64_t head_dim = 64, int64_t attn_group = 4,
+                            int64_t num_kv_heads = 8) {
     // Skip recompilation if we already failed for this key
     if (ctx->kernel_compile_failed.count(cache_key)) {
         return false;
@@ -2603,10 +2605,11 @@ static bool ensure_compiled(ggml_backend_xdna_context * ctx,
         // GQA + head_dim fixed for llama-3.2-1B (the emitter validates the shape).
         snprintf(cmd, sizeof(cmd),
                  "%s \"%s\" --quiet decode-layer-f3best --embed-dim %lld --hidden-dim %lld "
-                 "--group-size 32 --head-dim 64 --num-kv-heads 8 --attn-group 4 --seq-len 256 %s"
+                 "--group-size 32 --head-dim %lld --num-kv-heads %lld --attn-group %lld --seq-len 256 %s"
                  "--out \"%s\"%s",
                  xdna_python_cmd(), ctx->compile_script.c_str(),
                  (long long)K, (long long)N,
+                 (long long)head_dim, (long long)num_kv_heads, (long long)attn_group,
                  xdna_env_enabled("XDNA_F3BEST_NPU_KV") ? "--with-npu-kv " : "",
                  xclbin_path.c_str(), xdna_null_redirect());
         fprintf(stderr, "ggml-xdna: compiling DECODE_LAYER_F3BEST E=%lld H=%lld sl=32 (first run, will be cached; runtime seq=%lld)...\n",
@@ -5000,7 +5003,8 @@ static bool ggml_backend_xdna_decode_layer_f3best(
     const std::string cache_key = make_cache_key(XDNA_OP_DECODE_LAYER_F3BEST,
                                                  attn_group, E, hidden, "uint4", fake_num_cols);
     if (!ensure_compiled(ctx, cache_key, XDNA_OP_DECODE_LAYER_F3BEST,
-                         seq_len, E, hidden, "uint4", num_cols)) { fprintf(stderr,"f3best ensure_compiled failed cache=%s\n", cache_key.c_str()); return false; }
+                         seq_len, E, hidden, "uint4", num_cols,
+                         nullptr, head_dim, attn_group, num_kv)) { fprintf(stderr,"f3best ensure_compiled failed cache=%s\n", cache_key.c_str()); return false; }
     xdna_kernel_entry * entry = get_or_load_kernel(ctx, cache_key,
                                                    XDNA_OP_DECODE_LAYER_F3BEST, seq_len, E, hidden);
     if (!entry) { fprintf(stderr,"f3best get_or_load failed cache=%s\n", cache_key.c_str()); return false; }
