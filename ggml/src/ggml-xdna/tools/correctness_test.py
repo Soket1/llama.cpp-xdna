@@ -252,6 +252,27 @@ PRESETS: dict[str, dict[str, str]] = {
         "F3BEST_TRIPLE_B":               "1",
         "F3BEST_HANDASM_RR":             "1",
     },
+    "npu_f3best_loop_norr": {
+        # f3best without hand-asm RR kernel — used for non-1B models (#155) where
+        # the RR kernel may not be optimal (different KC, HD, etc.).
+        "XDNA_ENABLE_GEMV":              "1",
+        "XDNA_ENABLE_SWIGLU":            "1",
+        "XDNA_ENABLE_QKV":               "1",
+        "XDNA_ENABLE_DECODE_BATCH":      "1",
+        "XDNA_ENABLE_TRANSFORMER_BLOCK": "1",
+        "XDNA_ENABLE_FLOWKV_DECODE":     "1",
+        "XDNA_ENABLE_RMS_NORM":          "1",
+        "XDNA_ENABLE_GEMV_INT4":         "1",
+        "XDNA_ENABLE_SWIGLU_INT4":       "1",
+        "XDNA_ENABLE_FUSED_LAYER":       "1",
+        "XDNA_LAYER_FUSED":              "1",
+        "XDNA_ENABLE_LAYER_F3BEST":      "1",
+        "XDNA_ATTN_SUPPORTS":            "1",
+        "XDNA_LAYER_F3BEST_LIVE":        "1",
+        "XDNA_F3BEST_LOOP":              "1",
+        "F3BEST_MT_DECOUPLE":            "1",
+        "F3BEST_TRIPLE_B":               "1",
+    },
     "npu_f3best_loop_kv": {
         # Diagnostic K/V-capable f3best ABI: NPU K/V output replaces the CPU delegate.
         "XDNA_ENABLE_GEMV":              "1",
@@ -1264,19 +1285,17 @@ def build_bench_configs() -> list[BenchConfig]:
 
 
 def build_bench_configs_llama3b() -> list[BenchConfig]:
-    """Bench configs for Llama 3.2 3B Q4_0 (head_dim=128).
+    """Bench configs for Llama 3.2 3B Q4_0 (E=3072, H=8192, HD=128, AG=3, num_kv=8).
 
-    Phase 8.3 + 8.5 result: FlowKV NPU dispatch now fires on Q4_0 models.
-    The 'NPU INT4 v2' config exercises the full stack including FlowKV
-    on head_dim=128. The 'no-flowkv' variant isolates the GEMV+QKV-INT4
-    path -- useful to see whether FlowKV POC overwrite of kqv_out helps
-    or hurts perf in practice.
+    #155: f3best parametric attention — HD/AG/num_kv in cache key, flowkv compiled per-dim.
     """
     return [
         BenchConfig(label="3B CPU Q4_0",                 preset="cpu_baseline",          model=MODEL_LLAMA_3B_Q4_0),
         BenchConfig(label="3B NPU INT4 v2",              preset="npu_int4_v2",           model=MODEL_LLAMA_3B_Q4_0),
         BenchConfig(label="3B NPU INT4 v2 no-FlowKV",    preset="npu_int4_v2_no_flowkv", model=MODEL_LLAMA_3B_Q4_0),
         BenchConfig(label="3B NPU INT4 GEMV-only",       preset="npu_int4_gemv_only",    model=MODEL_LLAMA_3B_Q4_0),
+        # f3best (#155): parametric HD=128, AG=3. No-RR preset (RR оптимизирован под 1B).
+        BenchConfig(label="3B NPU f3best LOOP",          preset="npu_f3best_loop_norr",  model=MODEL_LLAMA_3B_Q4_0),
     ]
 
 
