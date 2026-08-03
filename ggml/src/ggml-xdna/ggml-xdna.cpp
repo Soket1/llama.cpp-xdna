@@ -17993,15 +17993,16 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                     if (n%32==31) { fprintf(stderr,"ggml-xdna: [f3best-gap] KV-delegate[%d,%d] avg=%.0f us (n=%d)\n", kv_lo, deleg_hi, _gsum/(n+1), n+1); fflush(stderr); }
                                 }
                             }
-                            std::vector<float> normed(2048, 0.0f);   // BUG1 fix: hand-rms(inpL)*w_norm1
+                            const int64_t E_model = lf_m.inpL_tensor->ne[0];
+                            std::vector<float> normed(E_model, 0.0f);   // BUG1 fix: hand-rms(inpL)*w_norm1
                             const float * inpL = (const float *)lf_m.inpL_tensor->data;
                             const float * gain = (const float *)lf_m.w_norm1->data;
                             double ss = 0.0;
-                            for (int e = 0; e < 2048; e++) ss += (double)inpL[e]*(double)inpL[e];
-                            const float inv = 1.0f/std::sqrt((float)(ss/2048.0)+1e-5f);
-                            for (int e = 0; e < 2048; e++) normed[e] = inpL[e]*inv*gain[e];
+                            for (int64_t e = 0; e < E_model; e++) ss += (double)inpL[e]*(double)inpL[e];
+                            const float inv = 1.0f/std::sqrt((float)(ss/(double)E_model)+1e-5f);
+                            for (int64_t e = 0; e < E_model; e++) normed[e] = inpL[e]*inv*gain[e];
                             const bool ok = ggml_backend_xdna_decode_layer_f3best(
-                                ctx, lf_m.outL_tensor, normed.data(), 2048, inpL,
+                                ctx, lf_m.outL_tensor, normed.data(), E_model, inpL,
                                 lf_m.w_q, lf_m.w_k, lf_m.w_v, lf_m.w_o, lf_m.w_gate, lf_m.w_up, lf_m.w_down,
                                 lf_m.w_norm2, cgraph->nodes[lf_m.q_rope_idx], k_perm, v_perm, 8);
                             if (ok) {
@@ -18041,14 +18042,14 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                         cpu_run_start = -1;
                         // Split delegate so add_attn (cpu_s) is snapshotted FRESH before the
                         // FFN delegate can reuse its buffer (ggml reuses intermediate buffers).
-                        std::vector<float> cpu_s_snap(2048, 0.0f);
+                        std::vector<float> cpu_s_snap(E_model, 0.0f);
                         bool have_cpu_s_snap = false;
                         if (lf_m.add_attn_idx >= i && lf_m.add_attn_idx < lf_m.add_ffn_idx) {
                             ggml_status sa = xdna_delegate_range(ctx, cgraph, i, lf_m.add_attn_idx + 1);
                             if (sa != GGML_STATUS_SUCCESS) return sa;
                             struct ggml_tensor * an = cgraph->nodes[lf_m.add_attn_idx];
-                            if (an && an->type == GGML_TYPE_F32 && an->data && an->ne[0] == 2048) {
-                                memcpy(cpu_s_snap.data(), an->data, 2048 * sizeof(float));
+                            if (an && an->type == GGML_TYPE_F32 && an->data && an->ne[0] == E_model) {
+                                memcpy(cpu_s_snap.data(), an->data, (size_t)E_model * sizeof(float));
                                 have_cpu_s_snap = true;
                             }
                             ggml_status sb = xdna_delegate_range(ctx, cgraph, lf_m.add_attn_idx + 1, lf_m.add_ffn_idx + 1);
