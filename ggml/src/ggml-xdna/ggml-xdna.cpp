@@ -1477,10 +1477,10 @@ static std::string make_cache_key(xdna_op_kind op_kind,
         const char * handasm_rr = getenv("F3BEST_HANDASM_RR");
         const char * rr_suffix = (handasm_rr && handasm_rr[0] != '\0') ? "_rr" : "";
         if (ffn_div && strcmp(ffn_div, "1") != 0) {
-            snprintf(buf, sizeof(buf), "decode_layer_f3best_K%lld_H%lld_sl256_d64_ag4_kv8_g32_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac%s_d%s%s%s%s",
+            snprintf(buf, sizeof(buf), "decode_layer_f3best_K%lld_H%lld_sl256_d64_ag4_kv8_g32_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac_pad%s_d%s%s%s%s",
                      (long long)K, (long long)N, kv_abi, ffn_div, dc_suffix, tb_suffix, rr_suffix);
         } else {
-            snprintf(buf, sizeof(buf), "decode_layer_f3best_K%lld_H%lld_sl256_d64_ag4_kv8_g32_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac%s%s%s%s",
+            snprintf(buf, sizeof(buf), "decode_layer_f3best_K%lld_H%lld_sl256_d64_ag4_kv8_g32_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac_pad%s%s%s%s",
                      (long long)K, (long long)N, kv_abi, dc_suffix, tb_suffix, rr_suffix);
         }
     } else {
@@ -4987,7 +4987,8 @@ static bool ggml_backend_xdna_decode_layer_f3best(
     const int64_t HH  = hidden;                       // 8192
     const int64_t KV_M = with_npu_kv ? 128 : 0;
     const size_t  PACKED   = (size_t)M * E / 2 + (size_t)M * (E / group_size) * 2;  // 4608
-    const int64_t WT_TILES = with_npu_kv ? 960 : 896;
+    constexpr int64_t PAD_TILES = 1;  // #177: keep DDR stream alive across phase boundaries
+    const int64_t WT_TILES = (with_npu_kv ? 960 : 896) + 2 * PAD_TILES;
     const size_t  WT_BYTES = (size_t)WT_TILES * PACKED;
     const size_t  RS       = (size_t)(E / group_size) * 18;   // 1152 (full E-row Q4_0)
     const size_t  WO_BYTES = 2359296;                 // unused arg3 placeholder
@@ -5111,12 +5112,16 @@ static bool ggml_backend_xdna_decode_layer_f3best(
                 uint8_t * hd = A + (size_t)h * WT_BYTES; size_t off = 0;
                 // #131B: column-major broadcast layout for Q/O (was row-major dot-product)
                 f3b::pack_bcast(qd + (size_t)h*256*RS, 256, E, E, 0, (int)group_size, PACKED, hd+off); off += 64*PACKED;
+                // #177 padding: sentinel tile keeps DDR read pipeline alive during rope
+                memset(hd + off, 0xFF, (size_t)PAD_TILES * PACKED); off += (size_t)PAD_TILES * PACKED;
                 if (with_npu_kv) {
                     // K/V: one KV head per center tile, KV_M=128 rows, 32 tiles each.
                     f3b::pack_bcast(kd + (size_t)h*KV_M*RS, (int)KV_M, E, E, 0, (int)group_size, PACKED, hd+off); off += (KV_M/M)*PACKED;
                     f3b::pack_bcast(vd + (size_t)h*KV_M*RS, (int)KV_M, E, E, 0, (int)group_size, PACKED, hd+off); off += (KV_M/M)*PACKED;
                 }
                 f3b::pack_bcast(od + (size_t)h*256*RS, 256, E, E, 0, (int)group_size, PACKED, hd+off); off += 64*PACKED;
+                // #177 padding: sentinel tile keeps DDR stream alive during attn_out relay
+                memset(hd + off, 0xFF, (size_t)PAD_TILES * PACKED); off += (size_t)PAD_TILES * PACKED;
                 f3b::pack_bcast(gd + (size_t)h*H8*RS, H8, E, E, 0, (int)group_size, PACKED, hd+off); off += 256*PACKED;
                 f3b::pack_bcast(ud + (size_t)h*H8*RS, H8, E, E, 0, (int)group_size, PACKED, hd+off); off += 256*PACKED;
                 f3b::pack_bcast(dd, E, H8, HH, h*H8, (int)group_size, PACKED, hd+off); off += 256*PACKED;
