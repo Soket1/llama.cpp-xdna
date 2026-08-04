@@ -229,6 +229,60 @@ PRESETS: dict[str, dict[str, str]] = {
         "XDNA_ENABLE_LAYER_F3BEST":      "1",
         "XDNA_ATTN_SUPPORTS":            "1",
     },
+    "npu_layer_f3best_probe_prod": {
+        # #188 ШАГ 11: probe path (no XDNA_F3BEST_LOOP → falls through to the
+        # per-layer diagnostic at ggml-xdna.cpp:18205) but with the SAME
+        # production xclbin flags as npu_f3best_loop (_decouple_tb_rr). This
+        # isolates whether the NaN seen under npu_layer_f3best_probe is a
+        # probe-only artifact of the broken _tb xclbin (no edge KV relay) or
+        # the real #188 regression. Expect per-layer |Onpu| on the production
+        # xclbin: NaN → real f3best bug; finite garbage → _tb xclbin is the
+        # broken one and the real bug is the Thenaissance garbage.
+        "XDNA_ENABLE_GEMV":              "1",
+        "XDNA_ENABLE_SWIGLU":            "1",
+        "XDNA_ENABLE_QKV":               "1",
+        "XDNA_ENABLE_DECODE_BATCH":      "1",
+        "XDNA_ENABLE_TRANSFORMER_BLOCK": "1",
+        "XDNA_ENABLE_FLOWKV_DECODE":     "1",
+        "XDNA_ENABLE_RMS_NORM":          "1",
+        "XDNA_ENABLE_GEMV_INT4":         "1",
+        "XDNA_ENABLE_SWIGLU_INT4":       "1",
+        "XDNA_ENABLE_FUSED_LAYER":       "1",
+        "XDNA_LAYER_FUSED":              "1",
+        "XDNA_DEBUG_LAYER_FUSED":        "1",
+        "XDNA_ENABLE_LAYER_F3BEST":      "1",
+        "XDNA_ATTN_SUPPORTS":            "1",
+        "XDNA_LAYER_F3BEST_LIVE":        "1",
+        "F3BEST_MT_DECOUPLE":            "1",
+        "F3BEST_TRIPLE_B":               "1",
+        "F3BEST_HANDASM_RR":             "1",
+    },
+    "npu_layer_f3best_probe_prod_norr": {
+        # #188 ШАГ 11b: same as npu_layer_f3best_probe_prod but WITHOUT
+        # F3BEST_HANDASM_RR → uses the baseline kc256.s bcast kernel instead
+        # of kc256_rr.s. Isolates whether the ~500× blow-up seen under
+        # probe_prod comes from the RR hand-asm kernel (suspected #86
+        # realdata AIE bug, never actually fixed — only worked around with
+        # "use baseline kernel" which RR then re-introduced). If blow-up
+        # disappears here → kc256_rr.s is the culprit.
+        "XDNA_ENABLE_GEMV":              "1",
+        "XDNA_ENABLE_SWIGLU":            "1",
+        "XDNA_ENABLE_QKV":               "1",
+        "XDNA_ENABLE_DECODE_BATCH":      "1",
+        "XDNA_ENABLE_TRANSFORMER_BLOCK": "1",
+        "XDNA_ENABLE_FLOWKV_DECODE":     "1",
+        "XDNA_ENABLE_RMS_NORM":          "1",
+        "XDNA_ENABLE_GEMV_INT4":         "1",
+        "XDNA_ENABLE_SWIGLU_INT4":       "1",
+        "XDNA_ENABLE_FUSED_LAYER":       "1",
+        "XDNA_LAYER_FUSED":              "1",
+        "XDNA_DEBUG_LAYER_FUSED":        "1",
+        "XDNA_ENABLE_LAYER_F3BEST":      "1",
+        "XDNA_ATTN_SUPPORTS":            "1",
+        "XDNA_LAYER_F3BEST_LIVE":        "1",
+        "F3BEST_MT_DECOUPLE":            "1",
+        "F3BEST_TRIPLE_B":               "1",
+    },
     "npu_f3best_loop": {
         # #35 unified loop: f3best drives every decode layer, and all 16 layers
         # are dispatched inside ONE backend call (XDNA_F3BEST_LOOP) so layers
@@ -772,7 +826,7 @@ TESTS: list[Test] = [
         n_predict=16,
         mode="single-turn",
         model=MODEL_Q4_0,
-        variants=["npu_f3best_loop", "npu_f3best_loop_kv"],
+        variants=["npu_f3best_loop", "npu_f3best_loop_kv", "npu_f3best_loop_norr", "npu_layer_f3best_probe", "npu_layer_f3best_probe_prod", "npu_layer_f3best_probe_prod_norr"],
         min_prefix_match=1,
         description="f3best no-KV and K/V ABI token-match vs CPU: 16 layers in one backend call.",
     ),
