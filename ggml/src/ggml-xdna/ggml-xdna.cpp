@@ -1458,7 +1458,7 @@ static std::string make_cache_key(xdna_op_kind op_kind,
                  (long long)K, (long long)N, num_cols);
     } else if (op_kind == XDNA_OP_DECODE_LAYER_F3BEST) {
         // #155: attention params parametric — head_dim/attn_group/num_kv in cache key.
-        // num_cols encodes head_dim; M encodes attn_group (abuse existing params).
+        // Match IRON operator's cache key format exactly (op.py base string).
         int64_t head_dim  = num_cols;       // overloaded: head_dim via num_cols
         int64_t attn_group = M;             // overloaded: attn_group via M
         const char * ffn_div = getenv("F3BEST_FFN_DIV");
@@ -1468,13 +1468,16 @@ static std::string make_cache_key(xdna_op_kind op_kind,
         const char * dc_suffix = (decouple && decouple[0] != '\0') ? "_decouple" : "";
         const char * triple_b = getenv("F3BEST_TRIPLE_B");
         const char * tb_suffix = (!triple_b || triple_b[0] != '0') ? "_tb" : "";
-        const char * cpp_bcast = "_cpp";  // #188: pure C++ bcast path (no hand-asm .s)
+        const char * ha_rr = getenv("F3BEST_HANDASM_RR");
+        const char * rr_suffix = (ha_rr && ha_rr[0] != '\0') ? "_rr" : "";
+        const char * qdump_env = getenv("F3BEST_QDUMP");
+        const char * qdump_suffix = (qdump_env && qdump_env[0] != '\0') ? "_qdump7" : "";
         if (ffn_div && strcmp(ffn_div, "1") != 0) {
-            snprintf(buf, sizeof(buf), "decode_layer_f3best_K%lld_H%lld_sl256_d%lld_ag%lld_kv8_g32_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac%s_d%s%s%s%s",
-                     (long long)K, (long long)N, (long long)head_dim, (long long)attn_group, kv_abi, ffn_div, dc_suffix, tb_suffix, cpp_bcast);
+            snprintf(buf, sizeof(buf), "decode_layer_f3best_%lldx%lld_d%lld_g%lld_s%lld_a%lld_kv%lld_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac%s_d%s%s%s%s%s",
+                     (long long)K, (long long)N, (long long)head_dim, (long long)32, (long long)256, (long long)attn_group, (long long)8, kv_abi, ffn_div, dc_suffix, tb_suffix, rr_suffix, qdump_suffix);
         } else {
-            snprintf(buf, sizeof(buf), "decode_layer_f3best_K%lld_H%lld_sl256_d%lld_ag%lld_kv8_g32_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac%s%s%s%s",
-                     (long long)K, (long long)N, (long long)head_dim, (long long)attn_group, kv_abi, dc_suffix, tb_suffix, cpp_bcast);
+            snprintf(buf, sizeof(buf), "decode_layer_f3best_%lldx%lld_d%lld_g%lld_s%lld_a%lld_kv%lld_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac%s%s%s%s%s",
+                     (long long)K, (long long)N, (long long)head_dim, (long long)32, (long long)256, (long long)attn_group, (long long)8, kv_abi, dc_suffix, tb_suffix, rr_suffix, qdump_suffix);
         }
     } else {
         snprintf(buf, sizeof(buf), "gemm_%lldx%lldx%lld_%s_%dcol",
@@ -5230,6 +5233,56 @@ static bool ggml_backend_xdna_decode_layer_f3best(
                                entry->kernel.group_id(5));
                 pack_weights((uint8_t *)packed.map<void*>());
                 packed.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                // #188 Ш21 scale check: one-shot read of the PACKED Wq bf16 scales
+                // (bcast layout: head h slice at h*WT_BYTES; tile t at h*WT_BYTES +
+                // t*PACKED; weights = KC*(N/2) = 4096B, scales at +4096 .. +4608 =
+                // 512B = 256 bf16). Verifies the garbage-scale hypothesis AT THE
+                // SOURCE (the bytes the kernel actually consumes).
+                static const bool _scalechk = xdna_env_enabled("XDNA_F3BEST_SCALECHK");
+                if (_scalechk) {
+                    static std::atomic<int> _scb{1};
+                    if (_scb.fetch_sub(1) > 0) {
+                        const uint8_t * AB = (const uint8_t *)packed.map<void*>();
+                        const size_t  SOFF = (size_t)(M/2) * E;   // 4096 (weight region end)
+                        auto _b2f = [](uint16_t b)->float{ uint32_t u=((uint32_t)b)<<16; float v; memcpy(&v,&u,4); return v; };
+                        int bad_tiles = 0, nf_total = 0; double mn = 1e30, mx = -1e30;
+                        for (int64_t h = 0; h < NH; h++) {
+                            int hbad = 0, hnf = 0;
+                            for (int64_t t = 0; t < GEMV_T; t++) {
+                                const uint8_t * sp = AB + (size_t)h*WT_BYTES + (size_t)t*PACKED + SOFF;
+                                int tnf = 0;
+                                for (int s = 0; s < 256; s++) {
+                                    uint16_t b; memcpy(&b, sp + 2*s, 2);
+                                    float v = _b2f(b);
+                                    if (std::isnan(v) || std::isinf(v)) tnf++;
+                                    else { mn = std::min(mn, (double)v); mx = std::max(mx, (double)v); }
+                                }
+                                if (tnf) { hbad++; hnf += tnf; }
+                            }
+                            bad_tiles += hbad; nf_total += hnf;
+                            fprintf(stderr, "ggml-xdna: [scalechk] head=%lld Wq bad_tiles=%lld/%lld nonfinite=%d\n",
+                                    (long long)h, (long long)hbad, (long long)GEMV_T, hnf);
+                        }
+                        fprintf(stderr, "ggml-xdna: [scalechk] ROLLUP tiles=%lld bad=%d nonfinite=%d min_finite=%.6g max_finite=%.6g\n",
+                                (long long)(NH*GEMV_T), bad_tiles, nf_total, mn, mx);
+                        bool printed = false;
+                        for (int64_t h = 0; h < NH && !printed; h++)
+                            for (int64_t t = 0; t < GEMV_T && !printed; t++) {
+                                const uint8_t * sp = AB + (size_t)h*WT_BYTES + (size_t)t*PACKED + SOFF;
+                                for (int s = 0; s < 256; s++) {
+                                    uint16_t b; memcpy(&b, sp + 2*s, 2);
+                                    float v = _b2f(b);
+                                    if (std::isnan(v) || std::isinf(v)) {
+                                        fprintf(stderr, "ggml-xdna: [scalechk] FIRST nonfinite head=%lld tile=%lld idx=%d bf16=0x%04X float=%g\n",
+                                                (long long)h, (long long)t, s, (unsigned)b, v);
+                                        printed = true; break;
+                                    }
+                                }
+                            }
+                        if (!printed) fprintf(stderr, "ggml-xdna: [scalechk] ALL 64x8 Wq tiles have FINITE scales\n");
+                        fflush(stderr);
+                    }
+                }
                 auto [ins, _] = entry->b_bo_cache.emplace(q_w->data, std::move(packed));
                 a_weights = &ins->second;
                 if (f3b_debug) {
@@ -5558,6 +5611,192 @@ static bool ggml_backend_xdna_decode_layer_f3best(
         const uint16_t * ob = (const uint16_t *)entry->c_bo->map<void*>();
         auto bf16f = [](uint16_t b)->float{ uint32_t u=((uint32_t)b)<<16; float v; memcpy(&v,&u,4); return v; };
         const uint16_t * s_blk = ob + (size_t)NH * PH_STRIDE;
+        // #188 Ш21 Direct-NPU Q dump: in qdump mode each score tile relayed its
+        // roped-Q (PT elems) into this SAME s-region (via the O_h relay -> oJ/oK ->
+        // orelay -> ANM(+resid) -> shim S2MM1). So s_blk[h*PT+e] = Q_h[e] + resid[e].
+        // NaN/finite survives the finite +resid, so the NaN count is exact; we also
+        // subtract resid to report |Q| directly for layer-0 tokens.
+        {
+            static const bool _qdump  = xdna_env_enabled("XDNA_F3BEST_QDUMP")
+                                     || xdna_env_enabled("F3BEST_QDUMP");
+            if (_qdump && out_dst && out_dst->type == GGML_TYPE_F32 && out_dst->data) {
+                static std::atomic<int> _qdb{6};
+                static std::atomic<int> _qseq{0};
+                if (_qdb.fetch_sub(1) > 0) {
+                    const int _qc = _qseq.fetch_add(1);   // monotonic dispatch index (0 = layer-0 token)
+                    const int64_t PT = E / NH;
+                    const float * R = resid;   // layer input residual (= ANM's resid)
+                    int64_t all_nan = 0; double all_qq = 0, all_ss = 0; float all_mx = 0.0f;
+                    for (int64_t h = 0; h < NH; h++) {
+                        double sum2 = 0.0, sum2s = 0.0; int64_t nan_cnt = 0; float mx = 0.0f;
+                        for (int64_t e = 0; e < PT; e++) {
+                            const float sv = bf16f(s_blk[(size_t)h * PT + e]);
+                            const float qv = R ? (sv - R[h * PT + e]) : sv;
+                            if (std::isnan(sv) || std::isinf(sv)) nan_cnt++;
+                            sum2 += (double)qv * (double)qv;
+                            sum2s += (double)sv * (double)sv;
+                            mx = std::max(mx, std::fabs(qv));
+                        }
+                        all_nan += nan_cnt; all_qq += sum2; all_ss += sum2s; all_mx = std::max(all_mx, mx);
+                        fprintf(stderr, "ggml-xdna: [qdump] seq=%d head=%lld |Q+resid|=%.4f |Q|=%.4f max|Q|=%.4f NaN+inf=%lld\n",
+                                _qc, (long long)h, std::sqrt(sum2s / (double)PT),
+                                std::sqrt(sum2 / (double)PT), mx, (long long)nan_cnt);
+                    }
+                    fprintf(stderr, "ggml-xdna: [qdump] seq=%d ROLLUP NH=%lld |Q|=%.4f max|Q|=%.4f NaN+inf(total)=%lld/%lld\n",
+                            _qc, (long long)NH, std::sqrt(all_qq / (double)(NH * PT)),
+                            all_mx, (long long)all_nan, (long long)(NH * PT));
+                    // #2: POSITIONAL corruption map (seq=0: full posmaps for heads 0,7
+                    // + 64-line for head0; seq=0 AND seq=1: first_bad_pos + alignment for
+                    // heads 0,1,4,7). One char per position: '.' = finite |q|<10,
+                    // 'N' = NaN, 'I'/+inf, 'i'/=-inf, 'h' = |q| in [10,1e38), '>' = |q|>=1e38.
+                    if (_qc <= 1) {
+                        auto qclass = [](float v)->char {
+                            if (std::isnan(v)) return 'N';
+                            if (std::isinf(v)) return (v > 0) ? 'I' : 'i';
+                            float a = std::fabs(v);
+                            if (a >= 1e38f) return '>';
+                            if (a >= 10.0f) return 'h';
+                            return '.';
+                        };
+                        auto qv_at = [&](int64_t h, int64_t e)->float {
+                            const float sv = bf16f(s_blk[(size_t)h * PT + e]);
+                            return R ? (sv - R[h * PT + e]) : sv;
+                        };
+                        auto firstbad = [&](int64_t h)->long long {
+                            for (int64_t e = 0; e < PT; e++)
+                                if (qclass(qv_at(h, e)) != '.') return (long long)e;
+                            return -1;
+                        };
+                        const long long fb0 = firstbad(0), fb1 = firstbad(1),
+                                        fb4 = firstbad(4), fb7 = firstbad(7);
+                        fprintf(stderr,
+                                "ggml-xdna: [posmap] seq=%d first_bad head0=%lld head1=%lld head4=%lld head7=%lld | mod32 %lld %lld %lld %lld | mod16 %lld %lld %lld %lld | mod8 %lld %lld %lld %lld\n",
+                                _qc, fb0, fb1, fb4, fb7,
+                                fb0 % 32, fb1 % 32, fb4 % 32, fb7 % 32,
+                                fb0 % 16, fb1 % 16, fb4 % 16, fb7 % 16,
+                                fb0 % 8,  fb1 % 8,  fb4 % 8,  fb7 % 8);
+                        if (_qc == 0) {
+                            for (int64_t hh : {0, 7}) {
+                                std::string pm;
+                                int valids = 0, nans = 0, infs = 0, huges = 0, bigs = 0;
+                                for (int64_t e = 0; e < PT; e++) {
+                                    const char c = qclass(qv_at(hh, e));
+                                    pm += c;
+                                    if      (c == '.') valids++;
+                                    else if (c == 'N') nans++;
+                                    else if (c == 'I' || c == 'i') infs++;
+                                    else if (c == '>') bigs++;
+                                    else huges++;
+                                }
+                                for (int ln = 0; ln < 4; ln++)
+                                    fprintf(stderr, "ggml-xdna: [posmap] seq=0 head=%lld l%d %s\n",
+                                            (long long)hh, ln, pm.substr((size_t)ln * 64, 64).c_str());
+                                fprintf(stderr, "ggml-xdna: [posmap] seq=0 head=%lld first_bad=%lld valid=%d nan=%d inf=%d huge=%d over1e38=%d\n",
+                                        (long long)hh, (hh == 7 ? fb7 : fb0), valids, nans, infs, huges, bigs);
+                            }
+                            std::string p60;
+                            for (int64_t e = 0; e < 64; e++) p60 += qclass(qv_at(0, e));
+                            fprintf(stderr, "ggml-xdna: [posmap] seq=0 head0 pos0..63 %s\n", p60.c_str());
+                        }
+                    }
+                    // #3: CPU-Q for head 0 (rows 0..255 = q-heads 0-3) with the EXACT
+                    // dequant semantics of _qkv_bcast_chunk (nib-8, group=32, per-group
+                    // bf16 scale), + rope_bundled (positional RoPE) + flowkv prescale
+                    // (1/sqrt(head_dim) = 0.125, FLOWKV_PRESCALE_Q=1). Compares finite
+                    // NPU Q (s - resid) vs CPU Q: rel-error + NaN-row correlation.
+                    if (_qc == 0 && q_w && q_w->type == GGML_TYPE_Q4_0 &&
+                        q_w->ne[0] == E && q_w->ne[1] == E && input_snap && E == 2048) {
+                        const int64_t ck = 256;
+                        std::vector<float> cpuq(ck, 0.0f);
+                        const uint8_t * qwb = (const uint8_t *)q_w->data;
+                        for (int64_t n = 0; n < ck; n++) {
+                            const uint8_t * row = qwb + (size_t)n * 64 * 18;
+                            double a = 0;
+                            for (int64_t b = 0; b < 64; b++) {
+                                const uint8_t * blk = row + b*18;
+                                ggml_fp16_t sh; memcpy(&sh, blk, 2); float sc = ggml_fp16_to_fp32(sh);
+                                const uint8_t * qs = blk + 2;
+                                for (int j = 0; j < 32; j++) {
+                                    int nib = (j < 16) ? (qs[j] & 0xF) : ((qs[j-16] >> 4) & 0xF);
+                                    a += (double)((nib - 8) * sc) * (double)input_snap[b*32 + j];
+                                }
+                            }
+                            cpuq[n] = (float)a;
+                        }
+                        int64_t pos0 = 0;
+                        if (rope_node && rope_node->src[1] && rope_node->src[1]->type == GGML_TYPE_I32 && rope_node->src[1]->data)
+                            pos0 = ((const int32_t *)rope_node->src[1]->data)[0];
+                        float fb = 10000.0f;
+                        if (rope_node) { const int32_t * pp = (const int32_t *)rope_node->op_params; memcpy(&fb, pp + 5, 4); }
+                        for (int hh2 = 0; hh2 < 4; hh2++) {
+                            float * q = &cpuq[hh2 * 64];
+                            float th = 1.0f;
+                            for (int i = 0; i < 32; i++) {
+                                float ang = (float)pos0 * th;
+                                float c = std::cos(ang), s = std::sin(ang);
+                                float x0 = q[2*i], x1 = q[2*i+1];
+                                q[2*i]   = x0*c - x1*s;
+                                q[2*i+1] = x0*s + x1*c;
+                                th *= std::pow(fb, -2.0f/64.0f);
+                            }
+                        }
+                        for (int64_t n = 0; n < ck; n++) cpuq[n] *= 0.125f;
+                        double nf_num = 0, nf_den = 0; int nf_cnt = 0; double cpu_mx = 0;
+                        int nanrows = 0; double nanrow_cpu_energy = 0, finrow_cpu_energy = 0;
+                        for (int64_t e = 0; e < ck; e++) {
+                            const float sv = bf16f(s_blk[e]);
+                            const float qv = R ? (sv - R[e]) : sv;
+                            const double cv = cpuq[e];
+                            cpu_mx = std::max(cpu_mx, std::fabs(cv));
+                            if (std::isnan(sv) || std::isinf(sv)) {
+                                nanrows++; nanrow_cpu_energy += cv*cv;
+                            } else {
+                                const double d = (double)qv - cv;
+                                nf_num += d*d; nf_den += cv*cv; nf_cnt++;
+                                finrow_cpu_energy += cv*cv;
+                            }
+                        }
+                        fprintf(stderr, "ggml-xdna: [qdump-cpuq] seq=0 head0 rows=256 finite=%d rel_err=%.5f |npu_fin|^2=%g |cpu|^2=%g NaN+inf_rows=%d nanrow_cpu|^2=%g finrow_cpu|^2=%g max|cpu|=%g\n",
+                                nf_cnt, std::sqrt(nf_num/(nf_den+1e-12)), nf_num, nf_den, nanrows, nanrow_cpu_energy, finrow_cpu_energy, cpu_mx);
+                        // plausible-magnitude fallback for finite NPU Q
+                        double nq2 = 0; int nqn = 0;
+                        for (int64_t e = 0; e < ck; e++) {
+                            const float sv = bf16f(s_blk[e]);
+                            if (std::isnan(sv) || std::isinf(sv)) continue;
+                            const float qv = R ? (sv - R[e]) : sv;
+                            nq2 += (double)qv*(double)qv; nqn++;
+                        }
+                        fprintf(stderr, "ggml-xdna: [qdump-cpuq] seq=0 head0 finite |Q|_rms=%.5f (CPU|Q|_rms=%.5f)\n",
+                                nqn ? std::sqrt(nq2/(double)nqn) : 0.0,
+                                std::sqrt(nf_den/(double)ck));
+                        // Refine: rel-error ONLY over the '.'-classified (small-valid,
+                        // |q|<10) NPU positions — does the good window match CPU Q?
+                        {
+                            auto _qc2 = [](float v)->char {
+                                if (std::isnan(v)) return 'N';
+                                if (std::isinf(v)) return (v > 0) ? 'I' : 'i';
+                                float a = std::fabs(v);
+                                if (a >= 1e38f) return '>';
+                                if (a >= 10.0f) return 'h';
+                                return '.';
+                            };
+                            double dn = 0, dd = 0; int dc = 0;
+                            for (int64_t e = 0; e < ck; e++) {
+                                const float sv = bf16f(s_blk[e]);
+                                const float qv = R ? (sv - R[e]) : sv;
+                                if (_qc2(qv) != '.') continue;
+                                const double d = (double)qv - (double)cpuq[e];
+                                dn += d*d; dd += (double)cpuq[e]*(double)cpuq[e]; dc++;
+                            }
+                            fprintf(stderr, "ggml-xdna: [qdump-cpuq] seq=0 head0 DOT-ONLY valid=%d rel_err=%.5f (good-lane Q vs CPU)\n",
+                                    dc, std::sqrt(dn/(dd+1e-12)));
+                        }
+                        fflush(stderr);
+                    }
+                    fflush(stderr);
+                }
+            }
+        }
         float * diag_extra = nullptr;
         if (out_dst->type == GGML_TYPE_F32 && out_dst->data && out_dst->nb[0] == 99) {
             diag_extra = (float *)out_dst->data + E;  // scratch layout: final[E] | s[E] | sum_partials[E]
