@@ -18174,11 +18174,18 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                         lf_m.w_o && lf_m.w_gate && lf_m.w_up &&
                         lf_m.w_down && lf_m.q_rope_idx >= 0) {
                         struct ggml_tensor * k_perm = nullptr, * v_perm = nullptr;
+                        // #205: identify K/V permutes by the KV projection width, not by loose
+                        // magnitude thresholds. k_perm is [head_dim, seq, num_kv], v_perm is
+                        // [seq, head_dim, num_kv]; both satisfy head_dim*num_kv == w_k->ne[1].
+                        // The old `ne[0]>=64` test matched the V-permute ([seq,hd,kv], seq>=64)
+                        // as k_perm, so head_dim was read as seq (256) and the cache key became
+                        // the 3B geometry `d256_a1` on a 1B model → wrong-shape xclbin compile.
+                        const int64_t kv_width = lf_m.w_k->ne[1];
                         for (int si = i; si <= lf_m.add_ffn_idx; si++) {
                             struct ggml_tensor * nd = cgraph->nodes[si];
                             if (!nd || nd->op != GGML_OP_PERMUTE) continue;
-                            if (!k_perm && nd->ne[0]>=64 && nd->ne[1]>=32 && nd->ne[2]>=4) k_perm = nd;
-                            else if (!v_perm && nd->ne[0]>=32 && nd->ne[1]>=64 && nd->ne[2]>=4) v_perm = nd;
+                            if (!k_perm && nd->ne[0]*nd->ne[2] == kv_width && nd->ne[1] >= 32) k_perm = nd;
+                            else if (!v_perm && nd->ne[1]*nd->ne[2] == kv_width && nd->ne[0] >= 32) v_perm = nd;
                         }
                         if (k_perm && v_perm) {
                             if (cpu_run_start >= 0) {   // materialize inpL + KV cache first
