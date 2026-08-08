@@ -1450,7 +1450,11 @@ static std::string make_cache_key(xdna_op_kind op_kind,
         // Fused front half (#32 Option B): K=embed_dim, N=head_dim, M=seq_len (the
         // KV-cache length, varies with context — MUST be in the key). GQA params
         // (attn_group=4, num_kv_heads=8, col_offset=2) hardcoded in the IRON op.
-        snprintf(buf, sizeof(buf), "decode_front_attn_K%lld_N%lld_sl%lld_%dcol_ag4_kv8_g32",
+        // _r4 = Ii fifo depth 2->1 (#188): the score/value packet race that left
+        // 3 of every 4 heads of the second temporal batch exactly zero. Must stay
+        // in sync with decode_front_attn/op.py (xclbin base + flowkv .o name) and
+        // design.py (fkv) -- all three name the same artifact.
+        snprintf(buf, sizeof(buf), "decode_front_attn_K%lld_N%lld_sl%lld_%dcol_ag4_kv8_g32_r4",
                  (long long)K, (long long)N, (long long)M, num_cols);
     } else if (op_kind == XDNA_OP_DECODE_BACK_MONO) {
         // Fused back half (#32 Option B): K=embed_dim, N=hidden_dim.
@@ -1472,12 +1476,18 @@ static std::string make_cache_key(xdna_op_kind op_kind,
         const char * rr_suffix = (ha_rr && ha_rr[0] != '\0') ? "_rr" : "";
         const char * qdump_env = getenv("F3BEST_QDUMP");
         const char * qdump_suffix = (qdump_env && qdump_env[0] != '\0') ? "_qdump7" : "";
+        // #206/#207: uni_partial size. Must mirror op.py's _uni_sfx.
+        const char * uni_env = getenv("F3BEST_UNI_SZ");
+        char uni_suffix[16] = "";
+        if (uni_env && uni_env[0] != '\0' && strcmp(uni_env, "128") != 0) {
+            snprintf(uni_suffix, sizeof(uni_suffix), "_u%s", uni_env);
+        }
         if (ffn_div && strcmp(ffn_div, "1") != 0) {
-            snprintf(buf, sizeof(buf), "decode_layer_f3best_%lldx%lld_d%lld_g%lld_s%lld_a%lld_kv%lld_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac%s_d%s%s%s%s%s",
-                     (long long)K, (long long)N, (long long)head_dim, (long long)32, (long long)256, (long long)attn_group, (long long)8, kv_abi, ffn_div, dc_suffix, tb_suffix, rr_suffix, qdump_suffix);
+            snprintf(buf, sizeof(buf), "decode_layer_f3best_%lldx%lld_d%lld_g%lld_s%lld_a%lld_kv%lld_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac_ug%s_d%s%s%s%s%s%s_fkfix",
+                     (long long)K, (long long)N, (long long)head_dim, (long long)32, (long long)256, (long long)attn_group, (long long)8, kv_abi, ffn_div, dc_suffix, tb_suffix, rr_suffix, qdump_suffix, uni_suffix);
         } else {
-            snprintf(buf, sizeof(buf), "decode_layer_f3best_%lldx%lld_d%lld_g%lld_s%lld_a%lld_kv%lld_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac%s%s%s%s%s",
-                     (long long)K, (long long)N, (long long)head_dim, (long long)32, (long long)256, (long long)attn_group, (long long)8, kv_abi, dc_suffix, tb_suffix, rr_suffix, qdump_suffix);
+            snprintf(buf, sizeof(buf), "decode_layer_f3best_%lldx%lld_d%lld_g%lld_s%lld_a%lld_kv%lld_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac_ug2%s%s%s%s%s%s_fkfix",
+                     (long long)K, (long long)N, (long long)head_dim, (long long)32, (long long)256, (long long)attn_group, (long long)8, kv_abi, dc_suffix, tb_suffix, rr_suffix, qdump_suffix, uni_suffix);
         }
     } else {
         snprintf(buf, sizeof(buf), "gemm_%lldx%lldx%lld_%s_%dcol",
@@ -4756,6 +4766,14 @@ static bool ggml_backend_xdna_decode_front_attn(
             while (lo < hi) { int64_t mid=(lo+hi+1)/2; if (k_zero(mid)) hi=mid-1; else lo=mid; }
             actual_seq = lo + 1;
         }
+        // DIAGNOSTIC (#188), XDNA_FRONT_SEQ=<n>: override the seq-meta slot the
+        // kernel decodes. Setting it to seq_len makes the "process all" fallback
+        // (32767) numerically identical to a correct decode, which separates a
+        // broken seq transport from a broken per-iteration chunk counter.
+        {
+            static const char * seq_ovr = getenv("XDNA_FRONT_SEQ");
+            if (seq_ovr) actual_seq = atoi(seq_ovr);
+        }
         xb[E + q_rows] = f32_to_bf16_scalar((float)actual_seq);
         entry->a_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
@@ -4773,6 +4791,13 @@ static bool ggml_backend_xdna_decode_front_attn(
                     const uint8_t * grp_src = (const uint8_t *)q_w->data + (size_t)g * q_rows * row_stride;
                     xdna_ffn16_pack_tiles(grp_src, q_rows, E, M, group_size, /*sub8=*/true,
                                           PACKED, wdst + (size_t)g * A_per_grp);
+                }
+                // DIAGNOSTIC (#188), XDNA_FRONT_CLONE0=1: see the K/V clone
+                // below -- the Q weights must be cloned too, or the groups
+                // would still compute different queries.
+                if (getenv("XDNA_FRONT_CLONE0") != NULL) {
+                    for (int64_t g = 1; g < num_kv; g++)
+                        memcpy(wdst + (size_t)g * A_per_grp, wdst, A_per_grp);
                 }
                 new_packed.sync(XCL_BO_SYNC_BO_TO_DEVICE);
                 auto [ins, _] = entry->b_bo_cache.emplace(q_w->data, std::move(new_packed));
@@ -4809,8 +4834,31 @@ static bool ggml_backend_xdna_decode_front_attn(
                 }
             }
         }
+        // DIAGNOSTIC (#188), XDNA_FRONT_CLONE0=1: replicate kv-group 0 into all
+        // eight slots. Every group then sees byte-identical K and V, so the
+        // eight per-group outputs MUST come back byte-identical too. Any
+        // surviving difference is state or transport inside the dispatch, not
+        // the data -- and unlike the in-kernel probes this does not perturb
+        // codegen at all. The Q weights are cloned in the same run below.
+        static const bool front_clone0 = (getenv("XDNA_FRONT_CLONE0") != NULL);
+        if (front_clone0) {
+            for (int64_t g = 1; g < num_kv; g++) {
+                memcpy(kdst + (size_t)g * ahs_elems, kdst, (size_t)ahs_elems * dts);
+                memcpy(vdst + (size_t)g * ahs_elems, vdst, (size_t)ahs_elems * dts);
+            }
+        }
         entry->d3_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
         entry->d4_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+        // Poison the output BO so "exactly zero" can be told apart from "never
+        // written": 0x3C00 is bf16 1.0. Heads that come back 1.0 were not DMA'd;
+        // heads that come back 0.0 were computed as zero.
+        static const bool o_poison = (getenv("XDNA_FRONT_POISON") != NULL);
+        if (o_poison) {
+            uint16_t * op = (uint16_t *)entry->c_bo->map<void*>();
+            for (size_t i = 0; i < out_elems; i++) op[i] = 0x3C00;
+            entry->c_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        }
 
         auto run = xrt::run(entry->kernel);
         run.set_arg(0, (uint32_t)3);
@@ -4843,11 +4891,80 @@ static bool ggml_backend_xdna_decode_front_attn(
                 for (size_t i=0;i<out_elems;i++){ double c=cpu[map(i)]; double d=npu[i]-c; num+=d*d; den+=c*c; }
                 return std::sqrt(num/(den+1e-12));
             };
+            // DIAGNOSTIC (#188), XDNA_FRONT_CLONE0=1: with every kv-group fed
+            // byte-identical K/V/weights, the eight per-group output blocks
+            // must be byte-identical. Report how many differ from group 0 and
+            // the magnitude of each block, so a dead group is unmistakable.
+            if (getenv("XDNA_FRONT_CLONE0") != NULL) {
+                const size_t blk = (size_t)(attn_group * head_dim);
+                char cb[512]; int cp = 0; int ndiff = 0;
+                for (int64_t g = 0; g < num_kv; g++) {
+                    int bad = 0; double mag = 0;
+                    for (size_t i = 0; i < blk; i++) {
+                        double v = npu[g*blk + i];
+                        mag += v*v;
+                        if (o_bf16[g*blk + i] != o_bf16[i]) bad = 1;
+                    }
+                    if (g && bad) ndiff++;
+                    cp += snprintf(cb+cp, sizeof(cb)-cp, "%sg%lld=%s|%.3g",
+                                   g?",":"", (long long)g, (g&&bad)?"DIFF":"same",
+                                   std::sqrt(mag));
+                }
+                fprintf(stderr, "ggml-xdna: [FRONT_CLONE0] ndiff=%d/%lld [%s]\n",
+                        ndiff, (long long)num_kv-1, cb);
+                fflush(stderr);
+            }
             const int64_t hd=head_dim, ag=attn_group, nkv=num_kv;
             double r_id  = rel([&](size_t i){return i;});  // identity
             // NPU layout [g(0..7) × slot(0..3) × hd]; try q-head = g*ag+slot vs slot*nkv+g
             double r_int = rel([&](size_t i){ int64_t d=i%hd, gs=i/hd, g=gs/ag, s=gs%ag;
                                               int64_t qh=s*nkv+g; return (size_t)(qh*hd+d); });
+            {   // best-match search: for each NPU head, which CPU head is closest?
+                // An ordering/aliasing bug shows up as a permuted mapping; a
+                // compute bug shows up as "no CPU head matches".
+                const int64_t nheads = (int64_t)(out_elems/hd);
+                char mb[1400]; int mp = 0;
+                for (int64_t nh = 0; nh < nheads; nh++) {
+                    double an = 0;
+                    for (int64_t d = 0; d < hd; d++) an += (double)npu[nh*hd+d]*npu[nh*hd+d];
+                    if (an == 0.0) { mp += snprintf(mb+mp, sizeof(mb)-mp, "%s%lld:ZERO", nh?" ":"", (long long)nh);
+                                     if (mp > (int)sizeof(mb)-24) break; continue; }
+                    double best = 1e30; int64_t bi = -1;
+                    for (int64_t ch = 0; ch < nheads; ch++) {
+                        double num=0,den=0;
+                        for (int64_t d=0; d<hd; d++){ double c=cpu[ch*hd+d]; double df=npu[nh*hd+d]-c; num+=df*df; den+=c*c; }
+                        double r = std::sqrt(num/(den+1e-12));
+                        if (r < best) { best = r; bi = ch; }
+                    }
+                    mp += snprintf(mb+mp, sizeof(mb)-mp, "%s%lld:%lld/%.2f", nh?" ":"", (long long)nh, (long long)bi, best);
+                    if (mp > (int)sizeof(mb)-24) break;
+                }
+                fprintf(stderr, "ggml-xdna: [FRONT_MATCH] npu->bestcpu=[%s]\n", mb); fflush(stderr);
+            }
+            {   // per-head rel: which of the 32 q-heads are wrong?
+                char hb[1024]; int hp = 0;
+                for (int64_t qh = 0; qh < (int64_t)(out_elems/hd); qh++) {
+                    double num=0,den=0;
+                    for (int64_t d=0; d<hd; d++){ double c=cpu[qh*hd+d]; double df=npu[qh*hd+d]-c; num+=df*df; den+=c*c; }
+                    double an=0; for (int64_t d=0; d<hd; d++) an += (double)npu[qh*hd+d]*npu[qh*hd+d];
+                    hp += snprintf(hb+hp, sizeof(hb)-hp, "%s%.2f/%.3g", qh?",":"", std::sqrt(num/(den+1e-12)), std::sqrt(an/hd));
+                    if (hp > (int)sizeof(hb)-16) break;
+                }
+                fprintf(stderr, "ggml-xdna: [FRONT_HEADS] rel/qhead=[%s]\n", hb); fflush(stderr);
+            }
+            if (getenv("XDNA_FRONT_STATE")) {
+                // Paired with -DFLOWKV_DUMP_STATE: the kernel writes value-tile
+                // state instead of the answer. Slot 0 = saved_denom, 1..4 =
+                // value_accum[0..3] of that head.
+                char sb[1400]; int sp = 0;
+                for (int64_t qh = 0; qh < (int64_t)(out_elems/hd); qh++) {
+                    sp += snprintf(sb+sp, sizeof(sb)-sp, "%s%lld:d=%.3g,m=%.3g,c=%.4g,n=%.0f",
+                                   qh?" ":"", (long long)qh,
+                                   npu[qh*hd+0], npu[qh*hd+3], npu[qh*hd+4], npu[qh*hd+5]);
+                    if (sp > (int)sizeof(sb)-40) break;
+                }
+                fprintf(stderr, "ggml-xdna: [FRONT_STATE] %s\n", sb); fflush(stderr);
+            }
             fprintf(stderr, "ggml-xdna: [FRONT_DIAG] out_elems=%zu E=%lld actual_seq=%lld seq_len=%lld; "
                     "relL2 identity=%.4f interleave=%.4f | npu[:3]=%.4f,%.4f,%.4f cpu[:3]=%.4f,%.4f,%.4f\n",
                     out_elems,(long long)E,(long long)actual_seq,(long long)seq_len, r_id, r_int, npu[0],npu[1],npu[2], cpu[0],cpu[1],cpu[2]);
@@ -5125,6 +5242,143 @@ static bool ggml_backend_xdna_decode_layer_f3best(
                 f3b::pack_bcast(gd + (size_t)h*H8*RS, H8, E, E, 0, (int)group_size, PACKED, hd+off); off += (size_t)GU_T*PACKED;
                 f3b::pack_bcast(ud + (size_t)h*H8*RS, H8, E, E, 0, (int)group_size, PACKED, hd+off); off += (size_t)GU_T*PACKED;
                 f3b::pack_bcast(dd, E, H8, HH, h*H8, (int)group_size, PACKED, hd+off); off += (size_t)GU_T*PACKED;
+            }
+            // #206 differential: give every head head-0's weights. All 8 center tiles
+            // then receive byte-identical weights AND byte-identical broadcast
+            // activations, so any tile-to-tile divergence in the output is a delivery
+            // or timing defect, not a weight-content defect. Math is wrong by design.
+            static const bool _samew = xdna_env_enabled("F3BEST_SAMEW");
+            if (_samew) {
+                for (int64_t h = 1; h < NH; h++) memcpy(A + (size_t)h*WT_BYTES, A, WT_BYTES);
+            }
+            // #206 zero-scale differential: pack_bcast writes the 8x32 bf16 group
+            // scales at byte offset KC*(N/2)=4096 of each 4608-byte tile. Zeroing
+            // that region makes EVERY dequantized weight exactly 0, so every GEMV
+            // output must be exactly 0. A non-zero partial then proves the kernel
+            // does not read its scales from where the host writes them.
+            static const bool _zerosc = xdna_env_enabled("F3BEST_ZEROSC");
+            if (_zerosc) {
+                const size_t NT = WT_BYTES / PACKED;
+                for (int64_t h = 0; h < NH; h++)
+                    for (size_t t = 0; t < NT; t++)
+                        memset(A + (size_t)h*WT_BYTES + t*PACKED + 4096, 0, PACKED - 4096);
+            }
+            // #206 FFN-chain split: zero ONLY the gate+up scales (tile range
+            // [2*GEMV_T, 2*GEMV_T+2*GU_T) in the per-head [Wq|Wo|gate|up|down]
+            // layout), leaving Q/O/down weights real. gate and up then produce
+            // exactly 0, so silu(gate)*up == 0 and the down GEMV must emit exactly
+            // 0. A non-zero partial proves down is not reading silu_buf — i.e.
+            // buffer aliasing or a stale read, not arithmetic.
+            static const bool _zerogu = xdna_env_enabled("F3BEST_ZEROGU");
+            if (_zerogu) {
+                const size_t t0 = (size_t)(2*GEMV_T), t1 = t0 + (size_t)(2*GU_T);
+                for (int64_t h = 0; h < NH; h++)
+                    for (size_t t = t0; t < t1; t++)
+                        memset(A + (size_t)h*WT_BYTES + t*PACKED + 4096, 0, PACKED - 4096);
+            }
+            // #206 silu read-out: turn the down projection into a column selector so
+            // the on-chip silu_buf becomes observable from the host. All down nibbles
+            // are set to signed 0 except column 0 of chunk 0, which is set to +1 for
+            // every row (byte 0x11 = rows 2k and 2k+1 both +1), and all down scales
+            // to 1.0. The down GEMV then computes P[block*32+r] = silu_buf[0], so the
+            // reported |part| IS the magnitude of the first silu element. This splits
+            // "gate/up blow up" from "down blows up" without any kernel change.
+            static const bool _dsel = xdna_env_enabled("F3BEST_DOWNSEL");
+            if (_dsel) {
+                // F3BEST_DOWNSEL_COL picks WHICH silu element is read out, in
+                // [0, H8): chunk = COL/256 selects the tile within a block,
+                // col = COL%256 the 16-byte column inside it.
+                // F3BEST_DOWNSEL_COL pins every block to the same silu element.
+                // Unset (the default) instead SWEEPS: output block b reads silu[b*16],
+                // so one run yields a 64-point magnitude profile of the whole silu
+                // buffer, readable straight off the existing per-block bad-map.
+                const char * cs = getenv("F3BEST_DOWNSEL_COL");
+                const char * bs = getenv("F3BEST_DOWNSEL_BASE");
+                const char * ss = getenv("F3BEST_DOWNSEL_STEP");
+                const size_t sw_base = bs ? (size_t)atoi(bs) : 0;
+                const size_t sw_step = ss ? (size_t)atoi(ss) : 16;
+                const size_t nch = (size_t)(H8 / 256);          // chunks per block
+                const size_t t0 = (size_t)(2*GEMV_T + 2*GU_T);   // first down tile
+                for (int64_t h = 0; h < NH; h++)
+                    for (size_t t = t0; t < t0 + (size_t)GU_T; t++) {
+                        const size_t b = (t - t0) / nch;                  // output block
+                        const size_t CI = cs ? (size_t)atoi(cs)
+                                             : (sw_base + b * sw_step) % (size_t)H8;
+                        const size_t ck = (CI / 256) % nch, cl = CI % 256;
+                        uint8_t * tile = A + (size_t)h*WT_BYTES + t*PACKED;
+                        memset(tile, 0x00, 4096);
+                        if ((t - t0) % nch == ck) memset(tile + cl*16, 0x11, 16);
+                        uint16_t * sc = (uint16_t *)(tile + 4096);
+                        for (size_t k = 0; k < (PACKED - 4096) / 2; k++) sc[k] = 0x3F80;
+                    }
+            }
+            // #206 null-weight differential: nibble 0 decodes to signed 0, so writing
+            // 0x00 across [0,4096) makes every weight exactly 0 while leaving the real
+            // scales in place. 0 * scale = 0, so every GEMV output must be exactly 0.
+            // Any residue is the accumulator, not the arithmetic.
+            static const bool _nib0 = xdna_env_enabled("F3BEST_NIB0");
+            if (_nib0) {
+                const size_t NT = WT_BYTES / PACKED;
+                for (int64_t h = 0; h < NH; h++)
+                    for (size_t t = 0; t < NT; t++)
+                        memset(A + (size_t)h*WT_BYTES + t*PACKED, 0x00, 4096);
+            }
+            // #206 zero-nibble differential: zero the nibble region [0,4096) while
+            // leaving the real scales intact. Every dequantized weight becomes
+            // (0-8)*scale = -8*scale, i.e. a known constant, so each output row must
+            // equal -8 * scale * sum(x). Any blow-up beyond that bound isolates the
+            // defect to the nibble/MAC path rather than the scales.
+            static const bool _zeronib = xdna_env_enabled("F3BEST_ZERONIB");
+            if (_zeronib) {
+                const size_t NT = WT_BYTES / PACKED;
+                for (int64_t h = 0; h < NH; h++)
+                    for (size_t t = 0; t < NT; t++)
+                        memset(A + (size_t)h*WT_BYTES + t*PACKED, 0x88, 4096);
+            }
+            // #206 unit-scale differential: every group scale = bf16 1.0. Output then
+            // reduces to a plain signed-int4 dot product, whose magnitude is bounded
+            // by |x|*8*sqrt(K) ~ 70. If the output is STILL ~1e16, the defect is not
+            // in the scale values and the nibble/accumulation path is implicated.
+            static const bool _onesc = xdna_env_enabled("F3BEST_ONESC");
+            if (_onesc) {
+                // Optional phase window: F3BEST_ONESC_T0/T1 restrict the scale
+                // override to a tile range so Q/O (tiles [0,2*GEMV_T)) can be
+                // separated from FFN (tiles [2*GEMV_T, NT)).
+                const size_t NT_all = WT_BYTES / PACKED;
+                const char * _e0 = getenv("F3BEST_ONESC_T0");
+                const char * _e1 = getenv("F3BEST_ONESC_T1");
+                const size_t T0 = _e0 ? (size_t)strtoul(_e0, NULL, 0) : 0;
+                const size_t NT = _e1 ? (size_t)strtoul(_e1, NULL, 0) : NT_all;
+                for (int64_t h = 0; h < NH; h++)
+                    for (size_t t = T0; t < NT && t < NT_all; t++) {
+                        uint16_t * sc = (uint16_t *)(A + (size_t)h*WT_BYTES + t*PACKED + 4096);
+                        // F3BEST_ONESC_VAL: bf16 bit pattern to write (default 1.0).
+                        // Sweeping it shows how many times the kernel applies the group
+                        // scale: the output scales as val^n for repeat count n.
+                        const char * _ev = getenv("F3BEST_ONESC_VAL");
+                        const uint16_t sv = _ev ? (uint16_t)strtoul(_ev, NULL, 0) : 0x3F80;
+                        for (size_t k = 0; k < (PACKED - 4096) / 2; k++) sc[k] = sv;
+                    }
+            }
+            // #207 unit-impulse differential: every scale = 1.0 and every nibble = 0
+            // (signed 0) EXCEPT column 0 of chunk 0, whose byte is 0x99 = both rows
+            // +1. With x the real activation, the exact output of each 32-row block
+            // is then x[0] for the rows fed by that column and 0 elsewhere, i.e. the
+            // whole GEMV collapses to a bounded, hand-computable value ~|x|~0.2.
+            // Anything larger is produced by the kernel, not by the arithmetic, and
+            // the ratio names the mechanism (row reuse, chunk reuse, or accumulator).
+            static const bool _imp = xdna_env_enabled("F3BEST_IMPULSE");
+            if (_imp) {
+                const size_t NT = WT_BYTES / PACKED;
+                for (int64_t h = 0; h < NH; h++)
+                    for (size_t t = 0; t < NT; t++) {
+                        uint8_t * tile = A + (size_t)h*WT_BYTES + t*PACKED;
+                        memset(tile, 0x00, 4096);
+                        const char * ib = getenv("F3BEST_IMPULSE_BYTE");
+                        memset(tile, ib ? (uint8_t)strtoul(ib,NULL,0) : 0x99, 16);
+                        uint16_t * sc = (uint16_t *)(tile + 4096);
+                        for (size_t k = 0; k < (PACKED - 4096) / 2; k++) sc[k] = 0x3F80;
+                    }
             }
         };
         // #35 sub-buffer test: XDNA_F3BEST_SUBBUF binds each layer's weights as a
@@ -5620,12 +5874,43 @@ static bool ggml_backend_xdna_decode_layer_f3best(
             static const bool _qdump  = xdna_env_enabled("XDNA_F3BEST_QDUMP")
                                      || xdna_env_enabled("F3BEST_QDUMP");
             if (_qdump && out_dst && out_dst->type == GGML_TYPE_F32 && out_dst->data) {
-                static std::atomic<int> _qdb{6};
+                static const int _qdb_n = [](){ const char* e = getenv("F3BEST_QDUMP_N");
+                                                return (e && *e) ? atoi(e) : 6; }();
+                static std::atomic<int> _qdb{_qdb_n};
                 static std::atomic<int> _qseq{0};
                 if (_qdb.fetch_sub(1) > 0) {
                     const int _qc = _qseq.fetch_add(1);   // monotonic dispatch index (0 = layer-0 token)
                     const int64_t PT = E / NH;
                     const float * R = resid;   // layer input residual (= ANM's resid)
+                    // #206: input-side sanity. |Q|==0 can come from a zero ACTIVATION
+                    // or from zero WEIGHTS just as easily as from a broken GEMV, so
+                    // read back the two buffers the tile actually consumes: the XR
+                    // bundle (post-sync device map) and the packed Wq tile 0.
+                    {
+                        const uint16_t * xrv = (const uint16_t *)entry->a_bo->map<void*>();
+                        double x2 = 0.0; int xnz = 0; float xmx = 0.0f;
+                        for (int64_t e = 0; e < E; e++) {
+                            const float v = bf16f(xrv[e]);
+                            if (v != 0.0f) xnz++;
+                            x2 += (double)v * (double)v; xmx = std::max(xmx, std::fabs(v));
+                        }
+                        double w2 = 0.0; int wnz = 0; int nib_nz = 0;
+                        if (a_weights) {
+                            const uint8_t * AB = (const uint8_t *)a_weights->map<void*>();
+                            const size_t SOFF = (size_t)(M/2) * E;   // scales start (4096)
+                            for (int s = 0; s < 256; s++) {
+                                uint16_t b; memcpy(&b, AB + SOFF + 2*s, 2);
+                                const float v = bf16f(b);
+                                if (v != 0.0f) wnz++;
+                                w2 += (double)v * (double)v;
+                            }
+                            for (size_t q = 0; q < 256; q++) if (AB[q] != 0x88) nib_nz++;
+                        }
+                        fprintf(stderr, "ggml-xdna: [qdump-in] seq=%d |x|rms=%.5f xnz=%d/%lld max|x|=%.5f | Wq_tile0 scale_nz=%d/256 |sc|rms=%.6f nib_nz=%d/256\n",
+                                _qc, std::sqrt(x2/(double)E), xnz, (long long)E, xmx,
+                                wnz, std::sqrt(w2/256.0), nib_nz);
+                        fflush(stderr);
+                    }
                     int64_t all_nan = 0; double all_qq = 0, all_ss = 0; float all_mx = 0.0f;
                     for (int64_t h = 0; h < NH; h++) {
                         double sum2 = 0.0, sum2s = 0.0; int64_t nan_cnt = 0; float mx = 0.0f;
@@ -5878,6 +6163,97 @@ static bool ggml_backend_xdna_decode_layer_f3best(
                 dst[e] = f32_to_bf16_scalar(acc);
             }
 #endif
+        }
+        // #206 IODUMP: clean per-dispatch I/O census on the PRODUCTION path.
+        // The qdump instrument overwrites the s-region with the Q relay, so the
+        // layer output it produces is corrupt BY CONSTRUCTION and cannot be used
+        // to reason about layer-to-layer propagation. This block touches nothing:
+        // it only reports |x| (XR bundle, what the tile consumed), |s| (attention
+        // stage), |partials| (FFN stage) and |dst| (what the next layer gets).
+        {
+            static const bool _io = xdna_env_enabled("F3BEST_IODUMP");
+            if (_io) {
+                static const int _ion = [](){ const char* e = getenv("F3BEST_IODUMP_N");
+                                              return (e && *e) ? atoi(e) : 34; }();
+                static std::atomic<int> _iob{_ion};
+                static std::atomic<int> _ioq{0};
+                if (_iob.fetch_sub(1) > 0) {
+                    const int _ic = _ioq.fetch_add(1);
+                    const uint16_t * xrv = (const uint16_t *)entry->a_bo->map<void*>();
+                    double x2 = 0.0, s2 = 0.0, p2 = 0.0, d2 = 0.0;
+                    int64_t dn = 0; float dmx = 0.0f;
+                    for (int64_t e = 0; e < E; e++) {
+                        const float xv = bf16f(xrv[e]);
+                        x2 += (double)xv * (double)xv;
+                        const float sv = bf16f(s_blk[e]);
+                        s2 += (double)sv * (double)sv;
+                        float ps = 0.0f;
+                        for (int64_t h = 0; h < NH; h++) ps += bf16f(ob[(size_t)h*PH_STRIDE + e]);
+                        p2 += (double)ps * (double)ps;
+                        const float dv = (out_dst->type == GGML_TYPE_F32)
+                                       ? ((const float *)out_dst->data)[e] : (sv + ps);
+                        if (std::isnan(dv) || std::isinf(dv)) dn++;
+                        else { d2 += (double)dv * (double)dv; dmx = std::max(dmx, std::fabs(dv)); }
+                    }
+                    fprintf(stderr, "ggml-xdna: [iodump] seq=%d |x|=%.5f |s|=%.5g |part|=%.5g |out|=%.5g max|out|=%.5g bad=%lld/%lld\n",
+                            _ic, std::sqrt(x2/(double)E), std::sqrt(s2/(double)E),
+                            std::sqrt(p2/(double)E), std::sqrt(d2/(double)E), dmx,
+                            (long long)dn, (long long)E);
+                    // Per-head partial census + the resid/gain halves of the XR bundle.
+                    // Distinguishes "all 8 tiles blow up" (shared weight/DMA defect)
+                    // from "one tile" (per-tile accumulator defect), and tells whether
+                    // |s| is small because resid never arrived at the ANM add.
+                    {
+                        double r2 = 0.0, g2 = 0.0;
+                        for (int64_t e = 0; e < E; e++) {
+                            const float rv = bf16f(xrv[XB + e]);       r2 += (double)rv*(double)rv;
+                            const float gv = bf16f(xrv[XB + E + e]);   g2 += (double)gv*(double)gv;
+                        }
+                        char hb[512]; int hp = 0;
+                        for (int64_t h = 0; h < NH; h++) {
+                            double h2 = 0.0; int64_t hn = 0;
+                            for (int64_t e = 0; e < E; e++) {
+                                const float pv = bf16f(ob[(size_t)h*PH_STRIDE + e]);
+                                if (std::isnan(pv) || std::isinf(pv)) hn++;
+                                else h2 += (double)pv * (double)pv;
+                            }
+                            hp += snprintf(hb + hp, sizeof(hb) - hp, " h%lld=%.3g%s",
+                                           (long long)h, std::sqrt(h2/(double)E),
+                                           hn ? "!" : "");
+                        }
+                        // |O| = |s - resid|: the attention contribution alone.
+                        double o2 = 0.0;
+                        for (int64_t e = 0; e < E; e++) {
+                            const float ov = bf16f(s_blk[e]) - bf16f(xrv[XB + e]);
+                            o2 += (double)ov * (double)ov;
+                        }
+                        fprintf(stderr, "ggml-xdna: [iodump] seq=%d |resid|=%.5g |gain|=%.5g |O|=%.5g parts:%s\n",
+                                _ic, std::sqrt(r2/(double)E), std::sqrt(g2/(double)E),
+                                std::sqrt(o2/(double)E), hb);
+                        // Per-head block profile: the down phase stores N=32 floats per
+                        // block, so a block-granular sane/blown map says whether the
+                        // corruption is a whole-tile property or starts at a block index.
+                        for (int64_t h = 0; h < NH; h++) {
+                            char bb[128]; int bp = 0; int first_bad = -1;
+                            const int64_t NBLK = E / 32;
+                            for (int64_t b = 0; b < NBLK && bp < 100; b++) {
+                                float mx = 0.0f; bool nn = false;
+                                for (int64_t e = b*32; e < (b+1)*32; e++) {
+                                    const float pv = bf16f(ob[(size_t)h*PH_STRIDE + e]);
+                                    if (std::isnan(pv) || std::isinf(pv)) nn = true;
+                                    else mx = std::max(mx, std::fabs(pv));
+                                }
+                                const bool bad = nn || mx > 10.0f;
+                                if (bad && first_bad < 0) first_bad = (int)b;
+                                bp += snprintf(bb + bp, sizeof(bb) - bp, "%c", bad ? 'X' : '.');
+                            }
+                            fprintf(stderr, "ggml-xdna: [iodump]   h%lld first_bad=%d blocks=%s\n",
+                                    (long long)h, first_bad, bb);
+                        }
+                    }
+                    fflush(stderr);
+                }
+            }
         }
         // K/V readback from c_bo (NPU-computed, diagnostic).
         if (with_npu_kv) {
@@ -18104,11 +18480,22 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                 double _t_kv=0,_t_f3=0; const auto _lt0=std::chrono::steady_clock::now();
                                 if (_glue) g_xdna_f3best_gluetime = {};
                                 std::vector<float> normed(2048,0.0f); bool disp_ok=true;
+                                std::vector<float> inpL_hold;
+                                static const bool _loopsnapdbg = xdna_env_enabled("XDNA_F3BEST_LIVESNAPDBG");
                                 for (auto & L : plan) {
                                     // CPU KV-write prefix (attn_norm + Q/K/V-proj + rope + SET_ROWS) from the
                                     // shared residual buffer; then f3best writes outL = next layer's inpL.
                                     // When NPU_KV=1, K/V are computed on NPU and written to kv_bo directly.
                                     static const bool f3b_npu_kv_skip = xdna_env_enabled("XDNA_F3BEST_NPU_KV");
+                                    // inpL lives in a ggml intermediate buffer that the KV delegate
+                                    // below can reuse. Snapshot it FIRST; reading it afterwards
+                                    // yields another layer's activations (measured rel=1.76).
+                                    inpL_hold.resize(2048);
+                                    bool have_hold=false;
+                                    if (L.m->inpL_tensor->type==GGML_TYPE_F32 && L.m->inpL_tensor->data) {
+                                        memcpy(inpL_hold.data(), L.m->inpL_tensor->data, 2048*sizeof(float));
+                                        have_hold=true;
+                                    }
                                     const auto _k0=std::chrono::steady_clock::now();
                                     if (!f3b_npu_kv_skip) {
                                         ggml_status sk=xdna_delegate_range(ctx,cgraph,L.kv_lo,L.kv_hi+1);
@@ -18116,7 +18503,17 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                     }
                                     if(_looptime) _t_kv+=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-_k0).count();
                                     const auto _r0=std::chrono::steady_clock::now();
-                                    const float* inpL=(const float*)L.m->inpL_tensor->data;
+                                    const float* inpL=have_hold?inpL_hold.data():(const float*)L.m->inpL_tensor->data;
+                                    if (_loopsnapdbg) {
+                                        static std::atomic<int> _sb{4};
+                                        if(_sb.fetch_sub(1)>0){
+                                            const float* lv=(const float*)L.m->inpL_tensor->data;
+                                            double dn=0,dd=0;
+                                            for(int e=0;e<2048;e++){double t=(double)inpL_hold[e]-(double)lv[e];dn+=t*t;dd+=(double)inpL_hold[e]*inpL_hold[e];}
+                                            fprintf(stderr,"ggml-xdna: [f3best-loopsnap] have=%d rel=%.6f |snap|=%.5f\n",
+                                                    (int)have_hold,std::sqrt(dn/(dd+1e-12)),std::sqrt(dd/2048.0));
+                                            fflush(stderr);}
+                                    }
                                     const float* gain=(const float*)L.m->w_norm1->data;
                                     double ss=0.0; for(int e=0;e<2048;e++) ss+=(double)inpL[e]*(double)inpL[e];
                                     const float inv=1.0f/std::sqrt((float)(ss/2048.0)+1e-5f);
@@ -18229,6 +18626,15 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                             // caused by the interleaved OTHER-xclbin dispatch (→ fold KV-write into
                             // f3best so all 16 per-token dispatches are the SAME xclbin, warm).
                             static const bool f3best_nodeleg = xdna_env_enabled("XDNA_F3BEST_NODELEG");
+                            // inpL is an intermediate buffer ggml may reuse; capture it BEFORE the
+                            // KV delegate runs, exactly as the probe path does.
+                            std::vector<float> live_inpL_snap((size_t)lf_m.inpL_tensor->ne[0], 0.0f);
+                            bool have_live_inpL = false;
+                            if (lf_m.inpL_tensor->type == GGML_TYPE_F32 && lf_m.inpL_tensor->data) {
+                                memcpy(live_inpL_snap.data(), lf_m.inpL_tensor->data,
+                                       (size_t)lf_m.inpL_tensor->ne[0] * sizeof(float));
+                                have_live_inpL = true;
+                            }
                             {
                                 static const bool _gdbg = xdna_env_enabled("XDNA_F3BEST_GAPDBG");
                                 const auto _gd0 = std::chrono::steady_clock::now();
@@ -18244,7 +18650,19 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                             }
                             const int64_t E_model = lf_m.inpL_tensor->ne[0];
                             std::vector<float> normed(E_model, 0.0f);   // BUG1 fix: hand-rms(inpL)*w_norm1
-                            const float * inpL = (const float *)lf_m.inpL_tensor->data;
+                            const float * inpL = have_live_inpL ? live_inpL_snap.data()
+                                                                : (const float *)lf_m.inpL_tensor->data;
+                            {
+                                static bool lsn = false;
+                                if (lsn == false && xdna_env_enabled("XDNA_F3BEST_LIVESNAPDBG")) { lsn = true;
+                                    const float * lv = (const float *)lf_m.inpL_tensor->data;
+                                    double dn=0, dd=0;
+                                    for (int64_t e=0;e<E_model;e++){ double t=(double)live_inpL_snap[e]-(double)lv[e]; dn+=t*t; dd+=(double)live_inpL_snap[e]*live_inpL_snap[e]; }
+                                    fprintf(stderr, "ggml-xdna: [f3best-livesnap] have=%d rel_snap_vs_live=%.6f |snap|=%.5f\n",
+                                            (int)have_live_inpL, std::sqrt(dn/(dd+1e-12)), std::sqrt(dd/(double)E_model));
+                                    fflush(stderr);
+                                }
+                            }
                             const float * gain = (const float *)lf_m.w_norm1->data;
                             double ss = 0.0;
                             for (int64_t e = 0; e < E_model; e++) ss += (double)inpL[e]*(double)inpL[e];
@@ -18294,6 +18712,18 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                         const int64_t E_probe = lf_m.inpL_tensor->ne[0];
                         std::vector<float> cpu_s_snap(E_probe, 0.0f);
                         bool have_cpu_s_snap = false;
+                        // attn_out (the O-proj input) lives in a reused intermediate buffer just
+                        // like cpu_s: snapshot it in the SAME window, before the FFN delegate.
+                        std::vector<float> gO_snap(E_probe, 0.0f);
+                        bool have_gO_snap = false;
+                        // inpL (the layer's residual input) is likewise an intermediate: capture
+                        // it BEFORE any delegate runs.
+                        std::vector<float> inpL_snap(E_probe, 0.0f);
+                        bool have_inpL_snap = false;
+                        if (lf_m.inpL_tensor->type == GGML_TYPE_F32 && lf_m.inpL_tensor->data) {
+                            memcpy(inpL_snap.data(), lf_m.inpL_tensor->data, (size_t)E_probe * sizeof(float));
+                            have_inpL_snap = true;
+                        }
                         if (lf_m.add_attn_idx >= i && lf_m.add_attn_idx < lf_m.add_ffn_idx) {
                             ggml_status sa = xdna_delegate_range(ctx, cgraph, i, lf_m.add_attn_idx + 1);
                             if (sa != GGML_STATUS_SUCCESS) return sa;
@@ -18301,6 +18731,16 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                             if (an && an->type == GGML_TYPE_F32 && an->data && an->ne[0] == E_probe) {
                                 memcpy(cpu_s_snap.data(), an->data, (size_t)E_probe * sizeof(float));
                                 have_cpu_s_snap = true;
+                            }
+                            for (int sj = i; sj <= lf_m.add_attn_idx; sj++) {
+                                struct ggml_tensor * nn = cgraph->nodes[sj];
+                                if (nn && nn->op == GGML_OP_MUL_MAT && nn->src[0] == lf_m.w_o &&
+                                    nn->src[1] && nn->src[1]->type == GGML_TYPE_F32 && nn->src[1]->data &&
+                                    ggml_nelements(nn->src[1]) >= E_probe) {
+                                    memcpy(gO_snap.data(), nn->src[1]->data, (size_t)E_probe * sizeof(float));
+                                    have_gO_snap = true;
+                                    break;
+                                }
                             }
                             ggml_status sb = xdna_delegate_range(ctx, cgraph, lf_m.add_attn_idx + 1, lf_m.add_ffn_idx + 1);
                             if (sb != GGML_STATUS_SUCCESS) return sb;
@@ -18341,8 +18781,11 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                             // CPU delegate runs, so it reads ~8.5x too small (|src1|~1.1 vs ~9.3).
                             // Feeding that stale value gave a tiny Q -> flat softmax -> rel~0.9.
                             // Hand-rms from inpL gives the correct attn input (verified relOp 0.0345).
+                            // inpL itself IS buffer-reused (measured: live vs pre-delegate snapshot
+                            // differ by rel=1.76), so read the snapshot taken before any delegate.
                             std::vector<float> normed(2048, 0.0f);
-                            const float * inpL = (const float *)lf_m.inpL_tensor->data;
+                            const float * inpL = have_inpL_snap ? inpL_snap.data()
+                                                                : (const float *)lf_m.inpL_tensor->data;
                             {
                                 const float * gain = (const float *)lf_m.w_norm1->data;
                                 double ss = 0.0;
@@ -18408,6 +18851,13 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                         double rkvm= rel([&](int64_t i){ int64_t d=i%hd,gs=i/hd,g=gs/ag,s=gs%ag; int64_t qh=g*ag+s; return qh*hd+d; });
                                         fprintf(stderr,"ggml-xdna: [f3best-frontattn] q=%d front_attn vs cpu_attn_out: id=%.4f interleave=%.4f kvmajor=%.4f\n",
                                                 lf_m.q_idx, rid, rint, rkvm); fflush(stderr);
+                                        { char hb[3200]; int off=0;
+                                          off+=snprintf(hb+off,sizeof(hb)-off,"ggml-xdna: [f3best-fahead] q=%d",lf_m.q_idx);
+                                          for(int h=0;h<32;h++){ double nu=0,de=0;
+                                            for(int d=0;d<64;d++){ double c=cpu_attn_out[h*64+d]; double df=(double)fa_out[h*64+d]-c; nu+=df*df; de+=c*c; }
+                                            double fn=0; for(int d=0;d<64;d++) fn+=(double)fa_out[h*64+d]*fa_out[h*64+d];
+                                            off+=snprintf(hb+off,sizeof(hb)-off," %.2f/%.3f/%.3f",std::sqrt(nu/(de+1e-12)),std::sqrt(fn/64.0),std::sqrt(de/64.0)); }
+                                          fprintf(stderr,"%s\n",hb); fflush(stderr); }
                                     } else { fprintf(stderr,"ggml-xdna: [f3best-frontattn] q=%d dispatch FAILED\n", lf_m.q_idx); fflush(stderr); }
                                 }
                             }
@@ -18513,14 +18963,70 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                                           case 1: sh=(h%4)*8+(h/4); break;     // 4x8 <-> 8x4 transpose
                                                           case 2: sh=(h%8)*4+(h/8); break;     // 8x4 <-> 4x8 transpose
                                                           case 3: sh=31-h; break;              // reverse
+                                                          case 4: sh=h; break;                 // mask: g>=3 && h%4!=3 -> zero
                                                           default: sh=h; }
-                                            for(int d=0;d<64;d++) r[h*64+d]=cpu_attn_out[sh*64+d]; }
+                                            bool zap = (mode==4) && ((h/4)>=3) && ((h%4)!=3);
+                                            for(int d=0;d<64;d++) r[h*64+d]= zap?0.0f:cpu_attn_out[sh*64+d]; }
                                         return r;
                                     };
                                     double p0=oproj_rel_np(permute(0)), p1=oproj_rel_np(permute(1)),
-                                           p2=oproj_rel_np(permute(2)), p3=oproj_rel_np(permute(3));
-                                    fprintf(stderr,"ggml-xdna: [f3best-perm] q=%d O_npu vs CPU-attn: id=%.4f tr48=%.4f tr84=%.4f rev=%.4f\n",
-                                            lf_m.q_idx, p0, p1, p2, p3); fflush(stderr);
+                                           p2=oproj_rel_np(permute(2)), p3=oproj_rel_np(permute(3)),
+                                           p4=oproj_rel_np(permute(4));
+                                    fprintf(stderr,"ggml-xdna: [f3best-perm] q=%d O_npu vs CPU-attn: id=%.4f tr48=%.4f tr84=%.4f rev=%.4f mask=%.4f\n",
+                                            lf_m.q_idx, p0, p1, p2, p3, p4); fflush(stderr);
+                                    // Decompose O_npu into per-head O-proj contributions and solve
+                                    // least squares for c_h. c_h ~ 1 => head present on NPU, ~0 => lost.
+                                    {
+                                        static std::vector<std::vector<double>> P(32, std::vector<double>(2048,0.0));
+                                        for (int h=0; h<32; h++) {
+                                            for (int64_t n=0;n<2048;n++){ const uint8_t* row=wob+(size_t)n*64*18; double acc=0;
+                                                for(int b2=h*2;b2<h*2+2;b2++){const uint8_t* blk=row+(size_t)b2*18;ggml_fp16_t sh2;memcpy(&sh2,blk,2);float sc=ggml_fp16_to_fp32(sh2);const uint8_t* qs=blk+2;
+                                                    for(int j=0;j<32;j++){int nib=(j<16)?(qs[j]&0xF):(qs[j-16]>>4);acc+=(double)((nib-8)*sc)*(double)cpu_attn_out[b2*32+j];}}
+                                                P[h][n]=acc; }
+                                        }
+                                        std::vector<double> y(2048);
+                                        for (int64_t n=0;n<2048;n++) y[n]=(double)s_outp[n]-(double)inpL[n];
+                                        std::vector<std::vector<double>> A(32, std::vector<double>(33,0.0));
+                                        for(int a2=0;a2<32;a2++){ for(int b2=0;b2<32;b2++){ double v=0; for(int64_t n=0;n<2048;n++) v+=P[a2][n]*P[b2][n]; A[a2][b2]=v; }
+                                            double v=0; for(int64_t n=0;n<2048;n++) v+=P[a2][n]*y[n]; A[a2][32]=v; A[a2][a2]+=1e-9; }
+                                        for(int c=0;c<32;c++){ int pv=c; for(int r2=c+1;r2<32;r2++) if(std::fabs(A[r2][c])>std::fabs(A[pv][c])) pv=r2;
+                                            std::swap(A[c],A[pv]); double d=A[c][c]; if(std::fabs(d)<1e-30) continue;
+                                            for(int k=c;k<33;k++) A[c][k]/=d;
+                                            for(int r2=0;r2<32;r2++) if(r2!=c){ double f=A[r2][c]; if(f!=0.0) for(int k=c;k<33;k++) A[r2][k]-=f*A[c][k]; } }
+                                        { double rn=0,rd=0; for(int64_t n=0;n<2048;n++){ double f=0; for(int h=0;h<32;h++) f+=A[h][32]*P[h][n];
+                                              double d2=y[n]-f; rn+=d2*d2; rd+=y[n]*y[n]; }
+                                          fprintf(stderr,"ggml-xdna: [f3best-hfit] q=%d residual_rel=%.4f\n",lf_m.q_idx,std::sqrt(rn/(rd+1e-12))); fflush(stderr); }
+                                        // Invert the O-projection once to recover the NPU's actual
+                                        // attention output, then compare per head against CPU.
+                                        { static std::atomic<bool> did_inv{false}; bool exp_i=false;
+                                          if (did_inv.compare_exchange_strong(exp_i,true)) {
+                                            std::vector<double> W((size_t)2048*2049,0.0);
+                                            for(int64_t n=0;n<2048;n++){ const uint8_t* row=wob+(size_t)n*64*18;
+                                                for(int b2=0;b2<64;b2++){const uint8_t* blk=row+(size_t)b2*18;ggml_fp16_t sh2;memcpy(&sh2,blk,2);float sc=ggml_fp16_to_fp32(sh2);const uint8_t* qs=blk+2;
+                                                    for(int j=0;j<32;j++){int nib=(j<16)?(qs[j]&0xF):(qs[j-16]>>4);W[(size_t)n*2049+b2*32+j]=(double)((nib-8)*sc);}}
+                                                W[(size_t)n*2049+2048]=y[n]; }
+                                            for(int64_t c=0;c<2048;c++){ int64_t pv=c; double best=std::fabs(W[(size_t)c*2049+c]);
+                                                for(int64_t r2=c+1;r2<2048;r2++){ double v=std::fabs(W[(size_t)r2*2049+c]); if(v>best){best=v;pv=r2;} }
+                                                if(best<1e-14) continue;
+                                                if(pv!=c) for(int64_t k=c;k<2049;k++) std::swap(W[(size_t)c*2049+k],W[(size_t)pv*2049+k]);
+                                                double d=W[(size_t)c*2049+c];
+                                                for(int64_t r2=c+1;r2<2048;r2++){ double f=W[(size_t)r2*2049+c]/d; if(f!=0.0)
+                                                    for(int64_t k=c;k<2049;k++) W[(size_t)r2*2049+k]-=f*W[(size_t)c*2049+k]; } }
+                                            std::vector<double> av(2048,0.0);
+                                            for(int64_t c=2047;c>=0;c--){ double acc=W[(size_t)c*2049+2048];
+                                                for(int64_t k=c+1;k<2048;k++) acc-=W[(size_t)c*2049+k]*av[k];
+                                                double d=W[(size_t)c*2049+c]; av[c]= (std::fabs(d)<1e-14)?0.0:acc/d; }
+                                            char ib[3200]; int io=0;
+                                            io+=snprintf(ib+io,sizeof(ib)-io,"ggml-xdna: [f3best-avinv] q=%d",lf_m.q_idx);
+                                            for(int h=0;h<32;h++){ double nu=0,de=0,an=0;
+                                                for(int d2=0;d2<64;d2++){ double c2=cpu_attn_out[h*64+d2]; double df=av[h*64+d2]-c2; nu+=df*df; de+=c2*c2; an+=av[h*64+d2]*av[h*64+d2]; }
+                                                io+=snprintf(ib+io,sizeof(ib)-io," %.2f/%.3f/%.3f",std::sqrt(nu/(de+1e-12)),std::sqrt(an/64.0),std::sqrt(de/64.0)); }
+                                            fprintf(stderr,"%s\n",ib); fflush(stderr); } }
+                                        char cb[2600]; int off=0;
+                                        off+=snprintf(cb+off,sizeof(cb)-off,"ggml-xdna: [f3best-hcoef] q=%d",lf_m.q_idx);
+                                        for(int h=0;h<32;h++) off+=snprintf(cb+off,sizeof(cb)-off," %.2f",A[h][32]);
+                                        fprintf(stderr,"%s\n",cb); fflush(stderr);
+                                    }
                                 }
                             }
                         }
@@ -18596,7 +19102,20 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                         }
                                     }
                                     }  // gqa_mode
-                                    const float * gO = (const float *)attn_out->data;
+                                    // Use the FRESH snapshot taken before the FFN delegate; the
+                                    // tensor's own buffer may have been reused by then.
+                                    const float * gO = have_gO_snap ? gO_snap.data() : (const float *)attn_out->data;
+                                    {
+                                        static bool gsn = false;
+                                        if (!gsn) { gsn = true;
+                                            const float * gL = (const float *)attn_out->data;
+                                            double dn=0, dd=0;
+                                            for (int e=0;e<2048;e++){ double t=(double)gO_snap[e]-(double)gL[e]; dn+=t*t; dd+=(double)gO_snap[e]*gO_snap[e]; }
+                                            fprintf(stderr, "ggml-xdna: [f3best-gosnap] have=%d rel_snap_vs_live=%.6f |snap|=%.5f\n",
+                                                    (int)have_gO_snap, std::sqrt(dn/(dd+1e-12)), std::sqrt(dd/2048.0));
+                                            fflush(stderr);
+                                        }
+                                    }
                                     static bool dumped1 = false;
                                     if (!dumped1) {
                                         dumped1 = true;
@@ -18636,7 +19155,19 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                     if (woT && woT->data && woT->type == GGML_TYPE_Q4_0 && cpu_s2 && woT->ne[0] == 2048 && woT->ne[1] == 2048) {
                                         const uint8_t * wb = (const uint8_t *)woT->data;
                                         const int64_t blocks_per_row = 2048 / 32;  // 64
-                                        const float * inpL2 = (const float *)lf_m.inpL_tensor->data;
+                                        const float * inpL2 = have_inpL_snap ? inpL_snap.data()
+                                                                             : (const float *)lf_m.inpL_tensor->data;
+                                        {
+                                            static bool isn = false;
+                                            if (!isn) { isn = true;
+                                                const float * iL = (const float *)lf_m.inpL_tensor->data;
+                                                double dn=0, dd=0;
+                                                for (int e=0;e<2048;e++){ double t=(double)inpL_snap[e]-(double)iL[e]; dn+=t*t; dd+=(double)inpL_snap[e]*inpL_snap[e]; }
+                                                fprintf(stderr, "ggml-xdna: [f3best-ilsnap] have=%d rel_snap_vs_live=%.6f |snap|=%.5f\n",
+                                                        (int)have_inpL_snap, std::sqrt(dn/(dd+1e-12)), std::sqrt(dd/2048.0));
+                                                fflush(stderr);
+                                            }
+                                        }
                                         // O-proj of an arbitrary attn vector av -> rel vs O_cpu
                                         auto oproj_rel = [&](const float * av) -> double {
                                             double on=0, od=0;
@@ -18693,7 +19224,7 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                             // HAND-RMS variant: normed = rms_norm(inpL)*gain from RELIABLE inpL (not stale src[1]).
                                             double rHR = -1.0; double hrn = 0.0;
                                             const float * gainW = (lf_m.w_norm1 && lf_m.w_norm1->type==GGML_TYPE_F32) ? (const float*)lf_m.w_norm1->data : nullptr;
-                                            const float * inpLr = (const float *)lf_m.inpL_tensor->data;
+                                            const float * inpLr = have_inpL_snap ? inpL_snap.data() : (const float *)lf_m.inpL_tensor->data;
                                             if (gainW && inpLr) {
                                                 double ss=0; for(int k=0;k<2048;k++) ss+=(double)inpLr[k]*inpLr[k];
                                                 float invr = 1.0f/std::sqrt((float)(ss/2048.0)+1e-5f);
@@ -18713,7 +19244,7 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                                 double qn0=0; for(int d=0;d<64;d++) qn0+=(double)Qil[d]*Qil[d];
                                                 const int64_t g0=0; float mx=-1e30f,mn=1e30f; int64_t am=-1;
                                                 for(int64_t p=0;p<n_valid;p++){ double dot=0; for(int64_t d=0;d<64;d++){ float kv_=rd(kdat+p*k_perm->nb[1]+g0*k_perm->nb[2]+d*k_perm->nb[0],kf32,kf16); dot+=(double)Qil[d]*(double)kv_; } float sv=(float)dot*0.125f; if(sv>mx){mx=sv;am=p;} if(sv<mn)mn=sv; }
-                                                double ocn=0; const float* inp3=(const float*)lf_m.inpL_tensor->data; for(int e=0;e<2048;e++){ double oc=(double)cpu_s2[e]-(double)inp3[e]; ocn+=oc*oc; }
+                                                double ocn=0; const float* inp3=have_inpL_snap?inpL_snap.data():(const float*)lf_m.inpL_tensor->data; for(int e=0;e<2048;e++){ double oc=(double)cpu_s2[e]-(double)inp3[e]; ocn+=oc*oc; }
                                                 double nn=0; for(int k=0;k<2048;k++) nn+=(double)nrm[k]*nrm[k];
                                                 ggml_fp16_t sh0; memcpy(&sh0, qwb, 2); float wsc0=ggml_fp16_to_fp32(sh0);
                                                 double kn0=0; for(int d=0;d<64;d++){ float kv_=rd(kdat+0*k_perm->nb[1]+0*k_perm->nb[2]+d*k_perm->nb[0],kf32,kf16); kn0+=(double)kv_*kv_; }
