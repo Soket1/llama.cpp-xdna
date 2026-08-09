@@ -1472,8 +1472,10 @@ static std::string make_cache_key(xdna_op_kind op_kind,
         const char * dc_suffix = (decouple && decouple[0] != '\0') ? "_decouple" : "";
         const char * triple_b = getenv("F3BEST_TRIPLE_B");
         const char * tb_suffix = (!triple_b || triple_b[0] != '0') ? "_tb" : "";
-        const char * ha_rr = getenv("F3BEST_HANDASM_RR");
-        const char * rr_suffix = (ha_rr && ha_rr[0] != '\0') ? "_rr" : "";
+        // #188: pure C++ bcast path (layer_fused_*_bcast_bf16 in layer_fused_relay.o).
+        // Hand-asm .s dropped (baseline NaN, RR ~500x blow-up). Suffix renamed _rr -> _cpp
+        // to invalidate the stale xclbin cache built against the broken hand-asm kernels.
+        const char * rr_suffix = "_cpp";
         const char * qdump_env = getenv("F3BEST_QDUMP");
         const char * qdump_suffix = (qdump_env && qdump_env[0] != '\0') ? "_qdump7" : "";
         // #206/#207: uni_partial size. Must mirror op.py's _uni_sfx.
@@ -1483,10 +1485,10 @@ static std::string make_cache_key(xdna_op_kind op_kind,
             snprintf(uni_suffix, sizeof(uni_suffix), "_u%s", uni_env);
         }
         if (ffn_div && strcmp(ffn_div, "1") != 0) {
-            snprintf(buf, sizeof(buf), "decode_layer_f3best_%lldx%lld_d%lld_g%lld_s%lld_a%lld_kv%lld_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac_ug%s_d%s%s%s%s%s%s_fkfix",
+            snprintf(buf, sizeof(buf), "decode_layer_f3best_%lldx%lld_d%lld_g%lld_s%lld_a%lld_kv%lld_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac_ug%s_d%s%s%s%s%s%s_fkfix2_silu2",
                      (long long)K, (long long)N, (long long)head_dim, (long long)32, (long long)256, (long long)attn_group, (long long)8, kv_abi, ffn_div, dc_suffix, tb_suffix, rr_suffix, qdump_suffix, uni_suffix);
         } else {
-            snprintf(buf, sizeof(buf), "decode_layer_f3best_%lldx%lld_d%lld_g%lld_s%lld_a%lld_kv%lld_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac_ug2%s%s%s%s%s%s_fkfix",
+            snprintf(buf, sizeof(buf), "decode_layer_f3best_%lldx%lld_d%lld_g%lld_s%lld_a%lld_kv%lld_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac_ug2%s%s%s%s%s%s_fkfix2_silu2",
                      (long long)K, (long long)N, (long long)head_dim, (long long)32, (long long)256, (long long)attn_group, (long long)8, kv_abi, dc_suffix, tb_suffix, rr_suffix, qdump_suffix, uni_suffix);
         }
     } else {
