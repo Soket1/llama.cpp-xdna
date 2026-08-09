@@ -827,7 +827,11 @@ TESTS: list[Test] = [
         mode="single-turn",
         model=MODEL_Q4_0,
         variants=["npu_f3best_loop", "npu_f3best_loop_kv", "npu_f3best_loop_norr", "npu_layer_f3best_probe", "npu_layer_f3best_probe_prod", "npu_layer_f3best_probe_prod_norr"],
-        min_prefix_match=1,
+        # 10 == len("The capital"), the first word past the shared prefix.
+        # It was 1, which passed on 'TheGGGGGGGGGGGGGGG' -- three matching
+        # characters of G-collapse read as a green suite. The LOOP variants
+        # fail this threshold today; that is the honest state (#206/#207).
+        min_prefix_match=10,
         description="f3best no-KV and K/V ABI token-match vs CPU: 16 layers in one backend call.",
     ),
     Test(
