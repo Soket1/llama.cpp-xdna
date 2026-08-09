@@ -327,6 +327,32 @@ PRESETS: dict[str, dict[str, str]] = {
         "F3BEST_MT_DECOUPLE":            "1",
         "F3BEST_TRIPLE_B":               "1",
     },
+    "npu_f3best_loop_tb0": {
+        # #211: the only f3best LOOP configuration currently known good.
+        # F3BEST_TRIPLE_B=1 NaNs in attention from layer 0, and every other
+        # LOOP preset here hardcodes TB=1 -- so without this variant the suite
+        # only ever exercises the broken path and reports a blanket failure
+        # that hides whether the working path still works. Deliberately also
+        # drops F3BEST_MT_DECOUPLE: this exact combination (xclbin key
+        # ..._nokv_cpp_fkfix2_silu2) is the one verified end-to-end after the
+        # #210 FFN silu fix.
+        "XDNA_ENABLE_GEMV":              "1",
+        "XDNA_ENABLE_SWIGLU":            "1",
+        "XDNA_ENABLE_QKV":               "1",
+        "XDNA_ENABLE_DECODE_BATCH":      "1",
+        "XDNA_ENABLE_TRANSFORMER_BLOCK": "1",
+        "XDNA_ENABLE_FLOWKV_DECODE":     "1",
+        "XDNA_ENABLE_RMS_NORM":          "1",
+        "XDNA_ENABLE_GEMV_INT4":         "1",
+        "XDNA_ENABLE_SWIGLU_INT4":       "1",
+        "XDNA_ENABLE_FUSED_LAYER":       "1",
+        "XDNA_LAYER_FUSED":              "1",
+        "XDNA_ENABLE_LAYER_F3BEST":      "1",
+        "XDNA_ATTN_SUPPORTS":            "1",
+        "XDNA_LAYER_F3BEST_LIVE":        "1",
+        "XDNA_F3BEST_LOOP":              "1",
+        "F3BEST_TRIPLE_B":               "0",
+    },
     "npu_f3best_loop_kv": {
         # Diagnostic K/V-capable f3best ABI: NPU K/V output replaces the CPU delegate.
         "XDNA_ENABLE_GEMV":              "1",
@@ -826,7 +852,7 @@ TESTS: list[Test] = [
         n_predict=16,
         mode="single-turn",
         model=MODEL_Q4_0,
-        variants=["npu_f3best_loop", "npu_f3best_loop_kv", "npu_f3best_loop_norr", "npu_layer_f3best_probe", "npu_layer_f3best_probe_prod", "npu_layer_f3best_probe_prod_norr"],
+        variants=["npu_f3best_loop_tb0", "npu_f3best_loop", "npu_f3best_loop_kv", "npu_f3best_loop_norr", "npu_layer_f3best_probe", "npu_layer_f3best_probe_prod", "npu_layer_f3best_probe_prod_norr"],
         # 10 == len("The capital"), the first word past the shared prefix.
         # It was 1, which passed on 'TheGGGGGGGGGGGGGGG' -- three matching
         # characters of G-collapse read as a green suite. The LOOP variants
