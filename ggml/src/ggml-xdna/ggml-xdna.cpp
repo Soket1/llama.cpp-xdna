@@ -18752,10 +18752,10 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                         }
                         // CPU reference is now materialized at outL. Build f3best inputs from the
                         // same match and run it redundantly (probe mode, no output overwrite).
-                        static std::atomic<int> f3best_timing_budget{16};
-                        if (f3best_timing_budget.fetch_sub(1) > 0) {
+                        static std::atomic<int> _probe_warn{1};
+                        if (_probe_warn.fetch_sub(1) > 0) {
                             fprintf(stderr,
-                                    "ggml-xdna: [f3best-probe] CPU reference ready q=%d out=%s (span [%d,%d] delegated)\n",
+                                    "ggml-xdna: [f3best-probe] *** CPU AUTHORITATIVE: output came from CPU (NPU probe did NOT overwrite it) *** q=%d out=%s (span [%d,%d] delegated)\n",
                                     lf_m.q_idx,
                                     lf_m.outL_tensor->name[0] ? lf_m.outL_tensor->name : "?",
                                     i, lf_m.add_ffn_idx);
