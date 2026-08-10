@@ -1470,14 +1470,23 @@ static std::string make_cache_key(xdna_op_kind op_kind,
         const char * kv_abi = with_npu_kv ? "_kv" : "_nokv";
         const char * decouple = getenv("F3BEST_MT_DECOUPLE");
         const char * dc_suffix = (decouple && decouple[0] != '\0') ? "_decouple" : "";
+        // #211: triple-B (F3BEST_TRIPLE_B=1) NaNs in attention from layer 0 --
+        // the mux MM2S0 broadcast is not phase-locked to the center S2MM1
+        // round-robin (b0->b1->b2), so the 8 center tiles desync and x_bundle
+        // lands in B1/B2 instead of B0. Single-B (TB=0) is rock-solid: every tile
+        // gets the right data every token. Default to single-B; triple-B needs a
+        // correct phase-locked broadcast protocol (separate task, parked).
         const char * triple_b = getenv("F3BEST_TRIPLE_B");
-        const char * tb_suffix = (!triple_b || triple_b[0] != '0') ? "_tb" : "";
+        const char * tb_suffix = (triple_b && triple_b[0] == '1') ? "_tb" : "";
         // #188: pure C++ bcast path (layer_fused_*_bcast_bf16 in layer_fused_relay.o).
         // Hand-asm .s dropped (baseline NaN, RR ~500x blow-up). Suffix renamed _rr -> _cpp
         // to invalidate the stale xclbin cache built against the broken hand-asm kernels.
         const char * rr_suffix = "_cpp";
         const char * qdump_env = getenv("F3BEST_QDUMP");
         const char * qdump_suffix = (qdump_env && qdump_env[0] != '\0') ? "_qdump7" : "";
+        // #211: B0 dump (snapshot x_bundle delivery via Pf0 drain). Must mirror op.py's _b0dump.
+        const char * b0dump_env = getenv("F3BEST_B0DUMP");
+        const char * b0dump_suffix = (b0dump_env && b0dump_env[0] != '\0') ? "_b0dump" : "";
         // #206/#207: uni_partial size. Must mirror op.py's _uni_sfx.
         const char * uni_env = getenv("F3BEST_UNI_SZ");
         char uni_suffix[16] = "";
@@ -1485,11 +1494,11 @@ static std::string make_cache_key(xdna_op_kind op_kind,
             snprintf(uni_suffix, sizeof(uni_suffix), "_u%s", uni_env);
         }
         if (ffn_div && strcmp(ffn_div, "1") != 0) {
-            snprintf(buf, sizeof(buf), "decode_layer_f3best_%lldx%lld_d%lld_g%lld_s%lld_a%lld_kv%lld_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac_ug%s_d%s%s%s%s%s%s_fkfix2_silu2",
-                     (long long)K, (long long)N, (long long)head_dim, (long long)32, (long long)256, (long long)attn_group, (long long)8, kv_abi, ffn_div, dc_suffix, tb_suffix, rr_suffix, qdump_suffix, uni_suffix);
+            snprintf(buf, sizeof(buf), "decode_layer_f3best_%lldx%lld_d%lld_g%lld_s%lld_a%lld_kv%lld_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac_ug%s_d%s%s%s%s%s%s%s_fkfix2_silu2",
+                     (long long)K, (long long)N, (long long)head_dim, (long long)32, (long long)256, (long long)attn_group, (long long)8, kv_abi, ffn_div, dc_suffix, tb_suffix, rr_suffix, qdump_suffix, b0dump_suffix, uni_suffix);
         } else {
-            snprintf(buf, sizeof(buf), "decode_layer_f3best_%lldx%lld_d%lld_g%lld_s%lld_a%lld_kv%lld_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac_ug2%s%s%s%s%s%s_fkfix2_silu2",
-                     (long long)K, (long long)N, (long long)head_dim, (long long)32, (long long)256, (long long)attn_group, (long long)8, kv_abi, dc_suffix, tb_suffix, rr_suffix, qdump_suffix, uni_suffix);
+            snprintf(buf, sizeof(buf), "decode_layer_f3best_%lldx%lld_d%lld_g%lld_s%lld_a%lld_kv%lld_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac_ug2%s%s%s%s%s%s%s_fkfix2_silu2",
+                     (long long)K, (long long)N, (long long)head_dim, (long long)32, (long long)256, (long long)attn_group, (long long)8, kv_abi, dc_suffix, tb_suffix, rr_suffix, qdump_suffix, b0dump_suffix, uni_suffix);
         }
     } else {
         snprintf(buf, sizeof(buf), "gemm_%lldx%lldx%lld_%s_%dcol",
@@ -6079,6 +6088,35 @@ static bool ggml_backend_xdna_decode_layer_f3best(
                                     dc, std::sqrt(dn/(dd+1e-12)));
                         }
                         fflush(stderr);
+                    }
+                    fflush(stderr);
+                }
+            }
+        }
+        // #211 B0 dump: in b0dump mode the center core memcpy'd B0 -> P after phase1,
+        // and the Pf0 MM2S drained P into arg0[h*E .. h*E+E] (the per-tile output
+        // region). B0 = x_bundle = [x(E) | rope-LUT(256) | seq-meta(16)], so the first
+        // E bf16 of the drained region = the x activation the mux actually delivered
+        // to this tile's B0. Compare TB=0 vs TB=1: if |x| differs, the mux->center
+        // flow delivers corrupt/wrong-phase data to B0 on triple-B.
+        {
+            static const bool _b0dump = xdna_env_enabled("F3BEST_B0DUMP");
+            if (_b0dump) {
+                static const int _b0n = [](){ const char* e = getenv("F3BEST_B0DUMP_N");
+                                            return (e && *e) ? atoi(e) : 4; }();
+                static std::atomic<int> _b0b{_b0n};
+                static std::atomic<int> _b0s{0};
+                if (_b0b.fetch_sub(1) > 0) {
+                    const int _bc = _b0s.fetch_add(1);
+                    for (int64_t h = 0; h < NH; h++) {
+                        double x2 = 0.0; int xnz = 0; float xmx = 0.0f; int64_t bad = 0;
+                        for (int64_t e = 0; e < E; e++) {
+                            const float v = bf16f(ob[(size_t)h * PH_STRIDE + e]);
+                            if (std::isnan(v) || std::isinf(v)) bad++;
+                            else { if (v != 0.0f) xnz++; x2 += (double)v * (double)v; xmx = std::max(xmx, std::fabs(v)); }
+                        }
+                        fprintf(stderr, "ggml-xdna: [b0dump] seq=%d tile=%lld |B0_x|=%.5f max=%.5f nz=%d bad=%lld/%lld\n",
+                                _bc, (long long)h, std::sqrt(x2/(double)E), xmx, xnz, (long long)bad, (long long)E);
                     }
                     fflush(stderr);
                 }
