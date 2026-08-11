@@ -1348,6 +1348,9 @@ def build_bench_configs() -> list[BenchConfig]:
         BenchConfig(label="NPU Phase B fused", preset="npu_phase_b",      model=MODEL_Q4_0),
         BenchConfig(label="NPU Layer Fused Live", preset="npu_layer_fused_live", model=MODEL_Q4_0),
         BenchConfig(label="NPU f3best LOOP",   preset="npu_f3best_loop",  model=MODEL_Q4_0_VOCABQ4),
+        # #211: single-B (TB=0) production path — the only f3best LOOP config
+        # that doesn't NaN. Measures the honest t/s we actually ship.
+        BenchConfig(label="NPU f3best LOOP tb0", preset="npu_f3best_loop_tb0", model=MODEL_Q4_0_VOCABQ4),
         # #188: baseline (no-RR) f3best kernel, same model — apples-to-apples t/s
         # vs the RR preset above. Let the harness do the bench, not a private script.
         BenchConfig(label="NPU f3best LOOP norr", preset="npu_f3best_loop_norr", model=MODEL_Q4_0_VOCABQ4),

@@ -1470,12 +1470,17 @@ static std::string make_cache_key(xdna_op_kind op_kind,
         const char * kv_abi = with_npu_kv ? "_kv" : "_nokv";
         const char * decouple = getenv("F3BEST_MT_DECOUPLE");
         const char * dc_suffix = (decouple && decouple[0] != '\0') ? "_decouple" : "";
-        // #211: triple-B (F3BEST_TRIPLE_B=1) NaNs in attention from layer 0 --
-        // the mux MM2S0 broadcast is not phase-locked to the center S2MM1
-        // round-robin (b0->b1->b2), so the 8 center tiles desync and x_bundle
-        // lands in B1/B2 instead of B0. Single-B (TB=0) is rock-solid: every tile
-        // gets the right data every token. Default to single-B; triple-B needs a
-        // correct phase-locked broadcast protocol (separate task, parked).
+        // #211/#212: triple-B (F3BEST_TRIPLE_B=1) collapses in attention from
+        // layer 0. Root = ARCHITECTURAL: circuit-flow mux->center multicast has
+        // NO per-consumer back-pressure; the center S2MM1 round-robin (b0->b1->b2)
+        // and the center core phase index are two independent state machines that
+        // drift because the 8 centers finish phases at different times. The mux
+        // lock protocol (non-RL_FIX = production branch) was ALREADY balanced
+        // (all 3 phases acquire mx_op / release mx_oc) -- an earlier lock fix
+        // landed in the DEAD RL_FIX branch and had zero effect. Fix paths
+        // (a)-(g) exhausted. Default = single-B (rock-solid, 47.30 t/s, harness
+        // 1 passed/0 failed); triple-B opt-in. _mxpp cache key keeps the final
+        // single-B xclbin distinct from the pre-#212 key.
         const char * triple_b = getenv("F3BEST_TRIPLE_B");
         const char * tb_suffix = (triple_b && triple_b[0] == '1') ? "_tb" : "";
         // #188: pure C++ bcast path (layer_fused_*_bcast_bf16 in layer_fused_relay.o).
@@ -1494,10 +1499,10 @@ static std::string make_cache_key(xdna_op_kind op_kind,
             snprintf(uni_suffix, sizeof(uni_suffix), "_u%s", uni_env);
         }
         if (ffn_div && strcmp(ffn_div, "1") != 0) {
-            snprintf(buf, sizeof(buf), "decode_layer_f3best_%lldx%lld_d%lld_g%lld_s%lld_a%lld_kv%lld_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac_ug%s_d%s%s%s%s%s%s%s_fkfix2_silu2",
+            snprintf(buf, sizeof(buf), "decode_layer_f3best_%lldx%lld_d%lld_g%lld_s%lld_a%lld_kv%lld_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac_ug%s_d%s%s%s%s%s%s%s_fkfix2_silu2_mxpp",
                      (long long)K, (long long)N, (long long)head_dim, (long long)32, (long long)256, (long long)attn_group, (long long)8, kv_abi, ffn_div, dc_suffix, tb_suffix, rr_suffix, qdump_suffix, b0dump_suffix, uni_suffix);
         } else {
-            snprintf(buf, sizeof(buf), "decode_layer_f3best_%lldx%lld_d%lld_g%lld_s%lld_a%lld_kv%lld_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac_ug2%s%s%s%s%s%s%s_fkfix2_silu2",
+            snprintf(buf, sizeof(buf), "decode_layer_f3best_%lldx%lld_d%lld_g%lld_s%lld_a%lld_kv%lld_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac_ug2%s%s%s%s%s%s%s_fkfix2_silu2_mxpp",
                      (long long)K, (long long)N, (long long)head_dim, (long long)32, (long long)256, (long long)attn_group, (long long)8, kv_abi, dc_suffix, tb_suffix, rr_suffix, qdump_suffix, b0dump_suffix, uni_suffix);
         }
     } else {
