@@ -38,6 +38,26 @@
         }
     },
 
+    # Performance variants: enable runtime-dispatch SIMD for x86_64 hosts.
+    # These opt in to AVX2/AVX-512 host paths. They REQUIRE a CPU with AVX2
+    # (the AVX2 path is hard-coded, no cpuid fallback at the /arch level), so
+    # use for native/local builds on the target machine, NOT for redistribution.
+    {   "name": "x86_64-avx2", "hidden": true,
+        "cacheVariables": {
+            "GGML_NATIVE":      "OFF",
+            "GGML_AVX2":        "ON",
+            "GGML_AVX":         "ON"
+        }
+    },
+    {   "name": "x86_64-avx512", "hidden": true,
+        "cacheVariables": {
+            "GGML_NATIVE":      "OFF",
+            "GGML_AVX512":      "ON",
+            "GGML_AVX2":        "ON",
+            "GGML_AVX":         "ON"
+        }
+    },
+
     {
         "name": "arm64-windows-llvm", "hidden": true,
         "architecture": { "value": "arm64",    "strategy": "external" },
@@ -80,8 +100,13 @@
     { "name": "x64-windows-llvm-reldbg", "inherits": [ "base", "x64-windows-llvm", "reldbg" ] },
     { "name": "x64-windows-llvm+static-release", "inherits": [ "base", "x64-windows-llvm", "reldbg", "static" ] },
 
+    # Windows MSVC presets: +avx2 / +avx512 opt-in performance variants.
+    # The base preset builds without SIMD (portable fallback). For a fast local
+    # build on this machine, use x64-windows-msvc-release+avx2 instead.
     { "name": "x64-windows-msvc-debug", "inherits": [ "base", "debug" ] },
     { "name": "x64-windows-msvc-release", "inherits": [ "base", "reldbg" ] },
+    { "name": "x64-windows-msvc-release+avx2", "inherits": [ "base", "reldbg", "x86_64-avx2" ] },
+    { "name": "x64-windows-msvc-release+avx512", "inherits": [ "base", "reldbg", "x86_64-avx512" ] },
     { "name": "x64-windows-msvc+static-release", "inherits": [ "base", "reldbg", "static" ] },
 
     { "name": "x64-windows-sycl-debug", "inherits": [ "sycl-base", "debug" ] },
