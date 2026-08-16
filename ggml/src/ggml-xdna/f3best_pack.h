@@ -141,4 +141,90 @@ static inline void pack_qo_bcast(const uint8_t * q4_0_src, int64_t n_rows, int64
     pack_bcast(q4_0_src, n_rows, K_full, K_full, 0, group_size, pad_to, tiles_out);
 }
 
+// ---- Shared f3best decode-layer host ABI -------------------------------------
+// Both the C++ dispatch (ggml_backend_xdna_decode_layer_f3best) and the CPU-only
+// regression (tests/test-f3best-abi.cpp) derive every XR span, packed-weight tile
+// count, per-phase A-stream offset, and byte size from this one geometry
+// descriptor, so the host feed and the kernel-consumed layout cannot drift.
+//
+// Physical broadcast tile: (bcast_n=32 output rows) x (bcast_kc=256 reduction
+// cols). pack_bcast()/pack_gemv() write a bcast_tile_bytes (4608) payload per
+// slot, but the kernel's DMA strides weight slots by the emitter's per-tile
+// PACKED = M*E/2 + M*(E/g)*2 (1B:4608, 3B:6912). The A-stream byte size is
+// therefore WT_TILES * PACKED, NOT WT_TILES * 4608. Only 1B coincides.
+
+static constexpr int64_t bcast_n   = 32;
+static constexpr int64_t bcast_kc  = 256;
+static constexpr size_t  bcast_tile_bytes   = 4608;
+static constexpr size_t  bcast_scale_offset = (size_t)bcast_kc * (bcast_n / 2);  // 4096
+
+static inline int64_t bcast_tile_count(int64_t rows, int64_t reduction_k) {
+    return (rows / bcast_n) * (reduction_k / bcast_kc);
+}
+
+struct f3best_host_abi {
+    int64_t NH     = 8;
+    int64_t group  = 32;
+    int64_t E      = 0;
+    int64_t hidden = 0;
+    int64_t head_d = 0;
+    int64_t ag     = 0;    // attention groups (Q heads per KV head)
+    bool    npu_kv = false;
+
+    // Derived (valid after make_f3best_host_abi):
+    int64_t H8       = 0;   // hidden per NH tile
+    int64_t q_rows   = 0;   // RoPE LUT span = ag * head_d
+    int64_t per_tile = 0;   // E per NH tile (Q/O row count)
+    int64_t q_t = 0, gu_t = 0, dn_t = 0, kv_t = 0;
+    int64_t wt_tiles = 0;          // packed weight tiles per head
+    size_t  packed   = 0;          // per-tile DMA stride (M-derived, 1B:4608 3B:6912)
+    size_t  wt_bytes = 0;          // packed weight bytes per head = wt_tiles * packed
+    size_t  a_total  = 0;          // NH * wt_bytes (whole layer A stream)
+    int64_t rope_elems = 0;
+    int64_t seq_off    = 0;        // E + rope_elems
+    int64_t XB         = 0;        // seq_off + 16
+    int64_t xr_elems   = 0;        // XB + 2*E
+
+    // Per-phase A-stream tile starts (head-local). No-KV layout:
+    //   [Wq | Wo | gate | up | down]
+    // With-NPU-KV layout (deferred #190, guarded only):
+    //   [Wq | K | V | Wo | gate | up | down]
+    int64_t off_q = 0, off_k = 0, off_v = 0, off_o = 0;
+    int64_t off_gate = 0, off_up = 0, off_down = 0, off_end = 0;
+};
+
+static inline f3best_host_abi make_f3best_host_abi(int64_t E, int64_t hidden,
+                                                   int64_t head_d, int64_t ag,
+                                                   bool npu_kv, int64_t M = 4,
+                                                   int64_t NH = 8,
+                                                   int64_t group = 32) {
+    f3best_host_abi a;
+    a.NH = NH; a.group = group; a.E = E; a.hidden = hidden;
+    a.head_d = head_d; a.ag = ag; a.npu_kv = npu_kv;
+    a.H8       = hidden / NH;
+    a.q_rows   = ag * head_d;
+    a.per_tile = E / NH;
+    a.q_t  = bcast_tile_count(a.per_tile, E);
+    a.gu_t = bcast_tile_count(a.H8, E);
+    a.dn_t = bcast_tile_count(E, a.H8);
+    a.kv_t = npu_kv ? bcast_tile_count(head_d, E) : 0;
+    a.wt_tiles = 2*a.q_t + 2*a.gu_t + a.dn_t + 2*a.kv_t;
+    a.packed   = (size_t)M * E / 2 + (size_t)M * (E / group) * 2;  // emitter PACKED
+    a.wt_bytes = (size_t)a.wt_tiles * a.packed;
+    a.a_total  = (size_t)a.NH * a.wt_bytes;
+    a.rope_elems = a.q_rows;
+    a.seq_off    = E + a.rope_elems;
+    a.XB         = a.seq_off + 16;
+    a.xr_elems   = a.XB + 2*E;
+    a.off_q = 0;
+    a.off_k = a.off_q + a.q_t;
+    a.off_v = a.off_k + a.kv_t;
+    a.off_o = a.off_v + a.kv_t;
+    a.off_gate = a.off_o + a.q_t;
+    a.off_up   = a.off_gate + a.gu_t;
+    a.off_down = a.off_up + a.gu_t;
+    a.off_end  = a.off_down + a.dn_t;
+    return a;
+}
+
 }  // namespace f3b

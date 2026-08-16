@@ -9,19 +9,25 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <future>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+#include <sheredom/subprocess.h>
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -61,11 +67,105 @@ static const char * xdna_python_cmd() {
     return env ? env : "python";
 }
 
-// Platform-specific null redirect suffix for system() calls.
-// Returns empty: compile.py errors must be visible for diagnostics.
-// The --quiet flag already suppresses normal output on success.
+// Split a trusted interpreter command into argv entries without invoking a
+// command shell. Quoting follows the simple command-line subset accepted by the
+// backend setting: whitespace separates arguments; matching single or double
+// quotes preserve whitespace; backslash escapes only the quote that opened the
+// current quoted segment. Shell syntax is never interpreted.
+static bool xdna_split_command(const char * command, std::vector<std::string> * argv) {
+    if (!command || !argv) return false;
+
+    argv->clear();
+    std::string token;
+    char quote = '\0';
+    bool token_started = false;
+    for (const char * p = command; *p; ++p) {
+        const unsigned char ch = static_cast<unsigned char>(*p);
+        if (quote != '\0') {
+            if (*p == '\\' && p[1] == quote) {
+                token.push_back(p[1]);
+                ++p;
+            } else if (*p == quote) {
+                quote = '\0';
+            } else {
+                token.push_back(*p);
+            }
+            token_started = true;
+            continue;
+        }
+
+        if (*p == '\'' || *p == '"') {
+            quote = *p;
+            token_started = true;
+        } else if (std::isspace(ch)) {
+            if (token_started) {
+                argv->push_back(std::move(token));
+                token.clear();
+                token_started = false;
+            }
+        } else {
+            token.push_back(*p);
+            token_started = true;
+        }
+    }
+
+    if (quote != '\0') return false;
+    if (token_started) {
+        argv->push_back(std::move(token));
+    }
+    return !argv->empty() && !argv->front().empty();
+}
+
+// Platform-specific null redirect suffix for the legacy shell invocations
+// elsewhere in this backend. FlowKV uses xdna_run_process() instead.
 static const char * xdna_null_redirect() {
-    return "";
+#ifdef _WIN32
+    return " > NUL 2>&1";
+#else
+    return " > /dev/null 2>&1";
+#endif
+}
+
+static void xdna_print_process_output(FILE * output) {
+    if (!output) return;
+
+    char buffer[4096];
+    while (fgets(buffer, sizeof(buffer), output) != nullptr) {
+        fputs(buffer, stderr);
+    }
+}
+
+// Launch the compiler without a command shell so values sourced from the
+// runtime environment stay individual argv elements. stdout and stderr are
+// deliberately combined and drained before join to retain diagnostics without
+// allowing the child to block on a full pipe.
+static int xdna_run_process(const std::vector<std::string> & argv) {
+    if (argv.empty() || argv.front().empty()) return -1;
+
+    std::vector<const char *> c_argv;
+    c_argv.reserve(argv.size() + 1);
+    for (const std::string & arg : argv) c_argv.push_back(arg.c_str());
+    c_argv.push_back(nullptr);
+
+    subprocess_s process{};
+    const int options = subprocess_option_no_window |
+                        subprocess_option_combined_stdout_stderr |
+                        subprocess_option_inherit_environment |
+                        subprocess_option_search_user_path;
+    if (subprocess_create(c_argv.data(), options, &process) != 0) return -1;
+
+    // compile.py is non-interactive, but explicitly close the inherited input
+    // pipe so a future prompt cannot hold the output drain open waiting for EOF.
+    if (process.stdin_file) {
+        fclose(process.stdin_file);
+        process.stdin_file = nullptr;
+    }
+    xdna_print_process_output(subprocess_stdout(&process));
+
+    int exit_code = -1;
+    if (subprocess_join(&process, &exit_code) != 0) exit_code = -1;
+    (void) subprocess_destroy(&process);
+    return exit_code;
 }
 
 // Session-wide buffer-traffic counters (behind XDNA_DEBUG). These measure
@@ -1406,7 +1506,7 @@ static std::vector<char> read_binary_file(const std::string & path) {
 static std::string make_cache_key(xdna_op_kind op_kind,
                                    int64_t M, int64_t K, int64_t N,
                                    const char * dtype_in, int num_cols) {
-    char buf[256];
+    char buf[512];
     if (op_kind == XDNA_OP_GEMV) {
         // GEMV: M is implicitly 1, key omits it.
         snprintf(buf, sizeof(buf), "gemv_K%lld_N%lld_%s_%dcol",
@@ -1465,6 +1565,7 @@ static std::string make_cache_key(xdna_op_kind op_kind,
         // Match IRON operator's cache key format exactly (op.py base string).
         int64_t head_dim  = num_cols;       // overloaded: head_dim via num_cols
         int64_t attn_group = M;             // overloaded: attn_group via M
+        int64_t num_q = attn_group * 8;     // GQA: q_heads = attn_group * kv_heads(8)
         const char * ffn_div = getenv("F3BEST_FFN_DIV");
         const bool with_npu_kv = xdna_env_enabled("XDNA_F3BEST_NPU_KV");
         const char * kv_abi = with_npu_kv ? "_kv" : "_nokv";
@@ -1498,12 +1599,20 @@ static std::string make_cache_key(xdna_op_kind op_kind,
         if (uni_env && uni_env[0] != '\0' && strcmp(uni_env, "128") != 0) {
             snprintf(uni_suffix, sizeof(uni_suffix), "_u%s", uni_env);
         }
+        // Match decode_layer_f3best/op.py: the outer artifact is partitioned
+        // by the exact fixed-tuning FlowKV object it links, not FLOWKV_CFLAGS.
+        static constexpr const char * flowkv_obj_fingerprint = "fe2d60c9196a71df";
+        char flowkv_obj_tag[96];
+        snprintf(flowkv_obj_tag, sizeof(flowkv_obj_tag),
+                 "_fkobj_flowkv_%lldd_h%lld_c256_t%s",
+                 (long long)head_dim, (long long)attn_group,
+                 flowkv_obj_fingerprint);
         if (ffn_div && strcmp(ffn_div, "1") != 0) {
-            snprintf(buf, sizeof(buf), "decode_layer_f3best_%lldx%lld_d%lld_g%lld_s%lld_a%lld_kv%lld_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac_ug%s_d%s%s%s%s%s%s%s_fkfix2_silu2_mxpp",
-                     (long long)K, (long long)N, (long long)head_dim, (long long)32, (long long)256, (long long)attn_group, (long long)8, kv_abi, ffn_div, dc_suffix, tb_suffix, rr_suffix, qdump_suffix, b0dump_suffix, uni_suffix);
+            snprintf(buf, sizeof(buf), "decode_layer_f3best_%lldx%lld_d%lld_g%lld_s%lld_a%lld_q%lld_kv%lld_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac_ug%s_d%s%s%s%s%s%s%s%s_fkfix2_silu2_mxpp_objid2_abi3",
+                     (long long)K, (long long)N, (long long)head_dim, (long long)32, (long long)256, (long long)attn_group, (long long)num_q, (long long)8, kv_abi, ffn_div, dc_suffix, tb_suffix, rr_suffix, qdump_suffix, b0dump_suffix, uni_suffix, flowkv_obj_tag);
         } else {
-            snprintf(buf, sizeof(buf), "decode_layer_f3best_%lldx%lld_d%lld_g%lld_s%lld_a%lld_kv%lld_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac_ug2%s%s%s%s%s%s%s_fkfix2_silu2_mxpp",
-                     (long long)K, (long long)N, (long long)head_dim, (long long)32, (long long)256, (long long)attn_group, (long long)8, kv_abi, dc_suffix, tb_suffix, rr_suffix, qdump_suffix, b0dump_suffix, uni_suffix);
+            snprintf(buf, sizeof(buf), "decode_layer_f3best_%lldx%lld_d%lld_g%lld_s%lld_a%lld_q%lld_kv%lld_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac_ug2%s%s%s%s%s%s%s%s_fkfix2_silu2_mxpp_objid2_abi3",
+                     (long long)K, (long long)N, (long long)head_dim, (long long)32, (long long)256, (long long)attn_group, (long long)num_q, (long long)8, kv_abi, dc_suffix, tb_suffix, rr_suffix, qdump_suffix, b0dump_suffix, uni_suffix, flowkv_obj_tag);
         }
     } else {
         snprintf(buf, sizeof(buf), "gemm_%lldx%lldx%lld_%s_%dcol",
@@ -2509,7 +2618,7 @@ static bool ensure_compiled(ggml_backend_xdna_context * ctx,
                             const char * dtype_in, int num_cols,
                             const char * dtype_out = nullptr,
                             int64_t head_dim = 64, int64_t attn_group = 4,
-                            int64_t num_kv_heads = 8) {
+                            int64_t num_kv_heads = 8, int64_t num_q_heads = 0) {
     // Skip recompilation if we already failed for this key
     if (ctx->kernel_compile_failed.count(cache_key)) {
         return false;
@@ -2631,13 +2740,18 @@ static bool ensure_compiled(ggml_backend_xdna_context * ctx,
     } else if (op_kind == XDNA_OP_DECODE_LAYER_F3BEST) {
         // Full fused decode layer. K=embed_dim, N=hidden_dim, M=seq_len (KV length).
         // GQA + head_dim fixed for llama-3.2-1B (the emitter validates the shape).
+        // #235: num_q_heads must reach the relay (-DNUM_HEADS). 0 = derive from
+        // attn_group*num_kv_heads in the operator (1B: 4*8=32; 3B: 3*8=24).
+        char nqh[32] = "";
+        if (num_q_heads > 0) snprintf(nqh, sizeof(nqh), "--num-q-heads %lld ", (long long)num_q_heads);
         snprintf(cmd, sizeof(cmd),
                  "%s \"%s\" --quiet decode-layer-f3best --embed-dim %lld --hidden-dim %lld "
-                 "--group-size 32 --head-dim %lld --num-kv-heads %lld --attn-group %lld --seq-len 256 %s"
+                 "--group-size 32 --head-dim %lld --num-kv-heads %lld --attn-group %lld --seq-len 256 %s%s"
                  "--out \"%s\"%s",
                  xdna_python_cmd(), ctx->compile_script.c_str(),
                  (long long)K, (long long)N,
                  (long long)head_dim, (long long)num_kv_heads, (long long)attn_group,
+                 nqh,
                  xdna_env_enabled("XDNA_F3BEST_NPU_KV") ? "--with-npu-kv " : "",
                  xclbin_path.c_str(), xdna_null_redirect());
         fprintf(stderr, "ggml-xdna: compiling DECODE_LAYER_F3BEST E=%lld H=%lld sl=32 (first run, will be cached; runtime seq=%lld)...\n",
@@ -4686,12 +4800,19 @@ static bool ggml_backend_xdna_decode_front_attn(
     const int64_t num_q     = q_w->ne[1] / head_dim;
     const int64_t attn_group = num_q / num_kv;        // q-heads per kv-head (GQA)
     const int group_size = 32;
-    // The IRON op is built for attn_group=4, num_kv=8 (llama-3.2-1B). Guard.
-    if (attn_group != 4 || num_kv != 8 || head_dim != 64) return false;
+    // #187: parametric for any llama-like geometry. Constraints:
+    //   - head_dim ∈ {64, 128, 256} (ISA LUT / GEMV tile limits)
+    //   - num_kv_heads must divide the 8-column NH topology (1,2,4,8)
+    //   - attn_group*head_dim ≤ 512 (q_rows → X-bundle LUT slot)
+    //   - attn_group ≥ 1, seq_len ≥ 32 (chunk=32)
+    if (!xdna_head_dim_supported(head_dim)) return false;
+    if (num_kv != 1 && num_kv != 2 && num_kv != 4 && num_kv != 8) return false;
+    const int64_t q_rows = attn_group * head_dim;
+    if (q_rows > 512 || q_rows <= 0) return false;
+    if (attn_group < 1) return false;
     if (E % group_size != 0) return false;
     if (seq_len % 32 != 0) return false;               // chunk_size=32
 
-    const int64_t q_rows = attn_group * head_dim;      // 256
     const std::string cache_key = make_cache_key(XDNA_OP_DECODE_FRONT_ATTN,
                                                  seq_len, E, head_dim, "uint4", num_cols);
     if (!ensure_compiled(ctx, cache_key, XDNA_OP_DECODE_FRONT_ATTN,
@@ -4743,8 +4864,9 @@ static bool ggml_backend_xdna_decode_front_attn(
             }
         }
         // head LUT (head_dim) tiled attn_group× over q_rows.
-        uint16_t head_lut[256];
-        xdna_build_rope_lut_bf16(rope_node, head_dim, head_lut);
+        // #187: parametric — q_rows = attn_group*head_dim varies (1B:256, 3B:384)
+        std::vector<uint16_t> head_lut(q_rows);
+        xdna_build_rope_lut_bf16(rope_node, head_dim, head_lut.data());
         {
             static const bool fd = (getenv("XDNA_FRONT_DIAG") != NULL);
             static int fdn = 0;
@@ -4762,7 +4884,7 @@ static bool ggml_backend_xdna_decode_front_attn(
             }
         }
         for (int64_t h = 0; h < attn_group; h++)
-            memcpy(xb + E + h * head_dim, head_lut, (size_t)head_dim * dts);
+            memcpy(xb + E + h * head_dim, head_lut.data(), (size_t)head_dim * dts);
         // actual_seq_len: scan K cache for last non-zero pos (padded tail = 0).
         const char * k_data = (const char *)k_perm->data;
         const size_t k_nb0 = k_perm->nb[0], k_nb1 = k_perm->nb[1], k_nb2 = k_perm->nb[2];
@@ -5013,6 +5135,7 @@ static bool ggml_backend_xdna_decode_front_attn(
 //   q/k/v/o/gate/up/down_w : Q4_0 weights; ffn_gain : ffn_norm.weight (f32/f16, [E])
 //   k_perm/v_perm : KV cache [head_dim, seq, kv_heads]; rope_node : Q RoPE source
 #include "f3best_pack.h"
+#include "xdna-f3best-reduce.h"
 
 struct xdna_f3best_gluetime_accum {
     double rms_us = 0.0;
@@ -5073,6 +5196,79 @@ static int patch_txn_ddr_offsets(std::vector<char>& txn, int target_argidx, int6
     return patched;
 }
 
+struct xdna_f3best_boundary_metrics {
+    int64_t finite_count = 0;
+    int64_t nonfinite_count = 0;
+    int64_t mismatch_count = 0;
+    double max_absolute_error = 0.0;
+    double max_relative_error = 0.0;
+    double error_l2 = 0.0;
+    double reference_l2 = 0.0;
+    double relative_l2 = 0.0;
+};
+
+static xdna_f3best_boundary_metrics xdna_f3best_measure_boundary(
+        const float * actual,
+        const float * reference,
+        int64_t embedding_dim) {
+    constexpr double epsilon = 1e-12;
+    xdna_f3best_boundary_metrics metrics;
+    if (!actual || !reference || embedding_dim <= 0) {
+        return metrics;
+    }
+
+    double error_squared = 0.0;
+    double reference_squared = 0.0;
+    for (int64_t e = 0; e < embedding_dim; ++e) {
+        const double actual_value = actual[e];
+        const double reference_value = reference[e];
+        if (!std::isfinite(actual_value) || !std::isfinite(reference_value)) {
+            ++metrics.nonfinite_count;
+            ++metrics.mismatch_count;
+            continue;
+        }
+
+        ++metrics.finite_count;
+        if (actual_value != reference_value) {
+            ++metrics.mismatch_count;
+        }
+        const double absolute_error = std::fabs(actual_value - reference_value);
+        error_squared += absolute_error * absolute_error;
+        reference_squared += reference_value * reference_value;
+        if (absolute_error > metrics.max_absolute_error) {
+            metrics.max_absolute_error = absolute_error;
+        }
+        const double relative_error = absolute_error /
+            (std::fabs(reference_value) + epsilon);
+        if (relative_error > metrics.max_relative_error) {
+            metrics.max_relative_error = relative_error;
+        }
+    }
+
+    metrics.error_l2 = std::sqrt(error_squared);
+    metrics.reference_l2 = std::sqrt(reference_squared);
+    metrics.relative_l2 = metrics.error_l2 / (metrics.reference_l2 + epsilon);
+    return metrics;
+}
+
+static void xdna_f3best_log_boundary_metrics(
+        int layer_index,
+        const char * boundary,
+        const xdna_f3best_boundary_metrics & metrics) {
+    fprintf(stderr,
+            "ggml-xdna: [f3best-probe] q=%d boundary=%s finite=%lld nonfinite=%lld mismatches=%lld "
+            "max_abs=%.6e max_rel=%.6e err_l2=%.6e ref_l2=%.6e rel_l2=%.6e\n",
+            layer_index, boundary,
+            (long long) metrics.finite_count,
+            (long long) metrics.nonfinite_count,
+            (long long) metrics.mismatch_count,
+            metrics.max_absolute_error,
+            metrics.max_relative_error,
+            metrics.error_l2,
+            metrics.reference_l2,
+            metrics.relative_l2);
+}
+
 static bool ggml_backend_xdna_decode_layer_f3best(
         ggml_backend_xdna_context * ctx,
         struct ggml_tensor * out_dst,
@@ -5089,8 +5285,20 @@ static bool ggml_backend_xdna_decode_layer_f3best(
         const struct ggml_tensor * rope_node,
         const struct ggml_tensor * k_perm,
         const struct ggml_tensor * v_perm,
-        int num_cols) {
+        int num_cols,
+        const xdna_f3best_reduce_diagnostics * diagnostics = nullptr) {
+    if (!ctx || !out_dst || !out_dst->data || !input_snap || !resid ||
+        !q_w || !k_w || !v_w || !o_w || !gate_w || !up_w || !down_w || !ffn_gain ||
+        !k_perm || !v_perm || !q_w->data || !k_w->data || !v_w->data || !o_w->data ||
+        !gate_w->data || !up_w->data || !down_w->data || !ffn_gain->data ||
+        !k_perm->data || !v_perm->data || input_E <= 0) {
+        fprintf(stderr, "f3best guard required input or tensor data missing\n");
+        return false;
+    }
     if (!ctx->device_valid) { fprintf(stderr, "f3best ENTER device invalid\n"); return false; }
+    static std::atomic<int> f3b_layer_count{0};
+    int f3b_layer_n = f3b_layer_count.fetch_add(1);
+    fprintf(stderr, "f3best ENTER layer_n=%d input_E=%lld\n", f3b_layer_n, (long long)input_E); fflush(stderr);
     if (q_w->type != GGML_TYPE_Q4_0 || k_w->type != GGML_TYPE_Q4_0 ||
         v_w->type != GGML_TYPE_Q4_0 || o_w->type != GGML_TYPE_Q4_0 ||
         gate_w->type != GGML_TYPE_Q4_0 || up_w->type != GGML_TYPE_Q4_0 ||
@@ -5100,6 +5308,7 @@ static bool ggml_backend_xdna_decode_layer_f3best(
         return false;
     }
     if (!input_snap || !resid || input_E <= 0) { fprintf(stderr, "f3best guard input null input=%p resid=%p E=%lld\n", (const void*)input_snap, (const void*)resid, (long long)input_E); return false; }
+
 
     const int64_t NH = 8, M = 4, group_size = 32;
     const int64_t E         = input_E;
@@ -5111,25 +5320,38 @@ static bool ggml_backend_xdna_decode_layer_f3best(
     const int64_t attn_group = num_kv ? num_q / num_kv : 0;
     // Geometry guard: E and H must divide evenly into NH tiles; attention params
     // #155: attention params parametric — flowkv kernel compiled per (HD, AG, SEQ)
+
     if (E % NH != 0 || hidden % NH != 0) { fprintf(stderr,"f3best guard geom fail E=%lld H=%lld (must be divisible by NH=%lld)\n",(long long)E,(long long)hidden,(long long)NH); return false; }
     if (seq_len < 32) { fprintf(stderr,"f3best guard seq fail seq=%lld\n",(long long)seq_len); return false; }
 
     const bool with_npu_kv = xdna_env_enabled("XDNA_F3BEST_NPU_KV");
-    const int64_t H8  = hidden / NH;                 // hidden per tile
-    const int64_t HH  = hidden;                       // full hidden
-    const int64_t PER_TILE = E / NH;                  // rows per tile for Q/O (256 for 1B)
+    // #235: single shared host-ABI descriptor (f3best_pack.h). Every XR span, tile
+    // count, per-phase A-stream offset, and byte size below is derived from live
+    // geometry so dispatch/packers/kernel cannot drift. PACKED is the per-tile byte
+    // stride the packers and the NPU kernel agree on: M-row packed nibbles + M-row
+    // group scales — M*E/2 + M*(E/g)*2, equal to the emitter's PACKED (1B:4608,
+    // 3B:6912). It is NOT the fixed 4608-byte bcast payload; keep it derived from M.
+    const f3b::f3best_host_abi abi = f3b::make_f3best_host_abi(
+        E, hidden, head_dim, attn_group, with_npu_kv);
+    const int64_t H8  = abi.H8;                        // hidden per tile
+    const int64_t HH  = hidden;                        // full hidden
+    const int64_t q_rows = abi.q_rows;                 // AG*HD (1B:256, 3B:384)
+    const int64_t PER_TILE = abi.per_tile;             // E/NH rows per tile for Q/O
     const int64_t KV_M = with_npu_kv ? 128 : 0;
-    const size_t  PACKED   = (size_t)M * E / 2 + (size_t)M * (E / group_size) * 2;
-    const int64_t GEMV_T   = PER_TILE / M;            // weight tiles for Q/O (64 for 1B)
-    const int64_t GU_T     = H8 / M;                  // weight tiles for gate/up/down (256 for 1B)
-    const int64_t WT_TILES = with_npu_kv ? (3*GEMV_T + 3*GU_T) : (2*GEMV_T + 3*GU_T);
-    const size_t  WT_BYTES = (size_t)WT_TILES * PACKED;
+    const size_t  PACKED   = abi.packed;   // 1B:4608, 3B:6912
+    const int64_t Q_T      = abi.q_t;                  // Q/O weight tiles (1B:64, 3B:144)
+    const int64_t GU_T     = abi.gu_t;                 // gate/up weight tiles (1B:256, 3B:384)
+    const int64_t DN_T     = abi.dn_t;                 // down weight tiles (1B:256, 3B:384)
+    const int64_t GEMV_T   = Q_T;                      // alias for Q/O
+    const int64_t KV_T     = abi.kv_t;                 // K/V weight tiles (NPU-KV path, #190)
+    const int64_t WT_TILES = abi.wt_tiles;
+    const size_t  WT_BYTES = (size_t)WT_TILES * PACKED; // must equal emitter's WT_TILES*PACKED
     const size_t  RS       = (size_t)(E / group_size) * 18;   // full E-row Q4_0
     const size_t  WO_BYTES = (size_t)(E / M) * PACKED;  // unused arg3 placeholder
     const int64_t KVN      = 256 * head_dim;            // f3best xclbin KV window is fixed at 256 tokens
     const int     dts      = 2;
-    const int64_t XB       = E + 256 + 16;            // x_bundle
-    const int64_t XR_ELEMS = XB + E + E;             // x|resid|gain
+    const int64_t XB       = abi.XB;                    // x_bundle: input + rope LUT + seq meta
+    const int64_t XR_ELEMS = abi.xr_elems;              // x|resid|gain
     const size_t  OUT_ELEMS = (size_t)NH * (E + 2*KV_M) + E;  // no-KV=NH*E+E; K/V=NH*(E+2*KV_M)+E
     const size_t  PH_STRIDE = (size_t)(E + 2*KV_M);  // per-head stride in output
 
@@ -5139,10 +5361,12 @@ static bool ggml_backend_xdna_decode_layer_f3best(
                                                  attn_group, E, hidden, "uint4", fake_num_cols);
     if (!ensure_compiled(ctx, cache_key, XDNA_OP_DECODE_LAYER_F3BEST,
                          seq_len, E, hidden, "uint4", num_cols,
-                         nullptr, head_dim, attn_group, num_kv)) { fprintf(stderr,"f3best ensure_compiled failed cache=%s\n", cache_key.c_str()); return false; }
+                         nullptr, head_dim, attn_group, num_kv, num_q)) { fprintf(stderr,"f3best ensure_compiled failed cache=%s\n", cache_key.c_str()); return false; }
+
     xdna_kernel_entry * entry = get_or_load_kernel(ctx, cache_key,
                                                    XDNA_OP_DECODE_LAYER_F3BEST, seq_len, E, hidden);
     if (!entry) { fprintf(stderr,"f3best get_or_load failed cache=%s\n", cache_key.c_str()); return false; }
+
 
     try {
         static const bool f3b_gluetime = xdna_env_enabled("XDNA_F3BEST_GLUETIME");
@@ -5169,15 +5393,16 @@ static bool ggml_backend_xdna_decode_layer_f3best(
         }
         // arg7 KV BO is per-layer cached below (#79), not a single shared d4_bo.
 
-        // --- XR bundle: [x(E) | rope-lut(256) | seq+pad(16) | resid(E) | gain(E)] ---
+        // --- XR bundle: [x(E) | rope-lut(q_rows) | seq+pad(16) | resid(E) | gain(E)] ---
+        // #187: q_rows = attn_group*head_dim is parametric (1B:256, 3B:384)
         const auto _gt_xr0 = std::chrono::steady_clock::now();
         uint16_t * xr = (uint16_t *)entry->a_bo->map<void*>();
         memset(xr, 0, (size_t)XR_ELEMS * dts);
         f32_to_bf16(input_snap, xr, (size_t)E);
-        uint16_t head_lut[256];
-        xdna_build_rope_lut_bf16(rope_node, head_dim, head_lut);
+        std::vector<uint16_t> head_lut(q_rows);
+        xdna_build_rope_lut_bf16(rope_node, head_dim, head_lut.data());
         for (int64_t h = 0; h < attn_group; h++)
-            memcpy(xr + E + h * head_dim, head_lut, (size_t)head_dim * dts);
+            memcpy(xr + E + h * head_dim, head_lut.data(), (size_t)head_dim * dts);
         // actual_seq: last non-zero K position (padded tail = 0).
         const char * k_data = (const char *)k_perm->data;
         const size_t k_nb0 = k_perm->nb[0], k_nb1 = k_perm->nb[1], k_nb2 = k_perm->nb[2];
@@ -5204,7 +5429,7 @@ static bool ggml_backend_xdna_decode_layer_f3best(
         const int64_t kv_len   = std::min<int64_t>(n_kv, 256);
         const int64_t kv_start = n_kv > 256 ? (n_kv - 256) : 0;
         const int64_t actual_seq = n_kv;
-        xr[E + 256] = f32_to_bf16_scalar((float)kv_len);
+        xr[E + q_rows] = f32_to_bf16_scalar((float)kv_len);
         {
             int32_t rope_pos = -1;
             if (rope_node && rope_node->src[1] && rope_node->src[1]->type == GGML_TYPE_I32 &&
@@ -5238,6 +5463,7 @@ static bool ggml_backend_xdna_decode_layer_f3best(
         const auto _gt_w0 = std::chrono::steady_clock::now();
         // Pack the 5 projections' Q4_0 weights into a device buffer `A` (WT_BYTES/head).
         auto pack_weights = [&](uint8_t * A) {
+
             const uint8_t * qd = (const uint8_t *)q_w->data;
             const uint8_t * kd = (const uint8_t *)k_w->data;
             const uint8_t * vd = (const uint8_t *)v_w->data;
@@ -5247,18 +5473,20 @@ static bool ggml_backend_xdna_decode_layer_f3best(
             const uint8_t * dd = (const uint8_t *)down_w->data;
             for (int64_t h = 0; h < NH; h++) {
                 uint8_t * hd = A + (size_t)h * WT_BYTES; size_t off = 0;
+
                 // #131B: column-major broadcast layout for Q/O (was row-major dot-product)
                 f3b::pack_bcast(qd + (size_t)h*PER_TILE*RS, PER_TILE, E, E, 0, (int)group_size, PACKED, hd+off); off += (size_t)GEMV_T*PACKED;
-                if (with_npu_kv) {
-                    // K/V: one KV head per center tile, KV_M=128 rows, 32 tiles each.
-                    f3b::pack_bcast(kd + (size_t)h*KV_M*RS, (int)KV_M, E, E, 0, (int)group_size, PACKED, hd+off); off += (size_t)(KV_M/M)*PACKED;
-                    f3b::pack_bcast(vd + (size_t)h*KV_M*RS, (int)KV_M, E, E, 0, (int)group_size, PACKED, hd+off); off += (size_t)(KV_M/M)*PACKED;
-                }
+
                 f3b::pack_bcast(od + (size_t)h*PER_TILE*RS, PER_TILE, E, E, 0, (int)group_size, PACKED, hd+off); off += (size_t)GEMV_T*PACKED;
+
                 f3b::pack_bcast(gd + (size_t)h*H8*RS, H8, E, E, 0, (int)group_size, PACKED, hd+off); off += (size_t)GU_T*PACKED;
+
                 f3b::pack_bcast(ud + (size_t)h*H8*RS, H8, E, E, 0, (int)group_size, PACKED, hd+off); off += (size_t)GU_T*PACKED;
-                f3b::pack_bcast(dd, E, H8, HH, h*H8, (int)group_size, PACKED, hd+off); off += (size_t)GU_T*PACKED;
+
+                f3b::pack_bcast(dd, E, H8, HH, h*H8, (int)group_size, PACKED, hd+off); off += (size_t)DN_T*PACKED;
+
             }
+
             // #206 differential: give every head head-0's weights. All 8 center tiles
             // then receive byte-identical weights AND byte-identical broadcast
             // activations, so any tile-to-tile divergence in the output is a delivery
@@ -5316,7 +5544,7 @@ static bool ggml_backend_xdna_decode_layer_f3best(
                 const size_t nch = (size_t)(H8 / 256);          // chunks per block
                 const size_t t0 = (size_t)(2*GEMV_T + 2*GU_T);   // first down tile
                 for (int64_t h = 0; h < NH; h++)
-                    for (size_t t = t0; t < t0 + (size_t)GU_T; t++) {
+                    for (size_t t = t0; t < t0 + (size_t)DN_T; t++) {
                         const size_t b = (t - t0) / nch;                  // output block
                         const size_t CI = cs ? (size_t)atoi(cs)
                                              : (sw_base + b * sw_step) % (size_t)H8;
@@ -5502,7 +5730,9 @@ static bool ggml_backend_xdna_decode_layer_f3best(
                 xrt::bo packed(ctx->device, (size_t)NH * WT_BYTES, xrt::bo::flags::host_only,
                                entry->kernel.group_id(5));
                 pack_weights((uint8_t *)packed.map<void*>());
+
                 packed.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
                 // #188 Ш21 scale check: one-shot read of the PACKED Wq bf16 scales
                 // (bcast layout: head h slice at h*WT_BYTES; tile t at h*WT_BYTES +
                 // t*PACKED; weights = KC*(N/2) = 4096B, scales at +4096 .. +4608 =
@@ -5513,7 +5743,7 @@ static bool ggml_backend_xdna_decode_layer_f3best(
                     static std::atomic<int> _scb{1};
                     if (_scb.fetch_sub(1) > 0) {
                         const uint8_t * AB = (const uint8_t *)packed.map<void*>();
-                        const size_t  SOFF = (size_t)(M/2) * E;   // 4096 (weight region end)
+                        const size_t  SOFF = f3b::bcast_scale_offset;  // 4096 (weight region end)
                         auto _b2f = [](uint16_t b)->float{ uint32_t u=((uint32_t)b)<<16; float v; memcpy(&v,&u,4); return v; };
                         int bad_tiles = 0, nf_total = 0; double mn = 1e30, mx = -1e30;
                         for (int64_t h = 0; h < NH; h++) {
@@ -5563,6 +5793,7 @@ static bool ggml_backend_xdna_decode_layer_f3best(
             }
             }   // end else (not f3b_onebo)
         }
+
         if (f3b_gluetime) g_xdna_f3best_gluetime.weight_us += xdna_elapsed_us(_gt_w0);
 
         // --- KV cache: [K0..K3 | K4..K7 | V0..V3 | V4..V7], each head seq*head_dim ---
@@ -5855,9 +6086,12 @@ static bool ggml_backend_xdna_decode_layer_f3best(
                 run.set_arg(5, *entry->shared_weight_bo);   // d2 will read a different BO than d1
             }
         }
+
         const auto _f3_ts = std::chrono::steady_clock::now();
         run.start();
+
         run.wait();
+
         const auto _f3_t2 = std::chrono::steady_clock::now();
         if (f3b_gluetime) g_xdna_f3best_gluetime.npu_us += xdna_elapsed_us(_f3_ts, _f3_t2);
         const auto _gt_os0 = std::chrono::steady_clock::now();
@@ -5913,7 +6147,7 @@ static bool ggml_backend_xdna_decode_layer_f3best(
                         double w2 = 0.0; int wnz = 0; int nib_nz = 0;
                         if (a_weights) {
                             const uint8_t * AB = (const uint8_t *)a_weights->map<void*>();
-                            const size_t SOFF = (size_t)(M/2) * E;   // scales start (4096)
+                            const size_t SOFF = f3b::bcast_scale_offset;   // scales start (4096)
                             for (int s = 0; s < 256; s++) {
                                 uint16_t b; memcpy(&b, AB + SOFF + 2*s, 2);
                                 const float v = bf16f(b);
@@ -6127,52 +6361,18 @@ static bool ggml_backend_xdna_decode_layer_f3best(
                 }
             }
         }
-        float * diag_extra = nullptr;
-        if (out_dst->type == GGML_TYPE_F32 && out_dst->data && out_dst->nb[0] == 99) {
-            diag_extra = (float *)out_dst->data + E;  // scratch layout: final[E] | s[E] | sum_partials[E]
-        }
         if (out_dst->type == GGML_TYPE_F32) {
-            float * dst = (float *)out_dst->data;
-#ifdef __AVX2__
-            // SIMD bf16 reduce: 8 elements per iteration.
-            // bf16→f32 = _mm256_cvtepu16_epi32 + _mm256_slli_epi32(..., 16).
-            // Accumulate partial[h][e..e+7] across NH heads, add s[e..e+7].
-            int64_t e = 0;
-            for (; e + 8 <= E; e += 8) {
-                __m256 ps = _mm256_setzero_ps();
-                for (int64_t h = 0; h < NH; h++) {
-                    __m128i bf16_8 = _mm_loadu_si128((const __m128i*)(ob + (size_t)h*PH_STRIDE + e));
-                    __m256i u32_8 = _mm256_cvtepu16_epi32(bf16_8);
-                    ps = _mm256_add_ps(ps, _mm256_castsi256_ps(_mm256_slli_epi32(u32_8, 16)));
-                }
-                __m128i s_8 = _mm_loadu_si128((const __m128i*)(s_blk + e));
-                __m256i s_u32 = _mm256_cvtepu16_epi32(s_8);
-                __m256 sv = _mm256_castsi256_ps(_mm256_slli_epi32(s_u32, 16));
-                __m256 result = _mm256_add_ps(ps, sv);
-                _mm256_storeu_ps(dst + e, result);
-                if (diag_extra) {
-                    _mm256_storeu_ps(diag_extra + e, sv);
-                    _mm256_storeu_ps(diag_extra + E + e, ps);
-                }
+            if (!xdna_f3best_reduce_f32(
+                    ob, s_blk, E, NH, static_cast<int64_t>(PH_STRIDE),
+                    static_cast<float *>(out_dst->data), diagnostics)) {
+                fprintf(stderr, "f3best guard F32 reduction diagnostics or geometry invalid\n");
+                return false;
             }
-            // scalar tail
-            for (; e < E; e++) {
-                float ps = 0.0f;
-                for (int64_t h = 0; h < NH; h++) ps += bf16f(ob[(size_t)h*PH_STRIDE + e]);
-                const float sv = bf16f(s_blk[e]);
-                dst[e] = sv + ps;
-                if (diag_extra) { diag_extra[e] = sv; diag_extra[E + e] = ps; }
-            }
-#else
-            for (int64_t e = 0; e < E; e++) {
-                float ps = 0.0f;
-                for (int64_t h = 0; h < NH; h++) ps += bf16f(ob[(size_t)h*PH_STRIDE + e]);
-                const float sv = bf16f(s_blk[e]);
-                dst[e] = sv + ps;
-                if (diag_extra) { diag_extra[e] = sv; diag_extra[E + e] = ps; }
-            }
-#endif
         } else {
+            if (diagnostics != nullptr) {
+                fprintf(stderr, "f3best guard diagnostics requested but out_dst is not F32\n");
+                return false;
+            }
             uint16_t * dst = (uint16_t *)out_dst->data;
 #ifdef __AVX2__
             // Same SIMD accumulation in f32, then scalar conversion back to bf16.
@@ -9595,6 +9795,123 @@ static bool xdna_validate_qkv_triple(const struct ggml_tensor * w_q,
     return true;
 }
 
+// The cgraph order of the three attention projections is not semantic: models
+// can emit Q/V/K as well as Q/K/V. Walk only the strict view-preserving path
+// from a ROPE input back to a candidate projection. CPY/DUP are deliberately
+// excluded because they do not preserve the projection provenance required by
+// the f3best cache matcher.
+static bool xdna_qkv_strict_rope_ancestor(
+        const struct ggml_tensor * rope,
+        const struct ggml_tensor * projection) {
+    if (!rope || rope->op != GGML_OP_ROPE || !rope->src[0] || !projection ||
+        projection->op != GGML_OP_MUL_MAT) {
+        return false;
+    }
+
+    constexpr int kMaxTraceDepth = 16;
+    const struct ggml_tensor * current = rope->src[0];
+    std::unordered_set<const struct ggml_tensor *> seen;
+    for (int depth = 0; depth < kMaxTraceDepth; ++depth) {
+        if (!current || !seen.insert(current).second) return false;
+        if (current == projection) return true;
+
+        switch (current->op) {
+            case GGML_OP_VIEW:
+            case GGML_OP_RESHAPE:
+            case GGML_OP_CONT:
+            case GGML_OP_PERMUTE:
+            case GGML_OP_TRANSPOSE:
+                break;
+            default:
+                return false;
+        }
+        if (!current->src[0]) return false;
+        current = current->src[0];
+    }
+
+    return false;
+}
+
+// Canonicalize one exactly-three shared-activation MUL_MAT group to semantic
+// {Q, K, V}. Q must be the unique widest projection; K and V must have equal
+// widths, and exactly one of them must have a strictly traceable downstream
+// ROPE. Ambiguous groups deliberately fall back to ordinary graph execution.
+static bool xdna_classify_qkv_triple(
+        const struct ggml_cgraph * cgraph,
+        const std::vector<int> & indices,
+        const struct ggml_tensor * shared_activation,
+        int * q_idx_out,
+        int * k_idx_out,
+        int * v_idx_out) {
+    if (!cgraph || !cgraph->nodes || indices.size() != 3 || !shared_activation ||
+        !q_idx_out || !k_idx_out || !v_idx_out) {
+        return false;
+    }
+
+    const struct ggml_tensor * nodes[3] = { nullptr, nullptr, nullptr };
+    int first_index = cgraph->n_nodes;
+    int last_index = -1;
+    int q_slot = -1;
+    int largest_count = 0;
+    int64_t largest_width = 0;
+    for (int slot = 0; slot < 3; ++slot) {
+        const int index = indices[slot];
+        if (index < 0 || index >= cgraph->n_nodes) return false;
+        const struct ggml_tensor * node = cgraph->nodes[index];
+        if (!node || node->op != GGML_OP_MUL_MAT || !node->src[0] ||
+            node->src[1] != shared_activation || node->ne[0] <= 0 ||
+            node->src[0]->ne[1] != node->ne[0]) {
+            return false;
+        }
+        nodes[slot] = node;
+        first_index = std::min(first_index, index);
+        last_index = std::max(last_index, index);
+        if (node->ne[0] > largest_width) {
+            largest_width = node->ne[0];
+            largest_count = 1;
+            q_slot = slot;
+        } else if (node->ne[0] == largest_width) {
+            largest_count++;
+        }
+    }
+    if (largest_count != 1 || q_slot < 0) return false;
+
+    int kv_slots[2] = { -1, -1 };
+    int kv_count = 0;
+    for (int slot = 0; slot < 3; ++slot) {
+        if (slot != q_slot) kv_slots[kv_count++] = slot;
+    }
+    if (kv_count != 2 || nodes[kv_slots[0]]->ne[0] != nodes[kv_slots[1]]->ne[0] ||
+        nodes[kv_slots[0]]->ne[0] >= largest_width) {
+        return false;
+    }
+
+    // The current attention block puts K's ROPE after its projection. Keep the
+    // search local so a later layer cannot classify this triple by accident.
+    constexpr int kMaxRopeFollowers = 64;
+    const int rope_scan_end = std::min(cgraph->n_nodes, last_index + kMaxRopeFollowers + 1);
+    int k_slot = -1;
+    int k_rope_count = 0;
+    for (int index = first_index + 1; index < rope_scan_end; ++index) {
+        const struct ggml_tensor * node = cgraph->nodes[index];
+        if (!node || node->op != GGML_OP_ROPE) continue;
+
+        const bool traces_k0 = xdna_qkv_strict_rope_ancestor(node, nodes[kv_slots[0]]);
+        const bool traces_k1 = xdna_qkv_strict_rope_ancestor(node, nodes[kv_slots[1]]);
+        if (traces_k0 && traces_k1) return false;
+        if (!traces_k0 && !traces_k1) continue;
+        if (++k_rope_count != 1) return false;
+        k_slot = traces_k0 ? kv_slots[0] : kv_slots[1];
+    }
+    if (k_rope_count != 1 || k_slot < 0) return false;
+
+    const int v_slot = (k_slot == kv_slots[0]) ? kv_slots[1] : kv_slots[0];
+    *q_idx_out = indices[q_slot];
+    *k_idx_out = indices[k_slot];
+    *v_idx_out = indices[v_slot];
+    return true;
+}
+
 // Pre-scan result: QKV triples planned for fused dispatch.
 struct xdna_qkv_plan {
     // Q node idx -> (Q idx, K idx, V idx). Looked up at Q's position during
@@ -9697,21 +10014,28 @@ static void xdna_plan_qkv(const struct ggml_cgraph * cgraph, xdna_qkv_plan * out
 
         if (indices.size() != 3) continue;
 
-        const int i_q = indices[0];
-        const int i_k = indices[1];
-        const int i_v = indices[2];
+        int i_q = -1;
+        int i_k = -1;
+        int i_v = -1;
+        if (!xdna_classify_qkv_triple(cgraph, indices, kv.first, &i_q, &i_k, &i_v)) {
+            if (verbose) {
+                fprintf(stderr, "ggml-xdna:   group-3 semantic Q/K/V classification rejected\n");
+            }
+            continue;
+        }
+
         const struct ggml_tensor * n_q = cgraph->nodes[i_q];
         const struct ggml_tensor * n_k = cgraph->nodes[i_k];
         const struct ggml_tensor * n_v = cgraph->nodes[i_v];
-
         int num_cols = 0;
         bool ok = xdna_validate_qkv_triple(n_q->src[0], n_k->src[0], n_v->src[0],
                                            n_q->src[1], &num_cols);
         if (verbose) {
             fprintf(stderr,
-                    "ggml-xdna:   group-3 validate=%d q_w ne=[%lld,%lld] k_w ne=[%lld,%lld] "
-                    "v_w ne=[%lld,%lld] input type=%d ne[1]=%lld contig(input)=%d\n",
-                    (int)ok,
+                    "ggml-xdna:   group-3 canonical=[Q:%d K:%d V:%d] validate=%d "
+                    "q_w ne=[%lld,%lld] k_w ne=[%lld,%lld] v_w ne=[%lld,%lld] "
+                    "input type=%d ne[1]=%lld contig(input)=%d\n",
+                    i_q, i_k, i_v, (int)ok,
                     (long long)n_q->src[0]->ne[0], (long long)n_q->src[0]->ne[1],
                     (long long)n_k->src[0]->ne[0], (long long)n_k->src[0]->ne[1],
                     (long long)n_v->src[0]->ne[0], (long long)n_v->src[0]->ne[1],
@@ -9805,14 +10129,187 @@ static void xdna_plan_qkv(const struct ggml_cgraph * cgraph, xdna_qkv_plan * out
 // and fused RoPE. Single xclbin with 2-tile pipeline per KV head group.
 // ============================================================================
 
+static constexpr const char * FLOWKV_DEFAULT_TUNING_FINGERPRINT = "63624e81faf2e175";
+
+struct xdna_flowkv_tuning {
+    std::vector<std::string> tokens;
+    std::string fingerprint;
+};
+
+static bool flowkv_ascii_space(char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
+}
+
+static bool flowkv_identifier(std::string_view value) {
+    if (value.empty()) return false;
+    const char first = value.front();
+    if (!((first >= 'A' && first <= 'Z') || (first >= 'a' && first <= 'z') || first == '_')) {
+        return false;
+    }
+    for (const char c : value.substr(1)) {
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+              (c >= '0' && c <= '9') || c == '_')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool flowkv_tuning_value(std::string_view value) {
+    if (value.empty()) return false;
+    for (const char c : value) {
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+              (c >= '0' && c <= '9') || c == '_' || c == '.' ||
+              c == '+' || c == '-')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool flowkv_protected_geometry_macro(std::string_view name) {
+    static constexpr std::array<std::string_view, 3> protected_macros = {
+        "HEAD_DIM", "MAX_Q_HEADS", "MAX_CHUNK",
+    };
+    for (const std::string_view protected_macro : protected_macros) {
+        if (name.size() >= protected_macro.size() &&
+            name.substr(0, protected_macro.size()) == protected_macro) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool flowkv_allowed_tuning_macro(std::string_view name) {
+    static constexpr std::array<std::string_view, 9> allowed_macros = {
+        "FLOWKV_PRESCALE_Q",
+        "FLOWKV_SCORE_STUB",
+        "FLOWKV_SCORE_NOREDUCE",
+        "FLOWKV_VEC_EXP",
+        "FLOWKV_NOEXP",
+        "FLOWKV_VALUE_STUB",
+        "FLOWKV_VALUE_LEGACY",
+        "FLOWKV_NOVALUE",
+        "FLOWKV_VALUE_AMAC",
+    };
+    return std::find(allowed_macros.begin(), allowed_macros.end(), name) != allowed_macros.end();
+}
+
+static std::string flowkv_tuning_fingerprint(const std::vector<std::string> & tokens) {
+    std::string canonical = "flowkv-cflags-v1;" + std::to_string(tokens.size()) + ";";
+    for (const std::string & token : tokens) {
+        canonical += std::to_string(token.size()) + ":" + token;
+    }
+
+    unsigned long long value = 0xcbf29ce484222325ULL;
+    for (const unsigned char byte : canonical) {
+        value ^= byte;
+        value *= 0x100000001b3ULL;
+    }
+    char fingerprint[17];
+    snprintf(fingerprint, sizeof(fingerprint), "%016llx", value);
+    return std::string(fingerprint);
+}
+
+static bool flowkv_tuning_from_environment(xdna_flowkv_tuning * tuning) {
+    const char * raw_environment = getenv("FLOWKV_CFLAGS");
+    const std::string_view raw = raw_environment ? std::string_view(raw_environment) : std::string_view();
+    std::vector<std::string_view> raw_tokens;
+    for (size_t begin = 0; begin < raw.size();) {
+        while (begin < raw.size() && flowkv_ascii_space(raw[begin])) begin++;
+        if (begin == raw.size()) break;
+        const size_t end = [&raw, begin]() {
+            size_t position = begin;
+            while (position < raw.size() && !flowkv_ascii_space(raw[position])) position++;
+            return position;
+        }();
+        if (end - begin > 128 || raw_tokens.size() == 32) {
+            GGML_LOG_ERROR("ggml-xdna: FLOWKV_CFLAGS contains an unsupported tuning flag\n");
+            return false;
+        }
+        raw_tokens.push_back(raw.substr(begin, end - begin));
+        begin = end;
+    }
+
+    std::vector<std::string> normalized;
+    std::unordered_set<std::string> seen_macros;
+    for (size_t index = 0; index < raw_tokens.size();) {
+        const std::string_view token = raw_tokens[index];
+        std::string_view kind;
+        std::string_view definition;
+        if (token == "-D" || token == "-U") {
+            if (index + 1 == raw_tokens.size()) {
+                GGML_LOG_ERROR("ggml-xdna: FLOWKV_CFLAGS contains an unsupported tuning flag\n");
+                return false;
+            }
+            kind = token;
+            definition = raw_tokens[index + 1];
+            index += 2;
+        } else if (token.size() >= 2 && (token.substr(0, 2) == "-D" || token.substr(0, 2) == "-U")) {
+            kind = token.substr(0, 2);
+            definition = token.substr(2);
+            index++;
+        } else {
+            GGML_LOG_ERROR("ggml-xdna: FLOWKV_CFLAGS contains an unsupported tuning flag\n");
+            return false;
+        }
+
+        if (definition.empty() || definition.size() > 120) {
+            GGML_LOG_ERROR("ggml-xdna: FLOWKV_CFLAGS contains an unsupported tuning flag\n");
+            return false;
+        }
+        if (kind == "-U") {
+            if (flowkv_identifier(definition) && flowkv_protected_geometry_macro(definition)) {
+                GGML_LOG_ERROR("ggml-xdna: FLOWKV_CFLAGS must not override FlowKV geometry\n");
+            } else {
+                GGML_LOG_ERROR("ggml-xdna: FLOWKV_CFLAGS contains an unsupported tuning flag\n");
+            }
+            return false;
+        }
+
+        const size_t separator = definition.find('=');
+        const std::string_view name = definition.substr(0, separator);
+        const std::string_view value = separator == std::string_view::npos
+            ? std::string_view()
+            : definition.substr(separator + 1);
+        if (!flowkv_identifier(name)) {
+            GGML_LOG_ERROR("ggml-xdna: FLOWKV_CFLAGS contains an unsupported tuning flag\n");
+            return false;
+        }
+        if (flowkv_protected_geometry_macro(name)) {
+            GGML_LOG_ERROR("ggml-xdna: FLOWKV_CFLAGS must not override FlowKV geometry\n");
+            return false;
+        }
+        if (!flowkv_allowed_tuning_macro(name) ||
+            (separator != std::string_view::npos &&
+             (!flowkv_tuning_value(value) || value == "0"))) {
+            GGML_LOG_ERROR("ggml-xdna: FLOWKV_CFLAGS contains an unsupported tuning flag\n");
+            return false;
+        }
+
+        const std::string macro(name);
+        if (!seen_macros.insert(macro).second) {
+            GGML_LOG_ERROR("ggml-xdna: FLOWKV_CFLAGS contains an unsupported tuning flag\n");
+            return false;
+        }
+        normalized.emplace_back("-D" + std::string(definition));
+    }
+
+    std::sort(normalized.begin(), normalized.end());
+    tuning->tokens = std::move(normalized);
+    tuning->fingerprint = flowkv_tuning_fingerprint(tuning->tokens);
+    return true;
+}
+
 static std::string make_flowkv_cache_key(int64_t num_heads, int64_t num_kv_heads,
                                          int64_t head_dim, int64_t seq_len,
-                                         int64_t chunk_size, int num_cols) {
+                                         int64_t chunk_size, int num_cols,
+                                         const char * tuning_fingerprint = FLOWKV_DEFAULT_TUNING_FINGERPRINT) {
     char buf[256];
-    snprintf(buf, sizeof(buf), "flowkv_H%lld_KV%lld_d%lld_S%lld_C%lld_%dcol",
+    snprintf(buf, sizeof(buf), "flowkv_H%lld_KV%lld_d%lld_S%lld_C%lld_%dcol_t%s",
              (long long)num_heads, (long long)num_kv_heads,
              (long long)head_dim, (long long)seq_len,
-             (long long)chunk_size, num_cols);
+             (long long)chunk_size, num_cols, tuning_fingerprint);
     return std::string(buf);
 }
 
@@ -9828,24 +10325,41 @@ static bool ensure_flowkv_compiled(ggml_backend_xdna_context * ctx,
                                    const std::string & cache_key,
                                    int64_t num_heads, int64_t num_kv_heads,
                                    int64_t head_dim, int64_t seq_len,
-                                   int64_t chunk_size, int num_cols) {
-    if (ctx->flowkv_compile_failed.count(cache_key)) return false;
+                                   int64_t chunk_size, int num_cols,
+                                   const xdna_flowkv_tuning & tuning) {
+    {
+        std::lock_guard<std::mutex> lock(ctx->cache_mutex);
+        if (ctx->flowkv_compile_failed.count(cache_key)) return false;
+    }
 
     std::string bundle_dir = ctx->cache_dir + "/" + cache_key;
     if (flowkv_bundle_present(bundle_dir)) return true;
 
-    // Invoke compile.py flowkv-decode
-    char cmd[1024];
-    snprintf(cmd, sizeof(cmd),
-             "%s %s --quiet flowkv-decode"
-             " --num-heads %lld --num-kv-heads %lld --head-dim %lld"
-             " --seq-len %lld --chunk-size %lld --num-cols %d"
-             " --out %s",
-             xdna_python_cmd(), ctx->compile_script.c_str(),
-             (long long)num_heads, (long long)num_kv_heads,
-             (long long)head_dim, (long long)seq_len,
-             (long long)chunk_size, num_cols,
-             bundle_dir.c_str());
+    std::vector<std::string> compiler_argv;
+    if (!xdna_split_command(xdna_python_cmd(), &compiler_argv)) {
+        GGML_LOG_ERROR("ggml-xdna: GGML_XDNA_PYTHON_CMD is not a valid command\n");
+        std::lock_guard<std::mutex> lock(ctx->cache_mutex);
+        ctx->flowkv_compile_failed.insert(cache_key);
+        return false;
+    }
+
+    compiler_argv.insert(compiler_argv.end(), {
+        ctx->compile_script,
+        "--quiet",
+        "flowkv-decode",
+        "--num-heads", std::to_string(num_heads),
+        "--num-kv-heads", std::to_string(num_kv_heads),
+        "--head-dim", std::to_string(head_dim),
+        "--seq-len", std::to_string(seq_len),
+        "--chunk-size", std::to_string(chunk_size),
+        "--num-cols", std::to_string(num_cols),
+    });
+    for (const std::string & token : tuning.tokens) {
+        compiler_argv.push_back("--flowkv-cflag=" + token);
+    }
+    compiler_argv.insert(compiler_argv.end(), {"--out", bundle_dir});
+
+    // Invoke compile.py flowkv-decode without shell interpretation.
 
     fprintf(stderr, "ggml-xdna: compiling FlowKV decode H=%lld KV=%lld d=%lld S=%lld C=%lld cols=%d "
             "(first run, will be cached)...\n",
@@ -9854,15 +10368,17 @@ static bool ensure_flowkv_compiled(ggml_backend_xdna_context * ctx,
             (long long)chunk_size, num_cols);
     fflush(stderr);
 
-    int ret = system(cmd);
+    int ret = xdna_run_process(compiler_argv);
     if (ret != 0) {
         GGML_LOG_ERROR("ggml-xdna: FlowKV decode compilation failed (exit code %d)\n", ret);
+        std::lock_guard<std::mutex> lock(ctx->cache_mutex);
         ctx->flowkv_compile_failed.insert(cache_key);
         return false;
     }
     if (!flowkv_bundle_present(bundle_dir)) {
         GGML_LOG_ERROR("ggml-xdna: FlowKV decode compilation succeeded but bundle files missing in %s\n",
                        bundle_dir.c_str());
+        std::lock_guard<std::mutex> lock(ctx->cache_mutex);
         ctx->flowkv_compile_failed.insert(cache_key);
         return false;
     }
@@ -9911,14 +10427,31 @@ static xdna_flowkv_entry * get_or_load_flowkv_kernel(
         int64_t num_heads, int64_t num_kv_heads,
         int64_t head_dim, int64_t seq_len,
         int64_t chunk_size, int num_cols) {
+    xdna_flowkv_tuning tuning;
+    if (!flowkv_tuning_from_environment(&tuning)) return nullptr;
     std::string cache_key = make_flowkv_cache_key(
-        num_heads, num_kv_heads, head_dim, seq_len, chunk_size, num_cols);
+        num_heads, num_kv_heads, head_dim, seq_len, chunk_size, num_cols,
+        tuning.fingerprint.c_str());
 
     {
         std::lock_guard<std::mutex> lock(ctx->cache_mutex);
         auto it = ctx->flowkv_cache.find(cache_key);
         if (it != ctx->flowkv_cache.end()) return &it->second;
         // Skip if a previous load attempt failed — don't recompile.
+        if (ctx->flowkv_compile_failed.count(cache_key)) return nullptr;
+    }
+
+    // Compilation and XCLBIN registration both mutate FlowKV bundle state. Serialize
+    // them so concurrent requests cannot race to stage a bundle or register duplicate
+    // hardware contexts.
+    static std::mutex flowkv_compile_load_mutex;
+    std::unique_lock<std::mutex> compile_load_lock(flowkv_compile_load_mutex);
+
+    // Another thread may have completed this specialization while we waited.
+    {
+        std::lock_guard<std::mutex> lock(ctx->cache_mutex);
+        auto it = ctx->flowkv_cache.find(cache_key);
+        if (it != ctx->flowkv_cache.end()) return &it->second;
         if (ctx->flowkv_compile_failed.count(cache_key)) return nullptr;
     }
 
@@ -9929,8 +10462,7 @@ static xdna_flowkv_entry * get_or_load_flowkv_kernel(
         if (!flowkv_bundle_present(bundle_dir)) {
             if (!ensure_flowkv_compiled(ctx, cache_key,
                                         num_heads, num_kv_heads, head_dim,
-                                        seq_len, chunk_size, num_cols)) {
-                ctx->flowkv_compile_failed.insert(cache_key);
+                                        seq_len, chunk_size, num_cols, tuning)) {
                 return nullptr;
             }
         }
@@ -9960,16 +10492,18 @@ static xdna_flowkv_entry * get_or_load_flowkv_kernel(
             fflush(stderr);
             // Best-effort cleanup of stale bundle directory.
             // Use _rmdir or platform-independent approach (rm -rf is Unix-only).
-#ifdef _WIN32
-            std::string rm_cmd = "rmdir /s /q \"" + bundle_dir + "\"";
-#else
-            std::string rm_cmd = "rm -rf \"" + bundle_dir + "\"";
-#endif
-            (void)system(rm_cmd.c_str());
+            std::error_code cleanup_ec;
+            std::filesystem::remove_all(bundle_dir, cleanup_ec);
+            if (cleanup_ec) {
+                GGML_LOG_WARN("ggml-xdna: failed to clean stale FlowKV bundle %s: %s\n",
+                              bundle_dir.c_str(), cleanup_ec.message().c_str());
+            }
+            std::lock_guard<std::mutex> lock(ctx->cache_mutex);
             ctx->flowkv_compile_failed.erase(cache_key);
         }
     }
     GGML_LOG_ERROR("ggml-xdna: failed to load FlowKV decode kernel after recompile\n");
+    std::lock_guard<std::mutex> lock(ctx->cache_mutex);
     ctx->flowkv_compile_failed.insert(cache_key);
     return nullptr;
 }
@@ -11554,6 +12088,458 @@ struct xdna_layer_fused_match {
     const struct ggml_tensor * inpL_tensor = nullptr;
     struct ggml_tensor       * outL_tensor = nullptr;
 };
+
+struct xdna_f3best_kv_permute_match {
+    struct ggml_tensor * k_perm = nullptr;
+    struct ggml_tensor * v_perm = nullptr;
+    int64_t head_dim = 0;
+    int64_t sequence = 0;
+    int64_t kv_heads = 0;
+};
+
+// K/V cache layouts are only acceptable for f3best when their ancestry proves
+// they came from this layer's exact K/V projections. Shape alone is ambiguous:
+// a later attention tensor can have the same dimensions, and CPY/DUP can change
+// cache ownership. SET_ROWS is a special case: src[0] is the exact projection
+// value being written, while src[2] identifies the cache view returned to the
+// attention path. The walk only follows the projection value after checking the
+// full SET_ROWS construction contract.
+static bool xdna_f3best_is_valid_set_rows_edge(const struct ggml_tensor * result) {
+    static const bool debug = xdna_env_enabled("XDNA_DEBUG_F3BEST_KV_MATCH");
+    if (!result || result->op != GGML_OP_SET_ROWS) return false;
+
+    const struct ggml_tensor * values = result->src[0];
+    const struct ggml_tensor * row_indices = result->src[1];
+    const struct ggml_tensor * cache = result->src[2];
+    if (!values || !row_indices || !cache || values->type != GGML_TYPE_F32 ||
+        (row_indices->type != GGML_TYPE_I32 && row_indices->type != GGML_TYPE_I64)) {
+        if (debug) fprintf(stderr, "f3best K/V SET_ROWS reject %s: source/type\n", result->name);
+        return false;
+    }
+    if (debug) {
+        fprintf(stderr, "f3best K/V SET_ROWS inspect %s\n", result->name);
+    }
+
+    for (int dim = 0; dim < GGML_MAX_DIMS; ++dim) {
+        if (values->ne[dim] <= 0 || row_indices->ne[dim] <= 0 || cache->ne[dim] <= 0) {
+            if (debug) fprintf(stderr, "f3best K/V SET_ROWS reject %s: nonpositive dimension\n", result->name);
+            return false;
+        }
+    }
+
+    // Mirror the invariants established by ggml_set_rows(). The result is a
+    // view of the cache argument, whereas src[0] is merely the F32 payload.
+    if (cache->ne[0] != values->ne[0] || cache->ne[2] != values->ne[2] ||
+        cache->ne[3] != values->ne[3] || values->ne[1] != row_indices->ne[0] ||
+        values->ne[2] % row_indices->ne[1] != 0 ||
+        values->ne[3] % row_indices->ne[2] != 0 || row_indices->ne[3] != 1 ||
+        !ggml_is_contiguous_rows(cache) || !ggml_is_contiguous_rows(values) ||
+        result->type != cache->type || !ggml_are_same_shape(result, cache) ||
+        !ggml_are_same_stride(result, cache)) {
+        if (debug) {
+            fprintf(stderr,
+                    "f3best K/V SET_ROWS reject %s: contract values=[%lld,%lld,%lld,%lld] "
+                    "indices=[%lld,%lld,%lld,%lld] cache=[%lld,%lld,%lld,%lld]\n",
+                    result->name,
+                    (long long) values->ne[0], (long long) values->ne[1],
+                    (long long) values->ne[2], (long long) values->ne[3],
+                    (long long) row_indices->ne[0], (long long) row_indices->ne[1],
+                    (long long) row_indices->ne[2], (long long) row_indices->ne[3],
+                    (long long) cache->ne[0], (long long) cache->ne[1],
+                    (long long) cache->ne[2], (long long) cache->ne[3]);
+        }
+        return false;
+    }
+
+    // ggml_view_tensor() normalizes nested views to their ultimate base and
+    // accumulates the offset. SET_ROWS is constructed by ggml_view_tensor(cache),
+    // so use the same normalization when checking that its result is the cache
+    // view that the attention path consumes.
+    const struct ggml_tensor * cache_view_src = cache;
+    size_t cache_view_offs = 0;
+    while (cache_view_src->view_src) {
+        if (cache_view_offs > std::numeric_limits<size_t>::max() - cache_view_src->view_offs) {
+            if (debug) fprintf(stderr, "f3best K/V SET_ROWS reject %s: cache view offset overflow\n", result->name);
+            return false;
+        }
+        cache_view_offs += cache_view_src->view_offs;
+        cache_view_src = cache_view_src->view_src;
+    }
+
+    const bool same_view = result->view_src == cache_view_src && result->view_offs == cache_view_offs;
+    if (debug && !same_view) {
+        fprintf(stderr, "f3best K/V SET_ROWS reject %s: cache view identity\n", result->name);
+    }
+    return same_view;
+}
+
+struct xdna_f3best_cache_region {
+    const struct ggml_tensor * backing = nullptr;
+    size_t offset = 0;
+    size_t size = 0;
+};
+
+// Calculate the physical byte span addressed by a tensor without accepting
+// malformed dimensions, strides, or arithmetic overflow. This is the same
+// layout extent as ggml_nbytes(), but returns failure instead of wrapping.
+static bool xdna_f3best_tensor_storage_span(
+        const struct ggml_tensor * tensor,
+        size_t * span_out) {
+    if (!tensor || !span_out) return false;
+
+    const size_t block_size = ggml_blck_size(tensor->type);
+    if (block_size == 0 || tensor->ne[0] <= 0 ||
+        tensor->ne[0] % static_cast<int64_t>(block_size) != 0) {
+        return false;
+    }
+    for (int dim = 1; dim < GGML_MAX_DIMS; ++dim) {
+        if (tensor->ne[dim] <= 0) return false;
+    }
+
+    const size_t ne0 = static_cast<size_t>(tensor->ne[0]);
+    if (ne0 > std::numeric_limits<size_t>::max() / tensor->nb[0]) return false;
+    size_t span = ne0 * tensor->nb[0] / block_size;
+    for (int dim = 1; dim < GGML_MAX_DIMS; ++dim) {
+        const size_t extent = static_cast<size_t>(tensor->ne[dim] - 1);
+        if (extent > (std::numeric_limits<size_t>::max() - span) / tensor->nb[dim]) {
+            return false;
+        }
+        span += extent * tensor->nb[dim];
+    }
+
+    if (span == 0) return false;
+    *span_out = span;
+    return true;
+}
+
+// ggml view constructors normalize nested view_src links to one backing
+// tensor, but make the normalization explicit here so a cache read can only
+// be associated with a SET_ROWS writer for the exact same backing region.
+static bool xdna_f3best_get_cache_region(
+        const struct ggml_tensor * tensor,
+        xdna_f3best_cache_region * out) {
+    if (!tensor || !out) return false;
+
+    constexpr int kMaxViewDepth = 16;
+    const struct ggml_tensor * current = tensor;
+    std::unordered_set<const struct ggml_tensor *> seen;
+    size_t offset = 0;
+    for (int depth = 0; depth < kMaxViewDepth; ++depth) {
+        if (!current || !seen.insert(current).second ||
+            current->view_offs > std::numeric_limits<size_t>::max() - offset) {
+            return false;
+        }
+        offset += current->view_offs;
+        if (!current->view_src) {
+            size_t span = 0;
+            if (!xdna_f3best_tensor_storage_span(tensor, &span) ||
+                span > std::numeric_limits<size_t>::max() - offset) {
+                return false;
+            }
+            *out = { current, offset, span };
+            return true;
+        }
+        current = current->view_src;
+    }
+
+    return false;
+}
+
+static bool xdna_f3best_cache_read_matches_cache(
+        const struct ggml_tensor * candidate,
+        const struct ggml_tensor * cache) {
+    if (!candidate || !cache || candidate->type != cache->type) return false;
+
+    xdna_f3best_cache_region candidate_region;
+    xdna_f3best_cache_region cache_region;
+    if (!xdna_f3best_get_cache_region(candidate, &candidate_region) ||
+        !xdna_f3best_get_cache_region(cache, &cache_region) ||
+        candidate_region.backing != cache_region.backing ||
+        candidate_region.offset < cache_region.offset) {
+        return false;
+    }
+
+    const size_t candidate_end = candidate_region.offset + candidate_region.size;
+    const size_t cache_end = cache_region.offset + cache_region.size;
+    return candidate_end <= cache_end;
+}
+
+// The cache read passed to f3best has a view-only ancestry ending at the cache
+// backing tensor. Its projection provenance lives in the corresponding
+// SET_ROWS writer. Require exactly one structurally related writer before the
+// caller is allowed to trace that writer's src[0] projection payload.
+static bool xdna_f3best_find_cache_writer(
+        const struct ggml_cgraph * cgraph,
+        int span_begin,
+        int span_end,
+        const struct ggml_tensor * candidate,
+        const struct ggml_tensor ** writer_out) {
+    static const bool debug = xdna_env_enabled("XDNA_DEBUG_F3BEST_KV_MATCH");
+    static std::atomic<int> debug_budget{debug ? 96 : 0};
+    const auto log_reject = [&](const char * reason) {
+        if (debug && debug_budget.fetch_sub(1) > 0) {
+            fprintf(stderr,
+                    "f3best K/V cache writer reject candidate=%s: %s\n",
+                    candidate && candidate->name[0] ? candidate->name : "?", reason);
+        }
+        return false;
+    };
+
+    if (!cgraph || !cgraph->nodes || !writer_out || !candidate ||
+        span_begin < 0 || span_end < span_begin || span_end >= cgraph->n_nodes) {
+        return log_reject("invalid search input");
+    }
+
+    const struct ggml_tensor * writer = nullptr;
+    for (int index = span_begin; index <= span_end; ++index) {
+        const struct ggml_tensor * node = cgraph->nodes[index];
+        if (!node || node->op != GGML_OP_SET_ROWS || !node->src[2] ||
+            !xdna_f3best_cache_read_matches_cache(candidate, node->src[2])) {
+            continue;
+        }
+        if (!xdna_f3best_is_valid_set_rows_edge(node)) {
+            return log_reject("malformed associated SET_ROWS writer");
+        }
+        if (writer) return log_reject("multiple associated SET_ROWS writers");
+        writer = node;
+    }
+
+    if (!writer) return log_reject("no associated SET_ROWS writer");
+    *writer_out = writer;
+    return true;
+}
+
+static bool xdna_f3best_trace_projection(
+        const struct ggml_tensor * candidate,
+        const struct ggml_tensor * expected_projection,
+        const struct ggml_tensor * expected_weight,
+        bool allow_rope,
+        const struct ggml_tensor ** activation_out) {
+    static const bool debug = xdna_env_enabled("XDNA_DEBUG_F3BEST_KV_MATCH");
+    static std::atomic<int> debug_budget{debug ? 96 : 0};
+    const char * const kind = allow_rope ? "K" : "V";
+    const auto log_reject = [&](const char * reason, const struct ggml_tensor * node, int depth) {
+        if (debug && debug_budget.fetch_sub(1) > 0) {
+            fprintf(stderr,
+                    "f3best K/V trace reject %s candidate=%s node=%s op=%s depth=%d: %s\n",
+                    kind,
+                    candidate && candidate->name[0] ? candidate->name : "?",
+                    node && node->name[0] ? node->name : "?",
+                    node ? ggml_op_name(node->op) : "null",
+                    depth, reason);
+        }
+        return false;
+    };
+
+    if (!candidate || !expected_projection || !expected_weight || !activation_out) {
+        return log_reject("missing trace input", candidate, -1);
+    }
+
+    if (debug && debug_budget.fetch_sub(1) > 0) {
+        fprintf(stderr,
+                "f3best K/V trace begin %s candidate=%s expected_projection=%s\n",
+                kind,
+                candidate->name[0] ? candidate->name : "?",
+                expected_projection->name[0] ? expected_projection->name : "?");
+    }
+
+    constexpr int kMaxTraceDepth = 16;
+    const struct ggml_tensor * current = candidate;
+    std::unordered_set<const struct ggml_tensor *> seen;
+    bool saw_rope = false;
+    bool saw_set_rows = false;
+
+    for (int depth = 0; depth < kMaxTraceDepth; ++depth) {
+        if (!current) return log_reject("null ancestry", current, depth);
+        if (!seen.insert(current).second) return log_reject("cyclic ancestry", current, depth);
+        if (current->op == GGML_OP_MUL_MAT) {
+            if (current != expected_projection || current->src[0] != expected_weight ||
+                !current->src[1]) {
+                return log_reject("unexpected projection terminal", current, depth);
+            }
+            *activation_out = current->src[1];
+            if (debug && debug_budget.fetch_sub(1) > 0) {
+                fprintf(stderr,
+                        "f3best K/V trace accept %s candidate=%s terminal=%s depth=%d\n",
+                        kind,
+                        candidate->name[0] ? candidate->name : "?",
+                        current->name[0] ? current->name : "?", depth);
+            }
+            return true;
+        }
+
+        switch (current->op) {
+            case GGML_OP_VIEW:
+            case GGML_OP_RESHAPE:
+            case GGML_OP_CONT:
+            case GGML_OP_PERMUTE:
+            case GGML_OP_TRANSPOSE:
+                break;
+            case GGML_OP_ROPE:
+                if (!allow_rope || saw_rope) {
+                    return log_reject("unexpected or duplicate RoPE", current, depth);
+                }
+                saw_rope = true;
+                break;
+            case GGML_OP_SET_ROWS:
+                if (saw_set_rows) return log_reject("duplicate SET_ROWS", current, depth);
+                if (!xdna_f3best_is_valid_set_rows_edge(current)) {
+                    return log_reject("invalid SET_ROWS", current, depth);
+                }
+                saw_set_rows = true;
+                break;
+            default:
+                return log_reject("unsupported ancestry operation", current, depth);
+        }
+
+        if (!current->src[0]) return log_reject("missing src[0]", current, depth);
+        current = current->src[0];
+    }
+
+    return log_reject("trace depth exceeded", current, kMaxTraceDepth);
+}
+
+static bool xdna_match_f3best_kv_permutes(
+        const struct ggml_cgraph * cgraph,
+        const xdna_layer_fused_match & layer,
+        int span_begin,
+        int span_end,
+        xdna_f3best_kv_permute_match * out) {
+    static const bool debug = xdna_env_enabled("XDNA_DEBUG_F3BEST_KV_MATCH");
+    static std::atomic<int> debug_budget{debug ? 128 : 0};
+    const auto log_reject = [&](const char * reason) {
+        if (debug && debug_budget.fetch_sub(1) > 0) {
+            fprintf(stderr, "f3best K/V match reject q=%d span=[%d,%d]: %s\n",
+                    layer.q_idx, span_begin, span_end, reason);
+        }
+        return false;
+    };
+
+    if (!cgraph || !cgraph->nodes || !out || span_begin < 0 || span_end < span_begin ||
+        span_end >= cgraph->n_nodes || layer.q_idx < 0 || layer.k_idx < 0 ||
+        layer.v_idx < 0 || layer.q_idx >= cgraph->n_nodes ||
+        layer.k_idx >= cgraph->n_nodes || layer.v_idx >= cgraph->n_nodes ||
+        !layer.w_q || !layer.w_k || !layer.w_v ||
+        !layer.q_out_tensor || !layer.k_out_tensor || !layer.v_out_tensor ||
+        cgraph->nodes[layer.q_idx] != layer.q_out_tensor ||
+        cgraph->nodes[layer.k_idx] != layer.k_out_tensor ||
+        cgraph->nodes[layer.v_idx] != layer.v_out_tensor ||
+        layer.q_out_tensor->op != GGML_OP_MUL_MAT ||
+        layer.q_out_tensor->src[0] != layer.w_q ||
+        layer.k_out_tensor->op != GGML_OP_MUL_MAT ||
+        layer.k_out_tensor->src[0] != layer.w_k ||
+        layer.v_out_tensor->op != GGML_OP_MUL_MAT ||
+        layer.v_out_tensor->src[0] != layer.w_v ||
+        layer.w_k->ne[1] <= 0 || layer.w_v->ne[1] != layer.w_k->ne[1]) {
+        return log_reject("layer/projection contract");
+    }
+
+    const struct ggml_tensor * q_activation = layer.q_out_tensor->src[1];
+    const struct ggml_tensor * k_activation = layer.k_out_tensor->src[1];
+    const struct ggml_tensor * v_activation = layer.v_out_tensor->src[1];
+    if (!q_activation || q_activation != k_activation || q_activation != v_activation) {
+        return log_reject("Q/K/V activation identity");
+    }
+
+    xdna_f3best_kv_permute_match match;
+    for (int index = span_begin; index <= span_end; ++index) {
+        struct ggml_tensor * candidate = cgraph->nodes[index];
+        if (!candidate || candidate->op != GGML_OP_PERMUTE ||
+            candidate->ne[0] <= 0 || candidate->ne[1] <= 0 || candidate->ne[2] <= 0) {
+            continue;
+        }
+
+        if (debug && debug_budget.fetch_sub(1) > 0) {
+            fprintf(stderr,
+                    "f3best K/V match candidate q=%d index=%d name=%s ne=[%lld,%lld,%lld]\n",
+                    layer.q_idx, index, candidate->name[0] ? candidate->name : "?",
+                    (long long) candidate->ne[0], (long long) candidate->ne[1],
+                    (long long) candidate->ne[2]);
+        }
+
+        const struct ggml_tensor * activation = nullptr;
+        bool k_matches = xdna_f3best_trace_projection(
+                candidate, layer.k_out_tensor, layer.w_k,
+                /* allow_rope = */ true, &activation);
+        if (!k_matches && index > span_begin) {
+            // A cache reader may be rooted at a backing/view leaf. Associate it
+            // only with an earlier writer in this attention span; a later writer
+            // cannot establish provenance for this graph node.
+            const struct ggml_tensor * writer = nullptr;
+            if (xdna_f3best_find_cache_writer(cgraph, span_begin, index - 1, candidate, &writer)) {
+                activation = nullptr;
+                k_matches = xdna_f3best_trace_projection(
+                        writer, layer.k_out_tensor, layer.w_k,
+                        /* allow_rope = */ true, &activation);
+            }
+        }
+        if (k_matches) {
+            if (activation != q_activation) return log_reject("K candidate activation identity");
+            if (match.k_perm) return log_reject("ambiguous K candidates");
+            match.k_perm = candidate;
+            match.head_dim = candidate->ne[0];
+            match.sequence = candidate->ne[1];
+            match.kv_heads = candidate->ne[2];
+            continue;
+        }
+
+        activation = nullptr;
+        bool v_matches = xdna_f3best_trace_projection(
+                candidate, layer.v_out_tensor, layer.w_v,
+                /* allow_rope = */ false, &activation);
+        if (!v_matches && index > span_begin) {
+            // Keep the writer lookup topologically predecessor-only, just as
+            // for K: a future SET_ROWS cannot be this reader's source.
+            const struct ggml_tensor * writer = nullptr;
+            if (xdna_f3best_find_cache_writer(cgraph, span_begin, index - 1, candidate, &writer)) {
+                activation = nullptr;
+                v_matches = xdna_f3best_trace_projection(
+                        writer, layer.v_out_tensor, layer.w_v,
+                        /* allow_rope = */ false, &activation);
+            }
+        }
+        if (v_matches) {
+            if (activation != q_activation) return log_reject("V candidate activation identity");
+            if (match.v_perm) return log_reject("ambiguous V candidates");
+            match.v_perm = candidate;
+        }
+    }
+
+    if (!match.k_perm || !match.v_perm || match.k_perm == match.v_perm ||
+        (match.k_perm->data && match.k_perm->data == match.v_perm->data) ||
+        match.head_dim <= 0 ||
+        match.sequence <= 0 || match.kv_heads <= 0 ||
+        !xdna_head_dim_supported(match.head_dim)) {
+        return log_reject("missing, aliased, or unsupported K/V pair");
+    }
+
+    const int64_t projection_width = layer.w_k->ne[1];
+    if (match.k_perm->ne[0] != match.head_dim || match.k_perm->ne[1] != match.sequence ||
+        match.k_perm->ne[2] != match.kv_heads ||
+        match.v_perm->ne[2] != match.kv_heads ||
+        match.head_dim > std::numeric_limits<int64_t>::max() / match.kv_heads ||
+        match.head_dim * match.kv_heads != projection_width) {
+        return log_reject("K/V geometry or projection width");
+    }
+
+    const bool v_sequence_major = match.v_perm->ne[0] == match.sequence &&
+                                  match.v_perm->ne[1] == match.head_dim;
+    const bool v_physical_k_major = match.v_perm->ne[0] == match.head_dim &&
+                                    match.v_perm->ne[1] == match.sequence;
+    if (!v_sequence_major && !v_physical_k_major) return log_reject("V layout");
+
+    if (debug && debug_budget.fetch_sub(1) > 0) {
+        fprintf(stderr,
+                "f3best K/V match accept q=%d K=%s V=%s hd=%lld seq=%lld kvh=%lld\n",
+                layer.q_idx,
+                match.k_perm->name[0] ? match.k_perm->name : "?",
+                match.v_perm->name[0] ? match.v_perm->name : "?",
+                (long long) match.head_dim, (long long) match.sequence,
+                (long long) match.kv_heads);
+    }
+    *out = match;
+    return true;
+}
 
 struct xdna_layer_fused_plan {
     std::vector<xdna_layer_fused_match> matches;
@@ -18478,8 +19464,8 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                         int min_q = -1;
                         for (auto & mm : MM) if (mm.q_idx >= 0 && (min_q < 0 || mm.q_idx < min_q)) min_q = mm.q_idx;
                         if (i == min_q) {
-                            struct LoopLayer { const xdna_layer_fused_match* m; int kv_lo, kv_hi;
-                                               struct ggml_tensor* kp; struct ggml_tensor* vp; };
+                            struct LoopLayer { const xdna_layer_fused_match * m; int kv_lo, kv_hi;
+                                               xdna_f3best_kv_permute_match kv; };
                             std::vector<int> order;
                             for (size_t oi = 0; oi < MM.size(); oi++) order.push_back((int)oi);
                             std::sort(order.begin(), order.end(),
@@ -18492,12 +19478,12 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                       m.inpL_tensor && m.inpL_tensor->data && m.w_norm1 && m.w_norm2 &&
                                       m.w_q && m.w_k && m.w_v && m.w_o && m.w_gate && m.w_up && m.w_down &&
                                       m.q_rope_idx>=0 && m.pre_norm_idx>=0)) { ok_all=false; break; }
-                                struct ggml_tensor *kp=nullptr,*vp=nullptr;
-                                for (int si=m.q_idx; si<=m.add_ffn_idx; si++){ struct ggml_tensor*nd=cgraph->nodes[si];
-                                    if(!nd||nd->op!=GGML_OP_PERMUTE)continue;
-                                    if(!kp&&nd->ne[0]==64&&nd->ne[1]>=32&&nd->ne[2]==8)kp=nd;
-                                    else if(!vp&&nd->ne[0]>=32&&nd->ne[1]==64&&nd->ne[2]==8)vp=nd; }
-                                if(!kp||!vp){ok_all=false;break;}
+                                xdna_f3best_kv_permute_match kv;
+                                if (!xdna_match_f3best_kv_permutes(
+                                        cgraph, m, m.q_idx, m.add_ffn_idx, &kv)) {
+                                    ok_all = false;
+                                    break;
+                                }
                                 int attn_hi=(m.add_attn_idx>=m.q_idx&&m.add_attn_idx<=m.add_ffn_idx)?m.add_attn_idx:m.add_ffn_idx;
                                 int kv_hi=-1; for(int si=m.q_idx;si<=attn_hi;si++)
                                     if(cgraph->nodes[si]&&cgraph->nodes[si]->op==GGML_OP_SET_ROWS) kv_hi=si;
@@ -18514,7 +19500,7 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                 const int kv_lo = (f3b_skipq && m.q_rope_idx >= m.pre_norm_idx &&
                                                    m.q_rope_idx < kv_hi) ? m.q_rope_idx + 1
                                                                          : m.pre_norm_idx;
-                                plan.push_back({&m, kv_lo, kv_hi, kp, vp});
+                                plan.push_back({&m, kv_lo, kv_hi, kv});
                             }
                             if (ok_all) {
                                 if (cpu_run_start >= 0) {   // materialize embeddings → inpL for layer 0
@@ -18522,10 +19508,16 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                     if(s!=GGML_STATUS_SUCCESS)return s; cpu_run_start=-1; }
                                 static const bool _looptime = xdna_env_enabled("XDNA_F3BEST_LOOPTIME");
                                 static const bool _glue = xdna_env_enabled("XDNA_F3BEST_GLUETIME");
+                                static const bool _driftdump = xdna_env_enabled("XDNA_F3BEST_DRIFTDUMP");
                                 double _t_kv=0,_t_f3=0; const auto _lt0=std::chrono::steady_clock::now();
                                 if (_glue) g_xdna_f3best_gluetime = {};
-                                std::vector<float> normed(2048,0.0f); bool disp_ok=true;
+                                // #187: LOOP path was hardcoded to E=2048 (1B). 3B has E=3072 —
+                                // read embed_dim from the first layer's inpL so the norm/inpL
+                                // buffers and RMS math scale to any model (SIGSEGV otherwise).
+                                const int64_t E_loop = plan[0].m->inpL_tensor->ne[0];
+                                std::vector<float> normed(E_loop, 0.0f); bool disp_ok=true;
                                 std::vector<float> inpL_hold;
+                                std::vector<float> last_outL_snap;  // #189: snapshot of final-layer outL
                                 static const bool _loopsnapdbg = xdna_env_enabled("XDNA_F3BEST_LIVESNAPDBG");
                                 for (auto & L : plan) {
                                     // CPU KV-write prefix (attn_norm + Q/K/V-proj + rope + SET_ROWS) from the
@@ -18535,10 +19527,10 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                     // inpL lives in a ggml intermediate buffer that the KV delegate
                                     // below can reuse. Snapshot it FIRST; reading it afterwards
                                     // yields another layer's activations (measured rel=1.76).
-                                    inpL_hold.resize(2048);
+                                    inpL_hold.resize(E_loop);
                                     bool have_hold=false;
                                     if (L.m->inpL_tensor->type==GGML_TYPE_F32 && L.m->inpL_tensor->data) {
-                                        memcpy(inpL_hold.data(), L.m->inpL_tensor->data, 2048*sizeof(float));
+                                        memcpy(inpL_hold.data(), L.m->inpL_tensor->data, (size_t)E_loop*sizeof(float));
                                         have_hold=true;
                                     }
                                     const auto _k0=std::chrono::steady_clock::now();
@@ -18554,24 +19546,46 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                         if(_sb.fetch_sub(1)>0){
                                             const float* lv=(const float*)L.m->inpL_tensor->data;
                                             double dn=0,dd=0;
-                                            for(int e=0;e<2048;e++){double t=(double)inpL_hold[e]-(double)lv[e];dn+=t*t;dd+=(double)inpL_hold[e]*inpL_hold[e];}
+                                            for(int64_t e=0;e<E_loop;e++){double t=(double)inpL_hold[e]-(double)lv[e];dn+=t*t;dd+=(double)inpL_hold[e]*inpL_hold[e];}
                                             fprintf(stderr,"ggml-xdna: [f3best-loopsnap] have=%d rel=%.6f |snap|=%.5f\n",
-                                                    (int)have_hold,std::sqrt(dn/(dd+1e-12)),std::sqrt(dd/2048.0));
+                                                    (int)have_hold,std::sqrt(dn/(dd+1e-12)),std::sqrt(dd/(double)E_loop));
                                             fflush(stderr);}
                                     }
                                     const float* gain=(const float*)L.m->w_norm1->data;
-                                    double ss=0.0; for(int e=0;e<2048;e++) ss+=(double)inpL[e]*(double)inpL[e];
-                                    const float inv=1.0f/std::sqrt((float)(ss/2048.0)+1e-5f);
-                                    for(int e=0;e<2048;e++) normed[e]=inpL[e]*inv*gain[e];
+                                    double ss=0.0; for(int64_t e=0;e<E_loop;e++) ss+=(double)inpL[e]*(double)inpL[e];
+                                    const float inv=1.0f/std::sqrt((float)(ss/(double)E_loop)+1e-5f);
+                                    for(int64_t e=0;e<E_loop;e++) normed[e]=inpL[e]*inv*gain[e];
                                     if (_glue) g_xdna_f3best_gluetime.rms_us += xdna_elapsed_us(_r0);
                                     const auto _q0=std::chrono::steady_clock::now();
-                                    bool ok=ggml_backend_xdna_decode_layer_f3best(ctx,L.m->outL_tensor,normed.data(),2048,inpL,
+                                    bool ok=ggml_backend_xdna_decode_layer_f3best(ctx,L.m->outL_tensor,normed.data(),E_loop,inpL,
                                         L.m->w_q,L.m->w_k,L.m->w_v,L.m->w_o,L.m->w_gate,L.m->w_up,L.m->w_down,L.m->w_norm2,
-                                        cgraph->nodes[L.m->q_rope_idx],L.kp,L.vp,8);
+                                        cgraph->nodes[L.m->q_rope_idx], L.kv.k_perm, L.kv.v_perm,
+                                        static_cast<int>(L.kv.kv_heads), nullptr);
                                     {
                                         const double _q_us = xdna_elapsed_us(_q0);
                                         if(_looptime) _t_f3+=_q_us;
                                         if(_glue) g_xdna_f3best_gluetime.f3call_us += _q_us;
+                                    }
+                                    // #189 Phase 2: per-layer residual drift curve — capture the
+                                    // NPU's on-chip residual chain across layers 0..15. A single
+                                    // layer whose |resid| diverges from its neighbours is a
+                                    // fixable bug; smooth monotonic growth is acceptable bf16
+                                    // precision loss. Env XDNA_F3BEST_DRIFTDUMP=1.
+                                    // Snapshot outL IMMEDIATELY after this layer's dispatch
+                                    // returns, into a local buffer. The outL buffer is a ggml
+                                    // intermediate that the NEXT layer's KV-delegate or dispatch
+                                    // reuses in-place — reading the raw pointer afterwards yields
+                                    // another layer's activations (or -nan from a forward buffer
+                                    // the scheduler hasn't filled yet). Same pitfall as inpL_hold
+                                    // above; the fix is the same one-line memcpy.
+                                    if (_driftdump && ok && L.m->outL_tensor && L.m->outL_tensor->data
+                                        && L.m->outL_tensor->type == GGML_TYPE_F32) {
+                                        const float * outL = (const float *)L.m->outL_tensor->data;
+                                        std::vector<float> outL_snap(outL, outL + E_loop);
+                                        double s=0; for(int64_t e=0;e<E_loop;e++) s+=(double)outL_snap[e]*(double)outL_snap[e];
+                                        fprintf(stderr,"ggml-xdna: [f3best-drift] layer=%zu |outL|=%.5f\n",
+                                                (size_t)(&L - plan.data()), std::sqrt(s/(double)E_loop)); fflush(stderr);
+                                        last_outL_snap = std::move(outL_snap);  // keep last layer's snapshot
                                     }
                                     if(!ok){disp_ok=false;break;}
                                 }
@@ -18590,6 +19604,31 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                             G.kv_zero_us, G.kv_copy_us, G.kv_sync_us, G.runprep_us, G.npu_us, G.outsync_us, G.reduce_us);
                                     fflush(stderr);} }
                                 if (disp_ok) {
+                                    // #189 Phase 2: dump the final-layer residual (the tensor that
+                                    // feeds output_norm -> lm_head -> logits) so logit distributions
+                                    // can be reconstructed OFFLINE and compared to a CPU fp32 reference.
+                                    // Env XDNA_F3BEST_DRIFTDUMP=2 writes the last outL to
+                                    // dev_notes/track_a_build/f3best_drift_dump/resid_N.bin (one file
+                                    // per token N=0..). Dormant unless the env flag is set.
+                                    // Dump from the SNAPSHOT taken inside the loop — NOT from
+                                    // last_outL->data, which by now has been reused by the next
+                                    // graph op (final RMS + lm_head on CPU).
+                                    if (_driftdump > 0 && !last_outL_snap.empty()) {
+                                        static std::atomic<int> _nd{4};
+                                        int n_tok = (int)_nd.fetch_sub(1);
+                                        if (n_tok > 0) {
+                                            int64_t tok_idx = n_tok;
+                                            const char * dir = "C:/llama.cpp-xdna/dev_notes/track_a_build/f3best_drift_dump";
+                                            char p[260];
+                                            snprintf(p, sizeof(p), "%s/resid_%04lld.bin", dir, (long long)tok_idx);
+                                            if (FILE* f = fopen(p, "wb")) {
+                                                fwrite(last_outL_snap.data(), 4, (size_t)E_loop, f);
+                                                fclose(f);
+                                                fprintf(stderr,"ggml-xdna: [f3best-drift] dumped %s (%lld f32)\n", p, (long long)E_loop);
+                                                fflush(stderr);
+                                            }
+                                        }
+                                    }
                                     // Skip ALL layers' full spans — avoid re-dispatch by per-op path.
                                     for(auto&m:MM){int lo=m.pre_norm_idx>=0?m.pre_norm_idx:m.q_idx;
                                         for(int j=lo;j<=m.add_ffn_idx;j++) qkv_plan.skip_indices.insert(j);}
@@ -18615,21 +19654,9 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                         lf_m.w_norm2 && lf_m.w_q && lf_m.w_k && lf_m.w_v &&
                         lf_m.w_o && lf_m.w_gate && lf_m.w_up &&
                         lf_m.w_down && lf_m.q_rope_idx >= 0) {
-                        struct ggml_tensor * k_perm = nullptr, * v_perm = nullptr;
-                        // #205: identify K/V permutes by the KV projection width, not by loose
-                        // magnitude thresholds. k_perm is [head_dim, seq, num_kv], v_perm is
-                        // [seq, head_dim, num_kv]; both satisfy head_dim*num_kv == w_k->ne[1].
-                        // The old `ne[0]>=64` test matched the V-permute ([seq,hd,kv], seq>=64)
-                        // as k_perm, so head_dim was read as seq (256) and the cache key became
-                        // the 3B geometry `d256_a1` on a 1B model → wrong-shape xclbin compile.
-                        const int64_t kv_width = lf_m.w_k->ne[1];
-                        for (int si = i; si <= lf_m.add_ffn_idx; si++) {
-                            struct ggml_tensor * nd = cgraph->nodes[si];
-                            if (!nd || nd->op != GGML_OP_PERMUTE) continue;
-                            if (!k_perm && nd->ne[0]*nd->ne[2] == kv_width && nd->ne[1] >= 32) k_perm = nd;
-                            else if (!v_perm && nd->ne[1]*nd->ne[2] == kv_width && nd->ne[0] >= 32) v_perm = nd;
-                        }
-                        if (k_perm && v_perm) {
+                        xdna_f3best_kv_permute_match kv_match;
+                        if (xdna_match_f3best_kv_permutes(
+                                cgraph, lf_m, i, lf_m.add_ffn_idx, &kv_match)) {
                             if (cpu_run_start >= 0) {   // materialize inpL + KV cache first
                                 ggml_status s = xdna_delegate_range(ctx, cgraph, cpu_run_start, i);
                                 if (s != GGML_STATUS_SUCCESS) return s;
@@ -18716,7 +19743,8 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                             const bool ok = ggml_backend_xdna_decode_layer_f3best(
                                 ctx, lf_m.outL_tensor, normed.data(), E_model, inpL,
                                 lf_m.w_q, lf_m.w_k, lf_m.w_v, lf_m.w_o, lf_m.w_gate, lf_m.w_up, lf_m.w_down,
-                                lf_m.w_norm2, cgraph->nodes[lf_m.q_rope_idx], k_perm, v_perm, 8);
+                                lf_m.w_norm2, cgraph->nodes[lf_m.q_rope_idx], kv_match.k_perm,
+                                kv_match.v_perm, static_cast<int>(kv_match.kv_heads), nullptr);
                             if (ok) {
                                 for (int j = i; j <= lf_m.add_ffn_idx; j++) qkv_plan.skip_indices.insert(j);
                                 static std::atomic<int> live_log{4};
@@ -18755,15 +19783,23 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                         // Split delegate so add_attn (cpu_s) is snapshotted FRESH before the
                         // FFN delegate can reuse its buffer (ggml reuses intermediate buffers).
                         const int64_t E_probe = lf_m.inpL_tensor->ne[0];
-                        std::vector<float> cpu_s_snap(E_probe, 0.0f);
+                        if (E_probe <= 0 ||
+                            static_cast<size_t>(E_probe) >
+                                std::numeric_limits<size_t>::max() / (3 * sizeof(float))) {
+                            fprintf(stderr, "ggml-xdna: [f3best-probe] invalid embedding width=%lld\n",
+                                    (long long) E_probe);
+                            return GGML_STATUS_FAILED;
+                        }
+                        const size_t E_probe_size = static_cast<size_t>(E_probe);
+                        std::vector<float> cpu_s_snap(E_probe_size, 0.0f);
                         bool have_cpu_s_snap = false;
                         // attn_out (the O-proj input) lives in a reused intermediate buffer just
                         // like cpu_s: snapshot it in the SAME window, before the FFN delegate.
-                        std::vector<float> gO_snap(E_probe, 0.0f);
+                        std::vector<float> gO_snap(E_probe_size, 0.0f);
                         bool have_gO_snap = false;
                         // inpL (the layer's residual input) is likewise an intermediate: capture
                         // it BEFORE any delegate runs.
-                        std::vector<float> inpL_snap(E_probe, 0.0f);
+                        std::vector<float> inpL_snap(E_probe_size, 0.0f);
                         bool have_inpL_snap = false;
                         if (lf_m.inpL_tensor->type == GGML_TYPE_F32 && lf_m.inpL_tensor->data) {
                             memcpy(inpL_snap.data(), lf_m.inpL_tensor->data, (size_t)E_probe * sizeof(float));
@@ -18805,21 +19841,15 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                             fflush(stderr);
                         }
 
-                        struct ggml_tensor * k_perm = nullptr;
-                        struct ggml_tensor * v_perm = nullptr;
-                        const int64_t hd = 64;
-                        for (int si = i; si <= lf_m.add_ffn_idx; si++) {
-                            struct ggml_tensor * nd = cgraph->nodes[si];
-                            if (!nd || nd->op != GGML_OP_PERMUTE) continue;
-                            if (!k_perm && nd->ne[0] == hd && nd->ne[1] >= 32 && nd->ne[2] == 8) {
-                                k_perm = nd;
-                            } else if (!v_perm && nd->ne[0] >= 32 && nd->ne[1] == hd && nd->ne[2] == 8) {
-                                v_perm = nd;
-                            }
-                        }
+                        xdna_f3best_kv_permute_match kv_match;
+                        const bool have_kv_match = xdna_match_f3best_kv_permutes(
+                            cgraph, lf_m, i, lf_m.add_ffn_idx, &kv_match);
 
                         bool f3_ok = false;
-                        if (k_perm && v_perm && lf_m.q_rope_idx >= 0) {
+                        bool legacy_1b_geometry = false;
+                        if (have_kv_match && lf_m.q_rope_idx >= 0) {
+                            struct ggml_tensor * const k_perm = kv_match.k_perm;
+                            struct ggml_tensor * const v_perm = kv_match.v_perm;
                             // normed = rms_norm(inpL)*gain computed from the RELIABLE inpL (layer
                             // input/residual, never buffer-reused). The graph's attn-norm node
                             // (q-node src[1]) is STALE here — ggml reuses its buffer after the
@@ -18828,22 +19858,47 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                             // Hand-rms from inpL gives the correct attn input (verified relOp 0.0345).
                             // inpL itself IS buffer-reused (measured: live vs pre-delegate snapshot
                             // differ by rel=1.76), so read the snapshot taken before any delegate.
-                            std::vector<float> normed(2048, 0.0f);
-                            const float * inpL = have_inpL_snap ? inpL_snap.data()
-                                                                : (const float *)lf_m.inpL_tensor->data;
-                            {
-                                const float * gain = (const float *)lf_m.w_norm1->data;
+                            if (!lf_m.w_norm1->data || lf_m.w_norm1->type != GGML_TYPE_F32 ||
+                                lf_m.w_norm1->ne[0] != E_probe ||
+                                ggml_nelements(lf_m.w_norm1) < E_probe ||
+                                (!have_inpL_snap &&
+                                 (lf_m.inpL_tensor->type != GGML_TYPE_F32 || !lf_m.inpL_tensor->data))) {
+                                fprintf(stderr, "ggml-xdna: [f3best-probe] invalid RMS-normalization inputs q=%d\n",
+                                        lf_m.q_idx);
+                            } else {
+                                std::vector<float> normed(E_probe_size, 0.0f);
+                                const float * inpL = have_inpL_snap ? inpL_snap.data()
+                                                                    : (const float *) lf_m.inpL_tensor->data;
+                                const float * gain = (const float *) lf_m.w_norm1->data;
                                 double ss = 0.0;
-                                for (int e = 0; e < 2048; e++) ss += (double)inpL[e] * (double)inpL[e];
-                                const float inv = 1.0f / std::sqrt((float)(ss / 2048.0) + 1e-5f);
-                                for (int e = 0; e < 2048; e++) normed[e] = inpL[e] * inv * gain[e];
-                            }
+                                for (int64_t e = 0; e < E_probe; ++e) {
+                                    ss += (double) inpL[e] * (double) inpL[e];
+                                }
+                                const float inv = 1.0f / std::sqrt(
+                                    static_cast<float>(ss / static_cast<double>(E_probe)) + 1e-5f);
+                                for (int64_t e = 0; e < E_probe; ++e) {
+                                    normed[static_cast<size_t>(e)] = inpL[e] * inv * gain[e];
+                                }
 
-                            // CORRECT CPU attention output (head-major [h*64+d]), built from the
-                            // hand-rms normed + Wq + cache K/V + IL rope. This is the 0.0345 ground
+
+                                legacy_1b_geometry =
+                                    E_probe == 2048 &&
+                                    lf_m.w_q && lf_m.w_q->ne[0] == E_probe && lf_m.w_q->ne[1] == E_probe &&
+                                    lf_m.w_o && lf_m.w_o->ne[0] == E_probe && lf_m.w_o->ne[1] == E_probe &&
+                                    k_perm->ne[0] == 64 && k_perm->ne[1] > 0 && k_perm->ne[2] == 8 &&
+                                    v_perm->ne[2] == 8 &&
+                                    ((v_perm->ne[0] == 64 && v_perm->ne[1] == k_perm->ne[1]) ||
+                                     (v_perm->ne[0] == k_perm->ne[1] && v_perm->ne[1] == 64));
+                            // The generic shadow dispatch and semantic-boundary comparison below apply
+                            // to all supported runtime widths. The old attention forensics are strictly
+                            // 1B-only and run after that generic comparison.
+                            std::vector<float> cpu_attn_out;
+                            if (legacy_1b_geometry) {
+                                // CORRECT CPU attention output (head-major [h*64+d]), built from the
+                                // hand-rms normed + Wq + cache K/V + IL rope. This is the 0.0345 ground
                             // truth (pre-O-proj). Used by the head-permutation test in the f3_ok block
                             // to detect a KV-head->score-tile routing/relay scramble in f3best.
-                            std::vector<float> cpu_attn_out(2048, 0.0f);
+                                cpu_attn_out.assign(2048, 0.0f);
                             {
                                 int64_t pos0 = 0;
                                 const struct ggml_tensor * rn2 = cgraph->nodes[lf_m.q_rope_idx];
@@ -18871,7 +19926,9 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                         for(int64_t d=0;d<64;d++){double ac=0;for(int64_t p=0;p<nval;p++){const char* vp=vrc?(vd+p*v_perm->nb[1]+g*v_perm->nb[2]+d*v_perm->nb[0]):(vd+d*v_perm->nb[1]+g*v_perm->nb[2]+p*v_perm->nb[0]);ac+=(double)(scv[p]*iv)*(double)rdh(vp,vf);}cpu_attn_out[h*64+d]=(float)ac;} }
                                 }
                             }
+                            }
 
+                            if (legacy_1b_geometry) {
                             // BUG2 localization: run the EXISTING decode_front_attn kernel (Q-GEMV+
                             // rope_il+flowkv -> attn_out to DDR, SAME flowkv/rope as f3best) on the
                             // SAME hand-rms normed + cache K/V, and diff its attn_out vs cpu_attn_out
@@ -18906,17 +19963,23 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                     } else { fprintf(stderr,"ggml-xdna: [f3best-frontattn] q=%d dispatch FAILED\n", lf_m.q_idx); fflush(stderr); }
                                 }
                             }
+                            }
 
-                            std::vector<float> npu_out(2048 * 3, 0.0f);
+                            std::vector<float> npu_probe(3 * E_probe_size, 0.0f);
                             struct ggml_tensor dummy = *lf_m.outL_tensor;
-                            dummy.data = npu_out.data();
-                            dummy.nb[0] = 99;  // diagnostic: request [final|s|sum_partials] in scratch
+                            dummy.data = npu_probe.data();
+                            xdna_f3best_reduce_diagnostics diagnostics{
+                                npu_probe.data() + E_probe_size,
+                                npu_probe.data() + 2 * E_probe_size,
+                                E_probe_size,
+                            };
                             // One-shot dump of REAL e2e tensors for the FIRST f3best call (= layer 0,
                             // matching the standalone's blk.0 weights) so the standalone can validate
                             // attention/O-proj on real data instead of random K. normed.bin = 2048 f32;
                             // kv.bin = [int32 nvd, int32 nh=8][K nh*nvd*64 f32][V nh*nvd*64 f32], head-
                             // major pos-major dim-minor (= standalone Kheads[h] layout), via permute strides.
-                            {
+                            // It encodes the legacy 1B layout and must not inspect 3B tensors.
+                            if (legacy_1b_geometry) {
                                 static std::atomic<bool> dumped_real{false};
                                 bool exp_d = false;
                                 if (dumped_real.compare_exchange_strong(exp_d, true)) {
@@ -18943,55 +20006,56 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                             }
                             fprintf(stderr, "ggml-xdna: [f3best-probe] CALL decode_layer_f3best q=%d\n", lf_m.q_idx); fflush(stderr);
                             f3_ok = ggml_backend_xdna_decode_layer_f3best(
-                                ctx, &dummy, normed.data(), 2048, inpL,
+                                ctx, &dummy, normed.data(), E_probe, inpL,
                                 lf_m.w_q, lf_m.w_k, lf_m.w_v, lf_m.w_o, lf_m.w_gate, lf_m.w_up, lf_m.w_down,
-                                lf_m.w_norm2, cgraph->nodes[lf_m.q_rope_idx], k_perm, v_perm,
-                                8);
+                                lf_m.w_norm2, cgraph->nodes[lf_m.q_rope_idx], kv_match.k_perm,
+                                kv_match.v_perm, static_cast<int>(kv_match.kv_heads), &diagnostics);
                             if (f3_ok && lf_m.outL_tensor->type == GGML_TYPE_F32) {
-                                const float * cpu_out = (const float *)lf_m.outL_tensor->data;
-                                const float * s_out = npu_out.data() + 2048;
-                                const float * p_out = npu_out.data() + 4096;
-                                const float * cpu_s = have_cpu_s_snap ? cpu_s_snap.data()
-                                    : ((lf_m.add_attn_idx >= 0 && cgraph->nodes[lf_m.add_attn_idx]->type == GGML_TYPE_F32)
-                                       ? (const float *)cgraph->nodes[lf_m.add_attn_idx]->data : nullptr);
-                                double num = 0.0, den = 0.0, nums = 0.0, dens = 0.0, nump = 0.0, denp = 0.0;
-                                for (int e = 0; e < 2048; e++) {
-                                    const double d = (double)npu_out[e] - (double)cpu_out[e];
-                                    num += d*d; den += (double)cpu_out[e] * (double)cpu_out[e];
-                                    if (cpu_s) {
-                                        const double ds = (double)s_out[e] - (double)cpu_s[e];
-                                        nums += ds*ds; dens += (double)cpu_s[e] * (double)cpu_s[e];
-                                        const double cp = (double)cpu_out[e] - (double)cpu_s[e];
-                                        const double dp = (double)p_out[e] - cp;
-                                        nump += dp*dp; denp += cp*cp;
+                                const float * cpu_out = (const float *) lf_m.outL_tensor->data;
+                                const float * npu_post_attention = diagnostics.post_attention;
+                                const float * npu_ffn_contribution = diagnostics.ffn_contribution;
+                                // CPU graph buffers may be reused after the delegated range. Only the
+                                // pre-delegate snapshot is a valid post-attention reference here.
+                                const float * cpu_post_attention = have_cpu_s_snap
+                                    ? cpu_s_snap.data() : nullptr;
+
+                                static std::atomic<int> boundary_budget{64};
+                                if (boundary_budget.fetch_sub(1) > 0) {
+                                    xdna_f3best_log_boundary_metrics(
+                                        lf_m.q_idx, "final",
+                                        xdna_f3best_measure_boundary(
+                                            npu_probe.data(), cpu_out, E_probe));
+                                    if (cpu_post_attention) {
+                                        xdna_f3best_log_boundary_metrics(
+                                            lf_m.q_idx, "post_attention",
+                                            xdna_f3best_measure_boundary(
+                                                npu_post_attention, cpu_post_attention, E_probe));
+                                        std::vector<float> cpu_ffn_contribution(E_probe_size);
+                                        for (int64_t e = 0; e < E_probe; ++e) {
+                                            cpu_ffn_contribution[static_cast<size_t>(e)] =
+                                                cpu_out[e] - cpu_post_attention[e];
+                                        }
+                                        xdna_f3best_log_boundary_metrics(
+                                            lf_m.q_idx, "ffn_contribution",
+                                            xdna_f3best_measure_boundary(
+                                                npu_ffn_contribution,
+                                                cpu_ffn_contribution.data(), E_probe));
+                                    } else {
+                                        fprintf(stderr,
+                                                "ggml-xdna: [f3best-probe] q=%d post_attention and ffn_contribution "
+                                                "unavailable: CPU post-attention snapshot missing\n",
+                                                lf_m.q_idx);
                                     }
-                                }
-                                static std::atomic<int> rel_budget{64};
-                                if (rel_budget.fetch_sub(1) > 0) {
-                                    // abs norms: is NPU attn output present-but-wrong, or near-zero?
-                                    // s = O + resid; resid = inpL. O_npu = s_out - inpL ; O_cpu = cpu_s - inpL.
-                                    double nOn=0, nOc=0, nR=0;
-                                    if (cpu_s) for (int e=0;e<2048;e++){
-                                        double on=(double)s_out[e]-(double)inpL[e];
-                                        double oc=(double)cpu_s[e]-(double)inpL[e];
-                                        nOn+=on*on; nOc+=oc*oc; nR+=(double)inpL[e]*(double)inpL[e];
-                                    }
-                                    fprintf(stderr,
-                                            "ggml-xdna: [f3best-probe] q=%d rel=%.5f s=%.5f p=%.5f |Onpu|=%.4f |Ocpu|=%.4f |resid|=%.4f k=%s v=%s\n",
-                                            lf_m.q_idx, std::sqrt(num / (den + 1e-12)),
-                                            cpu_s ? std::sqrt(nums / (dens + 1e-12)) : -1.0,
-                                            cpu_s ? std::sqrt(nump / (denp + 1e-12)) : -1.0,
-                                            std::sqrt(nOn), std::sqrt(nOc), std::sqrt(nR),
-                                            k_perm->name[0] ? k_perm->name : "?",
-                                            v_perm->name[0] ? v_perm->name : "?");
                                     fflush(stderr);
                                 }
-                                // HEAD-PERMUTATION test: O_npu = s_out - inpL. Try permutations of the
-                                // CORRECT cpu_attn_out, O-project each, find which matches O_npu best.
-                                // A low rel for a non-identity perm => f3best scrambles head routing.
-                                static std::atomic<int> perm_budget{4};
-                                if (perm_budget.fetch_sub(1) > 0 && lf_m.w_o && lf_m.w_o->type == GGML_TYPE_Q4_0) {
-                                    const float * s_outp = npu_out.data() + 2048;
+                                if (legacy_1b_geometry) {
+                                    // HEAD-PERMUTATION test: O_npu = s_out - inpL. Try permutations of the
+                                    // CORRECT cpu_attn_out, O-project each, find which matches O_npu best.
+                                    // A low rel for a non-identity perm => f3best scrambles head routing.
+                                    static std::atomic<int> perm_budget{4};
+                                    if (perm_budget.fetch_sub(1) > 0 && lf_m.w_o &&
+                                        lf_m.w_o->type == GGML_TYPE_Q4_0) {
+                                        const float * s_outp = diagnostics.post_attention;
                                     const uint8_t * wob = (const uint8_t *)lf_m.w_o->data;
                                     auto oproj_rel_np = [&](const std::vector<float>& av) -> double {
                                         double on=0, od=0;
@@ -19072,9 +20136,11 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                         for(int h=0;h<32;h++) off+=snprintf(cb+off,sizeof(cb)-off," %.2f",A[h][32]);
                                         fprintf(stderr,"%s\n",cb); fflush(stderr);
                                     }
+                                    }
                                 }
                             }
                         }
+                        if (legacy_1b_geometry) {
                         // --- LAYOUT-SAFE staging reference (systematic-debugging #70) ---
                         // Replicate the EXACT f3best K/V staging formula here, feed it
                         // ggml's OWN roped-Q (rope node data) + K/V tensors, compute CPU
@@ -19303,12 +20369,15 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                 }
                             }
                         }
+                        }
+                        }
                         if (!f3_ok) {
                             static std::atomic<int> fail_budget{32};
                             if (fail_budget.fetch_sub(1) > 0) {
                                 fprintf(stderr,
                                         "ggml-xdna: [f3best-probe] skip NPU compare q=%d k=%p v=%p rope=%d inp_type=%d\n",
-                                        lf_m.q_idx, (void*)k_perm, (void*)v_perm, lf_m.q_rope_idx,
+                                        lf_m.q_idx, (void*)kv_match.k_perm, (void*)kv_match.v_perm,
+                                        lf_m.q_rope_idx,
                                         lf_m.inpL_tensor ? (int)lf_m.inpL_tensor->type : -1);
                                 fflush(stderr);
                             }
@@ -21300,6 +22369,78 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
     // Flush any remaining batched decode GEMVs before the trailing CPU run.
     if (!decode_batcher.empty()) {
         decode_batcher.flush(ctx);
+    }
+
+    // #189 Phase 3: dump the post-decoder residual that feeds output_norm ->
+    // lm_head -> logits. This is the CONVERGENCE point for BOTH the NPU path
+    // (f3best writes outL, which becomes this residual) and the CPU path (the
+    // last transformer layer's add writes it directly). A single hook here
+    // captures either path with one instrument. Env XDNA_F3BEST_CPU_RESID_DUMP=N
+    // dumps the first N tokens' residuals to cpu_resid_000K.bin (2048 f32).
+    //
+    // The residual is the INPUT to output_norm (the GGML_OP_NORM node whose
+    // output feeds lm_head). The trailing CPU range may start at node 0 (CPU
+    // baseline: the whole graph runs on CPU) or at the output_norm node (NPU
+    // path: f3best already ran the transformer layers). So we SCAN the range
+    // [cpu_run_start, n) for the NORM node and snapshot its src[0] — that's
+    // the post-decoder residual regardless of where the range begins.
+    {
+        static const bool _cpudump = xdna_env_enabled("XDNA_F3BEST_CPU_RESID_DUMP");
+        if (_cpudump && cpu_run_start >= 0 && cpu_run_start < n) {
+            struct ggml_tensor * norm_node = nullptr;
+            struct ggml_tensor * resid_tensor = nullptr;
+            int norm_idx = -1;
+            for (int j = cpu_run_start; j < n; j++) {
+                struct ggml_tensor * nd = cgraph->nodes[j];
+                if (!nd) continue;
+                if (nd->op == GGML_OP_RMS_NORM && nd->src[0] && nd->src[0]->data &&
+                    nd->src[0]->type == GGML_TYPE_F32 && nd->src[0]->ne[0] == 2048) {
+                    norm_node = nd;
+                    resid_tensor = nd->src[0];
+                    norm_idx = j;
+                    break;
+                }
+            }
+            if (resid_tensor) {
+                int ndump = [](){ const char* e = getenv("XDNA_F3BEST_CPU_RESID_DUMP");
+                                  return (e && *e) ? atoi(e) : 4; }();
+                static std::atomic<int> _nd{(ndump > 0 ? ndump : 4)};
+                int n_tok = (int)_nd.fetch_sub(1);
+                if (n_tok > 0) {
+                    int64_t tok_idx = n_tok;
+                    const char * dir = "C:/llama.cpp-xdna/dev_notes/track_a_build/f3best_drift_dump";
+                    // Auto-tag by path: if f3best LOOP is active, the residual
+                    // comes from the NPU; otherwise it's a pure-CPU reference.
+                    // XDNA_F3BEST_LOOP is set by the npu_f3best_loop* presets.
+                    static const char * tag = [](){
+                        const char * e = getenv("XDNA_F3BEST_CPU_RESID_TAG");
+                        if (e && *e) return e;
+                        return xdna_env_enabled("XDNA_F3BEST_LOOP") ? "npu" : "cpu";
+                    }();
+                    char p[260];
+                    if (tag[0])
+                        snprintf(p, sizeof(p), "%s/cpu_resid_%s_%04lld.bin", dir, tag, (long long)tok_idx);
+                    else
+                        snprintf(p, sizeof(p), "%s/cpu_resid_%04lld.bin", dir, (long long)tok_idx);
+                    const float * rd = (const float *)resid_tensor->data;
+                    double s=0; for(int e=0;e<2048;e++) s+=(double)rd[e]*(double)rd[e];
+                    if (FILE* f = fopen(p, "wb")) {
+                        fwrite(rd, 4, 2048, f);
+                        fclose(f);
+                        fprintf(stderr,"ggml-xdna: [f3best-cpuresid] dumped %s |resid|=%.5f (node %d, NORM->src[0])\n",
+                                p, std::sqrt(s/2048.0), norm_idx);
+                        fflush(stderr);
+                    }
+                }
+            } else {
+                static std::atomic<int> _warn{1};
+                if (_warn.fetch_sub(1) > 0) {
+                    fprintf(stderr,"ggml-xdna: [f3best-cpuresid] SKIP: no NORM[2048] node in range [%d,%d)\n",
+                            cpu_run_start, n);
+                    fflush(stderr);
+                }
+            }
+        }
     }
 
     // Flush trailing CPU run.

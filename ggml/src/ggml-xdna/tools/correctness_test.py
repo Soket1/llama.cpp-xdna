@@ -838,10 +838,10 @@ TESTS: list[Test] = [
         n_predict=16,
         mode="single-turn",
         model=MODEL_LLAMA_3B_Q4_0,
-        variants=["npu_f3best_loop_norr"],
+        variants=["npu_f3best_loop_tb0"],
         min_prefix_match=1,
-        description="3B f3best no-RR (#155): head_dim=128, attn_group=3. Diagnostic for #186 — "
-                    "whether f3best dispatches (LIVE/LOOP markers) or silently falls back to per-op.",
+        description="3B f3best (#187): head_dim=128, attn_group=3, single-B no-decouple. "
+                    "Verifies f3best dispatches (LIVE/LOOP markers) and token-matches CPU.",
     ),
     Test(
         name="paris_short_q4_0_phase_b",

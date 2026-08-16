@@ -14,7 +14,12 @@ import pytest
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from compile import gemm_cache_key, get_cache_dir, get_cached_xclbin
+from compile import (
+    flowkv_decode_cache_key,
+    gemm_cache_key,
+    get_cache_dir,
+    get_cached_xclbin,
+)
 
 
 class TestCacheKey:
@@ -88,6 +93,18 @@ class TestCacheKey:
             "Update this test intentionally if the scheme was changed."
         )
 
+    def test_flowkv_key_matches_native_bundle_directory_format(self):
+        assert flowkv_decode_cache_key(24, 8, 128, 256, 256, 8) == (
+            "flowkv_H24_KV8_d128_S256_C256_8col_t63624e81faf2e175"
+        )
+
+    def test_flowkv_key_tracks_normalized_tuning_identity(self):
+        baseline = flowkv_decode_cache_key(24, 8, 128, 256, 256, 8)
+        tuned = flowkv_decode_cache_key(
+            24, 8, 128, 256, 256, 8, "fe2d60c9196a71df"
+        )
+        assert baseline != tuned
+
 
 class TestCacheDirectory:
 
@@ -97,7 +114,7 @@ class TestCacheDirectory:
         env_backup = os.environ.pop("GGML_XDNA_CACHE_DIR", None)
         try:
             cache_dir = get_cache_dir()
-            assert str(cache_dir).endswith(".cache/ggml-xdna/xclbin")
+            assert cache_dir.parts[-3:] == (".cache", "ggml-xdna", "xclbin")
         finally:
             if env_backup:
                 os.environ["GGML_XDNA_CACHE_DIR"] = env_backup

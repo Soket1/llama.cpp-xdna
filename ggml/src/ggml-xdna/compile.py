@@ -15,6 +15,7 @@ import json
 import os
 import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 import aie.utils as aie_utils
@@ -307,23 +308,20 @@ def rms_norm_cache_key(size: int, dtype: str, num_aie_columns: int,
 
 def flowkv_decode_cache_key(num_heads: int, num_kv_heads: int, head_dim: int,
                             seq_len: int, chunk_size: int,
-                            num_cols: int) -> str:
-    """Cache key for a FlowKV decode attention configuration.
+                            num_cols: int,
+                            tuning_fingerprint: str = "63624e81faf2e175") -> str:
+    """Return the shared native/Python FlowKV bundle-directory key."""
+    from iron.operators.flowkv_decode.contract import flowkv_bundle_cache_key
 
-    Single xclbin with 2-tile pipeline (score + value) per KV head group.
-    Disjoint from other ops by the "op" field.
-    """
-    key_data = {
-        "op": "flowkv_decode",
-        "num_heads": num_heads,
-        "num_kv_heads": num_kv_heads,
-        "head_dim": head_dim,
-        "seq_len": seq_len,
-        "chunk_size": chunk_size,
-        "num_cols": num_cols,
-    }
-    key_json = json.dumps(key_data, sort_keys=True)
-    return hashlib.sha256(key_json.encode()).hexdigest()[:16]
+    return flowkv_bundle_cache_key(
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        seq_len,
+        chunk_size,
+        num_cols,
+        tuning_fingerprint,
+    )
 
 
 # Single-kernel xclbin: insts file is staged as "flowkv_decode_main.insts"
@@ -1241,7 +1239,8 @@ def compile_decode_back_mono(embed_dim: int, hidden_dim: int, group_size: int,
 
 def compile_decode_layer_f3best(embed_dim: int, hidden_dim: int, group_size: int,
                                 head_dim: int, num_kv_heads: int, attn_group: int,
-                                seq_len: int, output_path: str, with_npu_kv: bool = False) -> str:
+                                seq_len: int, output_path: str, with_npu_kv: bool = False,
+                                num_q_heads: int = 0) -> str:
     """Compile the full fused decode layer (F3-best, one dispatch, below IRON).
 
     8 phase-blind center tiles time-mux Q-GEMV+RoPE -> O-proj -> FFN on one weight
@@ -1260,34 +1259,40 @@ def compile_decode_layer_f3best(embed_dim: int, hidden_dim: int, group_size: int
     from iron.operators.decode_layer_f3best.op import AIEDecodeLayerF3Best
     from iron.common.context import AIEContext
 
-    build_root = os.path.join(os.path.dirname(output_path) or ".", "layer_f3best_build")
-    os.makedirs(build_root, exist_ok=True)
+    # aiecc derives a deeply nested .mlir.prj tree from the generated MLIR.
+    # Keep that transient tree at the root of the public output's volume, rather
+    # than below its long cache path, then stage the completed artifacts back to
+    # the caller-selected cache identity below.
+    output_abs = os.path.abspath(output_path)
+    output_drive, _ = os.path.splitdrive(output_abs)
+    build_parent = output_drive + os.path.sep if output_drive else tempfile.gettempdir()
+    with tempfile.TemporaryDirectory(prefix="f3b_", dir=build_parent) as build_root:
+        op = AIEDecodeLayerF3Best(
+            embed_dim=embed_dim,
+            hidden_dim=hidden_dim,
+            K_gemv=embed_dim,
+            head_dim=head_dim,
+            group_size=group_size,
+            attn_group=attn_group,
+            num_kv_heads=num_kv_heads,
+            m_input=4,
+            seq_len=seq_len,
+            num_q_heads=num_q_heads,
+            with_npu_kv=with_npu_kv,
+            context=AIEContext(build_dir=build_root),
+        )
+        op.compile()
 
-    op = AIEDecodeLayerF3Best(
-        embed_dim=embed_dim,
-        hidden_dim=hidden_dim,
-        K_gemv=embed_dim,
-        head_dim=head_dim,
-        group_size=group_size,
-        attn_group=attn_group,
-        num_kv_heads=num_kv_heads,
-        m_input=4,
-        seq_len=seq_len,
-        with_npu_kv=with_npu_kv,
-        context=AIEContext(build_dir=build_root),
-    )
-    op.compile()
+        build_dir = op.context.build_dir
+        compiled_xclbin = build_dir / op.xclbin_artifact.filename
+        compiled_insts = build_dir / op.insts_artifact.filename
 
-    build_dir = op.context.build_dir
-    compiled_xclbin = build_dir / op.xclbin_artifact.filename
-    compiled_insts = build_dir / op.insts_artifact.filename
-
-    outdir = os.path.dirname(output_path)
-    if outdir:
-        os.makedirs(outdir, exist_ok=True)
-    shutil.copy2(str(compiled_xclbin), output_path)
-    insts_output = output_path.replace(".xclbin", ".insts")
-    shutil.copy2(str(compiled_insts), insts_output)
+        outdir = os.path.dirname(output_path)
+        if outdir:
+            os.makedirs(outdir, exist_ok=True)
+        shutil.copy2(str(compiled_xclbin), output_path)
+        insts_output = output_path.replace(".xclbin", ".insts")
+        shutil.copy2(str(compiled_insts), insts_output)
 
     return output_path
 
@@ -1937,7 +1942,8 @@ def _stage_flowkv_decode_artifacts(op, output_dir: str) -> None:
 
 def compile_flowkv_decode(num_heads: int, num_kv_heads: int, head_dim: int,
                           seq_len: int, chunk_size: int = 32,
-                          num_cols: int = 4, output_dir: str = "") -> str:
+                          num_cols: int = 4, output_dir: str = "",
+                          tuning_tokens: tuple[str, ...] = ()) -> str:
     """Compile a FlowKV decode attention operator.
 
     Produces one xclbin with a 2-tile streaming pipeline (score + value)
@@ -1948,8 +1954,10 @@ def compile_flowkv_decode(num_heads: int, num_kv_heads: int, head_dim: int,
         <output_dir>/combined.xclbin
         <output_dir>/flowkv_decode_main.insts
     """
+    from iron.operators.flowkv_decode.contract import normalize_flowkv_tuning_tokens
     from iron.operators.flowkv_decode.op import AIEFlowKVDecode
 
+    tuning_tokens = normalize_flowkv_tuning_tokens(tuning_tokens)
     op = AIEFlowKVDecode(
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
@@ -1957,6 +1965,7 @@ def compile_flowkv_decode(num_heads: int, num_kv_heads: int, head_dim: int,
         seq_len=seq_len,
         chunk_size=chunk_size,
         num_cols=num_cols,
+        tuning_tokens=tuning_tokens,
     )
     op.compile()
 
@@ -1967,14 +1976,27 @@ def compile_flowkv_decode(num_heads: int, num_kv_heads: int, head_dim: int,
 def compile_flowkv_decode_cached(num_heads: int, num_kv_heads: int,
                                  head_dim: int, seq_len: int,
                                  chunk_size: int = 32,
-                                 num_cols: int = 4) -> Path:
+                                 num_cols: int = 4,
+                                 tuning_tokens: tuple[str, ...] = ()) -> Path:
     """Compile a FlowKV decode attention operator with caching.
 
     Returns path to the cache directory containing combined.xclbin and
     flowkv_decode_main.insts.
     """
+    from iron.operators.flowkv_decode.contract import (
+        flowkv_tuning_fingerprint,
+        normalize_flowkv_tuning_tokens,
+    )
+
+    tuning_tokens = normalize_flowkv_tuning_tokens(tuning_tokens)
     key = flowkv_decode_cache_key(
-        num_heads, num_kv_heads, head_dim, seq_len, chunk_size, num_cols
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        seq_len,
+        chunk_size,
+        num_cols,
+        flowkv_tuning_fingerprint(tuning_tokens),
     )
 
     cached = get_cached_chained_dir(
@@ -1985,8 +2007,14 @@ def compile_flowkv_decode_cached(num_heads: int, num_kv_heads: int,
 
     output_dir = str(get_cache_dir() / key)
     compile_flowkv_decode(
-        num_heads, num_kv_heads, head_dim, seq_len, chunk_size, num_cols,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        seq_len,
+        chunk_size,
+        num_cols,
         output_dir,
+        tuning_tokens,
     )
     return Path(output_dir)
 
@@ -3158,6 +3186,8 @@ def main():
     f3best_parser.add_argument("--head-dim", type=int, default=64)
     f3best_parser.add_argument("--num-kv-heads", type=int, default=8)
     f3best_parser.add_argument("--attn-group", type=int, default=4)
+    f3best_parser.add_argument("--num-q-heads", type=int, default=0,
+                               help="Q heads for relay NUM_HEADS (0=derive attn_group*num_kv_heads)")
     f3best_parser.add_argument("--seq-len", type=int, default=32)
     f3best_parser.add_argument("--with-npu-kv", action="store_true",
                                help="Compile the expanded K/V-projection ABI")
@@ -3365,6 +3395,8 @@ def main():
                              help="K/V chunk size for streaming (default: 32)")
     fkvd_parser.add_argument("--num-cols", type=int, default=4,
                              help="Number of AIE columns (default: 4)")
+    fkvd_parser.add_argument("--flowkv-cflag", action="append", default=[],
+                             help="Optional validated FlowKV tuning definition")
     fkvd_parser.add_argument("--out", type=str,
                              help="Output directory (default: cache)")
 
@@ -3574,6 +3606,7 @@ def main():
             args.embed_dim, args.hidden_dim, args.group_size,
             args.head_dim, args.num_kv_heads, args.attn_group,
             args.seq_len, args.out, args.with_npu_kv,
+            args.num_q_heads,
         )
         if not args.quiet:
             print(path)
@@ -3734,14 +3767,24 @@ def main():
     elif args.op == "flowkv-decode":
         if args.out:
             path = compile_flowkv_decode(
-                args.num_heads, args.num_kv_heads, args.head_dim,
-                args.seq_len, args.chunk_size, args.num_cols,
+                args.num_heads,
+                args.num_kv_heads,
+                args.head_dim,
+                args.seq_len,
+                args.chunk_size,
+                args.num_cols,
                 args.out,
+                tuple(args.flowkv_cflag),
             )
         else:
             path = compile_flowkv_decode_cached(
-                args.num_heads, args.num_kv_heads, args.head_dim,
-                args.seq_len, args.chunk_size, args.num_cols,
+                args.num_heads,
+                args.num_kv_heads,
+                args.head_dim,
+                args.seq_len,
+                args.chunk_size,
+                args.num_cols,
+                tuple(args.flowkv_cflag),
             )
         if not args.quiet:
             print(path)
