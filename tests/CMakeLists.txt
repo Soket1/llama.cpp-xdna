@@ -239,6 +239,35 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
 endif()
 llama_build_and_test(test-gguf.cpp)
 llama_build_and_test(test-backend-ops.cpp)
+add_executable(
+    test-xdna-f3best-reduce
+    test-xdna-f3best-reduce.cpp
+    ${PROJECT_SOURCE_DIR}/ggml/src/ggml-xdna/xdna-f3best-reduce.cpp
+)
+target_include_directories(test-xdna-f3best-reduce PRIVATE
+    ${PROJECT_SOURCE_DIR}/ggml/src/ggml-xdna
+)
+if (MSVC)
+    target_compile_options(test-xdna-f3best-reduce PRIVATE /std:c++17 /Zc:__cplusplus)
+else()
+    target_compile_features(test-xdna-f3best-reduce PRIVATE cxx_std_17)
+endif()
+add_test(
+    NAME test-xdna-f3best-reduce
+    COMMAND $<TARGET_FILE:test-xdna-f3best-reduce>
+)
+set_property(TEST test-xdna-f3best-reduce PROPERTY LABELS main)
+
+llama_build_and_test(test-f3best-abi.cpp)
+target_include_directories(test-f3best-abi PRIVATE
+    ${PROJECT_SOURCE_DIR}/ggml/src/ggml-xdna
+)
+if (MSVC)
+    target_compile_options(test-f3best-abi PRIVATE /std:c++17 /Zc:__cplusplus)
+else()
+    target_compile_features(test-f3best-abi PRIVATE cxx_std_17)
+endif()
+set_property(TEST test-f3best-abi PROPERTY LABELS main)
 
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")

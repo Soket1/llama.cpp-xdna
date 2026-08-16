@@ -37,13 +37,19 @@ if (XRT_INCLUDE_DIR AND XRT_COREUTIL_LIB)
 
     # Heavy aiebu includes are isolated in aiebu_wrapper.cpp so they don't
     # pollute ggml-xdna.cpp's compile when aiebu is enabled.
-    set(GGML_XDNA_SRCS ggml-xdna.cpp)
+    set(GGML_XDNA_SRCS
+        ggml-xdna.cpp
+        xdna-f3best-reduce.cpp
+    )
     if (GGML_XDNA_USE_AIEBU)
         list(APPEND GGML_XDNA_SRCS aiebu_wrapper.cpp)
     endif()
     ggml_add_backend_library(ggml-xdna ${GGML_XDNA_SRCS})
 
-    target_include_directories(ggml-xdna SYSTEM PRIVATE ${XRT_INCLUDE_DIR})
+    target_include_directories(ggml-xdna SYSTEM PRIVATE
+        ${XRT_INCLUDE_DIR}
+        ${CMAKE_SOURCE_DIR}/vendor
+    )
     target_link_libraries(ggml-xdna PRIVATE ${XRT_COREUTIL_LIB} ggml-base ggml-cpu)
 
     if (GGML_XDNA_USE_AIEBU)
