@@ -6300,20 +6300,24 @@ static bool ggml_backend_xdna_decode_layer_f3best(
                             fprintf(stderr, "ggml-xdna: [posmap] seq=0 head0 pos0..63 %s\n", p60.c_str());
                         }
                     }
-                    // #3: CPU-Q for head 0 (rows 0..255 = q-heads 0-3) with the EXACT
+                    // #3: CPU-Q for the first attn-group (q-heads 0..ag-1) with the EXACT
                     // dequant semantics of _qkv_bcast_chunk (nib-8, group=32, per-group
                     // bf16 scale), + rope_bundled (positional RoPE) + flowkv prescale
-                    // (1/sqrt(head_dim) = 0.125, FLOWKV_PRESCALE_Q=1). Compares finite
-                    // NPU Q (s - resid) vs CPU Q: rel-error + NaN-row correlation.
+                    // (1/sqrt(head_dim)). Compares finite NPU Q (s - resid) vs CPU Q:
+                    // rel-error + NaN-row correlation. #235: generalized to any geometry
+                    // (was hardcoded E==2048, ck=256, b<64, hh2<4, hd=64, 0.125).
                     if (_qc == 0 && q_w && q_w->type == GGML_TYPE_Q4_0 &&
-                        q_w->ne[0] == E && q_w->ne[1] == E && input_snap && E == 2048) {
-                        const int64_t ck = 256;
-                        std::vector<float> cpuq(ck, 0.0f);
+                        q_w->ne[0] == E && q_w->ne[1] == E && input_snap && head_dim > 0) {
+                        const int64_t ag_f   = attn_group;
+                        const int64_t hd_f   = head_dim;
+                        const int64_t ck     = ag_f * hd_f;          // q_rows (1B:256, 3B:384)
+                        const int64_t nblk   = E / group_size;       // Q4_0 blocks per row (1B:64, 3B:96)
+                        std::vector<float> cpuq((size_t)ck, 0.0f);
                         const uint8_t * qwb = (const uint8_t *)q_w->data;
                         for (int64_t n = 0; n < ck; n++) {
-                            const uint8_t * row = qwb + (size_t)n * 64 * 18;
+                            const uint8_t * row = qwb + (size_t)n * (size_t)nblk * 18;
                             double a = 0;
-                            for (int64_t b = 0; b < 64; b++) {
+                            for (int64_t b = 0; b < nblk; b++) {
                                 const uint8_t * blk = row + b*18;
                                 ggml_fp16_t sh; memcpy(&sh, blk, 2); float sc = ggml_fp16_to_fp32(sh);
                                 const uint8_t * qs = blk + 2;
@@ -6329,19 +6333,20 @@ static bool ggml_backend_xdna_decode_layer_f3best(
                             pos0 = ((const int32_t *)rope_node->src[1]->data)[0];
                         float fb = 10000.0f;
                         if (rope_node) { const int32_t * pp = (const int32_t *)rope_node->op_params; memcpy(&fb, pp + 5, 4); }
-                        for (int hh2 = 0; hh2 < 4; hh2++) {
-                            float * q = &cpuq[hh2 * 64];
+                        for (int hh2 = 0; hh2 < ag_f; hh2++) {
+                            float * q = &cpuq[hh2 * hd_f];
                             float th = 1.0f;
-                            for (int i = 0; i < 32; i++) {
+                            for (int i = 0; i < hd_f/2; i++) {
                                 float ang = (float)pos0 * th;
                                 float c = std::cos(ang), s = std::sin(ang);
                                 float x0 = q[2*i], x1 = q[2*i+1];
                                 q[2*i]   = x0*c - x1*s;
                                 q[2*i+1] = x0*s + x1*c;
-                                th *= std::pow(fb, -2.0f/64.0f);
+                                th *= std::pow(fb, -2.0f/(float)hd_f);
                             }
                         }
-                        for (int64_t n = 0; n < ck; n++) cpuq[n] *= 0.125f;
+                        const float inv_sqrt_hd = 1.0f / std::sqrt((float)hd_f);
+                        for (int64_t n = 0; n < ck; n++) cpuq[n] *= inv_sqrt_hd;
                         double nf_num = 0, nf_den = 0; int nf_cnt = 0; double cpu_mx = 0;
                         int nanrows = 0; double nanrow_cpu_energy = 0, finrow_cpu_energy = 0;
                         for (int64_t e = 0; e < ck; e++) {
@@ -6357,8 +6362,8 @@ static bool ggml_backend_xdna_decode_layer_f3best(
                                 finrow_cpu_energy += cv*cv;
                             }
                         }
-                        fprintf(stderr, "ggml-xdna: [qdump-cpuq] seq=0 head0 rows=256 finite=%d rel_err=%.5f |npu_fin|^2=%g |cpu|^2=%g NaN+inf_rows=%d nanrow_cpu|^2=%g finrow_cpu|^2=%g max|cpu|=%g\n",
-                                nf_cnt, std::sqrt(nf_num/(nf_den+1e-12)), nf_num, nf_den, nanrows, nanrow_cpu_energy, finrow_cpu_energy, cpu_mx);
+                        fprintf(stderr, "ggml-xdna: [qdump-cpuq] seq=0 ag=%lld hd=%lld rows=%lld finite=%d rel_err=%.5f |npu_fin|^2=%g |cpu|^2=%g NaN+inf_rows=%d nanrow_cpu|^2=%g finrow_cpu|^2=%g max|cpu|=%g\n",
+                                (long long)ag_f, (long long)hd_f, (long long)ck, nf_cnt, std::sqrt(nf_num/(nf_den+1e-12)), nf_num, nf_den, nanrows, nanrow_cpu_energy, finrow_cpu_energy, cpu_mx);
                         // plausible-magnitude fallback for finite NPU Q
                         double nq2 = 0; int nqn = 0;
                         for (int64_t e = 0; e < ck; e++) {
