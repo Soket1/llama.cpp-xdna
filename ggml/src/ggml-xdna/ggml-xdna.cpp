@@ -5357,19 +5357,16 @@ static bool ggml_backend_xdna_decode_layer_f3best(
     const int64_t PER_TILE = abi.per_tile;             // E/NH rows per tile for Q/O
     const int64_t KV_M = with_npu_kv ? 128 : 0;
     const size_t  PACKED   = abi.packed;   // 1B:4608, 3B:6912
-    // Per-tile layout: [nibble region | scale region]. The nibble region holds
-    // M rows of E/2 packed int4 nibbles = M*E/2 bytes; the scale region holds
-    // M rows of (E/group_size) bf16 group scales = M*(E/group_size)*2 bytes.
-    // The historical diff-test constants hardcoded 4096 = bcast_kc*(bcast_n/2)
-    // = 1B's nibble-region size (M=4,E=2048 -> 4096). For 3B (M=4,E=3072) the
-    // nibble region is 6144 bytes and scales begin at offset 6144, so the 4096
-    // constant zeroed only the first 4096 of 6144 nibble bytes — leaving 2048
-    // real nibbles, which made EVERY diff-test (NIB0/ZERONIB/ZEROSC/ZEROGU/
-    // ONESC/DOWNSEL) produce non-zero garbage on 3B and invalidated their
-    // verdicts. SCALE_OFF is the byte offset where scales start (= nibble size).
-    const size_t  NIBBLE_BYTES = (size_t)M * (size_t)E / 2;   // 1B:4096, 3B:6144
-    const size_t  SCALE_OFF    = NIBBLE_BYTES;                 // scales begin here
-    const size_t  SCALE_BYTES  = PACKED - NIBBLE_BYTES;        // 1B:512, 3B:768
+    // Per-tile layout written by pack_bcast: [nibble region | scale region | pad].
+    // pack_bcast always writes KC*(N/2)=256*16=4096 nibble bytes then sg_per_chunk*N
+    // = 8*32 = 256 bf16 scales (512 bytes) into EACH PACKED-byte tile, regardless of
+    // E/M. NIBBLE_BYTES and SCALE_OFF are therefore the per-tile constants 4096 and
+    // 4096 (NOT M*E/2 — that would be the total across all M*E, not per tile). The
+    // 3B PACKED=6912 has 4096 nibbles + 512 scales + 2304 pad; scales still begin at
+    // 4096. The diff-tests below must use these per-tile constants, not geometry.
+    const size_t  NIBBLE_BYTES = 4096;                  // KC*(N/2), per-tile, geometry-independent
+    const size_t  SCALE_OFF    = NIBBLE_BYTES;          // scales begin at 4096 in each tile
+    const size_t  SCALE_BYTES  = PACKED - NIBBLE_BYTES;  // 1B:512, 3B:2816 (includes pad after scales)
     const int64_t Q_T      = abi.q_t;                  // Q/O weight tiles (1B:64, 3B:144)
     const int64_t GU_T     = abi.gu_t;                 // gate/up weight tiles (1B:256, 3B:384)
     const int64_t DN_T     = abi.dn_t;                 // down weight tiles (1B:256, 3B:384)
