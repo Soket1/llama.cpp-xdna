@@ -1608,10 +1608,10 @@ static std::string make_cache_key(xdna_op_kind op_kind,
                  (long long)head_dim, (long long)attn_group,
                  flowkv_obj_fingerprint);
         if (ffn_div && strcmp(ffn_div, "1") != 0) {
-            snprintf(buf, sizeof(buf), "decode_layer_f3best_%lldx%lld_d%lld_g%lld_s%lld_a%lld_q%lld_kv%lld_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac_ug%s_d%s%s%s%s%s%s%s%s_fkfix2_silu2_mxpp_objid2_abi3",
+            snprintf(buf, sizeof(buf), "decode_layer_f3best_%lldx%lld_d%lld_g%lld_s%lld_a%lld_q%lld_kv%lld_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac_ug%s_d%s%s%s%s%s%s%s%s_fkfix2_silu2_mxpp_objid2_abi3_al64",
                      (long long)K, (long long)N, (long long)head_dim, (long long)32, (long long)256, (long long)attn_group, (long long)num_q, (long long)8, kv_abi, ffn_div, dc_suffix, tb_suffix, rr_suffix, qdump_suffix, b0dump_suffix, uni_suffix, flowkv_obj_tag);
         } else {
-            snprintf(buf, sizeof(buf), "decode_layer_f3best_%lldx%lld_d%lld_g%lld_s%lld_a%lld_q%lld_kv%lld_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac_ug2%s%s%s%s%s%s%s%s_fkfix2_silu2_mxpp_objid2_abi3",
+            snprintf(buf, sizeof(buf), "decode_layer_f3best_%lldx%lld_d%lld_g%lld_s%lld_a%lld_q%lld_kv%lld_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac_ug2%s%s%s%s%s%s%s%s_fkfix2_silu2_mxpp_objid2_abi3_al64",
                      (long long)K, (long long)N, (long long)head_dim, (long long)32, (long long)256, (long long)attn_group, (long long)num_q, (long long)8, kv_abi, dc_suffix, tb_suffix, rr_suffix, qdump_suffix, b0dump_suffix, uni_suffix, flowkv_obj_tag);
         }
     } else {
@@ -5299,6 +5299,13 @@ static bool ggml_backend_xdna_decode_layer_f3best(
     static std::atomic<int> f3b_layer_count{0};
     int f3b_layer_n = f3b_layer_count.fetch_add(1);
     fprintf(stderr, "f3best ENTER layer_n=%d input_E=%lld\n", f3b_layer_n, (long long)input_E); fflush(stderr);
+    static std::atomic<int> _nh_diag{1};
+    if (_nh_diag.fetch_sub(1) > 0 && k_perm && v_perm && q_w) {
+        int64_t hd_ = k_perm->ne[0], nkv_ = k_perm->ne[2], nq_ = q_w->ne[1]/hd_;
+        fprintf(stderr, "ggml-xdna: [f3best-nh] NH_hardcoded=%lld k_hd=%lld nkv=%lld nq=%lld AG=%lld E=%lld\n",
+                (long long)8, (long long)hd_, (long long)nkv_, (long long)nq_, (long long)(nkv_?nq_/nkv_:0), (long long)input_E);
+        fflush(stderr);
+    }
     if (q_w->type != GGML_TYPE_Q4_0 || k_w->type != GGML_TYPE_Q4_0 ||
         v_w->type != GGML_TYPE_Q4_0 || o_w->type != GGML_TYPE_Q4_0 ||
         gate_w->type != GGML_TYPE_Q4_0 || up_w->type != GGML_TYPE_Q4_0 ||
@@ -5317,14 +5324,21 @@ static bool ggml_backend_xdna_decode_layer_f3best(
     const int64_t seq_len   = k_perm->ne[1];
     const int64_t num_kv    = k_perm->ne[2];
     const int64_t num_q     = q_w->ne[1] / head_dim;
+    const bool with_npu_kv = xdna_env_enabled("XDNA_F3BEST_NPU_KV");
     const int64_t attn_group = num_kv ? num_q / num_kv : 0;
+    // #235: NH is the FFN/attention PARTIAL-HEAD tile count used by the emitter
+    // output BO layout (NH=8 partial streams + attention residual at NH*PH_STRIDE).
+    // It MUST match the emitter's make_f3best_host_abi(NH=8) and the xclbin's
+    // hardcoded partial-head count — it is NOT num_q. Changing it to num_q (24 for
+    // 3B) breaks the read offset (host reads s_blk at 24*PH_STRIDE, kernel writes at
+    // 8*PH_STRIDE) → npu_post reads as zero. Verified 2026-08-18 via f3best-sblk.
     // Geometry guard: E and H must divide evenly into NH tiles; attention params
     // #155: attention params parametric — flowkv kernel compiled per (HD, AG, SEQ)
 
     if (E % NH != 0 || hidden % NH != 0) { fprintf(stderr,"f3best guard geom fail E=%lld H=%lld (must be divisible by NH=%lld)\n",(long long)E,(long long)hidden,(long long)NH); return false; }
     if (seq_len < 32) { fprintf(stderr,"f3best guard seq fail seq=%lld\n",(long long)seq_len); return false; }
 
-    const bool with_npu_kv = xdna_env_enabled("XDNA_F3BEST_NPU_KV");
+    // with_npu_kv declared above; NH=8 is the emitter/output partial-head count.
     // #235: single shared host-ABI descriptor (f3best_pack.h). Every XR span, tile
     // count, per-phase A-stream offset, and byte size below is derived from live
     // geometry so dispatch/packers/kernel cannot drift. PACKED is the per-tile byte
@@ -5332,7 +5346,11 @@ static bool ggml_backend_xdna_decode_layer_f3best(
     // group scales — M*E/2 + M*(E/g)*2, equal to the emitter's PACKED (1B:4608,
     // 3B:6912). It is NOT the fixed 4608-byte bcast payload; keep it derived from M.
     const f3b::f3best_host_abi abi = f3b::make_f3best_host_abi(
-        E, hidden, head_dim, attn_group, with_npu_kv);
+        E, hidden, head_dim, attn_group, with_npu_kv, M);
+    // NOTE: make_f3best_host_abi computes H8=hidden/NH internally with NH=8
+    // (the FFN tile count), NOT the attention NH. The attention NH (24 for 3B)
+    // only drives the partial-head stride in the output BO below, and is kept
+    // in the local NH variable, not passed into the ABI struct.
     const int64_t H8  = abi.H8;                        // hidden per tile
     const int64_t HH  = hidden;                        // full hidden
     const int64_t q_rows = abi.q_rows;                 // AG*HD (1B:256, 3B:384)
@@ -5362,12 +5380,9 @@ static bool ggml_backend_xdna_decode_layer_f3best(
     if (!ensure_compiled(ctx, cache_key, XDNA_OP_DECODE_LAYER_F3BEST,
                          seq_len, E, hidden, "uint4", num_cols,
                          nullptr, head_dim, attn_group, num_kv, num_q)) { fprintf(stderr,"f3best ensure_compiled failed cache=%s\n", cache_key.c_str()); return false; }
-
     xdna_kernel_entry * entry = get_or_load_kernel(ctx, cache_key,
                                                    XDNA_OP_DECODE_LAYER_F3BEST, seq_len, E, hidden);
     if (!entry) { fprintf(stderr,"f3best get_or_load failed cache=%s\n", cache_key.c_str()); return false; }
-
-
     try {
         static const bool f3b_gluetime = xdna_env_enabled("XDNA_F3BEST_GLUETIME");
         static const bool f3b_debug = xdna_env_enabled("XDNA_F3BEST_DEBUG");
@@ -5882,6 +5897,16 @@ static bool ggml_backend_xdna_decode_layer_f3best(
                 }
             }
         }
+        // XDNA_F3BEST_KVREPL=1: replicate KV head 0 into all NH heads after fill.
+        // With F3BEST_SAMEW (all tiles full same A-stream), every column then receives
+        // identical weights AND identical K/V — so all 8 attn_out/O columns MUST come
+        // out identical. Any column divergence = delivery/relay defect in that column.
+        if (xdna_env_enabled("XDNA_F3BEST_KVREPL")) {
+            for (int64_t g = 1; g < NH; g++) {
+                memcpy(kv + (size_t)g * KVN, kv, (size_t)KVN * dts);
+                memcpy(kv + (size_t)(NH + g) * KVN, kv + (size_t)NH * KVN, (size_t)KVN * dts);
+            }
+        }
         if (f3b_kv_verify) {
             std::vector<uint16_t> kv_ref((size_t)2 * NH * KVN, (uint16_t)0);
             for (int64_t g = 0; g < NH; g++) {
@@ -6114,6 +6139,23 @@ static bool ggml_backend_xdna_decode_layer_f3best(
         const auto _gt_red0 = std::chrono::steady_clock::now();
         const uint16_t * ob = (const uint16_t *)entry->c_bo->map<void*>();
         auto bf16f = [](uint16_t b)->float{ uint32_t u=((uint32_t)b)<<16; float v; memcpy(&v,&u,4); return v; };
+        // #235 DEBUG: check s_blk at NH vs at 8 (xclbin may hardcode 8 partial heads)
+        {
+            static std::atomic<int> _sbin{1};
+            if (_sbin.fetch_sub(1) > 0) {
+                float s_at_NH = 0.0f, s_at_8 = 0.0f;
+                double sum_nh = 0, sum_8 = 0;
+                for (int64_t e = 0; e < std::min(E, (int64_t)256); e++) {
+                    s_at_NH = std::max(s_at_NH, std::fabs(bf16f(ob[(size_t)NH * PH_STRIDE + e])));
+                    s_at_8  = std::max(s_at_8,  std::fabs(bf16f(ob[(size_t)8 * PH_STRIDE + e])));
+                    sum_nh += (double)bf16f(ob[(size_t)NH * PH_STRIDE + e]) * bf16f(ob[(size_t)NH * PH_STRIDE + e]);
+                    sum_8  += (double)bf16f(ob[(size_t)8 * PH_STRIDE + e]) * bf16f(ob[(size_t)8 * PH_STRIDE + e]);
+                }
+                fprintf(stderr, "ggml-xdna: [f3best-sblk] NH=%lld PH_STRIDE=%zu E=%lld | s@NH max=%.5f l2=%.5f | s@8 max=%.5f l2=%.5f | ob_total=%zu\n",
+                        (long long)NH, PH_STRIDE, (long long)E, s_at_NH, std::sqrt(sum_nh/256.0),
+                        s_at_8, std::sqrt(sum_8/256.0), OUT_ELEMS); fflush(stderr);
+            }
+        }
         const uint16_t * s_blk = ob + (size_t)NH * PH_STRIDE;
         // #188 Ш21 Direct-NPU Q dump: in qdump mode each score tile relayed its
         // roped-Q (PT elems) into this SAME s-region (via the O_h relay -> oJ/oK ->
@@ -19847,9 +19889,46 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
 
                         bool f3_ok = false;
                         bool legacy_1b_geometry = false;
+                        bool geometry_3b = false;
                         if (have_kv_match && lf_m.q_rope_idx >= 0) {
                             struct ggml_tensor * const k_perm = kv_match.k_perm;
                             struct ggml_tensor * const v_perm = kv_match.v_perm;
+                            // cpu_attn_out is declared at the if(have_kv_match) scope (NOT inside the
+                            // if(!w_norm1)...else below) so the staging-reference block — which lives
+                            // OUTSIDE that else — can compare against it for 3B geometry.
+                            std::vector<float> cpu_attn_out;
+                            const int64_t hd_f = k_perm->ne[0];
+                            const int64_t nq_f = (E_probe == 2048) ? 32 : 24;
+                            const int64_t nblocks_row = E_probe / 32;
+                            const int64_t ag_f = (E_probe == 2048) ? 4 : 3;
+                            // Geometry flags: must be detectable even if RMS-norm path is skipped.
+                            legacy_1b_geometry =
+                                E_probe == 2048 &&
+                                lf_m.w_q && lf_m.w_q->ne[0] == E_probe && lf_m.w_q->ne[1] == E_probe &&
+                                lf_m.w_o && lf_m.w_o->ne[0] == E_probe && lf_m.w_o->ne[1] == E_probe &&
+                                k_perm->ne[0] == 64 && k_perm->ne[1] > 0 && k_perm->ne[2] == 8 &&
+                                v_perm->ne[2] == 8 &&
+                                ((v_perm->ne[0] == 64 && v_perm->ne[1] == k_perm->ne[1]) ||
+                                 (v_perm->ne[0] == k_perm->ne[1] && v_perm->ne[1] == 64));
+                            geometry_3b =
+                                E_probe == 3072 &&
+                                lf_m.w_q && lf_m.w_q->ne[0] == E_probe && lf_m.w_q->ne[1] == 24*128 &&
+                                lf_m.w_o && lf_m.w_o->ne[0] == E_probe && lf_m.w_o->ne[1] == 24*128 &&
+                                k_perm->ne[0] == 128 && k_perm->ne[1] > 0 && k_perm->ne[2] == 8 &&
+                                v_perm->ne[2] == 8 &&
+                                ((v_perm->ne[0] == 128 && v_perm->ne[1] == k_perm->ne[1]) ||
+                                 (v_perm->ne[0] == k_perm->ne[1] && v_perm->ne[1] == 128));
+                            static std::atomic<int> geom_diag_count{1};
+                            if (geom_diag_count.fetch_sub(1) > 0) {
+                                fprintf(stderr, "ggml-xdna: [f3best-geom] q=%d E_probe=%lld w_q->ne=[%lld,%lld] w_o->ne=[%lld,%lld] k.ne=[%lld,%lld,%lld] v.ne=[%lld,%lld,%lld] legacy1b=%d geom3b=%d\n",
+                                        lf_m.q_idx, (long long)E_probe,
+                                        (long long)lf_m.w_q->ne[0], (long long)lf_m.w_q->ne[1],
+                                        (long long)lf_m.w_o->ne[0], (long long)lf_m.w_o->ne[1],
+                                        (long long)k_perm->ne[0], (long long)k_perm->ne[1], (long long)k_perm->ne[2],
+                                        (long long)v_perm->ne[0], (long long)v_perm->ne[1], (long long)v_perm->ne[2],
+                                        (int)legacy_1b_geometry, (int)geometry_3b);
+                                fflush(stderr);
+                            }
                             // normed = rms_norm(inpL)*gain computed from the RELIABLE inpL (layer
                             // input/residual, never buffer-reused). The graph's attn-norm node
                             // (q-node src[1]) is STALE here — ggml reuses its buffer after the
@@ -19889,16 +19968,25 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                     v_perm->ne[2] == 8 &&
                                     ((v_perm->ne[0] == 64 && v_perm->ne[1] == k_perm->ne[1]) ||
                                      (v_perm->ne[0] == k_perm->ne[1] && v_perm->ne[1] == 64));
+                                geometry_3b =
+                                    E_probe == 3072 &&
+                                    lf_m.w_q && lf_m.w_q->ne[0] == E_probe && lf_m.w_q->ne[1] == 24*128 &&
+                                    lf_m.w_o && lf_m.w_o->ne[0] == E_probe && lf_m.w_o->ne[1] == 24*128 &&
+                                    k_perm->ne[0] == 128 && k_perm->ne[1] > 0 && k_perm->ne[2] == 8 &&
+                                    v_perm->ne[2] == 8 &&
+                                    ((v_perm->ne[0] == 128 && v_perm->ne[1] == k_perm->ne[1]) ||
+                                     (v_perm->ne[0] == k_perm->ne[1] && v_perm->ne[1] == 128));
                             // The generic shadow dispatch and semantic-boundary comparison below apply
-                            // to all supported runtime widths. The old attention forensics are strictly
-                            // 1B-only and run after that generic comparison.
-                            std::vector<float> cpu_attn_out;
-                            if (legacy_1b_geometry) {
-                                // CORRECT CPU attention output (head-major [h*64+d]), built from the
+                            // to all supported runtime widths. The old attention forensics run for
+                            // both 1B and 3B geometries (legacy_1b_geometry || geometry_3b).
+                            // hd_f, nq_f, nblocks_row, ag_f, and cpu_attn_out are declared above
+                            // at the if(have_kv_match) scope for use by the staging-reference block.
+                            if (legacy_1b_geometry || geometry_3b) {
+                                // CORRECT CPU attention output (head-major [h*hd+d]), built from the
                                 // hand-rms normed + Wq + cache K/V + IL rope. This is the 0.0345 ground
                             // truth (pre-O-proj). Used by the head-permutation test in the f3_ok block
                             // to detect a KV-head->score-tile routing/relay scramble in f3best.
-                                cpu_attn_out.assign(2048, 0.0f);
+                                cpu_attn_out.assign((size_t)E_probe, 0.0f);
                             {
                                 int64_t pos0 = 0;
                                 const struct ggml_tensor * rn2 = cgraph->nodes[lf_m.q_rope_idx];
@@ -19908,27 +19996,28 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                 const int64_t n_cap = k_perm->ne[1];
                                 const int64_t nval = (pos0+1 < n_cap) ? (pos0+1) : n_cap;
                                 const struct ggml_tensor * wqT2 = lf_m.w_q;
-                                if (wqT2 && wqT2->data && wqT2->type==GGML_TYPE_Q4_0 && wqT2->ne[0]==2048 && wqT2->ne[1]==2048) {
+                                if (wqT2 && wqT2->data && wqT2->type==GGML_TYPE_Q4_0 && wqT2->ne[0]==E_probe && wqT2->ne[1]==E_probe) {
                                     const uint8_t* qwb=(const uint8_t*)wqT2->data;
                                     const char* kd=(const char*)k_perm->data; const char* vd=(const char*)v_perm->data;
-                                    bool kf=k_perm->type==GGML_TYPE_F16, vf=v_perm->type==GGML_TYPE_F16; bool vrc=(v_perm->ne[0]==64);
+                                    bool kf=k_perm->type==GGML_TYPE_F16, vf=v_perm->type==GGML_TYPE_F16; bool vrc=(v_perm->ne[0]==hd_f);
                                     auto rdh=[&](const char* pp,bool f16)->float{ if(f16){ggml_fp16_t h;memcpy(&h,pp,2);return ggml_fp16_to_fp32(h);} float v;memcpy(&v,pp,4);return v; };
-                                    std::vector<float> Qv(2048,0.0f);
-                                    for(int64_t n=0;n<2048;n++){ const uint8_t* row=qwb+(size_t)n*64*18; double a=0;
-                                        for(int64_t b=0;b<64;b++){ const uint8_t* blk=row+b*18; ggml_fp16_t sh;memcpy(&sh,blk,2);float scq=ggml_fp16_to_fp32(sh);const uint8_t* qs=blk+2;
+                                    std::vector<float> Qv((size_t)E_probe,0.0f);
+                                    for(int64_t n=0;n<E_probe;n++){ const uint8_t* row=qwb+(size_t)n*(size_t)nblocks_row*18; double a=0;
+                                        for(int64_t b=0;b<nblocks_row;b++){ const uint8_t* blk=row+b*18; ggml_fp16_t sh;memcpy(&sh,blk,2);float scq=ggml_fp16_to_fp32(sh);const uint8_t* qs=blk+2;
                                             for(int j=0;j<32;j++){int nib=(j<16)?(qs[j]&0xF):(qs[j-16]>>4);a+=(double)((nib-8)*scq)*(double)normed[b*32+j];}}
                                         Qv[n]=(float)a; }
-                                    for(int64_t h=0;h<32;h++){ float* q=&Qv[h*64]; float th=1.0f; for(int i=0;i<32;i++){float ang=(float)pos0*th;float c=std::cos(ang),s=std::sin(ang);float x0=q[2*i],x1=q[2*i+1];q[2*i]=x0*c-x1*s;q[2*i+1]=x0*s+x1*c;th*=std::pow(fb,-2.0f/64.0f);} }
+                                    for(int64_t h=0;h<nq_f;h++){ float* q=&Qv[h*hd_f]; float th=1.0f; for(int i=0;i<hd_f/2;i++){float ang=(float)pos0*th;float c=std::cos(ang),s=std::sin(ang);float x0=q[2*i],x1=q[2*i+1];q[2*i]=x0*c-x1*s;q[2*i+1]=x0*s+x1*c;th*=std::pow(fb,-2.0f/(float)hd_f);} }
                                     std::vector<float> scv(nval,0.0f);
-                                    for(int64_t h=0;h<32;h++){ const int64_t g=h/4; const float* q=&Qv[h*64];
-                                        float mx=-1e30f; for(int64_t p=0;p<nval;p++){double dot=0;for(int64_t d=0;d<64;d++){float kv_=rdh(kd+p*k_perm->nb[1]+g*k_perm->nb[2]+d*k_perm->nb[0],kf);dot+=(double)q[d]*(double)kv_;}float sv=(float)dot*0.125f;scv[p]=sv;if(sv>mx)mx=sv;}
+                                    for(int64_t h=0;h<nq_f;h++){ const int64_t g=h/ag_f; const float* q=&Qv[h*hd_f];
+                                        float qkscale_f=(float)(1.0/std::sqrt((double)hd_f));
+                                        float mx=-1e30f; for(int64_t p=0;p<nval;p++){double dot=0;for(int64_t d=0;d<hd_f;d++){float kv_=rdh(kd+p*k_perm->nb[1]+g*k_perm->nb[2]+d*k_perm->nb[0],kf);dot+=(double)q[d]*(double)kv_;}float sv=(float)(dot*(double)qkscale_f);scv[p]=sv;if(sv>mx)mx=sv;}
                                         double sm=0;for(int64_t p=0;p<nval;p++){scv[p]=std::exp(scv[p]-mx);sm+=scv[p];}float iv=1.0f/(float)sm;
-                                        for(int64_t d=0;d<64;d++){double ac=0;for(int64_t p=0;p<nval;p++){const char* vp=vrc?(vd+p*v_perm->nb[1]+g*v_perm->nb[2]+d*v_perm->nb[0]):(vd+d*v_perm->nb[1]+g*v_perm->nb[2]+p*v_perm->nb[0]);ac+=(double)(scv[p]*iv)*(double)rdh(vp,vf);}cpu_attn_out[h*64+d]=(float)ac;} }
+                                        for(int64_t d=0;d<hd_f;d++){double ac=0;for(int64_t p=0;p<nval;p++){const char* vp=vrc?(vd+p*v_perm->nb[1]+g*v_perm->nb[2]+d*v_perm->nb[0]):(vd+d*v_perm->nb[1]+g*v_perm->nb[2]+p*v_perm->nb[0]);ac+=(double)(scv[p]*iv)*(double)rdh(vp,vf);}cpu_attn_out[h*hd_f+d]=(float)ac;} }
                                 }
                             }
                             }
 
-                            if (legacy_1b_geometry) {
+                            if (legacy_1b_geometry || geometry_3b) {
                             // BUG2 localization: run the EXISTING decode_front_attn kernel (Q-GEMV+
                             // rope_il+flowkv -> attn_out to DDR, SAME flowkv/rope as f3best) on the
                             // SAME hand-rms normed + cache K/V, and diff its attn_out vs cpu_attn_out
@@ -19936,29 +20025,31 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                             // is correct on real K, so f3best's bug is its 8-tile relay; mismatch =>
                             // the attention kernel itself is wrong on real K.
                             {
+                                const int64_t fd_hd = hd_f, fd_nq = nq_f;
+                                const int64_t fd_ag = (E_probe == 2048) ? 4 : 3;
+                                const int64_t fd_nkv = 8;
                                 static std::atomic<int> fa_budget{3};
                                 if (fa_budget.fetch_sub(1) > 0) {
-                                    std::vector<float> fa_out(2048, 0.0f);
+                                    std::vector<float> fa_out((size_t)E_probe, 0.0f);
                                     struct ggml_tensor fad = *lf_m.outL_tensor;
                                     fad.data = fa_out.data(); fad.type = GGML_TYPE_F32;
-                                    fad.ne[0] = 2048; fad.ne[1] = 1; fad.nb[0] = 4;
+                                    fad.ne[0] = E_probe; fad.ne[1] = 1; fad.nb[0] = 4;
                                     bool fok = ggml_backend_xdna_decode_front_attn(
-                                        ctx, &fad, normed.data(), 2048, lf_m.w_q,
-                                        cgraph->nodes[lf_m.q_rope_idx], k_perm, v_perm, 4);
+                                        ctx, &fad, normed.data(), E_probe, lf_m.w_q,
+                                        cgraph->nodes[lf_m.q_rope_idx], k_perm, v_perm, fd_ag);
                                     if (fok) {
-                                        const int64_t hd=64, ag=4, nkv=8;
-                                        auto rel=[&](auto map)->double{ double nu=0,de=0; for(int64_t i=0;i<2048;i++){ double c=cpu_attn_out[map(i)]; double d=(double)fa_out[i]-c; nu+=d*d; de+=c*c;} return std::sqrt(nu/(de+1e-12)); };
+                                        auto rel=[&](auto map)->double{ double nu=0,de=0; for(int64_t i=0;i<E_probe;i++){ double c=cpu_attn_out[map(i)]; double d=(double)fa_out[i]-c; nu+=d*d; de+=c*c;} return std::sqrt(nu/(de+1e-12)); };
                                         double rid = rel([&](int64_t i){return i;});
-                                        double rint= rel([&](int64_t i){ int64_t d=i%hd,gs=i/hd,g=gs/ag,s=gs%ag; int64_t qh=s*nkv+g; return qh*hd+d; });
-                                        double rkvm= rel([&](int64_t i){ int64_t d=i%hd,gs=i/hd,g=gs/ag,s=gs%ag; int64_t qh=g*ag+s; return qh*hd+d; });
+                                        double rint= rel([&](int64_t i){ int64_t d=i%fd_hd,gs=i/fd_hd,g=gs/fd_ag,s=gs%fd_ag; int64_t qh=s*fd_nkv+g; return qh*fd_hd+d; });
+                                        double rkvm= rel([&](int64_t i){ int64_t d=i%fd_hd,gs=i/fd_hd,g=gs/fd_ag,s=gs%fd_ag; int64_t qh=g*fd_ag+s; return qh*fd_hd+d; });
                                         fprintf(stderr,"ggml-xdna: [f3best-frontattn] q=%d front_attn vs cpu_attn_out: id=%.4f interleave=%.4f kvmajor=%.4f\n",
                                                 lf_m.q_idx, rid, rint, rkvm); fflush(stderr);
                                         { char hb[3200]; int off=0;
                                           off+=snprintf(hb+off,sizeof(hb)-off,"ggml-xdna: [f3best-fahead] q=%d",lf_m.q_idx);
-                                          for(int h=0;h<32;h++){ double nu=0,de=0;
-                                            for(int d=0;d<64;d++){ double c=cpu_attn_out[h*64+d]; double df=(double)fa_out[h*64+d]-c; nu+=df*df; de+=c*c; }
-                                            double fn=0; for(int d=0;d<64;d++) fn+=(double)fa_out[h*64+d]*fa_out[h*64+d];
-                                            off+=snprintf(hb+off,sizeof(hb)-off," %.2f/%.3f/%.3f",std::sqrt(nu/(de+1e-12)),std::sqrt(fn/64.0),std::sqrt(de/64.0)); }
+                                          for(int h=0;h<fd_nq;h++){ double nu=0,de=0;
+                                            for(int d=0;d<fd_hd;d++){ double c=cpu_attn_out[h*fd_hd+d]; double df=(double)fa_out[h*fd_hd+d]-c; nu+=df*df; de+=c*c; }
+                                            double fn=0; for(int d=0;d<fd_hd;d++) fn+=(double)fa_out[h*fd_hd+d]*fa_out[h*fd_hd+d];
+                                            off+=snprintf(hb+off,sizeof(hb)-off," %.2f/%.3f/%.3f",std::sqrt(nu/(de+1e-12)),std::sqrt(fn/(double)fd_hd),std::sqrt(de/(double)fd_hd)); }
                                           fprintf(stderr,"%s\n",hb); fflush(stderr); }
                                     } else { fprintf(stderr,"ggml-xdna: [f3best-frontattn] q=%d dispatch FAILED\n", lf_m.q_idx); fflush(stderr); }
                                 }
@@ -20040,6 +20131,69 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                             xdna_f3best_measure_boundary(
                                                 npu_ffn_contribution,
                                                 cpu_ffn_contribution.data(), E_probe));
+                                        // #235 inpL/ffn diagnostic (XDNA_F3BEST_LIVESNAPDBG):
+                                        // Compare NPU post-attention residual vs CPU post-attention
+                                        // residual, and inspect NPU vs CPU FFN contributions to
+                                        // localize where the inpL→FFN chain diverges.
+                                        if (getenv("XDNA_F3BEST_LIVESNAPDBG") != NULL) {
+                                            double npu_post_l1 = 0, cpu_post_l1 = 0, diff_l1 = 0;
+                                            for (int64_t e = 0; e < E_probe; ++e) {
+                                                double npu_e = (double)npu_post_attention[e];
+                                                double cpu_e = (double)cpu_post_attention[e];
+                                                npu_post_l1 += std::fabs(npu_e);
+                                                cpu_post_l1 += std::fabs(cpu_e);
+                                                diff_l1 += std::fabs(npu_e - cpu_e);
+                                            }
+                                            npu_post_l1 /= (double)E_probe;
+                                            cpu_post_l1 /= (double)E_probe;
+                                            diff_l1 /= (double)E_probe;
+                                            double npu_ffn_l1 = 0, cpu_ffn_l1 = 0;
+                                            double npu_ffn_m3 = 0, cpu_ffn_m3 = 0;
+                                            for (int64_t e = 0; e < E_probe; ++e) {
+                                                npu_ffn_l1 += std::fabs((double)npu_ffn_contribution[e]);
+                                                cpu_ffn_l1 += std::fabs((double)cpu_ffn_contribution[static_cast<size_t>(e)]);
+                                                if (e < 3) {
+                                                    npu_ffn_m3 += (double)npu_ffn_contribution[e];
+                                                    cpu_ffn_m3 += (double)cpu_ffn_contribution[static_cast<size_t>(e)];
+                                                }
+                                            }
+                                            npu_ffn_l1 /= (double)E_probe;
+                                            cpu_ffn_l1 /= (double)E_probe;
+                                            npu_ffn_m3 /= 3.0;
+                                            cpu_ffn_m3 /= 3.0;
+                                            // O_cpu_delta = |cpu_s_snap - cpu_post_attention| = residual inpL
+                                            double o_cpu_delta_l1 = 0;
+                                            if (have_inpL_snap) {
+                                                for (int64_t e = 0; e < E_probe; ++e) {
+                                                    double resid = (double)cpu_s_snap[e] - (double)cpu_post_attention[e];
+                                                    o_cpu_delta_l1 += std::fabs(resid);
+                                                }
+                                                o_cpu_delta_l1 /= (double)E_probe;
+                                                fprintf(stderr,
+                                                    "[f3best-inpl] q=%d |npu_post=%.4f |cpu_post=%.4f "
+                                                    "|npu_post-cpu_post|=%.4f (|npu_post_cpu_post|/E) "
+                                                    "|npu_ffn|=%.4f |cpu_ffn|=%.4f "
+                                                    "mean_npu_ffn[0:3]=%.4f mean_cpu_ffn[0:3]=%.4f "
+                                                    "|cpu_s_snap-cpu_post|=O_cpu_delta=%.4f\n",
+                                                    lf_m.q_idx,
+                                                    npu_post_l1, cpu_post_l1, diff_l1,
+                                                    npu_ffn_l1, cpu_ffn_l1,
+                                                    npu_ffn_m3, cpu_ffn_m3,
+                                                    o_cpu_delta_l1);
+                                            } else {
+                                                fprintf(stderr,
+                                                    "[f3best-inpl] q=%d |npu_post=%.4f |cpu_post=%.4f "
+                                                    "|npu_post-cpu_post|=%.4f "
+                                                    "|npu_ffn|=%.4f |cpu_ffn|=%.4f "
+                                                    "mean_npu_ffn[0:3]=%.4f mean_cpu_ffn[0:3]=%.4f "
+                                                    "(inpL_snap unavailable, O_cpu_delta=NA)\n",
+                                                    lf_m.q_idx,
+                                                    npu_post_l1, cpu_post_l1, diff_l1,
+                                                    npu_ffn_l1, cpu_ffn_l1,
+                                                    npu_ffn_m3, cpu_ffn_m3);
+                                            }
+                                            fflush(stderr);
+                                        }
                                     } else {
                                         fprintf(stderr,
                                                 "ggml-xdna: [f3best-probe] q=%d post_attention and ffn_contribution "
@@ -20048,10 +20202,139 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                     }
                                     fflush(stderr);
                                 }
-                                if (legacy_1b_geometry) {
+                                // #235 avgV diagnostic (F3BEST_AVGV_DIAG=1): with Q forced to 0
+                                // (ONESC Q-only), NPU attention output must be avg(V[g,0:kv_len))
+                                // -> post_attention = O_proj(avgV)+resid. Using the REAL O weights
+                                // and KV cache, compare NPU (s-resid) against CPU O_proj(avgV) and
+                                // against (kv_len/256)*O_proj(avgV) to expose a broken softmax
+                                // denominator (masking dilutes attention by padding).
+                                if (getenv("F3BEST_AVGV_DIAG") != NULL &&
+                                    lf_m.w_o && lf_m.w_o->type == GGML_TYPE_Q4_0 &&
+                                    lf_m.w_o->ne[0] == E_probe && lf_m.w_o->ne[1] == E_probe) {
+                                    const int64_t nvd = k_perm->ne[1];
+                                    const float * s_outp = diagnostics.post_attention;
+                                    const int64_t qh = lf_m.q_idx;
+                                    const int64_t hd_pr = k_perm->ne[0];
+                                    const int64_t nkv_pr = kv_match.kv_heads;
+                                    // GQA fan-out derived from the runtime geometry, never hardcoded:
+                                    // O-proj consumes E = nkv * AG * HD columns, so AG = E/(nkv*HD).
+                                    // 1B: 2048/(8*64) = 4; 3B: 3072/(8*128) = 3. A hardcoded AG made
+                                    // this diagnostic unusable as a 1B control, which is the only way
+                                    // to tell a broken NPU from a broken CPU reference.
+                                    const int64_t ag_pr =
+                                        (nkv_pr > 0 && hd_pr > 0) ? E_probe / (nkv_pr * hd_pr) : 0;
+                                    const char * kd = (const char *)k_perm->data;
+                                    const char * vd = (const char *)v_perm->data;
+                                    const bool kf16 = k_perm->type == GGML_TYPE_F16;
+                                    const bool vf16 = v_perm->type == GGML_TYPE_F16;
+                                    const bool vrc = (v_perm->ne[0] == hd_pr);
+                                    // vrc=1: V layout [hd, seq, kv]; vrc=0: [seq, hd, kv]
+                                    auto v_ptr = [&](int64_t p, int64_t g8, int64_t d) -> const char * {
+                                        return vrc
+                                            ? (vd + p * v_perm->nb[1] + g8 * v_perm->nb[2] + d * v_perm->nb[0])
+                                            : (vd + d * v_perm->nb[1] + g8 * v_perm->nb[2] + p * v_perm->nb[0]);
+                                    };
+                                    auto rdh = [&](const char * pp, bool f16) -> float {
+                                        if (f16) { ggml_fp16_t h; memcpy(&h, pp, 2); return ggml_fp16_to_fp32(h); }
+                                        float v; memcpy(&v, pp, 4); return v;
+                                    };
+                                    int64_t pos0 = 0;
+                                    const struct ggml_tensor * rn2 = cgraph->nodes[lf_m.q_rope_idx];
+                                    if (rn2 && rn2->src[1] && rn2->src[1]->type == GGML_TYPE_I32 && rn2->src[1]->data)
+                                        pos0 = ((const int32_t *)rn2->src[1]->data)[0];
+                                    const int64_t kv_len = std::min<int64_t>(pos0 + 1, nvd);
+                                    // avgV[g][d] = mean over p in [0,kv_len) of V[p,g,d]
+                                    std::vector<float> avgV((size_t)nkv_pr * hd_pr, 0.0f);
+                                    for (int64_t g = 0; g < nkv_pr; g++) {
+                                        for (int64_t d = 0; d < hd_pr; d++) {
+                                            double acc = 0.0;
+                                            for (int64_t p = 0; p < kv_len; p++) {
+                                                const char * vp = v_ptr(p, g, d);
+                                                acc += rdh(vp, vf16);
+                                            }
+                                            avgV[(size_t)g * hd_pr + d] = (float)(acc / (double)kv_len);
+                                        }
+                                    }
+                                    // CPU O_proj(avgV): Q4_0 blocks cover input in KV-head order [g][d]
+                                    std::vector<float> o_avg(E_probe, 0.0f);
+                                    const uint8_t * wob = (const uint8_t *)lf_m.w_o->data;
+                                    const int64_t nblocks = E_probe / 32;
+                                    for (int64_t n = 0; n < E_probe; n++) {
+                                        const uint8_t * row = wob + (size_t)n * (size_t)nblocks * 18;
+                                        double acc = 0.0;
+                                        for (int64_t b = 0; b < nblocks; b++) {
+                                            const uint8_t * blk = row + (size_t)b * 18;
+                                            ggml_fp16_t sh; memcpy(&sh, blk, 2);
+                                            float scq = ggml_fp16_to_fp32(sh);
+                                            const uint8_t * qs = blk + 2;
+                                            for (int j = 0; j < 32; j++) {
+                                                int nib = (j < 16) ? (qs[j] & 0xF) : (qs[j - 16] >> 4);
+                                                // Q=0 (ONESC) => attention is uniform: attn_out[q*HD+d] =
+                                                // avgV[q/AG, d] (AG q-heads per KV head replicate avgV).
+                                                // Input column i=b*32+j → KV head g=i/(AG*HD),
+                                                // dim d=i%(AG*HD)%HD. AG comes from the runtime geometry
+                                                // (ag_pr above), so this holds for 1B (AG=4) and 3B (AG=3).
+                                                const int span = (int)(ag_pr * hd_pr);
+                                                int kvh = span > 0 ? (b * 32 + j) / span : 0;   // 0..nkv-1
+                                                int dd  = span > 0 ? ((b * 32 + j) % span) % (int)hd_pr : 0;
+                                                float av = (kvh < (int)nkv_pr) ? avgV[(size_t)kvh * hd_pr + dd] : 0.0f;
+                                                acc += (double)((nib - 8) * scq) * (double)av;
+                                            }
+                                        }
+                                        o_avg[n] = (float)acc;
+                                    }
+                                    double nu = 0, de = 0, nu2 = 0, npu_l2 = 0, oav_l2 = 0;
+                                    for (int64_t e = 0; e < E_probe; e++) {
+                                        double npu_o = (double)s_outp[e] - (double)inpL[e];
+                                        npu_l2 += npu_o * npu_o; oav_l2 += o_avg[e] * o_avg[e];
+                                        double d = npu_o - o_avg[e];
+                                        nu += d * d; de += o_avg[e] * o_avg[e];
+                                        double d2 = npu_o - ((double)kv_len / 256.0) * o_avg[e];
+                                        nu2 += d2 * d2;
+                                    }
+                                    fprintf(stderr,
+                                            "ggml-xdna: [f3best-avgv] q=%d kv_len=%lld ag=%lld hd=%lld nkv=%lld "
+                                            "vrc=%d kf=%d vf=%d "
+                                            "rel_O_proj_avgV=%.4f  rel_ratio_kvlen256=%.4f  "
+                                            "npuO_l2=%.4g cpuO_l2=%.4g\n",
+                                            (int)qh, (long long)kv_len, (long long)ag_pr,
+                                            (long long)hd_pr, (long long)nkv_pr,
+                                            (int)vrc, (int)kf16, (int)vf16,
+                                            std::sqrt(nu / (de + 1e-12)),
+                                            std::sqrt(nu2 / (de + 1e-12)),
+                                            std::sqrt(npu_l2), std::sqrt(oav_l2));
+                                    // Per-column (E/NH=384) slice: NPU (s-resid) vs CPU O_proj(avgV)
+                                    // vs (kv_len/256)*O_proj(avgV). Uniform agreement across slices
+                                    // points upstream (Q/softmax); a conflicted slice points to the
+                                    // O_h relay / value tile of that column.
+                                    {
+                                        const int64_t col = E_probe / 8;
+                                        char sb[512]; int sp = 0;
+                                        for (int64_t c8 = 0; c8 < 8; c8++) {
+                                            double nu_c = 0, de_c = 0, nu_r = 0;
+                                            for (int64_t e = c8 * col; e < (c8 + 1) * col && e < E_probe; e++) {
+                                                double npu_o = (double)s_outp[e] - (double)inpL[e];
+                                                double d = npu_o - o_avg[e];
+                                                nu_c += d * d; de_c += o_avg[e] * o_avg[e];
+                                                double d2 = npu_o - ((double)kv_len / 256.0) * o_avg[e];
+                                                nu_r += d2 * d2;
+                                            }
+                                            sp += snprintf(sb + sp, sizeof(sb) - sp, "[%lld]=%.3f/%.3f",
+                                                           (long long)c8,
+                                                           std::sqrt(nu_c / (de_c + 1e-12)),
+                                                           std::sqrt(nu_r / (de_c + 1e-12)));
+                                        }
+                                        fprintf(stderr, "ggml-xdna: [f3best-avgv-cols] q=%d%s\n",
+                                                (int)qh, sb);
+                                        fflush(stderr);
+                                    }
+                                    fflush(stderr);
+                                }
+                                if (legacy_1b_geometry || geometry_3b) {
                                     // HEAD-PERMUTATION test: O_npu = s_out - inpL. Try permutations of the
                                     // CORRECT cpu_attn_out, O-project each, find which matches O_npu best.
                                     // A low rel for a non-identity perm => f3best scrambles head routing.
+                                    const int64_t bpr_f = E_probe / 32;
                                     static std::atomic<int> perm_budget{4};
                                     if (perm_budget.fetch_sub(1) > 0 && lf_m.w_o &&
                                         lf_m.w_o->type == GGML_TYPE_Q4_0) {
@@ -20059,23 +20342,23 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                     const uint8_t * wob = (const uint8_t *)lf_m.w_o->data;
                                     auto oproj_rel_np = [&](const std::vector<float>& av) -> double {
                                         double on=0, od=0;
-                                        for (int64_t n=0;n<2048;n++){ const uint8_t* row=wob+(size_t)n*64*18; double acc=0;
-                                            for(int64_t b=0;b<64;b++){const uint8_t* blk=row+b*18;ggml_fp16_t sh;memcpy(&sh,blk,2);float sc=ggml_fp16_to_fp32(sh);const uint8_t* qs=blk+2;
+                                        for (int64_t n=0;n<E_probe;n++){ const uint8_t* row=wob+(size_t)n*(size_t)bpr_f*18; double acc=0;
+                                            for(int64_t b=0;b<bpr_f;b++){const uint8_t* blk=row+b*18;ggml_fp16_t sh;memcpy(&sh,blk,2);float sc=ggml_fp16_to_fp32(sh);const uint8_t* qs=blk+2;
                                                 for(int j=0;j<32;j++){int nib=(j<16)?(qs[j]&0xF):(qs[j-16]>>4);acc+=(double)((nib-8)*sc)*(double)av[b*32+j];}}
                                             double onp=(double)s_outp[n]-(double)inpL[n]; double dd=acc-onp; on+=dd*dd; od+=onp*onp; }
                                         return std::sqrt(on/(od+1e-12));
                                     };
                                     auto permute = [&](int mode) -> std::vector<float> {
-                                        std::vector<float> r(2048);
-                                        for (int h=0;h<32;h++){ int sh;
-                                            switch(mode){ case 0: sh=h; break;                 // identity
-                                                          case 1: sh=(h%4)*8+(h/4); break;     // 4x8 <-> 8x4 transpose
-                                                          case 2: sh=(h%8)*4+(h/8); break;     // 8x4 <-> 4x8 transpose
-                                                          case 3: sh=31-h; break;              // reverse
-                                                          case 4: sh=h; break;                 // mask: g>=3 && h%4!=3 -> zero
+                                        std::vector<float> r((size_t)E_probe);
+                                        for (int h=0;h<nq_f;h++){ int sh;
+                                            switch(mode){ case 0: sh=h; break;                                                     // identity
+                                                          case 1: sh=(h%(nq_f/8))*8+(h/(nq_f/8)); break;                         // 8-column-group transpose
+                                                          case 2: sh=(h%nq_f/4)*4+(h/nq_f*4); break;                              // 4x(NQ/4) layout transpose
+                                                          case 3: sh=nq_f-1-h; break;                                             // reverse
+                                                          case 4: sh=h; break;                                                   // mask: g>=3 && h%4!=3 -> zero
                                                           default: sh=h; }
-                                            bool zap = (mode==4) && ((h/4)>=3) && ((h%4)!=3);
-                                            for(int d=0;d<64;d++) r[h*64+d]= zap?0.0f:cpu_attn_out[sh*64+d]; }
+                                            bool zap = (mode==4) && ((h/(nq_f/8))>=3) && ((h%(nq_f/8))!=3);
+                                            for(int d=0;d<hd_f;d++) r[h*hd_f+d]= zap?0.0f:cpu_attn_out[sh*hd_f+d]; }
                                         return r;
                                     };
                                     double p0=oproj_rel_np(permute(0)), p1=oproj_rel_np(permute(1)),
@@ -20086,71 +20369,80 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                     // Decompose O_npu into per-head O-proj contributions and solve
                                     // least squares for c_h. c_h ~ 1 => head present on NPU, ~0 => lost.
                                     {
-                                        static std::vector<std::vector<double>> P(32, std::vector<double>(2048,0.0));
-                                        for (int h=0; h<32; h++) {
-                                            for (int64_t n=0;n<2048;n++){ const uint8_t* row=wob+(size_t)n*64*18; double acc=0;
+                                        static std::vector<std::vector<double>> P_dyn(32, std::vector<double>(2048,0.0));
+                                        std::vector<std::vector<double>> *Pptr = &P_dyn;
+                                        std::vector<std::vector<double>> P_local((size_t)nq_f, std::vector<double>((size_t)E_probe,0.0));
+                                        if (nq_f > 32 || E_probe != 2048) Pptr = &P_local;
+                                        auto &P = *Pptr;
+                                        const int64_t bpr2 = bpr_f; // Q4_0 blocks per row = E/32
+                                        for (int h=0; h<nq_f; h++) {
+                                            for (int64_t n=0;n<E_probe;n++){ const uint8_t* row=wob+(size_t)n*(size_t)bpr2*18; double acc=0;
                                                 for(int b2=h*2;b2<h*2+2;b2++){const uint8_t* blk=row+(size_t)b2*18;ggml_fp16_t sh2;memcpy(&sh2,blk,2);float sc=ggml_fp16_to_fp32(sh2);const uint8_t* qs=blk+2;
                                                     for(int j=0;j<32;j++){int nib=(j<16)?(qs[j]&0xF):(qs[j-16]>>4);acc+=(double)((nib-8)*sc)*(double)cpu_attn_out[b2*32+j];}}
                                                 P[h][n]=acc; }
                                         }
-                                        std::vector<double> y(2048);
-                                        for (int64_t n=0;n<2048;n++) y[n]=(double)s_outp[n]-(double)inpL[n];
-                                        std::vector<std::vector<double>> A(32, std::vector<double>(33,0.0));
-                                        for(int a2=0;a2<32;a2++){ for(int b2=0;b2<32;b2++){ double v=0; for(int64_t n=0;n<2048;n++) v+=P[a2][n]*P[b2][n]; A[a2][b2]=v; }
-                                            double v=0; for(int64_t n=0;n<2048;n++) v+=P[a2][n]*y[n]; A[a2][32]=v; A[a2][a2]+=1e-9; }
-                                        for(int c=0;c<32;c++){ int pv=c; for(int r2=c+1;r2<32;r2++) if(std::fabs(A[r2][c])>std::fabs(A[pv][c])) pv=r2;
+                                        std::vector<double> y((size_t)E_probe);
+                                        for (int64_t n=0;n<E_probe;n++) y[n]=(double)s_outp[n]-(double)inpL[n];
+                                        std::vector<std::vector<double>> A((size_t)nq_f, std::vector<double>((size_t)(nq_f+1),0.0));
+                                        for(int a2=0;a2<nq_f;a2++){ for(int b2=0;b2<nq_f;b2++){ double v=0; for(int64_t n=0;n<E_probe;n++) v+=P[a2][n]*P[b2][n]; A[a2][b2]=v; }
+                                            double v=0; for(int64_t n=0;n<E_probe;n++) v+=P[a2][n]*y[n]; A[a2][nq_f]=v; A[a2][a2]+=1e-9; }
+                                        for(int c=0;c<nq_f;c++){ int pv=c; for(int r2=c+1;r2<nq_f;r2++) if(std::fabs(A[r2][c])>std::fabs(A[pv][c])) pv=r2;
                                             std::swap(A[c],A[pv]); double d=A[c][c]; if(std::fabs(d)<1e-30) continue;
-                                            for(int k=c;k<33;k++) A[c][k]/=d;
-                                            for(int r2=0;r2<32;r2++) if(r2!=c){ double f=A[r2][c]; if(f!=0.0) for(int k=c;k<33;k++) A[r2][k]-=f*A[c][k]; } }
-                                        { double rn=0,rd=0; for(int64_t n=0;n<2048;n++){ double f=0; for(int h=0;h<32;h++) f+=A[h][32]*P[h][n];
+                                            for(int k=c;k<=nq_f;k++) A[c][k]/=d;
+                                            for(int r2=0;r2<nq_f;r2++) if(r2!=c){ double f=A[r2][c]; if(f!=0.0) for(int k=c;k<=nq_f;k++) A[r2][k]-=f*A[c][k]; } }
+                                        { double rn=0,rd=0; for(int64_t n=0;n<E_probe;n++){ double f=0; for(int h=0;h<nq_f;h++) f+=A[h][nq_f]*P[h][n];
                                               double d2=y[n]-f; rn+=d2*d2; rd+=y[n]*y[n]; }
                                           fprintf(stderr,"ggml-xdna: [f3best-hfit] q=%d residual_rel=%.4f\n",lf_m.q_idx,std::sqrt(rn/(rd+1e-12))); fflush(stderr); }
                                         // Invert the O-projection once to recover the NPU's actual
                                         // attention output, then compare per head against CPU.
                                         { static std::atomic<bool> did_inv{false}; bool exp_i=false;
                                           if (did_inv.compare_exchange_strong(exp_i,true)) {
-                                            std::vector<double> W((size_t)2048*2049,0.0);
-                                            for(int64_t n=0;n<2048;n++){ const uint8_t* row=wob+(size_t)n*64*18;
-                                                for(int b2=0;b2<64;b2++){const uint8_t* blk=row+(size_t)b2*18;ggml_fp16_t sh2;memcpy(&sh2,blk,2);float sc=ggml_fp16_to_fp32(sh2);const uint8_t* qs=blk+2;
-                                                    for(int j=0;j<32;j++){int nib=(j<16)?(qs[j]&0xF):(qs[j-16]>>4);W[(size_t)n*2049+b2*32+j]=(double)((nib-8)*sc);}}
-                                                W[(size_t)n*2049+2048]=y[n]; }
-                                            for(int64_t c=0;c<2048;c++){ int64_t pv=c; double best=std::fabs(W[(size_t)c*2049+c]);
-                                                for(int64_t r2=c+1;r2<2048;r2++){ double v=std::fabs(W[(size_t)r2*2049+c]); if(v>best){best=v;pv=r2;} }
+                                            std::vector<double> W((size_t)E_probe*(E_probe+1),0.0);
+                                            for(int64_t n=0;n<E_probe;n++){ const uint8_t* row=wob+(size_t)n*(size_t)bpr2*18;
+                                                for(int b2=0;b2<bpr2;b2++){const uint8_t* blk=row+(size_t)b2*18;ggml_fp16_t sh2;memcpy(&sh2,blk,2);float sc=ggml_fp16_to_fp32(sh2);const uint8_t* qs=blk+2;
+                                                    for(int j=0;j<32;j++){int nib=(j<16)?(qs[j]&0xF):(qs[j-16]>>4);W[(size_t)n*(E_probe+1)+b2*32+j]=(double)((nib-8)*sc);}}
+                                                W[(size_t)n*(E_probe+1)+E_probe]=y[n]; }
+                                            for(int64_t c=0;c<E_probe;c++){ int64_t pv=c; double best=std::fabs(W[(size_t)c*(E_probe+1)+c]);
+                                                for(int64_t r2=c+1;r2<E_probe;r2++){ double v=std::fabs(W[(size_t)r2*(E_probe+1)+c]); if(v>best){best=v;pv=r2;} }
                                                 if(best<1e-14) continue;
-                                                if(pv!=c) for(int64_t k=c;k<2049;k++) std::swap(W[(size_t)c*2049+k],W[(size_t)pv*2049+k]);
-                                                double d=W[(size_t)c*2049+c];
-                                                for(int64_t r2=c+1;r2<2048;r2++){ double f=W[(size_t)r2*2049+c]/d; if(f!=0.0)
-                                                    for(int64_t k=c;k<2049;k++) W[(size_t)r2*2049+k]-=f*W[(size_t)c*2049+k]; } }
-                                            std::vector<double> av(2048,0.0);
-                                            for(int64_t c=2047;c>=0;c--){ double acc=W[(size_t)c*2049+2048];
-                                                for(int64_t k=c+1;k<2048;k++) acc-=W[(size_t)c*2049+k]*av[k];
-                                                double d=W[(size_t)c*2049+c]; av[c]= (std::fabs(d)<1e-14)?0.0:acc/d; }
+                                                if(pv!=c) for(int64_t k=c;k<=E_probe;k++) std::swap(W[(size_t)c*(E_probe+1)+k],W[(size_t)pv*(E_probe+1)+k]);
+                                                double d=W[(size_t)c*(E_probe+1)+c];
+                                                for(int64_t r2=c+1;r2<E_probe;r2++){ double f=W[(size_t)r2*(E_probe+1)+c]/d; if(f!=0.0)
+                                                    for(int64_t k=c;k<=E_probe;k++) W[(size_t)r2*(E_probe+1)+k]-=f*W[(size_t)c*(E_probe+1)+k]; } }
+                                            std::vector<double> av((size_t)E_probe,0.0);
+                                            for(int64_t c=E_probe-1;c>=0;c--){ double acc=W[(size_t)c*(E_probe+1)+E_probe];
+                                                for(int64_t k=c+1;k<E_probe;k++) acc-=W[(size_t)c*(E_probe+1)+k]*av[k];
+                                                double d=W[(size_t)c*(E_probe+1)+c]; av[c]= (std::fabs(d)<1e-14)?0.0:acc/d; }
                                             char ib[3200]; int io=0;
                                             io+=snprintf(ib+io,sizeof(ib)-io,"ggml-xdna: [f3best-avinv] q=%d",lf_m.q_idx);
-                                            for(int h=0;h<32;h++){ double nu=0,de=0,an=0;
-                                                for(int d2=0;d2<64;d2++){ double c2=cpu_attn_out[h*64+d2]; double df=av[h*64+d2]-c2; nu+=df*df; de+=c2*c2; an+=av[h*64+d2]*av[h*64+d2]; }
-                                                io+=snprintf(ib+io,sizeof(ib)-io," %.2f/%.3f/%.3f",std::sqrt(nu/(de+1e-12)),std::sqrt(an/64.0),std::sqrt(de/64.0)); }
+                                            for(int h=0;h<nq_f;h++){ double nu=0,de=0,an=0;
+                                                for(int d2=0;d2<hd_f;d2++){ double c2=cpu_attn_out[h*hd_f+d2]; double df=av[h*hd_f+d2]-c2; nu+=df*df; de+=c2*c2; an+=av[h*hd_f+d2]*av[h*hd_f+d2]; }
+                                                io+=snprintf(ib+io,sizeof(ib)-io," %.2f/%.3f/%.3f",std::sqrt(nu/(de+1e-12)),std::sqrt(an/(double)hd_f),std::sqrt(de/(double)hd_f)); }
                                             fprintf(stderr,"%s\n",ib); fflush(stderr); } }
                                         char cb[2600]; int off=0;
                                         off+=snprintf(cb+off,sizeof(cb)-off,"ggml-xdna: [f3best-hcoef] q=%d",lf_m.q_idx);
-                                        for(int h=0;h<32;h++) off+=snprintf(cb+off,sizeof(cb)-off," %.2f",A[h][32]);
+                                        for(int h=0;h<nq_f;h++) off+=snprintf(cb+off,sizeof(cb)-off," %.2f",A[h][nq_f]);
                                         fprintf(stderr,"%s\n",cb); fflush(stderr);
                                     }
                                     }
                                 }
                             }
                         }
-                        if (legacy_1b_geometry) {
                         // --- LAYOUT-SAFE staging reference (systematic-debugging #70) ---
                         // Replicate the EXACT f3best K/V staging formula here, feed it
                         // ggml's OWN roped-Q (rope node data) + K/V tensors, compute CPU
                         // attn_out, and compare to ggml's TRUE attn_out (the O-proj input).
                         // MATCH => staging is correct, bug is NPU kernel/relay.
                         // MISMATCH => staging/perm/GQA is the bug (and which).
-                        {
+                        if (legacy_1b_geometry || geometry_3b) {
                             static std::atomic<int> ref_budget{16};
                             if (ref_budget.fetch_sub(1) > 0) {
-                                const int64_t hdR = 64, NHkv = 8, NQ = 32, AGr = NQ / NHkv;
+                                const int64_t hdR = k_perm->ne[0];
+                                const int64_t NHkv = 8;
+                                const int64_t NQ = (E_probe == 2048) ? 32 : 24;
+                                const int64_t AGr = NQ / NHkv;
+                                const float scaleR = 1.0f / std::sqrt((float)hdR);
+                                const int64_t E_sp = E_probe;
                                 const struct ggml_tensor * rnode = cgraph->nodes[lf_m.q_rope_idx];
                                 // find ggml attn_out = O-proj(mul_mat w_o) input src[1]
                                 const struct ggml_tensor * attn_out = nullptr;
@@ -20158,6 +20450,8 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                     struct ggml_tensor * nn = cgraph->nodes[sj];
                                     if (nn && nn->op == GGML_OP_MUL_MAT && nn->src[0] == lf_m.w_o) { attn_out = nn->src[1]; break; }
                                 }
+                                if (!attn_out) { fprintf(stderr, "ggml-xdna: [f3best-ref] attn_out NOT FOUND q=%d E=%d add_attn_idx=%d wO=%p\n", lf_m.q_idx, (int)E_probe, lf_m.add_attn_idx, (void*)lf_m.w_o); fflush(stderr); }
+                                if (attn_out && (!attn_out->data || attn_out->type != GGML_TYPE_F32)) { fprintf(stderr, "ggml-xdna: [f3best-ref] attn_out data=%p type=%d\n", (void*)attn_out->data, (int)attn_out->type); fflush(stderr); }
                                 if (rnode && rnode->data && attn_out && attn_out->data && attn_out->type == GGML_TYPE_F32) {
                                     // REAL valid seq-len = current decode position + 1 (NOT the full
                                     // allocated cache k_perm->ne[1], which includes unfilled cells).
@@ -20168,6 +20462,7 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                     const int64_t n_valid = (pos0 + 1 < n_cap) ? (pos0 + 1) : n_cap;
                                     const int64_t n_kvR = n_valid;
                                     const int64_t kv_lenR = n_kvR < 256 ? n_kvR : 256;
+                                    const int64_t nblocksR = E_sp / 32;
                                     const char * kdat = (const char *)k_perm->data;
                                     const char * vdat = (const char *)v_perm->data;
                                     const bool kf32 = k_perm->type == GGML_TYPE_F32, kf16 = k_perm->type == GGML_TYPE_F16;
@@ -20177,10 +20472,10 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                         if (f16) { ggml_fp16_t h; memcpy(&h,pp,2); return ggml_fp16_to_fp32(h); }
                                         uint16_t b; memcpy(&b,pp,2); float v; uint32_t u=(uint32_t)b<<16; memcpy(&v,&u,4); return v;
                                     };
-                                    std::vector<float> refO(2048, 0.0f);
-                                    std::vector<float> refOb(2048, 0.0f);   // alt GQA mapping g = h % NHkv
+                                    std::vector<float> refO((size_t)E_sp, 0.0f);
+                                    std::vector<float> refOb((size_t)E_sp, 0.0f);   // alt GQA mapping g = h % NHkv
                                     std::vector<float> sc(kv_lenR, 0.0f);
-                                    const float scale = 1.0f / 8.0f;
+                                    const float scale = scaleR;
                                     for (int gqa_mode = 0; gqa_mode < 2; gqa_mode++) {
                                     std::vector<float> & dstO = gqa_mode == 0 ? refO : refOb;
                                     for (int64_t h = 0; h < NQ; h++) {
@@ -20221,9 +20516,9 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                         if (!gsn) { gsn = true;
                                             const float * gL = (const float *)attn_out->data;
                                             double dn=0, dd=0;
-                                            for (int e=0;e<2048;e++){ double t=(double)gO_snap[e]-(double)gL[e]; dn+=t*t; dd+=(double)gO_snap[e]*gO_snap[e]; }
+                                            for (int e=0;e<E_sp;e++){ double t=(double)gO_snap[e]-(double)gL[e]; dn+=t*t; dd+=(double)gO_snap[e]*gO_snap[e]; }
                                             fprintf(stderr, "ggml-xdna: [f3best-gosnap] have=%d rel_snap_vs_live=%.6f |snap|=%.5f\n",
-                                                    (int)have_gO_snap, std::sqrt(dn/(dd+1e-12)), std::sqrt(dd/2048.0));
+                                                    (int)have_gO_snap, std::sqrt(dn/(dd+1e-12)), std::sqrt(dd/(double)E_probe));
                                             fflush(stderr);
                                         }
                                     }
@@ -20245,8 +20540,8 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                             const float * qh = (const float *)((const char *)rnode->data + 0);
                                             float mx=-1e30f, mn=1e30f; int64_t amax=-1; double mean=0;
                                             for (int64_t pos=0; pos<n_valid; pos++) {
-                                                double dot=0; for (int64_t d=0;d<64;d++){ float kv_=rd(kdat+pos*k_perm->nb[1]+g*k_perm->nb[2]+d*k_perm->nb[0],kf32,kf16); dot+=(double)qh[d]*(double)kv_; }
-                                                float s=(float)dot*0.125f; mean+=s; if(s>mx){mx=s;amax=pos;} if(s<mn)mn=s;
+                                                double dot=0; for (int64_t d=0;d<hdR;d++){ float kv_=rd(kdat+pos*k_perm->nb[1]+g*k_perm->nb[2]+d*k_perm->nb[0],kf32,kf16); dot+=(double)qh[d]*(double)kv_; }
+                                                float s=(float)dot*scaleR; mean+=s; if(s>mx){mx=s;amax=pos;} if(s<mn)mn=s;
                                             }
                                             fprintf(stderr, "ggml-xdna: [f3best-dbg] head0 score: max=%.4f min=%.4f mean=%.4f argmax=%lld/%lld spread=%.4f\n",
                                                     mx, mn, mean/n_valid, (long long)amax, (long long)n_valid, mx-mn);
@@ -20254,8 +20549,20 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                         fflush(stderr);
                                     }
                                     double rn=0, rd2=0, rfn=0, rnB=0;
-                                    for (int e=0;e<2048;e++){ double dd=(double)refO[e]-(double)gO[e]; rn+=dd*dd; rd2+=(double)gO[e]*(double)gO[e]; rfn+=(double)refO[e]*refO[e];
+                                    for (int e=0;e<E_sp;e++){ double dd=(double)refO[e]-(double)gO[e]; rn+=dd*dd; rd2+=(double)gO[e]*(double)gO[e]; rfn+=(double)refO[e]*refO[e];
                                                               double db=(double)refOb[e]-(double)gO[e]; rnB+=db*db; }
+                                    // Compare cpu_attn_out (from normed+Q-GEMV+RoPE+K/V) vs refO (staging_ref)
+                                    // If they diverge, the host-side Q-read or K/V-read is the bug.
+                                    {
+                                        if (cpu_attn_out.size() != (size_t)E_sp)
+                                            fprintf(stderr,"ggml-xdna: [f3best-qvcmp] q=%d WARN cpu_attn_out.size=%zu E_sp=%lld\n", lf_m.q_idx, cpu_attn_out.size(), (long long)E_sp);
+                                        double nu=0, de=0, nu2=0;
+                                        for (int e=0;e<E_sp && e<(int64_t)cpu_attn_out.size();e++){ double a=(double)cpu_attn_out[e]; double d=((double)refO[e]-a); nu+=d*d; de+=a*a;
+                                            double d2=((double)gO[e]-a); nu2+=d2*d2; }
+                                        fprintf(stderr,"ggml-xdna: [f3best-qvcmp] q=%d cpu_vs_refO=%.5f cpu_vs_gO=%.5f |cpu|=%.5f |refO|=%.5f |gO|=%.5f\n",
+                                                lf_m.q_idx, std::sqrt(nu/(de+1e-12)), std::sqrt(nu2/(de+1e-12)),
+                                                std::sqrt(de), std::sqrt(rfn), std::sqrt(rd2)); fflush(stderr);
+                                    }
                                     // RELIABLE check: O-proj(refO) on CPU vs O_cpu = cpu_s - inpL (cpu_s is fresh, NOT stale).
                                     // Wo = lf_m.w_o, Q4_0 [K=2048, N=2048]; mul_mat(Wo,attn): O[n]=sum_k Wo[k,n]*attn[k].
                                     double relOp = -1.0, relOpG = -1.0, relOpRN = -1.0;
@@ -20263,9 +20570,9 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                     const float * cpu_s2 = have_cpu_s_snap ? cpu_s_snap.data()
                                         : ((lf_m.add_attn_idx >= 0 && cgraph->nodes[lf_m.add_attn_idx]->type == GGML_TYPE_F32)
                                            ? (const float *)cgraph->nodes[lf_m.add_attn_idx]->data : nullptr);
-                                    if (woT && woT->data && woT->type == GGML_TYPE_Q4_0 && cpu_s2 && woT->ne[0] == 2048 && woT->ne[1] == 2048) {
+                                    if (woT && woT->data && woT->type == GGML_TYPE_Q4_0 && cpu_s2 && woT->ne[0] == E_sp && woT->ne[1] == E_sp) {
                                         const uint8_t * wb = (const uint8_t *)woT->data;
-                                        const int64_t blocks_per_row = 2048 / 32;  // 64
+                                        const int64_t blocks_per_row = E_sp / 32;  // E/32
                                         const float * inpL2 = have_inpL_snap ? inpL_snap.data()
                                                                              : (const float *)lf_m.inpL_tensor->data;
                                         {
@@ -20273,16 +20580,16 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                             if (!isn) { isn = true;
                                                 const float * iL = (const float *)lf_m.inpL_tensor->data;
                                                 double dn=0, dd=0;
-                                                for (int e=0;e<2048;e++){ double t=(double)inpL_snap[e]-(double)iL[e]; dn+=t*t; dd+=(double)inpL_snap[e]*inpL_snap[e]; }
+                                                for (int e=0;e<E_sp;e++){ double t=(double)inpL_snap[e]-(double)iL[e]; dn+=t*t; dd+=(double)inpL_snap[e]*inpL_snap[e]; }
                                                 fprintf(stderr, "ggml-xdna: [f3best-ilsnap] have=%d rel_snap_vs_live=%.6f |snap|=%.5f\n",
-                                                        (int)have_inpL_snap, std::sqrt(dn/(dd+1e-12)), std::sqrt(dd/2048.0));
+                                                        (int)have_inpL_snap, std::sqrt(dn/(dd+1e-12)), std::sqrt(dd/(double)E_sp));
                                                 fflush(stderr);
                                             }
                                         }
                                         // O-proj of an arbitrary attn vector av -> rel vs O_cpu
                                         auto oproj_rel = [&](const float * av) -> double {
                                             double on=0, od=0;
-                                            for (int64_t n = 0; n < 2048; n++) {
+                                            for (int64_t n = 0; n < E_sp; n++) {
                                                 const uint8_t * row = wb + (size_t)n * blocks_per_row * 18;
                                                 double acc = 0.0;
                                                 for (int64_t b = 0; b < blocks_per_row; b++) {
@@ -20305,30 +20612,30 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                         // Q = rope(Wq @ normed); attn over cache; O-proj; vs O_cpu. Same math as kernel.
                                         const struct ggml_tensor * wqT = lf_m.w_q;
                                         const struct ggml_tensor * qn2 = cgraph->nodes[i];
-                                        const float * nrm = (qn2 && qn2->src[1] && qn2->src[1]->type==GGML_TYPE_F32 && qn2->src[1]->data && qn2->src[1]->ne[0]==2048) ? (const float*)qn2->src[1]->data : nullptr;
-                                        if (nrm && wqT && wqT->data && wqT->type == GGML_TYPE_Q4_0 && wqT->ne[0]==2048 && wqT->ne[1]==2048) {
+                                        const float * nrm = (qn2 && qn2->src[1] && qn2->src[1]->type==GGML_TYPE_F32 && qn2->src[1]->data && qn2->src[1]->ne[0]==E_sp) ? (const float*)qn2->src[1]->data : nullptr;
+                                        if (nrm && wqT && wqT->data && wqT->type == GGML_TYPE_Q4_0 && wqT->ne[0]==E_sp && wqT->ne[1]==E_sp) {
                                             const uint8_t * qwb = (const uint8_t *)wqT->data;
-                                            std::vector<float> Qv(2048, 0.0f);
-                                            for (int64_t n=0;n<2048;n++){ const uint8_t* row=qwb+(size_t)n*64*18; double a=0;
-                                                for (int64_t b=0;b<64;b++){ const uint8_t* blk=row+b*18; ggml_fp16_t sh; memcpy(&sh,blk,2); float sc=ggml_fp16_to_fp32(sh); const uint8_t* qs=blk+2;
+                                            std::vector<float> Qv((size_t)E_sp, 0.0f);
+                                            for (int64_t n=0;n<E_sp;n++){ const uint8_t* row=qwb+(size_t)n*(size_t)nblocksR*18; double a=0;
+                                                for (int64_t b=0;b<nblocksR;b++){ const uint8_t* blk=row+b*18; ggml_fp16_t sh; memcpy(&sh,blk,2); float sc=ggml_fp16_to_fp32(sh); const uint8_t* qs=blk+2;
                                                     for(int j=0;j<32;j++){ int nib=(j<16)?(qs[j]&0xF):(qs[j-16]>>4); a+=(double)((nib-8)*sc)*(double)nrm[b*32+j]; } }
                                                 Qv[n]=(float)a; }
                                             float fb=10000.0f; int32_t rmode=-1; { const int32_t* pp=(const int32_t*)rnode->op_params; memcpy(&fb, pp+5, 4); rmode=pp[2]; }
                                             // attention from a roped-Q vector -> relOp vs O_cpu
                                             auto attn_relOp = [&](const std::vector<float>& Qr) -> double {
-                                                std::vector<float> myAO(2048,0.0f);
-                                                for (int64_t h=0;h<32;h++){ const int64_t g=h/AGr; const float* q=&Qr[h*64];
-                                                    float mx=-1e30f; for(int64_t p=0;p<n_valid;p++){ double dot=0; for(int64_t d=0;d<64;d++){ float kv_=rd(kdat+p*k_perm->nb[1]+g*k_perm->nb[2]+d*k_perm->nb[0],kf32,kf16); dot+=(double)q[d]*(double)kv_; } float sv=(float)dot*0.125f; sc[p]=sv; if(sv>mx)mx=sv; }
+                                                std::vector<float> myAO((size_t)E_sp,0.0f);
+                                                for (int64_t h=0;h<NQ;h++){ const int64_t g=h/AGr; const float* q=&Qr[h*hdR];
+                                                    float mx=-1e30f; for(int64_t p=0;p<n_valid;p++){ double dot=0; for(int64_t d=0;d<hdR;d++){ float kv_=rd(kdat+p*k_perm->nb[1]+g*k_perm->nb[2]+d*k_perm->nb[0],kf32,kf16); dot+=(double)q[d]*(double)kv_; } float sv=(float)dot*scaleR; sc[p]=sv; if(sv>mx)mx=sv; }
                                                     double sm=0; for(int64_t p=0;p<n_valid;p++){ sc[p]=std::exp(sc[p]-mx); sm+=sc[p]; } float iv=1.0f/(float)sm;
-                                                    for(int64_t d=0;d<64;d++){ double ac=0; for(int64_t p=0;p<n_valid;p++){ const char* vp=(v_perm->ne[0]==64)?(vdat+p*v_perm->nb[1]+g*v_perm->nb[2]+d*v_perm->nb[0]):(vdat+d*v_perm->nb[1]+g*v_perm->nb[2]+p*v_perm->nb[0]); ac+=(double)(sc[p]*iv)*(double)rd(vp,vf32,vf16); } myAO[h*64+d]=(float)ac; } }
+                                                    for(int64_t d=0;d<hdR;d++){ double ac=0; for(int64_t p=0;p<n_valid;p++){ const char* vp=(v_perm->ne[0]==hdR)?(vdat+p*v_perm->nb[1]+g*v_perm->nb[2]+d*v_perm->nb[0]):(vdat+d*v_perm->nb[1]+g*v_perm->nb[2]+p*v_perm->nb[0]); ac+=(double)(sc[p]*iv)*(double)rd(vp,vf32,vf16); } myAO[h*hdR+d]=(float)ac; } }
                                                 return oproj_rel(myAO.data());
                                             };
                                             // variant IL: interleaved pairs (2i,2i+1)
                                             std::vector<float> Qil(Qv);
-                                            for (int64_t h=0;h<32;h++){ float* q=&Qil[h*64]; float th=1.0f; for(int i=0;i<32;i++){ float ang=(float)pos0*th; float c=std::cos(ang),s=std::sin(ang); float x0=q[2*i],x1=q[2*i+1]; q[2*i]=x0*c-x1*s; q[2*i+1]=x0*s+x1*c; th*=std::pow(fb,-2.0f/64.0f); } }
-                                            // variant NX: two-halves pairs (i, i+32)
+                                            for (int64_t h=0;h<NQ;h++){ float* q=&Qil[h*hdR]; float th=1.0f; for(int i=0;i<hdR/2;i++){ float ang=(float)pos0*th; float c=std::cos(ang),s=std::sin(ang); float x0=q[2*i],x1=q[2*i+1]; q[2*i]=x0*c-x1*s; q[2*i+1]=x0*s+x1*c; th*=std::pow(fb,-2.0f/(float)hdR); } }
+                                            // variant NX: two-halves pairs (i, i+hdR/2)
                                             std::vector<float> Qnx(Qv);
-                                            for (int64_t h=0;h<32;h++){ float* q=&Qnx[h*64]; float th=1.0f; for(int i=0;i<32;i++){ float ang=(float)pos0*th; float c=std::cos(ang),s=std::sin(ang); float x0=q[i],x1=q[i+32]; q[i]=x0*c-x1*s; q[i+32]=x0*s+x1*c; th*=std::pow(fb,-2.0f/64.0f); } }
+                                            for (int64_t h=0;h<NQ;h++){ float* q=&Qnx[h*hdR]; float th=1.0f; for(int i=0;i<hdR/2;i++){ float ang=(float)pos0*th; float c=std::cos(ang),s=std::sin(ang); float x0=q[i],x1=q[i+hdR/2]; q[i]=x0*c-x1*s; q[i+hdR/2]=x0*s+x1*c; th*=std::pow(fb,-2.0f/(float)hdR); } }
                                             // variant NO: no rope (raw Q)
                                             double rIL=attn_relOp(Qil), rNX=attn_relOp(Qnx), rNO=attn_relOp(Qv);
                                             relOpRN = rIL;
@@ -20337,28 +20644,28 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                             const float * gainW = (lf_m.w_norm1 && lf_m.w_norm1->type==GGML_TYPE_F32) ? (const float*)lf_m.w_norm1->data : nullptr;
                                             const float * inpLr = have_inpL_snap ? inpL_snap.data() : (const float *)lf_m.inpL_tensor->data;
                                             if (gainW && inpLr) {
-                                                double ss=0; for(int k=0;k<2048;k++) ss+=(double)inpLr[k]*inpLr[k];
-                                                float invr = 1.0f/std::sqrt((float)(ss/2048.0)+1e-5f);
-                                                std::vector<float> hr(2048); for(int k=0;k<2048;k++) hr[k]=inpLr[k]*invr*gainW[k];
-                                                for(int k=0;k<2048;k++) hrn+=(double)hr[k]*hr[k];
-                                                std::vector<float> Qh(2048,0.0f);
-                                                for (int64_t n=0;n<2048;n++){ const uint8_t* row=qwb+(size_t)n*64*18; double a=0;
-                                                    for (int64_t b=0;b<64;b++){ const uint8_t* blk=row+b*18; ggml_fp16_t sh; memcpy(&sh,blk,2); float scq=ggml_fp16_to_fp32(sh); const uint8_t* qs=blk+2;
+                                                double ss=0; for(int64_t k=0;k<E_sp;k++) ss+=(double)inpLr[k]*inpLr[k];
+                                                float invr = 1.0f/std::sqrt((float)(ss/(double)E_sp)+1e-5f);
+                                                std::vector<float> hr((size_t)E_sp); for(int64_t k=0;k<E_sp;k++) hr[k]=inpLr[k]*invr*gainW[k];
+                                                for(int64_t k=0;k<E_sp;k++) hrn+=(double)hr[k]*hr[k];
+                                                std::vector<float> Qh((size_t)E_sp,0.0f);
+                                                for (int64_t n=0;n<E_sp;n++){ const uint8_t* row=qwb+(size_t)n*(size_t)nblocksR*18; double a=0;
+                                                    for (int64_t b=0;b<nblocksR;b++){ const uint8_t* blk=row+b*18; ggml_fp16_t sh; memcpy(&sh,blk,2); float scq=ggml_fp16_to_fp32(sh); const uint8_t* qs=blk+2;
                                                         for(int j=0;j<32;j++){ int nib=(j<16)?(qs[j]&0xF):(qs[j-16]>>4); a+=(double)((nib-8)*scq)*(double)hr[b*32+j]; } }
                                                     Qh[n]=(float)a; }
-                                                for (int64_t h=0;h<32;h++){ float* q=&Qh[h*64]; float th=1.0f; for(int i=0;i<32;i++){ float ang=(float)pos0*th; float c=std::cos(ang),s=std::sin(ang); float x0=q[2*i],x1=q[2*i+1]; q[2*i]=x0*c-x1*s; q[2*i+1]=x0*s+x1*c; th*=std::pow(fb,-2.0f/64.0f); } }
+                                                for (int64_t h=0;h<NQ;h++){ float* q=&Qh[h*hdR]; float th=1.0f; for(int i=0;i<hdR/2;i++){ float ang=(float)pos0*th; float c=std::cos(ang),s=std::sin(ang); float x0=q[2*i],x1=q[2*i+1]; q[2*i]=x0*c-x1*s; q[2*i+1]=x0*s+x1*c; th*=std::pow(fb,-2.0f/(float)hdR); } }
                                                 rHR = attn_relOp(Qh);
                                             }
-                                            { static bool d3=false; if(!d3){d3=true; fprintf(stderr,"ggml-xdna: [f3best-dbg3] relOp from-src1=%.4f from-handrms=%.4f |nrm_src1|=%.3f |handrms|=%.3f\n", rIL, rHR, std::sqrt([&]{double a=0;for(int k=0;k<2048;k++)a+=(double)nrm[k]*nrm[k];return a;}()), std::sqrt(hrn)); fflush(stderr);} }
+                                            { static bool d3=false; if(!d3){d3=true; fprintf(stderr,"ggml-xdna: [f3best-dbg3] relOp from-src1=%.4f from-handrms=%.4f |nrm_src1|=%.3f |handrms|=%.3f\n", rIL, rHR, std::sqrt([&]{double a=0;for(int64_t k=0;k<E_sp;k++)a+=(double)nrm[k]*nrm[k];return a;}()), std::sqrt(hrn)); fflush(stderr);} }
                                             static bool dmp2=false; if(!dmp2){dmp2=true;
                                                 // head-0 score spread with IL-Q + norms
-                                                double qn0=0; for(int d=0;d<64;d++) qn0+=(double)Qil[d]*Qil[d];
+                                                double qn0=0; for(int64_t d=0;d<hdR;d++) qn0+=(double)Qil[d]*Qil[d];
                                                 const int64_t g0=0; float mx=-1e30f,mn=1e30f; int64_t am=-1;
-                                                for(int64_t p=0;p<n_valid;p++){ double dot=0; for(int64_t d=0;d<64;d++){ float kv_=rd(kdat+p*k_perm->nb[1]+g0*k_perm->nb[2]+d*k_perm->nb[0],kf32,kf16); dot+=(double)Qil[d]*(double)kv_; } float sv=(float)dot*0.125f; if(sv>mx){mx=sv;am=p;} if(sv<mn)mn=sv; }
-                                                double ocn=0; const float* inp3=have_inpL_snap?inpL_snap.data():(const float*)lf_m.inpL_tensor->data; for(int e=0;e<2048;e++){ double oc=(double)cpu_s2[e]-(double)inp3[e]; ocn+=oc*oc; }
-                                                double nn=0; for(int k=0;k<2048;k++) nn+=(double)nrm[k]*nrm[k];
+                                                for(int64_t p=0;p<n_valid;p++){ double dot=0; for(int64_t d=0;d<hdR;d++){ float kv_=rd(kdat+p*k_perm->nb[1]+g0*k_perm->nb[2]+d*k_perm->nb[0],kf32,kf16); dot+=(double)Qil[d]*(double)kv_; } float sv=(float)dot*scaleR; if(sv>mx){mx=sv;am=p;} if(sv<mn)mn=sv; }
+                                                double ocn=0; const float* inp3=have_inpL_snap?inpL_snap.data():(const float*)lf_m.inpL_tensor->data; for(int64_t e=0;e<E_sp;e++){ double oc=(double)cpu_s2[e]-(double)inp3[e]; ocn+=oc*oc; }
+                                                double nn=0; for(int64_t k=0;k<E_sp;k++) nn+=(double)nrm[k]*nrm[k];
                                                 ggml_fp16_t sh0; memcpy(&sh0, qwb, 2); float wsc0=ggml_fp16_to_fp32(sh0);
-                                                double kn0=0; for(int d=0;d<64;d++){ float kv_=rd(kdat+0*k_perm->nb[1]+0*k_perm->nb[2]+d*k_perm->nb[0],kf32,kf16); kn0+=(double)kv_*kv_; }
+                                                double kn0=0; for(int64_t d=0;d<hdR;d++){ float kv_=rd(kdat+0*k_perm->nb[1]+0*k_perm->nb[2]+d*k_perm->nb[0],kf32,kf16); kn0+=(double)kv_*kv_; }
                                                 fprintf(stderr,"ggml-xdna: [f3best-dbg2] rmode=%d fb=%.0f IL=%.4f NX=%.4f NO=%.4f |nrm|=%.3f wq_sc0=%.5f |Kh0p0|=%.3f |Qh0|=%.3f score[max=%.3f min=%.3f] |Ocpu|=%.3f\n",
                                                         rmode, fb, rIL, rNX, rNO, std::sqrt(nn), wsc0, std::sqrt(kn0), std::sqrt(qn0), mx, mn, std::sqrt(ocn)); fflush(stderr);}
                                         }
@@ -20368,7 +20675,6 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                     fflush(stderr);
                                 }
                             }
-                        }
                         }
                         }
                         if (!f3_ok) {
