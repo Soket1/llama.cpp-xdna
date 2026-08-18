@@ -5357,6 +5357,19 @@ static bool ggml_backend_xdna_decode_layer_f3best(
     const int64_t PER_TILE = abi.per_tile;             // E/NH rows per tile for Q/O
     const int64_t KV_M = with_npu_kv ? 128 : 0;
     const size_t  PACKED   = abi.packed;   // 1B:4608, 3B:6912
+    // Per-tile layout: [nibble region | scale region]. The nibble region holds
+    // M rows of E/2 packed int4 nibbles = M*E/2 bytes; the scale region holds
+    // M rows of (E/group_size) bf16 group scales = M*(E/group_size)*2 bytes.
+    // The historical diff-test constants hardcoded 4096 = bcast_kc*(bcast_n/2)
+    // = 1B's nibble-region size (M=4,E=2048 -> 4096). For 3B (M=4,E=3072) the
+    // nibble region is 6144 bytes and scales begin at offset 6144, so the 4096
+    // constant zeroed only the first 4096 of 6144 nibble bytes — leaving 2048
+    // real nibbles, which made EVERY diff-test (NIB0/ZERONIB/ZEROSC/ZEROGU/
+    // ONESC/DOWNSEL) produce non-zero garbage on 3B and invalidated their
+    // verdicts. SCALE_OFF is the byte offset where scales start (= nibble size).
+    const size_t  NIBBLE_BYTES = (size_t)M * (size_t)E / 2;   // 1B:4096, 3B:6144
+    const size_t  SCALE_OFF    = NIBBLE_BYTES;                 // scales begin here
+    const size_t  SCALE_BYTES  = PACKED - NIBBLE_BYTES;        // 1B:512, 3B:768
     const int64_t Q_T      = abi.q_t;                  // Q/O weight tiles (1B:64, 3B:144)
     const int64_t GU_T     = abi.gu_t;                 // gate/up weight tiles (1B:256, 3B:384)
     const int64_t DN_T     = abi.dn_t;                 // down weight tiles (1B:256, 3B:384)
@@ -5510,17 +5523,18 @@ static bool ggml_backend_xdna_decode_layer_f3best(
             if (_samew) {
                 for (int64_t h = 1; h < NH; h++) memcpy(A + (size_t)h*WT_BYTES, A, WT_BYTES);
             }
-            // #206 zero-scale differential: pack_bcast writes the 8x32 bf16 group
-            // scales at byte offset KC*(N/2)=4096 of each 4608-byte tile. Zeroing
-            // that region makes EVERY dequantized weight exactly 0, so every GEMV
-            // output must be exactly 0. A non-zero partial then proves the kernel
-            // does not read its scales from where the host writes them.
+            // #206 zero-scale differential: pack_bcast writes the M*(E/g) bf16 group
+            // scales at byte offset SCALE_OFF (=M*E/2) of each PACKED-byte tile.
+            // Zeroing that region makes EVERY dequantized weight exactly 0, so
+            // every GEMV output must be exactly 0. A non-zero partial then proves
+            // the kernel does not read its scales from where the host writes them.
+            // (#235: SCALE_OFF is geometry-derived, not the 1B-only constant 4096.)
             static const bool _zerosc = xdna_env_enabled("F3BEST_ZEROSC");
             if (_zerosc) {
                 const size_t NT = WT_BYTES / PACKED;
                 for (int64_t h = 0; h < NH; h++)
                     for (size_t t = 0; t < NT; t++)
-                        memset(A + (size_t)h*WT_BYTES + t*PACKED + 4096, 0, PACKED - 4096);
+                        memset(A + (size_t)h*WT_BYTES + t*PACKED + SCALE_OFF, 0, SCALE_BYTES);
             }
             // #206 FFN-chain split: zero ONLY the gate+up scales (tile range
             // [2*GEMV_T, 2*GEMV_T+2*GU_T) in the per-head [Wq|Wo|gate|up|down]
@@ -5533,7 +5547,7 @@ static bool ggml_backend_xdna_decode_layer_f3best(
                 const size_t t0 = (size_t)(2*GEMV_T), t1 = t0 + (size_t)(2*GU_T);
                 for (int64_t h = 0; h < NH; h++)
                     for (size_t t = t0; t < t1; t++)
-                        memset(A + (size_t)h*WT_BYTES + t*PACKED + 4096, 0, PACKED - 4096);
+                        memset(A + (size_t)h*WT_BYTES + t*PACKED + SCALE_OFF, 0, SCALE_BYTES);
             }
             // #206 silu read-out: turn the down projection into a column selector so
             // the on-chip silu_buf becomes observable from the host. All down nibbles
@@ -5565,25 +5579,31 @@ static bool ggml_backend_xdna_decode_layer_f3best(
                                              : (sw_base + b * sw_step) % (size_t)H8;
                         const size_t ck = (CI / 256) % nch, cl = CI % 256;
                         uint8_t * tile = A + (size_t)h*WT_BYTES + t*PACKED;
-                        memset(tile, 0x00, 4096);
+                        memset(tile, 0x00, NIBBLE_BYTES);
                         if ((t - t0) % nch == ck) memset(tile + cl*16, 0x11, 16);
-                        uint16_t * sc = (uint16_t *)(tile + 4096);
-                        for (size_t k = 0; k < (PACKED - 4096) / 2; k++) sc[k] = 0x3F80;
+                        uint16_t * sc = (uint16_t *)(tile + SCALE_OFF);
+                        for (size_t k = 0; k < SCALE_BYTES / 2; k++) sc[k] = 0x3F80;
                     }
             }
             // #206 null-weight differential: nibble 0 decodes to signed 0, so writing
-            // 0x00 across [0,4096) makes every weight exactly 0 while leaving the real
-            // scales in place. 0 * scale = 0, so every GEMV output must be exactly 0.
-            // Any residue is the accumulator, not the arithmetic.
+            // 0x00 across the nibble region [0, NIBBLE_BYTES) makes every weight
+            // exactly 0 while leaving the real scales in place. 0 * scale = 0, so
+            // every GEMV output must be exactly 0. Any residue is the accumulator,
+            // not the arithmetic. (#235: NIBBLE_BYTES = M*E/2, geometry-derived, not
+            // the 1B-only 4096.)
             static const bool _nib0 = xdna_env_enabled("F3BEST_NIB0");
             if (_nib0) {
                 const size_t NT = WT_BYTES / PACKED;
+                static std::atomic<int> _nib0_log{2};
+                if (_nib0_log.fetch_sub(1) > 0)
+                    fprintf(stderr, "ggml-xdna: [f3best-nib0] APPLIED NH=%lld E=%lld PACKED=%zu NIBBLE_BYTES=%zu SCALE_OFF=%zu SCALE_BYTES=%zu NT=%zu WT_BYTES=%zu\n",
+                            (long long)NH, (long long)E, PACKED, NIBBLE_BYTES, SCALE_OFF, SCALE_BYTES, NT, (size_t)WT_BYTES);
                 for (int64_t h = 0; h < NH; h++)
                     for (size_t t = 0; t < NT; t++)
-                        memset(A + (size_t)h*WT_BYTES + t*PACKED, 0x00, 4096);
+                        memset(A + (size_t)h*WT_BYTES + t*PACKED, 0x00, NIBBLE_BYTES);
             }
-            // #206 zero-nibble differential: zero the nibble region [0,4096) while
-            // leaving the real scales intact. Every dequantized weight becomes
+            // #206 zero-nibble differential: zero the nibble region [0, NIBBLE_BYTES)
+            // while leaving the real scales intact. Every dequantized weight becomes
             // (0-8)*scale = -8*scale, i.e. a known constant, so each output row must
             // equal -8 * scale * sum(x). Any blow-up beyond that bound isolates the
             // defect to the nibble/MAC path rather than the scales.
@@ -5592,7 +5612,7 @@ static bool ggml_backend_xdna_decode_layer_f3best(
                 const size_t NT = WT_BYTES / PACKED;
                 for (int64_t h = 0; h < NH; h++)
                     for (size_t t = 0; t < NT; t++)
-                        memset(A + (size_t)h*WT_BYTES + t*PACKED, 0x88, 4096);
+                        memset(A + (size_t)h*WT_BYTES + t*PACKED, 0x88, NIBBLE_BYTES);
             }
             // #206 unit-scale differential: every group scale = bf16 1.0. Output then
             // reduces to a plain signed-int4 dot product, whose magnitude is bounded
@@ -5610,13 +5630,13 @@ static bool ggml_backend_xdna_decode_layer_f3best(
                 const size_t NT = _e1 ? (size_t)strtoul(_e1, NULL, 0) : NT_all;
                 for (int64_t h = 0; h < NH; h++)
                     for (size_t t = T0; t < NT && t < NT_all; t++) {
-                        uint16_t * sc = (uint16_t *)(A + (size_t)h*WT_BYTES + t*PACKED + 4096);
+                        uint16_t * sc = (uint16_t *)(A + (size_t)h*WT_BYTES + t*PACKED + SCALE_OFF);
                         // F3BEST_ONESC_VAL: bf16 bit pattern to write (default 1.0).
                         // Sweeping it shows how many times the kernel applies the group
                         // scale: the output scales as val^n for repeat count n.
                         const char * _ev = getenv("F3BEST_ONESC_VAL");
                         const uint16_t sv = _ev ? (uint16_t)strtoul(_ev, NULL, 0) : 0x3F80;
-                        for (size_t k = 0; k < (PACKED - 4096) / 2; k++) sc[k] = sv;
+                        for (size_t k = 0; k < SCALE_BYTES / 2; k++) sc[k] = sv;
                     }
             }
             // #207 unit-impulse differential: every scale = 1.0 and every nibble = 0
@@ -5632,11 +5652,11 @@ static bool ggml_backend_xdna_decode_layer_f3best(
                 for (int64_t h = 0; h < NH; h++)
                     for (size_t t = 0; t < NT; t++) {
                         uint8_t * tile = A + (size_t)h*WT_BYTES + t*PACKED;
-                        memset(tile, 0x00, 4096);
+                        memset(tile, 0x00, NIBBLE_BYTES);
                         const char * ib = getenv("F3BEST_IMPULSE_BYTE");
                         memset(tile, ib ? (uint8_t)strtoul(ib,NULL,0) : 0x99, 16);
-                        uint16_t * sc = (uint16_t *)(tile + 4096);
-                        for (size_t k = 0; k < (PACKED - 4096) / 2; k++) sc[k] = 0x3F80;
+                        uint16_t * sc = (uint16_t *)(tile + SCALE_OFF);
+                        for (size_t k = 0; k < SCALE_BYTES / 2; k++) sc[k] = 0x3F80;
                     }
             }
         };
