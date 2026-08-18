@@ -1505,7 +1505,8 @@ static std::vector<char> read_binary_file(const std::string & path) {
 
 static std::string make_cache_key(xdna_op_kind op_kind,
                                    int64_t M, int64_t K, int64_t N,
-                                   const char * dtype_in, int num_cols) {
+                                   const char * dtype_in, int num_cols,
+                                   int64_t attn_group = 0) {
     char buf[512];
     if (op_kind == XDNA_OP_GEMV) {
         // GEMV: M is implicitly 1, key omits it.
@@ -1548,14 +1549,14 @@ static std::string make_cache_key(xdna_op_kind op_kind,
                  (long long)K, (long long)N, num_cols);
     } else if (op_kind == XDNA_OP_DECODE_FRONT_ATTN) {
         // Fused front half (#32 Option B): K=embed_dim, N=head_dim, M=seq_len (the
-        // KV-cache length, varies with context — MUST be in the key). GQA params
-        // (attn_group=4, num_kv_heads=8, col_offset=2) hardcoded in the IRON op.
-        // _r4 = Ii fifo depth 2->1 (#188): the score/value packet race that left
-        // 3 of every 4 heads of the second temporal batch exactly zero. Must stay
-        // in sync with decode_front_attn/op.py (xclbin base + flowkv .o name) and
-        // design.py (fkv) -- all three name the same artifact.
-        snprintf(buf, sizeof(buf), "decode_front_attn_K%lld_N%lld_sl%lld_%dcol_ag4_kv8_g32_r4",
-                 (long long)K, (long long)N, (long long)M, num_cols);
+        // KV-cache length, varies with context — MUST be in the key). #235: GQA
+        // attn_group parameterized (op.py emits `_a{attn_group}_kv{num_kv_heads}`).
+        // attn_group is threaded through ensure_compiled's num_q_heads slot (abused
+        // as ag here, since front_attn has no num_q). 1B: a4, 3B: a3. _r4 = Ii fifo
+        // depth 2->1 (#188). Must stay in sync with op.py + design.py (fkv).
+        snprintf(buf, sizeof(buf), "decode_front_attn_K%lld_N%lld_sl%lld_%dcol_ag%lld_kv8_g32_r4",
+                 (long long)K, (long long)N, (long long)M, num_cols,
+                 (long long)attn_group);
     } else if (op_kind == XDNA_OP_DECODE_BACK_MONO) {
         // Fused back half (#32 Option B): K=embed_dim, N=hidden_dim.
         snprintf(buf, sizeof(buf), "decode_back_mono_K%lld_N%lld_%dcol_g32",
@@ -2714,18 +2715,22 @@ static bool ensure_compiled(ggml_backend_xdna_context * ctx,
                       (long long)K, (long long)N);
     } else if (op_kind == XDNA_OP_DECODE_FRONT_ATTN) {
         // Fused front half (#32). K=embed_dim, N=head_dim, M=seq_len (KV-cache
-        // length, threaded so the op is built for the real context). GQA params
-        // hardcoded for llama-3.2-1B (attn-group 4, num-kv-heads 8, col-offset 2).
+        // length, threaded so the op is built for the real context). #235: GQA
+        // attn_group threaded via num_q_heads slot (1B:4, 3B:3); num_kv_heads via
+        // num_kv_heads slot. col_offset fixed at 2 (8-col partition: 4 attn + 2+2).
+        int64_t fa_ag  = (num_q_heads > 0 && num_q_heads <= 8) ? num_q_heads : 4;
+        int64_t fa_nkv = (num_kv_heads > 0) ? num_kv_heads : 8;
         snprintf(cmd, sizeof(cmd),
                  "%s \"%s\" --quiet decode-front-attn --embed-dim %lld --head-dim %lld "
-                 "--attn-group 4 --num-kv-heads 8 --seq-len %lld --col-offset 2 "
+                 "--attn-group %lld --num-kv-heads %lld --seq-len %lld --col-offset 2 "
                  "--num-aie-columns %d --group-size 32 --out \"%s\"%s",
                  xdna_python_cmd(), ctx->compile_script.c_str(),
-                 (long long)K, (long long)N, (long long)M,
+                 (long long)K, (long long)N,
+                 (long long)fa_ag, (long long)fa_nkv, (long long)M,
                  num_cols,
                  xclbin_path.c_str(), xdna_null_redirect());
-        fprintf(stderr, "ggml-xdna: compiling DECODE_FRONT_ATTN E=%lld hd=%lld (first run, will be cached)...\n",
-                      (long long)K, (long long)N);
+        fprintf(stderr, "ggml-xdna: compiling DECODE_FRONT_ATTN E=%lld hd=%lld ag=%lld nkv=%lld (first run, will be cached)...\n",
+                      (long long)K, (long long)N, (long long)fa_ag, (long long)fa_nkv);
     } else if (op_kind == XDNA_OP_DECODE_BACK_MONO) {
         // Fused back half (#32). K=embed_dim, N=hidden_dim. insts alongside xclbin.
         snprintf(cmd, sizeof(cmd),
@@ -4814,9 +4819,11 @@ static bool ggml_backend_xdna_decode_front_attn(
     if (seq_len % 32 != 0) return false;               // chunk_size=32
 
     const std::string cache_key = make_cache_key(XDNA_OP_DECODE_FRONT_ATTN,
-                                                 seq_len, E, head_dim, "uint4", num_cols);
+                                                 seq_len, E, head_dim, "uint4", num_cols,
+                                                 attn_group);
     if (!ensure_compiled(ctx, cache_key, XDNA_OP_DECODE_FRONT_ATTN,
-                         seq_len, E, head_dim, "uint4", num_cols)) return false;
+                         seq_len, E, head_dim, "uint4", num_cols,
+                         nullptr, head_dim, attn_group, num_kv, attn_group)) return false;
     xdna_kernel_entry * entry = get_or_load_kernel(ctx, cache_key,
                                                    XDNA_OP_DECODE_FRONT_ATTN, seq_len, E, head_dim);
     if (!entry) return false;
@@ -20053,7 +20060,7 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                     fad.ne[0] = E_probe; fad.ne[1] = 1; fad.nb[0] = 4;
                                     bool fok = ggml_backend_xdna_decode_front_attn(
                                         ctx, &fad, normed.data(), E_probe, lf_m.w_q,
-                                        cgraph->nodes[lf_m.q_rope_idx], k_perm, v_perm, fd_ag);
+                                        cgraph->nodes[lf_m.q_rope_idx], k_perm, v_perm, 4);
                                     if (fok) {
                                         auto rel=[&](auto map)->double{ double nu=0,de=0; for(int64_t i=0;i<E_probe;i++){ double c=cpu_attn_out[map(i)]; double d=(double)fa_out[i]-c; nu+=d*d; de+=c*c;} return std::sqrt(nu/(de+1e-12)); };
                                         double rid = rel([&](int64_t i){return i;});
