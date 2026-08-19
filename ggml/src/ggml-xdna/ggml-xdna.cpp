@@ -5455,6 +5455,11 @@ static bool ggml_backend_xdna_decode_layer_f3best(
         f32_to_bf16(input_snap, xr, (size_t)E);
         std::vector<uint16_t> head_lut(q_rows);
         xdna_build_rope_lut_bf16(rope_node, head_dim, head_lut.data());
+        // #254: log rope_mode once per process in the live f3best path too.
+        { static std::atomic<bool> did_rm2{false}; bool ex2=false;
+          if (did_rm2.compare_exchange_strong(ex2,true) && rope_node && rope_node->op_params) {
+              const int32_t rm2 = ((const int32_t*)rope_node->op_params)[2];
+              fprintf(stderr,"ggml-xdna: [f3best-ropemode-live] rope_mode=%d (0=NORMAL/interleaved, 2=NEOX/galary)\n", (int)rm2); fflush(stderr); } }
         for (int64_t h = 0; h < attn_group; h++)
             memcpy(xr + E + h * head_dim, head_lut.data(), (size_t)head_dim * dts);
         // actual_seq: last non-zero K position (padded tail = 0).
@@ -20211,6 +20216,14 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                 if (rn2 && rn2->src[1] && rn2->src[1]->type==GGML_TYPE_I32 && rn2->src[1]->data)
                                     pos0 = ((const int32_t*)rn2->src[1]->data)[0];
                                 float fb=10000.0f; { const int32_t* pp=(const int32_t*)rn2->op_params; memcpy(&fb,pp+5,4); }
+                                // #254: log rope_mode (op_params[2]) once per process to resolve the
+                                // 1B-vs-3B contradiction (f3best hardcodes INTERLEAVED rope_il; llama-3.2
+                                // needs NEOX=2/galary). 1B=NORMAL(0) would make interleaved correct for 1B.
+                                { static std::atomic<bool> did_rm{false}; bool ex=false;
+                                  if (did_rm.compare_exchange_strong(ex,true) && rn2 && rn2->op_params) {
+                                      const int32_t rm = ((const int32_t*)rn2->op_params)[2];
+                                      fprintf(stderr,"ggml-xdna: [f3best-ropemode] q=%d rope_mode=%d fb=%.1f hd=%lld nq=%lld (0=NORMAL/interleaved, 2=NEOX/galary)\n",
+                                              lf_m.q_idx, rm, fb, (long long)hd_f, (long long)nq_f); fflush(stderr); } }
                                 const int64_t n_cap = k_perm->ne[1];
                                 const int64_t nval = (pos0+1 < n_cap) ? (pos0+1) : n_cap;
                                 const struct ggml_tensor * wqT2 = lf_m.w_q;
