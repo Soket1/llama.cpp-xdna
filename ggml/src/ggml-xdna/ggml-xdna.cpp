@@ -6513,6 +6513,15 @@ static bool ggml_backend_xdna_decode_layer_f3best(
                     const float sv = bf16f(s_blk[p * attn_group]);
                     fprintf(stderr, " %.4f", sv);
                 }
+                // #259b: raw first-32 bf16 of s_blk to disambiguate Q-values
+                // (varying, |~2|) vs scores (exp2, <=1) vs garbage (NaN/inf).
+                // Also dump first 32 of per-head region ob[0..31] (Qs drain in SDUMP?).
+                fprintf(stderr, "\nggml-xdna: [sdump-raw] seq=%d s_blk[0:32]:", _sc);
+                for (int64_t e = 0; e < 32; e++) fprintf(stderr, " %.4f", bf16f(s_blk[e]));
+                fprintf(stderr, "\nggml-xdna: [sdump-raw] seq=%d ob[0:32] (head0 per-head region):", _sc);
+                for (int64_t e = 0; e < 32; e++) fprintf(stderr, " %.4f", bf16f(ob[e]));
+                fprintf(stderr, "\nggml-xdna: [sdump-raw] seq=%d ob[NH*PH_STRIDE:8] (s_blk head0):", _sc);
+                for (int64_t e = 0; e < 8; e++) fprintf(stderr, " %.4f", bf16f(ob[(size_t)NH*PH_STRIDE + e]));
                 double s2 = 0; int snz = 0; float smx = -1e30f, smn = 1e30f; int64_t amx = -1;
                 for (int64_t p = 0; p < kv_len; p++) {
                     const float sv = bf16f(s_blk[p * attn_group]);
