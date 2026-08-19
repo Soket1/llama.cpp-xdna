@@ -20750,6 +20750,77 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                                     refO_p[h*hd_p + d] = (float)acc;
                                                 }
                                             }
+                                            // #258c: CPU-реплика ОНЛАЙН-softmax flowkv с bf16 round-trips
+                                            // (как AIE: chunk c_correction в bf16, denom в bf16, score weight в bf16).
+                                            // Сравнение refO_online vs native (через oproj) решает: баг в bf16
+                                            // онлайн-softmax-алгоритме (R6 §4) или в AIE-специфике.
+                                            //   refO_online ≈ native (rel~0.0045) => bf16 онлайн-softmax КОРРЕКТЕН, баг в AIE-специфике
+                                            //   refO_online ≠ native (rel~0.3)    => bf16 онлайн-softmax = root (#244)
+                                            std::vector<float> refO_on((size_t)E_probe, 0.0f);
+                                            const bool vrc_on = (v_perm->ne[0] == hd_p);
+                                            // bf16 helper (truncation, как AIE static_cast<bfloat16>)
+                                            auto bf16q = [](float x)->float {
+                                                uint32_t u; memcpy(&u,&x,4); u = (u + 0x7FFF + ((u>>16)&1)) & 0xFFFF0000;
+                                                float r; memcpy(&r,&u,4); return r;
+                                            };
+                                            const int64_t chunk_sz = 128;
+                                            const int64_t nchk = (kvL_p + chunk_sz - 1) / chunk_sz;
+                                            for (int64_t h = 0; h < nq_p; h++) {
+                                                const int64_t g = h / agp;
+                                                const float * qh_p = (const float *)((const char *)rnode_p->data + h * rnode_p->nb[1]);
+                                                float m_old = -1e30f; float l_old = 0.0f;
+                                                std::vector<float> vacc((size_t)hd_p, 0.0f);
+                                                std::vector<float> sc_on((size_t)kvL_p, 0.0f);
+                                                for (int64_t ci = 0; ci < nchk; ci++) {
+                                                    int64_t lo = ci * chunk_sz;
+                                                    int64_t eff = std::min(chunk_sz, kvL_p - lo);
+                                                    float m_chunk = -1e30f;
+                                                    for (int64_t j = 0; j < eff; j++) {
+                                                        int64_t pos = lo + j;
+                                                        int64_t src_pos = (nval > 256 && pos == 0) ? 0 : (nval - kvL_p + pos);
+                                                        double dot = 0;
+                                                        for (int64_t d = 0; d < hd_p; d++)
+                                                            dot += (double)qh_p[d] * (double)rd_p((const char*)k_perm->data + src_pos*k_perm->nb[1] + g*k_perm->nb[2] + d*k_perm->nb[0], kf2, kh2);
+                                                        float s = (float)dot * scale_p;
+                                                        sc_on[pos] = s; if (s > m_chunk) m_chunk = s;
+                                                    }
+                                                    // bf16 round-trip chunk max (как AIE m_chunk_bf16)
+                                                    float m_new = (m_chunk > m_old) ? m_chunk : m_old;
+                                                    // c_correction в bf16 (flowkv.cc:293): exp2((m_old-m_new)*log2e)
+                                                    float corr = std::pow(2.0f, (float)bf16q((m_old - m_new) * 1.4426950408889634f));
+                                                    // l_old через bf16 round-trip (flowkv.cc:299 l_new_bf16)
+                                                    l_old = bf16q(corr * l_old);
+                                                    float l_chunk = 0.0f;
+                                                    for (int64_t j = 0; j < eff; j++) {
+                                                        int64_t pos = lo + j;
+                                                        // bf16 score weight (flowkv.cc:319-327 VEC_EXP: diff f32, exp2 → bf16)
+                                                        float diff = (sc_on[pos] - m_new) * 1.4426950408889634f;
+                                                        float f = std::pow(2.0f, diff);
+                                                        float f_bf16 = bf16q(f);
+                                                        l_chunk = bf16q(l_chunk + f_bf16);
+                                                        sc_on[pos] = f_bf16;  // reuse as weight
+                                                    }
+                                                    // value_accum: y *= corr (bf16), y += weight*V (bf16 weight)
+                                                    for (int64_t d = 0; d < hd_p; d++)
+                                                        vacc[d] = bf16q(vacc[d] * corr);
+                                                    for (int64_t j = 0; j < eff; j++) {
+                                                        int64_t pos = lo + j;
+                                                        int64_t src_pos = (nval > 256 && pos == 0) ? 0 : (nval - kvL_p + pos);
+                                                        float w_bf16 = bf16q(sc_on[pos]);
+                                                        for (int64_t d = 0; d < hd_p; d++) {
+                                                            float vv = rd_p(vrc_on ? ((const char*)v_perm->data + src_pos*v_perm->nb[1] + g*v_perm->nb[2] + d*v_perm->nb[0])
+                                                                                : ((const char*)v_perm->data + d*v_perm->nb[1] + g*v_perm->nb[2] + src_pos*v_perm->nb[0]), vf2, vh2);
+                                                            vacc[d] = bf16q(vacc[d] + bf16q(w_bf16 * vv));
+                                                        }
+                                                    }
+                                                    l_old = bf16q(l_old + l_chunk);
+                                                    m_old = m_new;
+                                                }
+                                                // normalize: inv_l (flowkv.cc:557)
+                                                float inv_l = 1.0f / l_old;
+                                                for (int64_t d = 0; d < hd_p; d++)
+                                                    refO_on[h*hd_p + d] = vacc[d] * inv_l;
+                                            }
                                             const float * s_npu = diagnostics.post_attention;
                                             const float * inpL_p2 = have_inpL_snap ? inpL_snap.data() : (const float *)lf_m.inpL_tensor->data;
                                             const float * cpu_s_p2 = have_cpu_s_snap ? cpu_s_snap.data() : nullptr;
@@ -20773,6 +20844,25 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                                     }
                                                     return std::sqrt(on/(od+1e-12));
                                                 };
+                                                // #258c: O-proj(online bf16) vs native — решает bf16-онлайн-softmax vs AIE-специфика
+                                                { auto oproj_native = [&](const std::vector<float>& av) -> double {
+                                                    double on=0, od=0;
+                                                    for (int64_t n = 0; n < E_probe; n++) {
+                                                        const uint8_t * row = (const uint8_t *)lf_m.w_o->data + (size_t)n * (size_t)(E_probe/32) * 18;
+                                                        double acc = 0;
+                                                        for (int64_t b = 0; b < E_probe/32; b++) {
+                                                            const uint8_t * blk = row + b * 18;
+                                                            ggml_fp16_t sh; memcpy(&sh, blk, 2); const float sc = ggml_fp16_to_fp32(sh);
+                                                            const uint8_t * qs = blk + 2;
+                                                            for (int j = 0; j < 32; j++) { const int nib = (j < 16) ? (qs[j] & 0xF) : (qs[j-16] >> 4);
+                                                                acc += (double)((nib - 8) * sc) * (double)av[b*32 + j]; }
+                                                        }
+                                                        double oc=(double)cpu_s_p2[n]-(double)inpL_p2[n]; double dd=acc-oc; on+=dd*dd; od+=oc*oc;
+                                                    }
+                                                    return std::sqrt(on/(od+1e-12)); };
+                                                fprintf(stderr,"ggml-xdna: [f3best-ref-online] q=%d online_bf16_vs_npu=%.5f online_bf16_vs_native=%.5f full_f32_vs_native=%.5f\n",
+                                                        lf_m.q_idx, oproj_r(refO_on), oproj_native(refO_on), oproj_native(refO_p));
+                                                fflush(stderr); }
                                                 auto permute_p = [&](int mode) -> std::vector<float> {
                                                     std::vector<float> r((size_t)E_probe, 0.0f);
                                                     for (int h=0; h<nq_p; h++){ int sh;
