@@ -262,6 +262,10 @@ struct xdna_kernel_entry {
     // MM2S ch1 + sh2 S2MM ch0. Only allocated/bound when the _attnout xclbin (9-arg
     // kernel) is active; nullptr on the production 8-arg path.
     std::unique_ptr<xrt::bo> tap_bo;
+    // #260: AIE2P hardware trace BO (F3BEST_AIE_TRACE). The trace packets from
+    // score tile sc1 land here via sh7 S2MM ch1 (aie.trace.host_config arg_idx=-1
+    // appends the trace buffer after the last tensor arg => set_arg(8)). 64KB.
+    std::unique_ptr<xrt::bo> trace_bo;
     // Phase 9 per-call BO ring. Indexed 0..XDNA_PHASE9_RING_SIZE-1.
     // The ring's per-slot run + deferred lambda live in the context-level
     // inflight tracker (xdna_inflight_tracker), keyed by slot_dst_data[i].
@@ -1600,6 +1604,9 @@ static std::string make_cache_key(xdna_op_kind op_kind,
         // QDUMP). Must mirror op.py's _sdump.
         const char * sdump_env = getenv("F3BEST_SDUMP");
         const char * sdump_suffix = (sdump_env && sdump_env[0] != '\0') ? "_sdump" : "";
+        // #260: AIE2P hardware trace on score tile sc1. Must mirror op.py's _atrace.
+        const char * atrace_env = getenv("F3BEST_AIE_TRACE");
+        const char * atrace_suffix = (atrace_env && atrace_env[0] != '\0') ? "_atrace" : "";
         // #211: B0 dump (snapshot x_bundle delivery via Pf0 drain). Must mirror op.py's _b0dump.
         const char * b0dump_env = getenv("F3BEST_B0DUMP");
         const char * b0dump_suffix = (b0dump_env && b0dump_env[0] != '\0') ? "_b0dump" : "";
@@ -1623,11 +1630,11 @@ static std::string make_cache_key(xdna_op_kind op_kind,
                  (long long)head_dim, (long long)attn_group,
                  flowkv_obj_fingerprint);
         if (ffn_div && strcmp(ffn_div, "1") != 0) {
-            snprintf(buf, sizeof(buf), "decode_layer_f3best_%lldx%lld_d%lld_g%lld_s%lld_a%lld_q%lld_kv%lld_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac_ug%s_d%s%s%s%s%s%s%s%s%s_fkfix2_silu2_mxpp_objid2_abi3_al64",
-                     (long long)K, (long long)N, (long long)head_dim, (long long)32, (long long)256, (long long)attn_group, (long long)num_q, (long long)8, kv_abi, ffn_div, dc_suffix, tb_suffix, rr_suffix, qdump_suffix, sdump_suffix, b0dump_suffix, attnout_suffix, uni_suffix, flowkv_obj_tag);
+            snprintf(buf, sizeof(buf), "decode_layer_f3best_%lldx%lld_d%lld_g%lld_s%lld_a%lld_q%lld_kv%lld_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac_ug%s_d%s%s%s%s%s%s%s%s%s%s_fkfix2_silu2_mxpp_objid2_abi3_al64",
+                     (long long)K, (long long)N, (long long)head_dim, (long long)32, (long long)256, (long long)attn_group, (long long)num_q, (long long)8, kv_abi, ffn_div, dc_suffix, tb_suffix, rr_suffix, qdump_suffix, sdump_suffix, b0dump_suffix, attnout_suffix, atrace_suffix, uni_suffix, flowkv_obj_tag);
         } else {
-            snprintf(buf, sizeof(buf), "decode_layer_f3best_%lldx%lld_d%lld_g%lld_s%lld_a%lld_q%lld_kv%lld_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac_ug2%s%s%s%s%s%s%s%s%s%s_fkfix2_silu2_mxpp_objid2_abi3_al64",
-                     (long long)K, (long long)N, (long long)head_dim, (long long)32, (long long)256, (long long)attn_group, (long long)num_q, (long long)8, kv_abi, dc_suffix, tb_suffix, rr_suffix, qdump_suffix, sdump_suffix, b0dump_suffix, attnout_suffix, uni_suffix, flowkv_obj_tag);
+            snprintf(buf, sizeof(buf), "decode_layer_f3best_%lldx%lld_d%lld_g%lld_s%lld_a%lld_q%lld_kv%lld_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac_ug2%s%s%s%s%s%s%s%s%s%s%s_fkfix2_silu2_mxpp_objid2_abi3_al64",
+                     (long long)K, (long long)N, (long long)head_dim, (long long)32, (long long)256, (long long)attn_group, (long long)num_q, (long long)8, kv_abi, dc_suffix, tb_suffix, rr_suffix, qdump_suffix, sdump_suffix, b0dump_suffix, attnout_suffix, atrace_suffix, uni_suffix, flowkv_obj_tag);
         }
     } else {
         snprintf(buf, sizeof(buf), "gemm_%lldx%lldx%lld_%s_%dcol",
@@ -5409,6 +5416,8 @@ static bool ggml_backend_xdna_decode_layer_f3best(
     // XR bundle so the s-region holds the relayed scores (It) without the
     // attention residual added (nm's add_bf16 still runs but adds 0).
     static const bool f3b_sdump = xdna_env_enabled("F3BEST_SDUMP");
+    // #260: AIE2P hardware trace (score tile sc1 -> sh7 S2MM ch1 -> trace BO).
+    static const bool f3b_atrace = xdna_env_enabled("F3BEST_AIE_TRACE");
     const int64_t XB       = abi.XB;                    // x_bundle: input + rope LUT + seq meta
     const int64_t XR_ELEMS = abi.xr_elems;              // x|resid|gain
     // #245: in ATTN_DUMP mode grow OUT_ELEMS by E to hold the tap region at
@@ -5448,10 +5457,18 @@ static bool ggml_backend_xdna_decode_layer_f3best(
             entry->a_bo = std::make_unique<xrt::bo>(ctx->device, (size_t)XR_ELEMS * dts,
                 xrt::bo::flags::host_only, entry->kernel.group_id(4));
         if (!entry->d3_bo) {
-            entry->d3_bo = std::make_unique<xrt::bo>(ctx->device, WO_BYTES,
+            const size_t d3_bytes = f3b_atrace ? (size_t)65536 : (size_t)WO_BYTES;
+            entry->d3_bo = std::make_unique<xrt::bo>(ctx->device, d3_bytes,
                 xrt::bo::flags::host_only, entry->kernel.group_id(6));
-            memset(entry->d3_bo->map<void*>(), 0, WO_BYTES);
+            memset(entry->d3_bo->map<void*>(), 0, d3_bytes);
             entry->d3_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);     // never DMA'd, bound once
+        }
+        // #260: in AIE_TRACE mode the d3_bo (Wo placeholder, XRT arg 6) is
+        // re-sized to 64KB and reused as the trace BO (aie.trace.host_config
+        // arg_idx=6). XRT caps kernels at 8 args, so no extra arg is possible.
+        // Host reads trace packets back after sync FROM_DEVICE.
+        if (f3b_atrace && entry->d3_bo) {
+            entry->d3_bo.reset();
         }
         // arg7 KV BO is per-layer cached below (#79), not a single shared d4_bo.
 
@@ -6190,6 +6207,22 @@ static bool ggml_backend_xdna_decode_layer_f3best(
         if (f3b_gluetime) g_xdna_f3best_gluetime.npu_us += xdna_elapsed_us(_f3_ts, _f3_t2);
         const auto _gt_os0 = std::chrono::steady_clock::now();
         entry->c_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        // #260: sync the trace BO (d3_bo in AIE_TRACE mode) back and dump the
+        // trace packets to raw_trace.bin once for offline parse.py analysis.
+        if (f3b_atrace && entry->d3_bo) {
+            entry->d3_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+            static std::atomic<bool> _atrace_dumped{false};
+            bool exp = false;
+            if (_atrace_dumped.compare_exchange_strong(exp, true)) {
+                const void * tb = entry->d3_bo->map<void*>();
+                if (FILE * f = fopen("raw_trace.bin", "wb")) {
+                    fwrite(tb, 1, 65536, f);
+                    fclose(f);
+                    fprintf(stderr, "ggml-xdna: [atrace] wrote raw_trace.bin (65536 bytes)\n");
+                    fflush(stderr);
+                }
+            }
+        }
         // #245: tap attn_out now lands in c_bo (output BO, arg0) at offset (NH+1)*E
         // — c_bo is already synced above, no separate d3_bo sync needed.
         if (f3b_gluetime) g_xdna_f3best_gluetime.outsync_us += xdna_elapsed_us(_gt_os0);
