@@ -1596,6 +1596,10 @@ static std::string make_cache_key(xdna_op_kind op_kind,
         const char * rr_suffix = "_cpp";
         const char * qdump_env = getenv("F3BEST_QDUMP");
         const char * qdump_suffix = (qdump_env && qdump_env[0] != '\0') ? "_qdump7" : "";
+        // #259: score-tile dump — per-position Q·K scores via @S_alloc (like
+        // QDUMP). Must mirror op.py's _sdump.
+        const char * sdump_env = getenv("F3BEST_SDUMP");
+        const char * sdump_suffix = (sdump_env && sdump_env[0] != '\0') ? "_sdump" : "";
         // #211: B0 dump (snapshot x_bundle delivery via Pf0 drain). Must mirror op.py's _b0dump.
         const char * b0dump_env = getenv("F3BEST_B0DUMP");
         const char * b0dump_suffix = (b0dump_env && b0dump_env[0] != '\0') ? "_b0dump" : "";
@@ -1619,11 +1623,11 @@ static std::string make_cache_key(xdna_op_kind op_kind,
                  (long long)head_dim, (long long)attn_group,
                  flowkv_obj_fingerprint);
         if (ffn_div && strcmp(ffn_div, "1") != 0) {
-            snprintf(buf, sizeof(buf), "decode_layer_f3best_%lldx%lld_d%lld_g%lld_s%lld_a%lld_q%lld_kv%lld_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac_ug%s_d%s%s%s%s%s%s%s%s_fkfix2_silu2_mxpp_objid2_abi3_al64",
-                     (long long)K, (long long)N, (long long)head_dim, (long long)32, (long long)256, (long long)attn_group, (long long)num_q, (long long)8, kv_abi, ffn_div, dc_suffix, tb_suffix, rr_suffix, qdump_suffix, b0dump_suffix, attnout_suffix, uni_suffix, flowkv_obj_tag);
+            snprintf(buf, sizeof(buf), "decode_layer_f3best_%lldx%lld_d%lld_g%lld_s%lld_a%lld_q%lld_kv%lld_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac_ug%s_d%s%s%s%s%s%s%s%s%s_fkfix2_silu2_mxpp_objid2_abi3_al64",
+                     (long long)K, (long long)N, (long long)head_dim, (long long)32, (long long)256, (long long)attn_group, (long long)num_q, (long long)8, kv_abi, ffn_div, dc_suffix, tb_suffix, rr_suffix, qdump_suffix, sdump_suffix, b0dump_suffix, attnout_suffix, uni_suffix, flowkv_obj_tag);
         } else {
-            snprintf(buf, sizeof(buf), "decode_layer_f3best_%lldx%lld_d%lld_g%lld_s%lld_a%lld_q%lld_kv%lld_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac_ug2%s%s%s%s%s%s%s%s%s_fkfix2_silu2_mxpp_objid2_abi3_al64",
-                     (long long)K, (long long)N, (long long)head_dim, (long long)32, (long long)256, (long long)attn_group, (long long)num_q, (long long)8, kv_abi, dc_suffix, tb_suffix, rr_suffix, qdump_suffix, b0dump_suffix, attnout_suffix, uni_suffix, flowkv_obj_tag);
+            snprintf(buf, sizeof(buf), "decode_layer_f3best_%lldx%lld_d%lld_g%lld_s%lld_a%lld_q%lld_kv%lld_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac_ug2%s%s%s%s%s%s%s%s%s%s_fkfix2_silu2_mxpp_objid2_abi3_al64",
+                     (long long)K, (long long)N, (long long)head_dim, (long long)32, (long long)256, (long long)attn_group, (long long)num_q, (long long)8, kv_abi, dc_suffix, tb_suffix, rr_suffix, qdump_suffix, sdump_suffix, b0dump_suffix, attnout_suffix, uni_suffix, flowkv_obj_tag);
         }
     } else {
         snprintf(buf, sizeof(buf), "gemm_%lldx%lldx%lld_%s_%dcol",
@@ -5401,6 +5405,10 @@ static bool ggml_backend_xdna_decode_layer_f3best(
     // bf16(Q+R)), giving the s-region an exact bf16 Q without resid corruption.
     static const bool f3b_qdump = xdna_env_enabled("XDNA_F3BEST_QDUMP")
                                || xdna_env_enabled("F3BEST_QDUMP");
+    // #259: score-tile dump — like QDUMP, the host zeroes the resid region of the
+    // XR bundle so the s-region holds the relayed scores (It) without the
+    // attention residual added (nm's add_bf16 still runs but adds 0).
+    static const bool f3b_sdump = xdna_env_enabled("F3BEST_SDUMP");
     const int64_t XB       = abi.XB;                    // x_bundle: input + rope LUT + seq meta
     const int64_t XR_ELEMS = abi.xr_elems;              // x|resid|gain
     // #245: in ATTN_DUMP mode grow OUT_ELEMS by E to hold the tap region at
@@ -5503,7 +5511,9 @@ static bool ggml_backend_xdna_decode_layer_f3best(
         }
         // #242: in QDUMP mode, zero the resid region so nm's add_bf16 computes
         // F = O(Q) + 0 = Q (clean Q in the s-region, no bf16(Q+R)-minus-R loss).
-        if (f3b_qdump) {
+        // #259: SDUMP does the same — the s-region holds relayed It scores, and
+        // zeroing resid makes nm's add_bf16 yield F = scores + 0 = clean scores.
+        if (f3b_qdump || f3b_sdump) {
             std::memset(xr + XB, 0, (size_t)E * dts);
         } else {
             f32_to_bf16(resid, xr + XB, (size_t)E);
@@ -6474,6 +6484,53 @@ static bool ggml_backend_xdna_decode_layer_f3best(
                     }
                     fflush(stderr);
                 }
+            }
+        }
+        // #259 SDUMP readback: each score tile relayed its per-chunk Q·K scores
+        // (It, ITC bf16 = chunk_size*AG + 2*AG: [score_pos0_head0, score_pos0_head1,
+        // ... score_posN_headAG-1, corr_head0..corr_headAG-1, denom_head0..denom_headAG-1])
+        // into the s-region via @S_alloc. Resid is host-zeroed, so s_blk = clean
+        // scores. Print head-0 first kv_len scores + magnitude to verify the tap
+        // produced non-zero, well-shaped scores (the probe-path [f3best-sdump-cmp]
+        // block compares these against the CPU online-bf16 replica scores).
+        if (f3b_sdump && out_dst && out_dst->type == GGML_TYPE_F32 && out_dst->data) {
+            static const int _sdb_n = [](){ const char* e = getenv("F3BEST_SDUMP_N");
+                                            return (e && *e) ? atoi(e) : 6; }();
+            static std::atomic<int> _sdb{_sdb_n};
+            static std::atomic<int> _sseq{0};
+            if (_sdb.fetch_sub(1) > 0) {
+                const int _sc = _sseq.fetch_add(1);
+                const int64_t PT = E / NH;
+                // It layout (flowkv.cc:327): scores_out[pos * num_q_heads + h] for
+                // the chunk's attention-group heads (AG heads). Head-0 scores at
+                // stride num_q_heads (=AG*num_kv, but score tile handles AG heads per
+                // chunk, so the in-chunk stride is AG). Verify by reading stride AG.
+                // Actually flowkv_score_chunk writes scores_out[pos*AG+h] within the
+                // chunk's AG heads (the score tile owns one attn-group). Print first
+                // min(kv_len,16) positions of head-0 (stride AG within the group).
+                fprintf(stderr, "ggml-xdna: [sdump] seq=%d head0 scores[0:%lld]:", _sc, (long long)std::min<int64_t>(kv_len, 16));
+                for (int64_t p = 0; p < std::min<int64_t>(kv_len, 16); p++) {
+                    const float sv = bf16f(s_blk[p * attn_group]);
+                    fprintf(stderr, " %.4f", sv);
+                }
+                double s2 = 0; int snz = 0; float smx = -1e30f, smn = 1e30f; int64_t amx = -1;
+                for (int64_t p = 0; p < kv_len; p++) {
+                    const float sv = bf16f(s_blk[p * attn_group]);
+                    if (std::isnan(sv) || std::isinf(sv)) continue;
+                    s2 += (double)sv*(double)sv; if (sv != 0.0f) snz++;
+                    if (sv > smx) { smx = sv; amx = p; } if (sv < smn) smn = sv;
+                }
+                fprintf(stderr, "\nggml-xdna: [sdump] seq=%d head0 |scores|_rms=%.5f nz=%d/%lld max=%.4f min=%.4f argmax=%lld spread=%.4f\n",
+                        _sc, std::sqrt(s2/(double)kv_len), snz, (long long)kv_len, smx, smn, (long long)amx, smx-smn);
+                // also the corr/denom tail: scores_out[chunk_size*AG + h] = corr,
+                // scores_out[chunk_size*AG + AG + h] = denom (for head h in group).
+                const int64_t csz = 128; // CHUNK
+                const int64_t cbase = csz * attn_group;
+                fprintf(stderr, "ggml-xdna: [sdump] seq=%d head0 corr=%.5f denom=%.5f (chunk0 tail at cbase=%lld)\n",
+                        _sc, (cbase < PT) ? bf16f(s_blk[cbase]) : 0.0f,
+                        (cbase + attn_group < PT) ? bf16f(s_blk[cbase + attn_group]) : 0.0f,
+                        (long long)cbase);
+                fflush(stderr);
             }
         }
         // #211 B0 dump: in b0dump mode the center core memcpy'd B0 -> P after phase1,
