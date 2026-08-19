@@ -5397,6 +5397,10 @@ static bool ggml_backend_xdna_decode_layer_f3best(
     const int     dts      = 2;
     // #245: tapped debug-build (declared early — OUT_ELEMS depends on it).
     static const bool f3b_attn_dump = xdna_env_enabled("F3BEST_ATTN_DUMP");
+    // #242: clean Q-dump — zero the resid region so nm add_bf16 yields F=Q (not
+    // bf16(Q+R)), giving the s-region an exact bf16 Q without resid corruption.
+    static const bool f3b_qdump = xdna_env_enabled("XDNA_F3BEST_QDUMP")
+                               || xdna_env_enabled("F3BEST_QDUMP");
     const int64_t XB       = abi.XB;                    // x_bundle: input + rope LUT + seq meta
     const int64_t XR_ELEMS = abi.xr_elems;              // x|resid|gain
     // #245: in ATTN_DUMP mode grow OUT_ELEMS by E to hold the tap region at
@@ -5492,7 +5496,13 @@ static bool ggml_backend_xdna_decode_layer_f3best(
                 fflush(stderr);
             }
         }
-        f32_to_bf16(resid, xr + XB, (size_t)E);
+        // #242: in QDUMP mode, zero the resid region so nm's add_bf16 computes
+        // F = O(Q) + 0 = Q (clean Q in the s-region, no bf16(Q+R)-minus-R loss).
+        if (f3b_qdump) {
+            std::memset(xr + XB, 0, (size_t)E * dts);
+        } else {
+            f32_to_bf16(resid, xr + XB, (size_t)E);
+        }
         // ffn_norm gain -> bf16 (norm weights are usually f32).
         {
             uint16_t * gdst = xr + XB + E;
