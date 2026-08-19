@@ -6384,6 +6384,42 @@ static bool ggml_backend_xdna_decode_layer_f3best(
                         }
                         const float inv_sqrt_hd = 1.0f / std::sqrt((float)hd_f);
                         for (int64_t n = 0; n < ck; n++) cpuq[n] *= inv_sqrt_hd;
+                        // #256c DECISIVE Q-PATH BISECTION (R6 §9.1): compare NPU roped-Q
+                        // (s-region, raw, NO prescale — #242 established the tap reads
+                        // pre-prescale Q) against ggml's NATIVE roped-Q tensor
+                        // (rope_node->data, also raw/no-prescale). Unlike cpuq above
+                        // (hand-rolled Wq-dequant+RoPE, relOp_fromNormed=0.95 = broken
+                        // golden), rnode->data is the ggml graph's own roped-Q that the
+                        // CPU reference (relOp_ref=0.0045) uses — the ONLY trustworthy
+                        // golden. Direct element-wise rel_l2 decides where the bug lives:
+                        //   NPU-Q ≈ rnode  => Q-GEMV+RoPE correct, bug is in score/softmax/value
+                        //   NPU-Q ≠ rnode  => bug is ABOVE flowkv (Q-GEMV / RoPE kernel / LUT / Q delivery)
+                        // Probe-mode only: CPU graph ran fully so rnode->data is filled.
+                        if (rope_node && rope_node->data && rope_node->type == GGML_TYPE_F32) {
+                            // rnode is [hd_f, nq_f] head-major: head h at h*nb[1].
+                            double rn_num = 0, rn_den = 0; int rn_cnt = 0, rn_nan = 0;
+                            double npu_mx = 0, rnode_mx = 0, rat_sum = 0; int rat_cnt = 0;
+                            for (int64_t h = 0; h < ag_f; h++) {
+                                const float * qh_native = (const float *)((const char *)rope_node->data + h * rope_node->nb[1]);
+                                for (int64_t d = 0; d < hd_f; d++) {
+                                    const int64_t e = h * hd_f + d;
+                                    const float sv = bf16f(s_blk[e]);
+                                    const float qv = R ? (sv - R[e]) : sv;
+                                    const float nat = qh_native[d];
+                                    if (std::isnan(qv) || std::isinf(qv) || std::isnan(nat) || std::isinf(nat)) { rn_nan++; continue; }
+                                    npu_mx = std::max(npu_mx, (double)std::fabs(qv));
+                                    rnode_mx = std::max(rnode_mx, (double)std::fabs(nat));
+                                    const double dd = (double)qv - (double)nat;
+                                    rn_num += dd * dd; rn_den += (double)nat * (double)nat; rn_cnt++;
+                                    if (std::fabs(nat) > 1e-3f) { rat_sum += (double)qv / (double)nat; rat_cnt++; }
+                                }
+                            }
+                            fprintf(stderr, "ggml-xdna: [qdump-rnode] seq=0 ag=%lld hd=%lld cmp=%lld nan=%d rel_err=%.6f npu_max=%.4f rnode_max=%.4f mean_ratio=%.5f\n",
+                                    (long long)ag_f, (long long)hd_f, (long long)rn_cnt, rn_nan,
+                                    std::sqrt(rn_num / (rn_den + 1e-12)), npu_mx, rnode_mx,
+                                    rat_cnt ? (rat_sum / rat_cnt) : 0.0);
+                            fflush(stderr);
+                        }
                         double nf_num = 0, nf_den = 0; int nf_cnt = 0; double cpu_mx = 0;
                         int nanrows = 0; double nanrow_cpu_energy = 0, finrow_cpu_energy = 0;
                         for (int64_t e = 0; e < ck; e++) {
