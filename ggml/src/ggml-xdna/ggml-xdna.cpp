@@ -20692,6 +20692,133 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                         fprintf(stderr,"%s\n",cb); fflush(stderr);
                                     }
                                     }
+                                    // #258 H2 против ДОВЕРЕННОГО эталона (R6 §9.3): perm/hfit выше
+                                    // (20618-20692) строят базис из cpu_attn_out — битого ручного
+                                    // golden (relOp_fromNormed=0.95). Здесь пересобираем permutation
+                                    // + least-squares fit против refO (нативный rnode-based,
+                                    // relOp_ref=0.0045) — единственный верный эталон. refO считается
+                                    // inline из roped-Q rnode + cache K/V. Вердикт:
+                                    //   perm-ref id~0 + hfit-ref residual~0 => ЛИНЕЙНЫЙ дефект (перм/масштаб голов); H2 жив, баг = роутинг
+                                    //   perm-ref всё высоко + residual высок => НЕЛИНЕЙНЫЙ (softmax/value); баг ВНУТРИ flowkv
+                                    {
+                                        const struct ggml_tensor * rnode_p = cgraph->nodes[lf_m.q_rope_idx];
+                                        if (rnode_p && rnode_p->data && rnode_p->type == GGML_TYPE_F32 &&
+                                            k_perm && v_perm && k_perm->data && v_perm->data &&
+                                            lf_m.w_o && lf_m.w_o->type == GGML_TYPE_Q4_0 && lf_m.w_o->data) {
+                                            const int64_t hd_p = k_perm->ne[0];
+                                            const int64_t nq_p = lf_m.w_q->ne[1] / hd_p;
+                                            const int64_t nkv_p = k_perm->ne[2];
+                                            const int64_t agp = nkv_p ? nq_p / nkv_p : 0;
+                                            const float scale_p = 1.0f / std::sqrt((float)hd_p);
+                                            int64_t pos_p = 0;
+                                            if (rnode_p->src[1] && rnode_p->src[1]->type == GGML_TYPE_I32 && rnode_p->src[1]->data)
+                                                pos_p = ((const int32_t *)rnode_p->src[1]->data)[0];
+                                            const int64_t ncap = k_perm->ne[1];
+                                            const int64_t nval = (pos_p + 1 < ncap) ? (pos_p + 1) : ncap;
+                                            const int64_t kvL_p = nval < 256 ? nval : 256;
+                                            const bool kf2 = k_perm->type == GGML_TYPE_F32, kh2 = k_perm->type == GGML_TYPE_F16;
+                                            const bool vf2 = v_perm->type == GGML_TYPE_F32, vh2 = v_perm->type == GGML_TYPE_F16;
+                                            auto rd_p = [](const char * pp, bool f32, bool f16) -> float {
+                                                if (f32) { float v; memcpy(&v,pp,4); return v; }
+                                                if (f16) { ggml_fp16_t h; memcpy(&h,pp,2); return ggml_fp16_to_fp32(h); }
+                                                uint16_t b; memcpy(&b,pp,2); float v; uint32_t u=(uint32_t)b<<16; memcpy(&v,&u,4); return v;
+                                            };
+                                            std::vector<float> refO_p((size_t)E_probe, 0.0f);
+                                            std::vector<float> sc_p((size_t)kvL_p, 0.0f);
+                                            for (int64_t h = 0; h < nq_p; h++) {
+                                                const int64_t g = h / agp;
+                                                const float * qh_p = (const float *)((const char *)rnode_p->data + h * rnode_p->nb[1]);
+                                                float mx = -1e30f;
+                                                for (int64_t pos = 0; pos < kvL_p; pos++) {
+                                                    const int64_t src_pos = (nval > 256 && pos == 0) ? 0 : (nval - kvL_p + pos);
+                                                    double dot = 0;
+                                                    for (int64_t d = 0; d < hd_p; d++)
+                                                        dot += (double)qh_p[d] * (double)rd_p((const char*)k_perm->data + src_pos*k_perm->nb[1] + g*k_perm->nb[2] + d*k_perm->nb[0], kf2, kh2);
+                                                    float s = (float)dot * scale_p; sc_p[pos] = s; if (s > mx) mx = s;
+                                                }
+                                                double sum = 0; for (int64_t p = 0; p < kvL_p; p++) { sc_p[p] = std::exp(sc_p[p]-mx); sum += sc_p[p]; }
+                                                float inv = 1.0f/(float)sum;
+                                                const bool vrc = (v_perm->ne[0] == hd_p);
+                                                for (int64_t d = 0; d < hd_p; d++) {
+                                                    double acc = 0;
+                                                    for (int64_t p = 0; p < kvL_p; p++) {
+                                                        const int64_t src_pos = (nval > 256 && p == 0) ? 0 : (nval - kvL_p + p);
+                                                        const char * vp = vrc ? ((const char*)v_perm->data + src_pos*v_perm->nb[1] + g*v_perm->nb[2] + d*v_perm->nb[0])
+                                                                              : ((const char*)v_perm->data + d*v_perm->nb[1] + g*v_perm->nb[2] + src_pos*v_perm->nb[0]);
+                                                        acc += (double)(sc_p[p]*inv) * (double)rd_p(vp, vf2, vh2);
+                                                    }
+                                                    refO_p[h*hd_p + d] = (float)acc;
+                                                }
+                                            }
+                                            const float * s_npu = diagnostics.post_attention;
+                                            const float * inpL_p2 = have_inpL_snap ? inpL_snap.data() : (const float *)lf_m.inpL_tensor->data;
+                                            const float * cpu_s_p2 = have_cpu_s_snap ? cpu_s_snap.data() : nullptr;
+                                            if (s_npu && inpL_p2 && cpu_s_p2) {
+                                                auto oproj_r = [&](const std::vector<float>& av) -> double {
+                                                    double on=0, od=0;
+                                                    for (int64_t n = 0; n < E_probe; n++) {
+                                                        const uint8_t * row = (const uint8_t *)lf_m.w_o->data + (size_t)n * (size_t)(E_probe/32) * 18;
+                                                        double acc = 0;
+                                                        for (int64_t b = 0; b < E_probe/32; b++) {
+                                                            const uint8_t * blk = row + b * 18;
+                                                            ggml_fp16_t sh; memcpy(&sh, blk, 2); const float sc = ggml_fp16_to_fp32(sh);
+                                                            const uint8_t * qs = blk + 2;
+                                                            for (int j = 0; j < 32; j++) { const int nib = (j < 16) ? (qs[j] & 0xF) : (qs[j-16] >> 4);
+                                                                acc += (double)((nib - 8) * sc) * (double)av[b*32 + j]; }
+                                                        }
+                                                        // #258: сравниваем O-proj(av) vs O_NPU (NPU post_attention residual),
+                                                        // НЕ vs native O_cpu. Это тест H2: если identity(refO)≈0 — NPU attn=refO
+                                                        // (float softmax корректен, баг в чём-то ещё); если высоко — NPU≠refO.
+                                                        double oc=(double)s_npu[n]-(double)inpL_p2[n]; double dd=acc-oc; on+=dd*dd; od+=oc*oc;
+                                                    }
+                                                    return std::sqrt(on/(od+1e-12));
+                                                };
+                                                auto permute_p = [&](int mode) -> std::vector<float> {
+                                                    std::vector<float> r((size_t)E_probe, 0.0f);
+                                                    for (int h=0; h<nq_p; h++){ int sh;
+                                                        switch(mode){ case 0: sh=h; break;
+                                                                      case 1: sh=(h%(nq_p/8))*8+(h/(nq_p/8)); break;
+                                                                      case 2: sh=(h%nq_p/4)*4+(h/nq_p*4); break;
+                                                                      case 3: sh=nq_p-1-h; break;
+                                                                      default: sh=h; }
+                                                        for(int d=0;d<hd_p;d++) r[h*hd_p+d]=refO_p[sh*hd_p+d]; }
+                                                    return r;
+                                                };
+                                                double pp0=oproj_r(permute_p(0)), pp1=oproj_r(permute_p(1)),
+                                                       pp2=oproj_r(permute_p(2)), pp3=oproj_r(permute_p(3));
+                                                fprintf(stderr,"ggml-xdna: [f3best-perm-ref] q=%d O_npu vs refO: id=%.4f tr48=%.4f tr84=%.4f rev=%.4f\n",
+                                                        lf_m.q_idx, pp0, pp1, pp2, pp3); fflush(stderr);
+                                                // least-squares c_h fit по refO-базису (та же матем. что hfit на 20638)
+                                                {
+                                                    const int64_t bpr2 = E_probe/32;
+                                                    const uint8_t * wob = (const uint8_t *)lf_m.w_o->data;
+                                                    std::vector<std::vector<double>> Pp((size_t)nq_p, std::vector<double>((size_t)E_probe,0.0));
+                                                    for (int h=0; h<nq_p; h++) {
+                                                        for (int64_t n=0;n<E_probe;n++){ const uint8_t* row=wob+(size_t)n*(size_t)bpr2*18; double acc=0;
+                                                            for(int64_t b2=h*2;b2<h*2+2;b2++){const uint8_t* blk=row+(size_t)b2*18;ggml_fp16_t sh2;memcpy(&sh2,blk,2);float sc=ggml_fp16_to_fp32(sh2);const uint8_t* qs=blk+2;
+                                                                for(int j=0;j<32;j++){int nib=(j<16)?(qs[j]&0xF):(qs[j-16]>>4);acc+=(double)((nib-8)*sc)*(double)refO_p[b2*32+j];}}
+                                                            Pp[h][n]=acc; }
+                                                    }
+                                                    std::vector<double> y((size_t)E_probe);
+                                                    for (int64_t n=0;n<E_probe;n++) y[n]=(double)s_npu[n]-(double)inpL_p2[n];
+                                                    std::vector<std::vector<double>> Ap((size_t)nq_p, std::vector<double>((size_t)(nq_p+1),0.0));
+                                                    for(int a2=0;a2<nq_p;a2++){ for(int b2=0;b2<nq_p;b2++){ double v=0; for(int64_t n=0;n<E_probe;n++) v+=Pp[a2][n]*Pp[b2][n]; Ap[a2][b2]=v; }
+                                                        double v=0; for(int64_t n=0;n<E_probe;n++) v+=Pp[a2][n]*y[n]; Ap[a2][nq_p]=v; Ap[a2][a2]+=1e-9; }
+                                                    for(int c=0;c<nq_p;c++){ int pv=c; for(int r2=c+1;r2<nq_p;r2++) if(std::fabs(Ap[r2][c])>std::fabs(Ap[pv][c])) pv=r2;
+                                                        std::swap(Ap[c],Ap[pv]); double d=Ap[c][c]; if(std::fabs(d)<1e-30) continue;
+                                                        for(int k=c;k<=nq_p;k++) Ap[c][k]/=d;
+                                                        for(int r2=0;r2<nq_p;r2++) if(r2!=c){ double f=Ap[r2][c]; if(f!=0.0) for(int k=c;k<=nq_p;k++) Ap[r2][k]-=f*Ap[c][k]; } }
+                                                    double rn=0,rd=0;
+                                                    for(int64_t n=0;n<E_probe;n++){ double f=0; for(int h=0;h<nq_p;h++) f+=Ap[h][nq_p]*Pp[h][n];
+                                                        double d2=y[n]-f; rn+=d2*d2; rd+=y[n]*y[n]; }
+                                                    char cb3[1600]; int off3=0;
+                                                    off3+=snprintf(cb3+off3,sizeof(cb3)-off3,"ggml-xdna: [f3best-hfit-ref] q=%d residual_rel=%.4f coefs=",lf_m.q_idx,std::sqrt(rn/(rd+1e-12)));
+                                                    for(int h=0;h<nq_p && off3<(int)sizeof(cb3)-8;h++) off3+=snprintf(cb3+off3,sizeof(cb3)-off3," %.2f",Ap[h][nq_p]);
+                                                    fprintf(stderr,"%s\n",cb3); fflush(stderr);
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
