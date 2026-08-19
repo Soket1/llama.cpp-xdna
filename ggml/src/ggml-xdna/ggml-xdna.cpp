@@ -257,6 +257,11 @@ struct xdna_kernel_entry {
     // FFN16_2MM extra BOs: O(out)/W via a_bo-pattern + 2 dummy (D3,D4).
     std::unique_ptr<xrt::bo> d3_bo;
     std::unique_ptr<xrt::bo> d4_bo;
+    // #245: tapped debug-build (F3BEST_ATTN_DUMP). The relay (rl) tile copies its
+    // pre-O-proj attn_out (E bf16) into this host-visible BO via the rl tile's free
+    // MM2S ch1 + sh2 S2MM ch0. Only allocated/bound when the _attnout xclbin (9-arg
+    // kernel) is active; nullptr on the production 8-arg path.
+    std::unique_ptr<xrt::bo> tap_bo;
     // Phase 9 per-call BO ring. Indexed 0..XDNA_PHASE9_RING_SIZE-1.
     // The ring's per-slot run + deferred lambda live in the context-level
     // inflight tracker (xdna_inflight_tracker), keyed by slot_dst_data[i].
@@ -1594,6 +1599,11 @@ static std::string make_cache_key(xdna_op_kind op_kind,
         // #211: B0 dump (snapshot x_bundle delivery via Pf0 drain). Must mirror op.py's _b0dump.
         const char * b0dump_env = getenv("F3BEST_B0DUMP");
         const char * b0dump_suffix = (b0dump_env && b0dump_env[0] != '\0') ? "_b0dump" : "";
+        // #245: tapped debug-build — rl tile dumps pre-O-proj attn_out into a
+        // host-visible debug BO via free rl MM2S ch1 + sh2 S2MM ch0. Must mirror
+        // op.py's _attnout. Produces a 9-arg xclbin (extra %arg5 = tap BO).
+        const char * attnout_env = getenv("F3BEST_ATTN_DUMP");
+        const char * attnout_suffix = (attnout_env && attnout_env[0] != '\0') ? "_attnout" : "";
         // #206/#207: uni_partial size. Must mirror op.py's _uni_sfx.
         const char * uni_env = getenv("F3BEST_UNI_SZ");
         char uni_suffix[16] = "";
@@ -1610,10 +1620,10 @@ static std::string make_cache_key(xdna_op_kind op_kind,
                  flowkv_obj_fingerprint);
         if (ffn_div && strcmp(ffn_div, "1") != 0) {
             snprintf(buf, sizeof(buf), "decode_layer_f3best_%lldx%lld_d%lld_g%lld_s%lld_a%lld_q%lld_kv%lld_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac_ug%s_d%s%s%s%s%s%s%s%s_fkfix2_silu2_mxpp_objid2_abi3_al64",
-                     (long long)K, (long long)N, (long long)head_dim, (long long)32, (long long)256, (long long)attn_group, (long long)num_q, (long long)8, kv_abi, ffn_div, dc_suffix, tb_suffix, rr_suffix, qdump_suffix, b0dump_suffix, uni_suffix, flowkv_obj_tag);
+                     (long long)K, (long long)N, (long long)head_dim, (long long)32, (long long)256, (long long)attn_group, (long long)num_q, (long long)8, kv_abi, ffn_div, dc_suffix, tb_suffix, rr_suffix, qdump_suffix, b0dump_suffix, attnout_suffix, uni_suffix, flowkv_obj_tag);
         } else {
-            snprintf(buf, sizeof(buf), "decode_layer_f3best_%lldx%lld_d%lld_g%lld_s%lld_a%lld_q%lld_kv%lld_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac_ug2%s%s%s%s%s%s%s%s_fkfix2_silu2_mxpp_objid2_abi3_al64",
-                     (long long)K, (long long)N, (long long)head_dim, (long long)32, (long long)256, (long long)attn_group, (long long)num_q, (long long)8, kv_abi, dc_suffix, tb_suffix, rr_suffix, qdump_suffix, b0dump_suffix, uni_suffix, flowkv_obj_tag);
+            snprintf(buf, sizeof(buf), "decode_layer_f3best_%lldx%lld_d%lld_g%lld_s%lld_a%lld_q%lld_kv%lld_mc_preq_vexp_vreg_dq8_qp_mxp_ub_amac_ug2%s%s%s%s%s%s%s%s%s_fkfix2_silu2_mxpp_objid2_abi3_al64",
+                     (long long)K, (long long)N, (long long)head_dim, (long long)32, (long long)256, (long long)attn_group, (long long)num_q, (long long)8, kv_abi, dc_suffix, tb_suffix, rr_suffix, qdump_suffix, b0dump_suffix, attnout_suffix, uni_suffix, flowkv_obj_tag);
         }
     } else {
         snprintf(buf, sizeof(buf), "gemm_%lldx%lldx%lld_%s_%dcol",
@@ -5385,6 +5395,8 @@ static bool ggml_backend_xdna_decode_layer_f3best(
     const size_t  WO_BYTES = (size_t)(E / M) * PACKED;  // unused arg3 placeholder
     const int64_t KVN      = 256 * head_dim;            // f3best xclbin KV window is fixed at 256 tokens
     const int     dts      = 2;
+    // #245: tapped debug-build (declared early — OUT_ELEMS depends on it).
+    static const bool f3b_attn_dump = xdna_env_enabled("F3BEST_ATTN_DUMP");
     const int64_t XB       = abi.XB;                    // x_bundle: input + rope LUT + seq meta
     const int64_t XR_ELEMS = abi.xr_elems;              // x|resid|gain
     const size_t  OUT_ELEMS = (size_t)NH * (E + 2*KV_M) + E;  // no-KV=NH*E+E; K/V=NH*(E+2*KV_M)+E
@@ -5403,6 +5415,10 @@ static bool ggml_backend_xdna_decode_layer_f3best(
     try {
         static const bool f3b_gluetime = xdna_env_enabled("XDNA_F3BEST_GLUETIME");
         static const bool f3b_debug = xdna_env_enabled("XDNA_F3BEST_DEBUG");
+        // #245: tapped debug-build. XRT caps MLIR_AIE at 8 group_ids (all used:
+        // 3 infra + 5 data). The tap writes into the output BO (arg0) at offset
+        // (NH+1)*E (the S2MM-writable region), NOT arg3/Wo (input-tagged, rejects
+        // S2MM writes). f3b_attn_dump declared early (OUT_ELEMS depends on it).
         if (f3b_debug) fprintf(stderr, "f3best BEFORE BO alloc cache=%s\n", cache_key.c_str());
         static std::atomic<int> f3b_abi_log_budget{1};
         if (f3b_abi_log_budget.fetch_sub(1) > 0) {
@@ -5421,7 +5437,12 @@ static bool ggml_backend_xdna_decode_layer_f3best(
             entry->d3_bo = std::make_unique<xrt::bo>(ctx->device, WO_BYTES,
                 xrt::bo::flags::host_only, entry->kernel.group_id(6));
             memset(entry->d3_bo->map<void*>(), 0, WO_BYTES);
-            entry->d3_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);     // never DMA'd, bound once
+            // Production: never DMA'd, bound once. #245 debug (F3BEST_ATTN_DUMP):
+            // the rl tile's S2MM tap writes E bf16 of attn_out into offset 0 of
+            // this BO, so do NOT sync-to-device in debug mode (would clobber the
+            // tap destination with zeros before the NPU writes).
+            if (!f3b_attn_dump)
+                entry->d3_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
         }
         // arg7 KV BO is per-layer cached below (#79), not a single shared d4_bo.
 
@@ -6038,6 +6059,8 @@ static bool ggml_backend_xdna_decode_layer_f3best(
             run.set_arg(5, *a_weights);            // A weights
             run.set_arg(6, *entry->d3_bo);         // Wo placeholder (unused)
             run.set_arg(7, kv_bo);                 // KV
+            // #245: arg3/d3_bo (Wo placeholder) is reused as the attn_out tap
+            // destination on the _attnout xclbin — no extra arg (XRT caps at 8).
         }
         // #35 DE-RISK (XDNA_F3BEST_LOOPPROBE=N): dispatch this SAME run N times back-to-back
         // WITHIN one backend call, alternating the weight BO each iter (mimics 16 different
@@ -6145,6 +6168,8 @@ static bool ggml_backend_xdna_decode_layer_f3best(
         if (f3b_gluetime) g_xdna_f3best_gluetime.npu_us += xdna_elapsed_us(_f3_ts, _f3_t2);
         const auto _gt_os0 = std::chrono::steady_clock::now();
         entry->c_bo->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        // #245: tap attn_out now lands in c_bo (output BO, arg0) at offset (NH+1)*E
+        // — c_bo is already synced above, no separate d3_bo sync needed.
         if (f3b_gluetime) g_xdna_f3best_gluetime.outsync_us += xdna_elapsed_us(_gt_os0);
         if (f3b_time) {
             auto _us = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b){
@@ -6430,6 +6455,144 @@ static bool ggml_backend_xdna_decode_layer_f3best(
                     }
                     fflush(stderr);
                 }
+            }
+        }
+        // #245 tapped attn_out forensics: compare NPU pre-O-proj attn_out (from the
+        // tap BO) against a CPU-golden scaled-dot-product attention per q-head.
+        // This is the ONLY measurement that can confirm/refute H2 (a within-group
+        // q-head permutation in attn_out/O-proj gather): AVGV is blind to it (Q=0
+        // -> identical avg(V)), and QDUMP is upstream of attention. The tap sits at
+        // the rl tile, AFTER flowkv normalization and join, BEFORE O-proj -- exactly
+        // where a within-group reorder would be visible.
+        //
+        // attn_out layout in rl_A (= tap BO): E bf16, NH-tile t in [0,NH) occupies
+        // offset t*PER_TILE .. t*PER_TILE+PER_TILE. For 3B: 8 tiles x 384, each tile
+        // holds attn_group=3 q-heads of head_dim=128 -> within-group order is the H2
+        // signal. CPU computes the canonical order; a head-rotation/swap inside any
+        // tile shows as a per-q-head rel_l2 spike on a rotated index.
+        if (f3b_attn_dump && entry->c_bo && out_dst && out_dst->type == GGML_TYPE_F32 &&
+            q_w && q_w->type == GGML_TYPE_Q4_0 && q_w->ne[0] == E && q_w->ne[1] == E &&
+            input_snap && head_dim > 0 && attn_group > 0 && num_kv > 0) {
+            static const int _attn_n = [](){ const char* e = getenv("F3BEST_ATTN_DUMP_N");
+                                             return (e && *e) ? atoi(e) : 4; }();
+            static std::atomic<int> _attn_b{_attn_n};
+            static std::atomic<int> _attn_seq{0};
+            if (_attn_b.fetch_sub(1) > 0) {
+                const int _ac = _attn_seq.fetch_add(1);
+                const int64_t ag_f  = attn_group;
+                const int64_t hd_f  = head_dim;
+                const int64_t nq_f  = num_q;
+                const int64_t nkv_f = num_kv;
+                const int64_t nblk  = E / group_size;
+                const float inv_sqrt_hd = 1.0f / std::sqrt((float)hd_f);
+                // --- CPU Q (post-GEMV, post-RoPE, prescaled) -- mirrors qdump-cpuq
+                // but over ALL num_q heads (24 for 3B), not just ck=ag*hd.
+                // WQ is [E,E] row-major Q4_0: row n (n in [0, nq*hd)) at offset
+                // n*nblk*18. cpuq[n] = sum over E inputs of WQ[n,e]*x[e] (one scalar
+                // per output row; NOT indexed by [head][dim] during the GEMV).
+                const int64_t total_q = nq_f * hd_f;
+                std::vector<float> cpuq((size_t)total_q, 0.0f);
+                const uint8_t * qwb = (const uint8_t *)q_w->data;
+                for (int64_t n = 0; n < total_q; n++) {
+                    const uint8_t * row = qwb + (size_t)n * (size_t)nblk * 18;
+                    double a = 0.0;
+                    for (int64_t b = 0; b < nblk; b++) {
+                        const uint8_t * blk = row + b*18;
+                        ggml_fp16_t sh; memcpy(&sh, blk, 2); float sc = ggml_fp16_to_fp32(sh);
+                        const uint8_t * qs = blk + 2;
+                        for (int j = 0; j < 32; j++) {
+                            int nib = (j < 16) ? (qs[j] & 0xF) : ((qs[j-16] >> 4) & 0xF);
+                            a += (double)((nib - 8) * sc) * (double)input_snap[b*32 + j];
+                        }
+                    }
+                    cpuq[(size_t)n] = (float)a;
+                }
+                // RoPE (positional) -- same as qdump-cpuq but over ALL nq_f heads
+                int64_t pos0 = 0;
+                if (rope_node && rope_node->src[1] && rope_node->src[1]->type == GGML_TYPE_I32 && rope_node->src[1]->data)
+                    pos0 = ((const int32_t *)rope_node->src[1]->data)[0];
+                float fb = 10000.0f;
+                if (rope_node) { const int32_t * pp = (const int32_t *)rope_node->op_params; memcpy(&fb, pp + 5, 4); }
+                for (int64_t hh2 = 0; hh2 < nq_f; hh2++) {
+                    float * q = &cpuq[(size_t)hh2 * hd_f];
+                    float th = 1.0f;
+                    for (int i = 0; i < hd_f/2; i++) {
+                        float ang = (float)pos0 * th;
+                        float c = std::cos(ang), s = std::sin(ang);
+                        float x0 = q[2*i], x1 = q[2*i+1];
+                        q[2*i]   = x0*c - x1*s;
+                        q[2*i+1] = x0*s + x1*c;
+                        th *= std::pow(fb, -2.0f/(float)hd_f);
+                    }
+                }
+                for (int64_t n = 0; n < nq_f * hd_f; n++) cpuq[n] *= inv_sqrt_hd;
+                // --- CPU K/V from the SAME kv_bo the NPU consumed (already filled) ---
+                const uint16_t * kvb = (const uint16_t *)kv_bo.map<void*>();
+                // --- CPU attention per q-head: q-head h shares KV head g=h/ag ---
+                std::vector<float> cpu_attn((size_t)nq_f * hd_f, 0.0f);
+                const int64_t ag = ag_f;
+                for (int64_t h = 0; h < nq_f; h++) {
+                    const int64_t g = h / ag;
+                    const uint16_t * Kg = kvb + (size_t)g * KVN;
+                    const uint16_t * Vg = kvb + (size_t)(NH + g) * KVN;
+                    std::vector<float> sc((size_t)kv_len);
+                    float mx = -1e30f;
+                    for (int64_t p = 0; p < kv_len; p++) {
+                        float dot = 0.0f;
+                        for (int64_t d = 0; d < hd_f; d++)
+                            dot += cpuq[(size_t)h*hd_f + d] * bf16f(Kg[(size_t)p*hd_f + d]);
+                        sc[(size_t)p] = dot;
+                        mx = std::max(mx, dot);
+                    }
+                    double denom = 0.0;
+                    for (int64_t p = 0; p < kv_len; p++) { sc[p] = std::exp(sc[p] - mx); denom += sc[p]; }
+                    float inv_den = (float)(1.0 / denom);
+                    for (int64_t d = 0; d < hd_f; d++) {
+                        double acc = 0.0;
+                        for (int64_t p = 0; p < kv_len; p++)
+                            acc += (double)sc[p] * (double)bf16f(Vg[(size_t)p*hd_f + d]);
+                        cpu_attn[(size_t)h*hd_f + d] = (float)acc * inv_den;
+                    }
+                }
+                // --- NPU tap: rl_A copied into c_bo (output BO, arg0) at offset (NH+1)*E ---
+                const uint16_t * tap = (const uint16_t *)entry->c_bo->map<void*>() + (size_t)(NH+1)*E;
+                // Raw tap census (diagnose single-shot-vs-streaming tap delivery)
+                {
+                    int nz = 0; double t2 = 0; float tmx = 0;
+                    for (int64_t e = 0; e < E; e++) {
+                        const float v = bf16f(tap[e]);
+                        if (v != 0.0f) nz++;
+                        t2 += (double)v*v; tmx = std::max(tmx, std::fabs(v));
+                    }
+                    fprintf(stderr, "ggml-xdna: [attnout-tap] seq=%d d3_bo[0..E) nz=%d/%lld |tap|rms=%.6f max=%.6f first6=%g %g %g %g %g %g\n",
+                            _ac, nz, (long long)E, std::sqrt(t2/(double)E), tmx,
+                            (double)bf16f(tap[0]),(double)bf16f(tap[1]),(double)bf16f(tap[2]),
+                            (double)bf16f(tap[3]),(double)bf16f(tap[4]),(double)bf16f(tap[5]));
+                    fflush(stderr);
+                }
+                fprintf(stderr, "ggml-xdna: [attnout] seq=%d nq=%lld nkv=%lld ag=%lld hd=%lld kv_len=%lld\n",
+                        _ac, (long long)nq_f, (long long)nkv_f, (long long)ag_f, (long long)hd_f, (long long)kv_len);
+                double tot_num = 0, tot_den = 0; int tot_cnt = 0; int tot_nan = 0;
+                for (int64_t h = 0; h < nq_f; h++) {
+                    const int64_t tile = h / ag;
+                    const int64_t win  = (h % ag) * hd_f;
+                    const int64_t base = tile * PER_TILE + win;
+                    double hn = 0, hd2 = 0, nv2 = 0; int cn = 0; int nanh = 0;
+                    for (int64_t d = 0; d < hd_f; d++) {
+                        const float nv = bf16f(tap[(size_t)base + d]);
+                        const float cv = cpu_attn[(size_t)h*hd_f + d];
+                        if (std::isnan(nv) || std::isinf(nv)) { nanh++; continue; }
+                        const double diff = (double)nv - (double)cv;
+                        hn += diff*diff; hd2 += (double)cv*(double)cv; nv2 += (double)nv*(double)nv; cn++;
+                    }
+                    tot_num += hn; tot_den += hd2; tot_cnt += cn; tot_nan += nanh;
+                    fprintf(stderr, "ggml-xdna: [attnout] seq=%d qhead=%lld tile=%lld win=%lld rel_l2=%.5f |npu|^2=%.4g |cpu|^2=%.4g nan=%d\n",
+                            _ac, (long long)h, (long long)tile, (long long)win,
+                            cn ? std::sqrt(hn/(hd2+1e-12)) : -1.0f, nv2, hd2, nanh);
+                }
+                fprintf(stderr, "ggml-xdna: [attnout] seq=%d ROLLUP rel_l2=%.5f over=%d nan(total)=%d\n",
+                        _ac, tot_cnt ? std::sqrt(tot_num/(tot_den+1e-12)) : -1.0f, tot_cnt, tot_nan);
+                fflush(stderr);
             }
         }
         if (out_dst->type == GGML_TYPE_F32) {
