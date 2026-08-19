@@ -5399,7 +5399,9 @@ static bool ggml_backend_xdna_decode_layer_f3best(
     static const bool f3b_attn_dump = xdna_env_enabled("F3BEST_ATTN_DUMP");
     const int64_t XB       = abi.XB;                    // x_bundle: input + rope LUT + seq meta
     const int64_t XR_ELEMS = abi.xr_elems;              // x|resid|gain
-    const size_t  OUT_ELEMS = (size_t)NH * (E + 2*KV_M) + E;  // no-KV=NH*E+E; K/V=NH*(E+2*KV_M)+E
+    // #245: in ATTN_DUMP mode grow OUT_ELEMS by E to hold the tap region at
+    // [(NH+1)*E, (NH+2)*E) in the output BO (arg0/c_bo). Mirrors P_TY in the emitter.
+    const size_t  OUT_ELEMS = (size_t)NH * (E + 2*KV_M) + E + (f3b_attn_dump ? (size_t)E : 0);
     const size_t  PH_STRIDE = (size_t)(E + 2*KV_M);  // per-head stride in output
 
     // #155: pass attention params via overloaded M=attn_group, num_cols=head_dim
@@ -5437,12 +5439,7 @@ static bool ggml_backend_xdna_decode_layer_f3best(
             entry->d3_bo = std::make_unique<xrt::bo>(ctx->device, WO_BYTES,
                 xrt::bo::flags::host_only, entry->kernel.group_id(6));
             memset(entry->d3_bo->map<void*>(), 0, WO_BYTES);
-            // Production: never DMA'd, bound once. #245 debug (F3BEST_ATTN_DUMP):
-            // the rl tile's S2MM tap writes E bf16 of attn_out into offset 0 of
-            // this BO, so do NOT sync-to-device in debug mode (would clobber the
-            // tap destination with zeros before the NPU writes).
-            if (!f3b_attn_dump)
-                entry->d3_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            entry->d3_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);     // never DMA'd, bound once
         }
         // arg7 KV BO is per-layer cached below (#79), not a single shared d4_bo.
 
@@ -6564,7 +6561,7 @@ static bool ggml_backend_xdna_decode_layer_f3best(
                         if (v != 0.0f) nz++;
                         t2 += (double)v*v; tmx = std::max(tmx, std::fabs(v));
                     }
-                    fprintf(stderr, "ggml-xdna: [attnout-tap] seq=%d d3_bo[0..E) nz=%d/%lld |tap|rms=%.6f max=%.6f first6=%g %g %g %g %g %g\n",
+                    fprintf(stderr, "ggml-xdna: [attnout-tap] seq=%d c_bo[(NH+1)*E..) nz=%d/%lld |tap|rms=%.6f max=%.6f first6=%g %g %g %g %g %g\n",
                             _ac, nz, (long long)E, std::sqrt(t2/(double)E), tmx,
                             (double)bf16f(tap[0]),(double)bf16f(tap[1]),(double)bf16f(tap[2]),
                             (double)bf16f(tap[3]),(double)bf16f(tap[4]),(double)bf16f(tap[5]));
