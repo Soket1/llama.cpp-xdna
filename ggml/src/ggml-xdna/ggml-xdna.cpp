@@ -6552,19 +6552,38 @@ static bool ggml_backend_xdna_decode_layer_f3best(
                     }
                 }
                 // --- NPU tap: rl_A copied into c_bo (output BO, arg0) at offset (NH+1)*E ---
-                const uint16_t * tap = (const uint16_t *)entry->c_bo->map<void*>() + (size_t)(NH+1)*E;
-                // Raw tap census (diagnose single-shot-vs-streaming tap delivery)
+                const uint16_t * cob = (const uint16_t *)entry->c_bo->map<void*>();
+                const uint16_t * tap = cob + (size_t)(NH+1)*E;
+                // R5 §6 diagnostics: scan ALL c_bo regions to localize the failure.
+                // H-A: @P7 partial at c_bo[7*E..8*E) — if zero, sh7 shim broken entirely.
+                // H-B: scan every E-region [h*E, h*E+E) for h=0..NH+1; report any non-zero
+                //      outside the expected partials[0..NH)/s[NH]/tap[NH+1] to catch a
+                //      mis-targeted @ATN_alloc BD writing elsewhere.
                 {
-                    int nz = 0; double t2 = 0; float tmx = 0;
+                    int p7_nz = 0; double p7_2 = 0; float p7_mx = 0;
+                    for (int64_t e = 0; e < E; e++) {
+                        const float v = bf16f(cob[(size_t)7*E + e]);
+                        if (v != 0.0f) p7_nz++;
+                        p7_2 += (double)v*v; p7_mx = std::max(p7_mx, std::fabs(v));
+                    }
+                    int tap_nz = 0; double tap_2 = 0; float tap_mx = 0;
                     for (int64_t e = 0; e < E; e++) {
                         const float v = bf16f(tap[e]);
-                        if (v != 0.0f) nz++;
-                        t2 += (double)v*v; tmx = std::max(tmx, std::fabs(v));
+                        if (v != 0.0f) tap_nz++;
+                        tap_2 += (double)v*v; tap_mx = std::max(tap_mx, std::fabs(v));
                     }
-                    fprintf(stderr, "ggml-xdna: [attnout-tap] seq=%d c_bo[(NH+1)*E..) nz=%d/%lld |tap|rms=%.6f max=%.6f first6=%g %g %g %g %g %g\n",
-                            _ac, nz, (long long)E, std::sqrt(t2/(double)E), tmx,
-                            (double)bf16f(tap[0]),(double)bf16f(tap[1]),(double)bf16f(tap[2]),
-                            (double)bf16f(tap[3]),(double)bf16f(tap[4]),(double)bf16f(tap[5]));
+                    // region census: nz + rms per [h*E, h*E+E) for h=0..NH+1
+                    std::string rc;
+                    for (int64_t h = 0; h <= NH + 1; h++) {
+                        int nz = 0;
+                        for (int64_t e = 0; e < E; e++)
+                            if (bf16f(cob[(size_t)h*E + e]) != 0.0f) nz++;
+                        char b[24]; snprintf(b, sizeof(b), " h%lld=%d", (long long)h, nz);
+                        rc += b;
+                    }
+                    fprintf(stderr, "ggml-xdna: [attnout-tap] seq=%d |P7| nz=%d/%lld rms=%.6f mx=%.6f | |tap[NH+1]| nz=%d/%lld rms=%.6f mx=%.6f | regions:%s\n",
+                            _ac, p7_nz, (long long)E, std::sqrt(p7_2/(double)E), p7_mx,
+                            tap_nz, (long long)E, std::sqrt(tap_2/(double)E), tap_mx, rc.c_str());
                     fflush(stderr);
                 }
                 fprintf(stderr, "ggml-xdna: [attnout] seq=%d nq=%lld nkv=%lld ag=%lld hd=%lld kv_len=%lld\n",
