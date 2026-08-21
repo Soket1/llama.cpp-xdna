@@ -1282,6 +1282,24 @@ def compile_decode_layer_f3best(embed_dim: int, hidden_dim: int, group_size: int
             context=AIEContext(build_dir=build_root),
         )
         op.compile()
+        # #260: the trace parser (aie.utils.trace.parse) needs the LOWERED MLIR
+        # that aiecc leaves in its .mlir.prj tree, not the high-level emit. Stage
+        # it next to the public artifact ONLY when a trace build was requested --
+        # #234 requires the default path to leave nothing beside the long cache
+        # identity, and the staged tree is large.
+        if os.environ.get("F3BEST_AIE_TRACE", "").strip():
+            try:
+                import glob as _glob
+                _stage = os.path.join(os.path.dirname(os.path.abspath(output_path)),
+                                      "f3best_lowered_mlir")
+                _prj = _glob.glob(str(build_root) + "/*.mlir.prj")
+                for _p in _prj:
+                    for _m in _glob.glob(_p + "/*.mlir"):
+                        _dst = os.path.join(_stage, os.path.basename(_m))
+                        os.makedirs(os.path.dirname(_dst), exist_ok=True)
+                        shutil.copy2(_m, _dst)
+            except Exception:
+                pass
 
         build_dir = op.context.build_dir
         compiled_xclbin = build_dir / op.xclbin_artifact.filename

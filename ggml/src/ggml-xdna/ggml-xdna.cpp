@@ -1623,7 +1623,52 @@ static std::string make_cache_key(xdna_op_kind op_kind,
         }
         // Match decode_layer_f3best/op.py: the outer artifact is partitioned
         // by the exact fixed-tuning FlowKV object it links, not FLOWKV_CFLAGS.
-        static constexpr const char * flowkv_obj_fingerprint = "fe2d60c9196a71df";
+        // #266: F3BEST_VALUE_LEGACY swaps the value tile's accumulator form
+        // (AMAC register-resident -> memory-resident reference). #267i:
+        // F3BEST_DOT_MULINIT seeds the score dot product from the c == 0 product
+        // instead of aie::zeros(). Both change the FlowKV object fingerprint, so
+        // both must change this tag or the probe silently reuses the old xclbin
+        // and the A/B reads bit-identical.
+        // The fingerprint is COMPUTED here (FNV-1a over the same canonical form
+        // as flowkv_tuning_fingerprint in flowkv_decode/contract.py) rather than
+        // hardcoded: a hardcoded hex string silently desynchronizes from op.py
+        // the moment a tuning macro is added, which is exactly how #266's first
+        // A/B came back bit-identical.
+        const char * value_legacy_env = getenv("F3BEST_VALUE_LEGACY");
+        const char * dot_mulinit_env  = getenv("F3BEST_DOT_MULINIT");
+        const char * rawscore_env     = getenv("F3BEST_RAWSCORE");
+        std::vector<std::string> fk_tokens;
+        if (dot_mulinit_env && dot_mulinit_env[0] != '\0')
+            fk_tokens.emplace_back("-DFLOWKV_DOT_MULINIT=1");
+        fk_tokens.emplace_back("-DFLOWKV_PRESCALE_Q=1");
+        fk_tokens.emplace_back((value_legacy_env && value_legacy_env[0] != '\0')
+                               ? "-DFLOWKV_VALUE_LEGACY=1" : "-DFLOWKV_VALUE_AMAC=1");
+        // #267k: F3BEST_RAWSCORE builds the score tile with FLOWKV_NOEXP so the
+        // relayed score region holds raw scores instead of softmax weights.
+        // #267l/n: the 16-wide block exp2 loop (FLOWKV_VEC_EXP) is the root of
+        // #187 — correct at head_dim 64, broken at 128 — so the production
+        // selection is by head_dim, mirroring op.py exactly. F3BEST_SCALAR_EXP
+        // and F3BEST_VEC_EXP force either arm for A/B.
+        const char * scalar_exp_env = getenv("F3BEST_SCALAR_EXP");
+        const char * vec_exp_env    = getenv("F3BEST_VEC_EXP");
+        if (rawscore_env && rawscore_env[0] != '\0')
+            fk_tokens.emplace_back("-DFLOWKV_NOEXP=1");
+        else if (scalar_exp_env && scalar_exp_env[0] != '\0')
+            ; // no exp macro: scalar path
+        else if (vec_exp_env && vec_exp_env[0] != '\0')
+            fk_tokens.emplace_back("-DFLOWKV_VEC_EXP=1");
+        else if (head_dim == 64)
+            fk_tokens.emplace_back("-DFLOWKV_VEC_EXP=1");
+        // else: head_dim != 64 -> scalar path, no exp macro
+        std::sort(fk_tokens.begin(), fk_tokens.end());
+        std::string fk_canon = "flowkv-cflags-v1;" + std::to_string(fk_tokens.size()) + ";";
+        for (const std::string & t : fk_tokens)
+            fk_canon += std::to_string(t.size()) + ":" + t;
+        uint64_t fk_fnv = 0xCBF29CE484222325ull;
+        for (unsigned char c : fk_canon) { fk_fnv ^= (uint64_t)c; fk_fnv *= 0x100000001B3ull; }
+        char flowkv_obj_fingerprint[17];
+        snprintf(flowkv_obj_fingerprint, sizeof(flowkv_obj_fingerprint), "%016llx",
+                 (unsigned long long)fk_fnv);
         char flowkv_obj_tag[96];
         snprintf(flowkv_obj_tag, sizeof(flowkv_obj_tag),
                  "_fkobj_flowkv_%lldd_h%lld_c256_t%s",
@@ -5416,6 +5461,12 @@ static bool ggml_backend_xdna_decode_layer_f3best(
     // XR bundle so the s-region holds the relayed scores (It) without the
     // attention residual added (nm's add_bf16 still runs but adds 0).
     static const bool f3b_sdump = xdna_env_enabled("F3BEST_SDUMP");
+    // #267k: raw-score dump. Only meaningful together with F3BEST_SDUMP and a
+    // kernel built with FLOWKV_NOEXP, where the score tile relays scores_bf16
+    // verbatim instead of exp2((s-m)*log2e). Selects the [f3best-rawscore]
+    // comparison, which is free of both the sparsity artifact and the
+    // running-max coupling that defeat every weight-domain measurement.
+    static const bool f3b_rawscore = xdna_env_enabled("F3BEST_RAWSCORE");
     // #260: AIE2P hardware trace (score tile sc1 -> sh7 S2MM ch1 -> trace BO).
     static const bool f3b_atrace = xdna_env_enabled("F3BEST_AIE_TRACE");
     const int64_t XB       = abi.XB;                    // x_bundle: input + rope LUT + seq meta
@@ -5464,12 +5515,10 @@ static bool ggml_backend_xdna_decode_layer_f3best(
             entry->d3_bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);     // never DMA'd, bound once
         }
         // #260: in AIE_TRACE mode the d3_bo (Wo placeholder, XRT arg 6) is
-        // re-sized to 64KB and reused as the trace BO (aie.trace.host_config
-        // arg_idx=6). XRT caps kernels at 8 args, so no extra arg is possible.
-        // Host reads trace packets back after sync FROM_DEVICE.
-        if (f3b_atrace && entry->d3_bo) {
-            entry->d3_bo.reset();
-        }
+        // allocated at 64KB above (d3_bytes) and reused as the trace BO
+        // (aie.trace.host_config arg_idx=6). XRT caps kernels at 8 args, so
+        // no extra arg is possible. Host reads trace packets back after sync
+        // FROM_DEVICE. NOTE: d3_bo is created fresh per entry, so no reset.
         // arg7 KV BO is per-layer cached below (#79), not a single shared d4_bo.
 
         // --- XR bundle: [x(E) | rope-lut(q_rows) | seq+pad(16) | resid(E) | gain(E)] ---
@@ -6566,12 +6615,470 @@ static bool ggml_backend_xdna_decode_layer_f3best(
                         _sc, std::sqrt(s2/(double)kv_len), snz, (long long)kv_len, smx, smn, (long long)amx, smx-smn);
                 // also the corr/denom tail: scores_out[chunk_size*AG + h] = corr,
                 // scores_out[chunk_size*AG + AG + h] = denom (for head h in group).
-                const int64_t csz = 128; // CHUNK
+                // #266: the tail offset is chunk_size*AG with the FULL chunk_size
+                // (flowkv.cc:200-203 computes scores_size = chunk_size*num_q_heads
+                // from the %sC constant, NOT from eff_chunk — eff_chunk only bounds
+                // the write loop, and positions [eff_chunk, chunk_size) are zeroed
+                // in place). So cbase = 128*AG = 384. The old guard `cbase < PT`
+                // (PT = E/NH = 384) rejected exactly that index; the relayed Sd
+                // buffer is ITC = CHUNK*AG + 2*AG = 390 elements long, so 384..389
+                // are valid. Guard against ITC instead.
+                const int64_t csz   = 128; // CHUNK
+                const int64_t itc   = csz * attn_group + 2 * attn_group;
                 const int64_t cbase = csz * attn_group;
-                fprintf(stderr, "ggml-xdna: [sdump] seq=%d head0 corr=%.5f denom=%.5f (chunk0 tail at cbase=%lld)\n",
-                        _sc, (cbase < PT) ? bf16f(s_blk[cbase]) : 0.0f,
-                        (cbase + attn_group < PT) ? bf16f(s_blk[cbase + attn_group]) : 0.0f,
-                        (long long)cbase);
+                fprintf(stderr, "ggml-xdna: [sdump] seq=%d head0 corr=%.5f denom=%.5f (tail cbase=%lld itc=%lld kv_len=%lld)\n",
+                        _sc, (cbase < itc) ? bf16f(s_blk[cbase]) : 0.0f,
+                        (cbase + attn_group < itc) ? bf16f(s_blk[cbase + attn_group]) : 0.0f,
+                        (long long)cbase, (long long)itc, (long long)kv_len);
+                fprintf(stderr, "ggml-xdna: [sdump] seq=%d tail raw s_blk[%lld:%lld]:",
+                        _sc, (long long)cbase, (long long)itc);
+                for (int64_t e = cbase; e < itc; e++) fprintf(stderr, " %.5f", bf16f(s_blk[e]));
+                fprintf(stderr, "\n");
+                // [f3best-sdump-cmp] NPU score-tile exp-weights (s_blk, head0, stride AG)
+                // vs CPU online-bf16 softmax replica (sc_on). Both are softmax NUMERATORS
+                // (before denom division): max weight = 1.0. rel_l2~0 && ratio~1 => score
+                // tile CORRECT (bug below in value/softmax too unlikely); rel_l2 high with
+                // ratio consistently ~c => scale/prescale mismatch; high with scattered ratio
+                // => structural defect in score_chunk (huge discovery for #187).
+                {
+                    auto bf16q_s = [](float x)->float {
+                        uint32_t u; memcpy(&u,&x,4); u = (u + 0x7FFF + ((u>>16)&1)) & 0xFFFF0000;
+                        float r; memcpy(&r,&u,4); return r;
+                    };
+                    const int64_t hd_p = head_dim, agp = attn_group, kvL_p = kv_len;
+                    const float scale_p = 1.0f / std::sqrt((float)hd_p);
+                    int64_t pos0_cmp = 0;
+                    if (rope_node && rope_node->src[1] && rope_node->src[1]->type == GGML_TYPE_I32 && rope_node->src[1]->data)
+                        pos0_cmp = ((const int32_t *)rope_node->src[1]->data)[0];
+                    const int64_t ncap2 = k_perm ? k_perm->ne[1] : 0;
+                    const int64_t nval2 = (ncap2 > 0 && pos0_cmp + 1 < ncap2) ? (pos0_cmp + 1) : ncap2;
+                    const bool kf2 = k_perm && k_perm->type == GGML_TYPE_F32;
+                    const bool kh2 = k_perm && k_perm->type == GGML_TYPE_F16;
+                    auto rd_p = [](const char * pp, bool f32, bool f16) -> float {
+                        if (f32) { float v; memcpy(&v, pp, 4); return v; }
+                        if (f16) { ggml_fp16_t h; memcpy(&h, pp, 2); return ggml_fp16_to_fp32(h); }
+                        uint16_t b; memcpy(&b, pp, 2); float v; uint32_t u = (uint32_t)b << 16; memcpy(&v, &u, 4); return v;
+                    };
+                    const float * qh_cmp = (rope_node && rope_node->type == GGML_TYPE_F32 && rope_node->data)
+                                           ? (const float *)((const char *)rope_node->data + 0) : nullptr;
+                    if (qh_cmp && k_perm && k_perm->data && kvL_p > 0 && nval2 > 0) {
+                        std::vector<float> sc_on((size_t)kvL_p, 0.0f);
+                        const int64_t chunk_sz = 128;
+                        const int64_t nchk = (kvL_p + chunk_sz - 1) / chunk_sz;
+                        float m_old = -1e30f;
+                        for (int64_t ci = 0; ci < nchk; ci++) {
+                            int64_t lo = ci * chunk_sz;
+                            int64_t eff = std::min(chunk_sz, kvL_p - lo);
+                            float m_chunk = -1e30f;
+                            for (int64_t j = 0; j < eff; j++) {
+                                int64_t pos = lo + j;
+                                int64_t src_pos = (nval2 > 256 && pos == 0) ? 0 : (nval2 - kvL_p + pos);
+                                double dot = 0;
+                                for (int64_t d = 0; d < hd_p; d++)
+                                    dot += (double)qh_cmp[d] * (double)rd_p((const char*)k_perm->data + src_pos*k_perm->nb[1] + 0*k_perm->nb[2] + d*k_perm->nb[0], kf2, kh2);
+                                float s = (float)dot * scale_p;
+                                sc_on[pos] = s; if (s > m_chunk) m_chunk = s;
+                            }
+                            float m_new = (m_chunk > m_old) ? m_chunk : m_old;
+                            float corr_c = std::pow(2.0f, (float)bf16q_s((m_old - m_new) * 1.4426950408889634f));
+                            for (int64_t j = 0; j < eff; j++) {
+                                int64_t pos = lo + j;
+                                float diff = (sc_on[pos] - m_new) * 1.4426950408889634f;
+                                sc_on[pos] = bf16q_s(std::pow(2.0f, diff));
+                            }
+                            (void)corr_c;
+                            m_old = m_new;
+                        }
+                        // #265: s_blk carries the score tile's exp-WEIGHTS for head0,
+                        // laid out with stride attn_group (q-head interleave within the
+                        // group), so weight(pos) = s_blk[pos*AG]. sc_on[pos] is the CPU
+                        // online-bf16 replica of the same quantity (softmax numerator,
+                        // max = 1.0, before the /l division).
+                        // VERDICT recorded 2026-08-20: rel_l2 = 0.0004..0.014, ratio mean
+                        // ~1.04 => score tile (Q.K + prescale + running max + exp2) is
+                        // CORRECT on 3B hd=128; the #187 bug is BELOW this point
+                        // (value_accum / value_normalize / denom-accum / O-proj gather).
+                        const int64_t ncmp_s = std::min<int64_t>(kvL_p, PT / (agp > 0 ? agp : 1));
+                        double l2d = 0, l2c = 0; float rmin = 1e30f, rmax = -1e30f; double rsum = 0; int rcnt = 0;
+                        for (int64_t p = 0; p < ncmp_s; p++) {
+                            const float cpu_w = sc_on[p];
+                            const float npu_w = bf16f(s_blk[(size_t)(p * agp)]);
+                            double dd = (double)npu_w - (double)cpu_w;
+                            l2d += dd*dd; l2c += (double)cpu_w*(double)cpu_w;
+                            if (std::fabs(cpu_w) > 1e-8f && !std::isnan(npu_w) && !std::isinf(npu_w)) {
+                                float r = npu_w / cpu_w; if (r < rmin) rmin = r; if (r > rmax) rmax = r;
+                                rsum += std::fabs(r); rcnt++;
+                            }
+                        }
+                        fprintf(stderr, "ggml-xdna: [f3best-sdump-cmp] seq=%d n=%lld rel_l2=%.5f ratio_absmin/max/mean=%.3f/%.3f/%.3f\n",
+                                _sc, (long long)ncmp_s, std::sqrt(l2d/(l2c+1e-12)), rmin, rmax, rcnt ? (float)(rsum/rcnt) : 0.0f);
+                        fprintf(stderr, "ggml-xdna: [f3best-sdump-cmp] NPU w head0:");
+                        for (int64_t e = 0; e < std::min<int64_t>(ncmp_s,12); e++) fprintf(stderr, " %.4f", bf16f(s_blk[(size_t)(e*agp)]));
+                        fprintf(stderr, "  | CPU w:");
+                        for (int64_t e = 0; e < std::min<int64_t>(ncmp_s,12); e++) fprintf(stderr, " %.4f", sc_on[e]);
+                        fprintf(stderr, "\n");
+                        // #266 DENOM: the kernel accumulates the softmax denominator l
+                        // in bf16, re-truncating after EVERY addition
+                        // (flowkv.cc:326/345: l = (bf16)((float)l + (float)f)). Once
+                        // l >= 1.0 the bf16 step is 2^-7 = 0.0078, so every weight
+                        // below ~0.0039 is rounded away entirely. With the max weight
+                        // pinned at 1.0 by the online softmax, that is MOST of them.
+                        // Print the exact f32 sum next to a replica of the kernel's
+                        // bf16-truncating accumulation to size the swallowing error,
+                        // and next to the NPU's own denom read from the packed tail.
+                        {
+                            double l_exact = 0.0;
+                            float  l_trunc = 0.0f;
+                            int    swallowed = 0;
+                            for (int64_t p = 0; p < kvL_p; p++) {
+                                l_exact += (double)sc_on[p];
+                                const float before = l_trunc;
+                                l_trunc = bf16q_s(l_trunc + sc_on[p]);
+                                if (l_trunc == before && sc_on[p] != 0.0f) swallowed++;
+                            }
+                            const int64_t itc_d  = 128 * agp + 2 * agp;
+                            const int64_t dbase  = 128 * agp + agp; // denom_out[0]
+                            const float npu_den  = (dbase < itc_d) ? bf16f(s_blk[dbase]) : 0.0f;
+                            fprintf(stderr, "ggml-xdna: [f3best-denom] seq=%d n=%lld l_exact=%.5f l_bf16trunc=%.5f swallowed=%d/%lld npu_denom=%.5f | trunc/exact=%.4f npu/exact=%.4f\n",
+                                    _sc, (long long)kvL_p, l_exact, l_trunc, swallowed, (long long)kvL_p,
+                                    npu_den, (float)(l_trunc / l_exact),
+                                    (npu_den > 0.0f) ? (float)(npu_den / l_exact) : 0.0f);
+                        }
+                        // #267b PER-HEAD score coupling -- the last unmeasured joint.
+                        // #265 compared ONLY head 0 (s_blk[p*AG]); heads 1..AG-1 and
+                        // their pairing with correction_in[h]/denom_in[h] were never
+                        // measured. #267a (avgV with Q=0) exonerated the entire
+                        // post-score path, but with Q=0 every weight is exactly 1.0 and
+                        // IDENTICAL across heads, so a head-index defect is invisible
+                        // there. Here the replica is rebuilt for every q-head of group 0
+                        // (rope_node->data + h*nb[1], all against kv-head 0, matching
+                        // Q[0:AG*hd] = [q0|q1|q2] delivered to column 0) and compared
+                        // against s_blk[p*AG + h] plus the per-head denom tail.
+                        // rel_l2 ~0 for all h => coupling correct, defect is elsewhere;
+                        // head 0 clean while h>=1 dirty => score->value head indexing.
+                        for (int64_t hh = 0; hh < agp; hh++) {
+                            const float * qh_h = (const float *)((const char *)rope_node->data + hh * rope_node->nb[1]);
+                            std::vector<float> sc_h((size_t)kvL_p, 0.0f);
+                            const int64_t chunk_h = 128;
+                            const int64_t nchk_h  = (kvL_p + chunk_h - 1) / chunk_h;
+                            float m_old_h = -1e30f;
+                            for (int64_t ci = 0; ci < nchk_h; ci++) {
+                                const int64_t lo  = ci * chunk_h;
+                                const int64_t eff = std::min(chunk_h, kvL_p - lo);
+                                float m_chunk_h = -1e30f;
+                                for (int64_t j = 0; j < eff; j++) {
+                                    const int64_t pos = lo + j;
+                                    const int64_t src_pos = (nval2 > 256 && pos == 0) ? 0 : (nval2 - kvL_p + pos);
+                                    double dot = 0;
+                                    for (int64_t d = 0; d < hd_p; d++)
+                                        dot += (double)qh_h[d] * (double)rd_p((const char*)k_perm->data + src_pos*k_perm->nb[1] + 0*k_perm->nb[2] + d*k_perm->nb[0], kf2, kh2);
+                                    const float s = (float)dot * scale_p;
+                                    sc_h[pos] = s; if (s > m_chunk_h) m_chunk_h = s;
+                                }
+                                const float m_new_h = (m_chunk_h > m_old_h) ? m_chunk_h : m_old_h;
+                                for (int64_t j = 0; j < eff; j++) {
+                                    const int64_t pos = lo + j;
+                                    sc_h[pos] = bf16q_s(std::pow(2.0f, (sc_h[pos] - m_new_h) * 1.4426950408889634f));
+                                }
+                                m_old_h = m_new_h;
+                            }
+                            const int64_t ncmp_h = std::min<int64_t>(kvL_p, PT / (agp > 0 ? agp : 1));
+                            double l2d_h = 0, l2c_h = 0, rsum_h = 0; int rcnt_h = 0;
+                            for (int64_t p = 0; p < ncmp_h; p++) {
+                                const float cw = sc_h[p];
+                                const float nw = bf16f(s_blk[(size_t)(p * agp + hh)]);
+                                const double dd = (double)nw - (double)cw;
+                                l2d_h += dd*dd; l2c_h += (double)cw*(double)cw;
+                                if (std::fabs(cw) > 1e-8f && !std::isnan(nw) && !std::isinf(nw)) { rsum_h += std::fabs(nw/cw); rcnt_h++; }
+                            }
+                            double lex_h = 0.0; for (int64_t p = 0; p < kvL_p; p++) lex_h += (double)sc_h[p];
+                            const int64_t itc_h = 128 * agp + 2 * agp;
+                            const int64_t db_h  = 128 * agp + agp + hh;   // denom_out[hh]
+                            const int64_t cb_h  = 128 * agp + hh;         // correction_out[hh]
+                            fprintf(stderr, "ggml-xdna: [f3best-perhead] seq=%d h=%lld n=%lld rel_l2=%.5f ratio_mean=%.3f npu_denom=%.5f l_exact=%.5f npu/exact=%.4f npu_corr=%.4f\n",
+                                    _sc, (long long)hh, (long long)ncmp_h,
+                                    std::sqrt(l2d_h/(l2c_h+1e-12)), rcnt_h ? (float)(rsum_h/rcnt_h) : 0.0f,
+                                    (db_h < itc_h) ? bf16f(s_blk[db_h]) : 0.0f, lex_h,
+                                    (db_h < itc_h && lex_h > 0.0) ? (float)(bf16f(s_blk[db_h]) / lex_h) : 0.0f,
+                                    (cb_h < itc_h) ? bf16f(s_blk[cb_h]) : 0.0f);
+                            fprintf(stderr, "ggml-xdna: [f3best-perhead] seq=%d h=%lld NPU:", _sc, (long long)hh);
+                            for (int64_t e = 0; e < std::min<int64_t>(ncmp_h, 10); e++) fprintf(stderr, " %.4f", bf16f(s_blk[(size_t)(e*agp + hh)]));
+                            fprintf(stderr, "  | CPU:");
+                            for (int64_t e = 0; e < std::min<int64_t>(ncmp_h, 10); e++) fprintf(stderr, " %.4f", sc_h[e]);
+                            fprintf(stderr, "\n");
+                        }
+                        // #267c IDENTIFY which (q-head, kv-head) actually occupies each
+                        // slot h of the packed score row. #267b showed slot 0 matches
+                        // q-head 0 / kv-head 0 to 0.0004-0.014 while slots 1,2 are
+                        // garbage (rel_l2 0.24-2.2, ratio_mean up to 128) AND carry no
+                        // weight equal to 1.0 -- yet their denominators are sometimes
+                        // near-exact. That is the signature of a head-IDENTITY swap, not
+                        // of arithmetic. So instead of assuming slot h == q-head h, do a
+                        // brute-force search: build the online-bf16 replica for every
+                        // (qh < n_q_all, kvh < n_kv_all) pair and report the argmin.
+                        // If slot 1 resolves to q-head 8 (= 1*num_kv) the GQA mapping is
+                        // interleaved, not blocked; if it resolves to nothing, the score
+                        // row for h>=1 is genuinely corrupt.
+                        {
+                            const int64_t n_q_all  = rope_node->ne[1] > 0 ? rope_node->ne[1] : agp;
+                            const int64_t n_kv_all = k_perm->ne[2]   > 0 ? k_perm->ne[2]   : 1;
+                            const int64_t ncmp_i   = std::min<int64_t>(kvL_p, PT / (agp > 0 ? agp : 1));
+                            for (int64_t hh = 0; hh < agp; hh++) {
+                                double best = 1e300, second = 1e300, b_alpha = 0.0, b_rl = 0.0;
+                                int64_t bq = -1, bk = -1;
+                                for (int64_t qh = 0; qh < n_q_all; qh++) {
+                                    const float * qp = (const float *)((const char *)rope_node->data + qh * rope_node->nb[1]);
+                                    for (int64_t kvh = 0; kvh < n_kv_all; kvh++) {
+                                        std::vector<float> sc_i((size_t)kvL_p, 0.0f);
+                                        float m_i = -1e30f;
+                                        for (int64_t p = 0; p < kvL_p; p++) {
+                                            const int64_t src_pos = (nval2 > 256 && p == 0) ? 0 : (nval2 - kvL_p + p);
+                                            double dot = 0;
+                                            for (int64_t d = 0; d < hd_p; d++)
+                                                dot += (double)qp[d] * (double)rd_p((const char*)k_perm->data + src_pos*k_perm->nb[1] + kvh*k_perm->nb[2] + d*k_perm->nb[0], kf2, kh2);
+                                            const float s = (float)dot * scale_p;
+                                            sc_i[p] = s; if (s > m_i) m_i = s;
+                                        }
+                                        double l2d_i = 0, l2c_i = 0, dot_nc = 0, l2n_i = 0;
+                                        for (int64_t p = 0; p < ncmp_i; p++) {
+                                            const float cw = bf16q_s(std::pow(2.0f, (sc_i[p] - m_i) * 1.4426950408889634f));
+                                            const float nw = bf16f(s_blk[(size_t)(p * agp + hh)]);
+                                            const double dd = (double)nw - (double)cw;
+                                            l2d_i += dd*dd; l2c_i += (double)cw*(double)cw;
+                                            dot_nc += (double)nw * (double)cw; l2n_i += (double)nw*(double)nw;
+                                        }
+                                        // Scale-invariant residual: fit the single best
+                                        // scalar alpha (NPU ~ alpha*CPU) and report what
+                                        // is left. A tiny scaled residual with alpha != 1
+                                        // means the head identity is RIGHT and only the
+                                        // running-max normalization differs; a large one
+                                        // means the identity itself is wrong.
+                                        const double alpha = (l2c_i > 1e-30) ? (dot_nc / l2c_i) : 0.0;
+                                        const double res_sc = (l2n_i > 1e-30)
+                                            ? std::sqrt(std::max(0.0, l2n_i - alpha*dot_nc) / l2n_i) : 1.0;
+                                        const double rl = std::sqrt(l2d_i / (l2c_i + 1e-12));
+                                        if (res_sc < best) { second = best; best = res_sc; bq = qh; bk = kvh; b_alpha = alpha; b_rl = rl; }
+                                        else if (res_sc < second) { second = res_sc; }
+                                    }
+                                }
+                                fprintf(stderr, "ggml-xdna: [f3best-hid] seq=%d slot=%lld best=(q=%lld,kv=%lld) scaled_res=%.5f alpha=%.4f raw_rel_l2=%.5f second_best=%.5f  (assumed q=%lld,kv=0) n_q=%lld n_kv=%lld\n",
+                                        _sc, (long long)hh, (long long)bq, (long long)bk, best, b_alpha, b_rl, second,
+                                        (long long)hh, (long long)n_q_all, (long long)n_kv_all);
+                            }
+                        }
+                        // #267f LOG-LINEAR FIT -- the only normalization-robust test.
+                        // Every search above (hid / qoff / layout) is defeated by the
+                        // SPARSITY of the weight vector: after the online softmax one
+                        // position holds 1.0 and the rest are ~1e-3, so "mostly zeros with
+                        // a spike" fits almost any candidate and rel_l2 is dominated by
+                        // whether the two argmaxes coincide, not by whether Q.K agrees.
+                        // That also means the earlier per-head rel_l2 of 1.3-2.2 does NOT
+                        // prove wrong arithmetic: a different running max alone produces it.
+                        // Fix the comparison instead of the search. The kernel writes
+                        // w[p] = exp2((s[p]-m)*log2e), so log2(w[p]) = log2e*s[p] - log2e*m
+                        // is AFFINE in the CPU score s[p] with a KNOWN slope (1.442695) and
+                        // an unknown intercept that absorbs the max entirely. Fit slope and
+                        // intercept over the positions where the NPU weight is resolvable
+                        // in bf16 and report:
+                        //   slope ~ 1.4427, tiny residual => Q.K for this head is CORRECT
+                        //                                    and only m/normalization moved
+                        //   slope off / large residual    => the head's score vector itself
+                        //                                    is wrong (Q or K delivery)
+                        // argmax_npu vs argmax_cpu is printed alongside: equal argmax with a
+                        // good fit means the head is fine and the earlier rel_l2 was an
+                        // artifact; differing argmax with a good fit means the max search
+                        // (running max / m_exp) picked a different winner.
+                        {
+                            const int64_t ncmp_f = std::min<int64_t>(kvL_p, PT / (agp > 0 ? agp : 1));
+                            // #267j: CPU scores of the PREVIOUS q-head, kept alive across
+                            // the hh iterations so [f3best-stale0] can ask whether the one
+                            // corrupt entry of head h (always pos 0) carries head h-1's data.
+                            std::vector<float> s_prev;
+                            for (int64_t hh = 0; hh < agp; hh++) {
+                                const float * qh_f = (const float *)((const char *)rope_node->data + hh * rope_node->nb[1]);
+                                std::vector<float> s_cpu((size_t)kvL_p, 0.0f);
+                                float m_cpu = -1e30f; int64_t am_cpu = -1;
+                                for (int64_t p = 0; p < kvL_p; p++) {
+                                    const int64_t src_pos = (nval2 > 256 && p == 0) ? 0 : (nval2 - kvL_p + p);
+                                    double dot = 0;
+                                    for (int64_t d = 0; d < hd_p; d++)
+                                        dot += (double)qh_f[d] * (double)rd_p((const char*)k_perm->data + src_pos*k_perm->nb[1] + 0*k_perm->nb[2] + d*k_perm->nb[0], kf2, kh2);
+                                    const float s = (float)dot * scale_p;
+                                    s_cpu[p] = s;
+                                    if (s > m_cpu) { m_cpu = s; am_cpu = p; }
+                                }
+                                // NPU argmax and the log-linear fit over resolvable weights.
+                                double sx = 0, sy = 0, sxx = 0, sxy = 0; int nfit = 0;
+                                float w_mx = -1e30f; int64_t am_npu = -1;
+                                for (int64_t p = 0; p < ncmp_f; p++) {
+                                    const float nw = bf16f(s_blk[(size_t)(p * agp + hh)]);
+                                    if (nw > w_mx) { w_mx = nw; am_npu = p; }
+                                    if (nw > 1.0e-3f && nw <= 4.0f && !std::isnan(nw)) {
+                                        const double x = (double)s_cpu[p];
+                                        const double y = std::log2((double)nw);
+                                        sx += x; sy += y; sxx += x*x; sxy += x*y; nfit++;
+                                    }
+                                }
+                                double slope = 0, icpt = 0, res = -1.0;
+                                if (nfit >= 3) {
+                                    const double den = (double)nfit*sxx - sx*sx;
+                                    if (std::fabs(den) > 1e-12) {
+                                        slope = ((double)nfit*sxy - sx*sy) / den;
+                                        icpt  = (sy - slope*sx) / (double)nfit;
+                                        double ss = 0, sv = 0; const double ym = sy/(double)nfit;
+                                        for (int64_t p = 0; p < ncmp_f; p++) {
+                                            const float nw = bf16f(s_blk[(size_t)(p * agp + hh)]);
+                                            if (nw > 1.0e-3f && nw <= 4.0f && !std::isnan(nw)) {
+                                                const double y = std::log2((double)nw);
+                                                const double pr = slope*(double)s_cpu[p] + icpt;
+                                                ss += (y - pr)*(y - pr); sv += (y - ym)*(y - ym);
+                                            }
+                                        }
+                                        res = (sv > 1e-12) ? std::sqrt(ss / sv) : 0.0;
+                                    }
+                                }
+                                // Intercept implies the max the kernel actually used.
+                                const double m_impl = (std::fabs(slope) > 1e-9) ? (-icpt / slope) : 0.0;
+                                fprintf(stderr, "ggml-xdna: [f3best-logfit] seq=%d head=%lld nfit=%d slope=%.5f (exp 1.44270) norm_res=%.5f argmax_npu=%lld argmax_cpu=%lld m_implied=%.4f m_cpu=%.4f\n",
+                                        _sc, (long long)hh, nfit, slope, res,
+                                        (long long)am_npu, (long long)am_cpu, m_impl, m_cpu);
+                                // #267k RAW SCORE COMPARISON -- valid only when the kernel
+                                // was built with FLOWKV_NOEXP (F3BEST_RAWSCORE=1), where the
+                                // score tile writes scores_bf16[pos] into scores_out VERBATIM
+                                // instead of exp2((s-m)*log2e). That removes the softmax
+                                // entirely, so this is the first score measurement free of
+                                // BOTH the sparsity artifact and the running-max coupling:
+                                // s_npu[p] is directly comparable to s_cpu[p].
+                                // What it decides: [f3best-stale0] shows the pos-0 weight of
+                                // every head h >= 1 reads EXACTLY 0.0 while head 0 is clean,
+                                // which requires scores_bf16[0] to be hugely negative (~-1e30,
+                                // the m_chunk_bf16 sentinel) rather than merely wrong. If the
+                                // raw dump confirms s_npu[0] ~ -1e30 for h >= 1, the defect is
+                                // in the dot-product store at pos 0; if s_npu[0] is correct
+                                // here, the defect is in the max/exp2 stage instead.
+                                if (f3b_rawscore) {
+                                    double l2d_r = 0, l2c_r = 0;
+                                    for (int64_t p = 0; p < ncmp_f; p++) {
+                                        const double dn = (double)bf16f(s_blk[(size_t)(p * agp + hh)]);
+                                        const double dc = (double)s_cpu[p];
+                                        l2d_r += (dn - dc)*(dn - dc); l2c_r += dc*dc;
+                                    }
+                                    fprintf(stderr, "ggml-xdna: [f3best-rawscore] seq=%d head=%lld n=%lld rel_l2=%.5f s_npu0=%.6g s_cpu0=%.6g NPU:",
+                                            _sc, (long long)hh, (long long)ncmp_f,
+                                            std::sqrt(l2d_r/(l2c_r+1e-12)),
+                                            (double)bf16f(s_blk[(size_t)(0 * agp + hh)]),
+                                            (double)s_cpu[0]);
+                                    for (int64_t e = 0; e < std::min<int64_t>(ncmp_f, 8); e++)
+                                        fprintf(stderr, " %.4g", (double)bf16f(s_blk[(size_t)(e*agp + hh)]));
+                                    fprintf(stderr, "  | CPU:");
+                                    for (int64_t e = 0; e < std::min<int64_t>(ncmp_f, 8); e++)
+                                        fprintf(stderr, " %.4g", (double)s_cpu[e]);
+                                    fprintf(stderr, "\n");
+                                }
+                                // #267g MAX-DROP TEST. The logfit above established that the
+                                // SLOPE is 1.4427 for EVERY head (res <= 0.022), i.e. the kernel's
+                                // Q.K scores are CORRECT for heads 1 and 2 as well -- only the
+                                // intercept (= the running max m) moved. So the defect is not
+                                // arithmetic and not delivery: the max search itself lost one
+                                // entry. This block tests the exact form of that loss: recompute
+                                // the CPU max EXCLUDING the winning position and ask whether the
+                                // kernel's implied max equals it. If m_implied ~ second_max and
+                                // argmax_npu == the second-max position, the kernel dropped
+                                // scores_bf16[am_cpu] from BOTH the max reduction and the exp2
+                                // write-back (w_npu at am_cpu reads ~0 while w_pred is huge) ->
+                                // a codegen defect on the per-head score scratch, exactly the
+                                // sensitivity flagged in flowkv.cc:331-333.
+                                {
+                                    float m2 = -1e30f; int64_t am2 = -1;
+                                    for (int64_t p = 0; p < ncmp_f; p++) {
+                                        if (p == am_cpu) continue;
+                                        if (s_cpu[p] > m2) { m2 = s_cpu[p]; am2 = p; }
+                                    }
+                                    const float w_at_amcpu = (am_cpu >= 0 && am_cpu < ncmp_f)
+                                        ? bf16f(s_blk[(size_t)(am_cpu * agp + hh)]) : 0.0f;
+                                    const double w_pred_amcpu = (am_cpu >= 0)
+                                        ? std::pow(2.0, ((double)s_cpu[am_cpu] - m_impl) * 1.4426950408889634) : 0.0;
+                                    fprintf(stderr, "ggml-xdna: [f3best-maxdrop] seq=%d head=%lld am_cpu=%lld m_cpu=%.4f second=(p=%lld,%.4f) m_implied=%.4f d(m_impl-second)=%.4f w_npu@am_cpu=%.6f w_pred@am_cpu=%.3f am_npu=%lld am_second_match=%d\n",
+                                            _sc, (long long)hh, (long long)am_cpu, m_cpu,
+                                            (long long)am2, m2, m_impl, m_impl - (double)m2,
+                                            w_at_amcpu, w_pred_amcpu, (long long)am_npu,
+                                            (am_npu == am2) ? 1 : 0);
+                                    // #267h DROP-ONE RECONSTRUCTION. If the kernel simply lost
+                                    // ONE score entry, then rebuilding the CPU weight vector with
+                                    // that entry EXCLUDED -- max taken over the survivors, the
+                                    // dropped slot forced to 0 -- must reproduce the NPU vector to
+                                    // bf16 accuracy. Sweep the dropped index over every position
+                                    // and take the argmin: `drop=p*` with a tiny residual names the
+                                    // lost entry outright, and `drop=-1` (no-drop baseline) winning
+                                    // means nothing was dropped. Unlike every earlier argmin search
+                                    // this one is NOT defeated by sparsity: each candidate changes
+                                    // the max, hence rescales ALL 29 weights, so a wrong candidate
+                                    // misses on the whole vector rather than on one spike.
+                                    double best_r = 1e30; int64_t best_drop = -2;
+                                    double base_r = 1e30;
+                                    for (int64_t dr = -1; dr < ncmp_f; dr++) {
+                                        float md = -1e30f;
+                                        for (int64_t p = 0; p < ncmp_f; p++) {
+                                            if (p == dr) continue;
+                                            if (s_cpu[p] > md) md = s_cpu[p];
+                                        }
+                                        double l2d = 0, l2n = 0;
+                                        for (int64_t p = 0; p < ncmp_f; p++) {
+                                            const double wc = (p == dr) ? 0.0
+                                                : std::pow(2.0, ((double)s_cpu[p] - (double)md) * 1.4426950408889634);
+                                            const double wn = (double)bf16f(s_blk[(size_t)(p * agp + hh)]);
+                                            l2d += (wn - wc)*(wn - wc); l2n += wn*wn;
+                                        }
+                                        const double r = (l2n > 1e-30) ? std::sqrt(l2d / l2n) : 1.0;
+                                        if (dr == -1) base_r = r;
+                                        if (r < best_r) { best_r = r; best_drop = dr; }
+                                    }
+                                    fprintf(stderr, "ggml-xdna: [f3best-dropone] seq=%d head=%lld best_drop=%lld res=%.5f nodrop_res=%.5f gain=%.2fx am_cpu=%lld\n",
+                                            _sc, (long long)hh, (long long)best_drop, best_r, base_r,
+                                            (best_r > 1e-12) ? (base_r / best_r) : 0.0, (long long)am_cpu);
+                                }
+                                // #267j STALE-ACCUMULATOR TEST -- decides the CAUSE of the
+                                // pos-0 corruption that [f3best-dropone] localized, without
+                                // a rebuild. If pos 0 of head h reuses head h-1's live
+                                // accumulator (the hoisted-zeros() candidate), then the
+                                // kernel's score at pos 0 is a SUM of two dot products:
+                                //   s_npu[0] = s_cpu[h][0] + s_cpu[h-1][p*]
+                                // for some p* -- p* = eff_chunk-1 if the carry comes from the
+                                // previous head's LAST position. The log-linear fit already
+                                // gives the kernel's own scale and offset, so the NPU weight
+                                // can be inverted back into a score:
+                                //   s_npu[p] = log2(w[p])/slope - icpt/slope = log2(w[p])/slope + m_impl
+                                // Report the residue at pos 0 and the best-matching entry of
+                                // the previous head's score vector. A residue that lands on
+                                // s_prev[eff_chunk-1] to within bf16 noise CONFIRMS the carry;
+                                // a residue matching nothing refutes it and points at the
+                                // scratch buffer (scores_bf16 / tmp_in) instead.
+                                if (nfit >= 3 && std::fabs(slope) > 1e-9) {
+                                    const float w0 = bf16f(s_blk[(size_t)(0 * agp + hh)]);
+                                    const bool inv_ok = (w0 > 1.0e-6f) && !std::isnan(w0) && !std::isinf(w0);
+                                    const double s_npu0 = inv_ok
+                                        ? (std::log2((double)w0) / slope + m_impl) : 0.0;
+                                    const double resid0 = inv_ok ? (s_npu0 - (double)s_cpu[0]) : 0.0;
+                                    double bm = 1e30; int64_t bp = -1;
+                                    const int64_t np = (int64_t)s_prev.size();
+                                    for (int64_t p = 0; p < np; p++) {
+                                        const double d = std::fabs(resid0 - (double)s_prev[p]);
+                                        if (d < bm) { bm = d; bp = p; }
+                                    }
+                                    const double s_prev_last = (np > 0)
+                                        ? (double)s_prev[std::min<int64_t>(np, ncmp_f) - 1] : 0.0;
+                                    const double s_self_last = (double)s_cpu[std::min<int64_t>((int64_t)s_cpu.size(), ncmp_f) - 1];
+                                    fprintf(stderr, "ggml-xdna: [f3best-stale0] seq=%d head=%lld inv=%d w0=%.6f s_npu0=%.4f s_cpu0=%.4f resid0=%.4f prev_best=(p=%lld,%.4f,|d|=%.4f) prev_last=%.4f self_last=%.4f nprev=%lld\n",
+                                            _sc, (long long)hh, inv_ok ? 1 : 0, w0, s_npu0,
+                                            (double)s_cpu[0], resid0, (long long)bp,
+                                            (bp >= 0) ? (double)s_prev[bp] : 0.0, bm,
+                                            s_prev_last, s_self_last, (long long)np);
+                                }
+                                s_prev = s_cpu;
+                            }
+                        }
+                    }
+                }
                 fflush(stderr);
             }
         }

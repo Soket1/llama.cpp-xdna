@@ -250,7 +250,7 @@ def test_f3best_passes_tuned_flowkv_identity_through_mlir_emitter():
     assert "rope_obj = KernelObjectArtifact.new(\n            rope_obj_name," in op_source
     assert "relay_obj = KernelObjectArtifact.new(\n            relay_obj_name," in op_source
     assert "rope_obj_name, relay_obj_name," in op_source
-    assert "_objid2_abi2" in op_source
+    assert "_objid2_abi3_al64" in op_source
 
     native_source = (_REPO_ROOT / "ggml/src/ggml-xdna/ggml-xdna.cpp").read_text(
         encoding="utf-8"
@@ -258,9 +258,33 @@ def test_f3best_passes_tuned_flowkv_identity_through_mlir_emitter():
     f3best_start = native_source.index("} else if (op_kind == XDNA_OP_DECODE_LAYER_F3BEST) {")
     f3best_end = native_source.index("    } else {", f3best_start)
     f3best_source = native_source[f3best_start:f3best_end]
-    assert 'flowkv_obj_fingerprint = "fe2d60c9196a71df"' in f3best_source
+    # #267i: the native mirror now COMPUTES the fingerprint with the same
+    # canonical form and FNV-1a constants as flowkv_tuning_fingerprint instead of
+    # hardcoding hex strings, so adding a tuning macro can no longer desynchronize
+    # the two cache keys (which is how #266's first A/B came back bit-identical).
+    assert '"flowkv-cflags-v1;"' in f3best_source
+    assert "0xCBF29CE484222325ull" in f3best_source
+    assert "0x100000001B3ull" in f3best_source
+    assert "std::sort(fk_tokens.begin(), fk_tokens.end())" in f3best_source
+    for token in (
+        "-DFLOWKV_PRESCALE_Q=1",
+        "-DFLOWKV_VEC_EXP=1",
+        "-DFLOWKV_VALUE_AMAC=1",
+        "-DFLOWKV_VALUE_LEGACY=1",
+        "-DFLOWKV_DOT_MULINIT=1",
+    ):
+        assert f'"{token}"' in f3best_source
+        assert f'"{token}"' in op_source or token in op_source
     assert '"_fkobj_flowkv_%lldd_h%lld_c256_t%s"' in f3best_source
-    assert "%s_fkfix2_silu2_mxpp_objid2_abi3" in f3best_source
+    assert "%s_fkfix2_silu2_mxpp_objid2_abi3_al64" in f3best_source
+    # #267l/n: the 16-wide block exp2 loop is the root of #187 and is correct
+    # only at head_dim 64, so the production arm is selected BY GEOMETRY in both
+    # op.py and the native cache key. If the two selections drift apart the
+    # probe silently links a different FlowKV object than the xclbin name claims.
+    assert "elif self.head_dim == 64:" in op_source
+    assert "else if (head_dim == 64)" in f3best_source
+    assert "FLOWKV_VEC_EXP_DIRECT" not in op_source
+    assert "FLOWKV_VEC_EXP_DIRECT" not in f3best_source
 
     assert "with_npu_kv=False, flowkv_obj_name=None, rope_obj_name=None," in design_source
     assert "relay_obj_name=None):" in design_source
