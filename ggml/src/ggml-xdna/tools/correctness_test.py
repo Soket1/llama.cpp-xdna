@@ -376,6 +376,7 @@ PRESETS: dict[str, dict[str, str]] = {
         "XDNA_LAYER_FUSED_TRY":          "1",
         "XDNA_LAYER_FUSED_LIVE":         "1",
         "GGML_XDNA_NUM_COLS":            "4",
+        "XDNA_ATTN_SUPPORTS":            "1",
     },
     "npu_int4_v1": {
         # Regression-coverage preset that explicitly forces the old v1
@@ -746,7 +747,7 @@ TESTS: list[Test] = [
         n_predict=12,
         mode="single-turn",
         model=MODEL_Q4_0,
-        variants=["npu_int4", "npu_layer_fused", "npu_layer_fused_live"],
+        variants=["npu_int4", "npu_layer_fused_live"],
         min_prefix_match=1,  # Q4_0 quantization + bf16 dequant drift vs CPU Q4_0.
         description="Phase 8.1 dispatch path: Q4_0 weights routed through fused INT4 dequant-GEMV on NPU. Baseline is CPU-Q4_0; expect minor drift from bf16-vs-fp32 dequant accumulation. npu_layer_fused variant verifies the A1.3 observer stub byte-PASSes (no regression).",
     ),

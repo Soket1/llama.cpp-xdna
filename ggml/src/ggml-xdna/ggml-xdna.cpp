@@ -6580,7 +6580,12 @@ static bool ggml_backend_xdna_decode_layer_f3best(
                                             return (e && *e) ? atoi(e) : 6; }();
             static std::atomic<int> _sdb{_sdb_n};
             static std::atomic<int> _sseq{0};
-            if (_sdb.fetch_sub(1) > 0) {
+            // #268-2chunk: single-chunk captures (kv_len<=128) never exercise the
+            // inter-chunk correction, so burn no budget on them — the budget is
+            // per-invocation and 28 layers/token would exhaust it in the 1-chunk
+            // region. Gate on kv_len>128 so every capture lands in the 2-chunk path.
+            if (kv_len <= 128) { /* skip single-chunk capture */ }
+            else if (_sdb.fetch_sub(1) > 0) {
                 const int _sc = _sseq.fetch_add(1);
                 const int64_t PT = E / NH;
                 // It layout (flowkv.cc:327): scores_out[pos * num_q_heads + h] for
@@ -6686,7 +6691,23 @@ static bool ggml_backend_xdna_decode_layer_f3best(
                                 float diff = (sc_on[pos] - m_new) * 1.4426950408889634f;
                                 sc_on[pos] = bf16q_s(std::pow(2.0f, diff));
                             }
-                            (void)corr_c;
+                            // #268-2chunk: print the inter-chunk correction factor so
+                            // the NPU tail corr (s_blk[cbase]) can be compared against
+                            // BOTH log2e constants — the kernel uses 1.4453125f
+                            // (aie2p/flowkv.cc:314), the CPU replica 1.4426950408889634f.
+                            // Single-chunk runs never apply corr (chunk-0 sentinel = 0),
+                            // so this is only meaningful at kv_len>128.
+                            if (ci == 1) {
+                                const float corr_kern = std::pow(2.0f, (float)bf16q_s((m_old - m_new) * 1.4453125f));
+                                fprintf(stderr,
+                                        "ggml-xdna: [f3best-corr] chunk=%lld m_old=%.4f m_new=%.4f dm=%.4f "
+                                        "corr_cpu(true-log2e)=%.6f corr_kern(1.4453125)=%.6f corr_npu_tail=%.6f denom_npu_tail=%.6f\n",
+                                        (long long)ci, m_old, m_new, m_old - m_new,
+                                        corr_c, corr_kern,
+                                        (cbase < itc) ? (double)bf16f(s_blk[cbase]) : -1.0,
+                                        (cbase + attn_group < itc) ? (double)bf16f(s_blk[cbase + attn_group]) : -1.0);
+                            }
+                            m_old = m_new;
                             m_old = m_new;
                         }
                         // #265: s_blk carries the score tile's exp-WEIGHTS for head0,
