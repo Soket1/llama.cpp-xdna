@@ -21248,9 +21248,11 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                         if (nq_f > 32 || E_probe != 2048) Pptr = &P_local;
                                         auto &P = *Pptr;
                                         const int64_t bpr2 = bpr_f; // Q4_0 blocks per row = E/32
+                                        // #268: blocks per head = (E/nq)/32, not the 1B-only constant 2.
+                                        const int64_t bph_f = nq_f ? (E_probe / nq_f) / 32 : 2;
                                         for (int h=0; h<nq_f; h++) {
                                             for (int64_t n=0;n<E_probe;n++){ const uint8_t* row=wob+(size_t)n*(size_t)bpr2*18; double acc=0;
-                                                for(int b2=h*2;b2<h*2+2;b2++){const uint8_t* blk=row+(size_t)b2*18;ggml_fp16_t sh2;memcpy(&sh2,blk,2);float sc=ggml_fp16_to_fp32(sh2);const uint8_t* qs=blk+2;
+                                                for(int64_t b2=h*bph_f;b2<(h+1)*bph_f;b2++){const uint8_t* blk=row+(size_t)b2*18;ggml_fp16_t sh2;memcpy(&sh2,blk,2);float sc=ggml_fp16_to_fp32(sh2);const uint8_t* qs=blk+2;
                                                     for(int j=0;j<32;j++){int nib=(j<16)?(qs[j]&0xF):(qs[j-16]>>4);acc+=(double)((nib-8)*sc)*(double)cpu_attn_out[b2*32+j];}}
                                                 P[h][n]=acc; }
                                         }
@@ -21488,10 +21490,16 @@ static enum ggml_status ggml_backend_xdna_graph_compute(ggml_backend_t backend, 
                                                 {
                                                     const int64_t bpr2 = E_probe/32;
                                                     const uint8_t * wob = (const uint8_t *)lf_m.w_o->data;
+                                                    // #268: blocks per head is head_dim/32, NOT the 1B-only constant 2.
+                                                    // With the old hardcode the 3B basis (hd=128 => 4 blocks) covered only
+                                                    // the first half of every head and only elements 0..1535 of E=3072,
+                                                    // so residual_rel was structurally large and said nothing about
+                                                    // linearity. Same class of bug as the flowkv_cpu_reference float[64].
+                                                    const int64_t bph_p = hd_p / 32;
                                                     std::vector<std::vector<double>> Pp((size_t)nq_p, std::vector<double>((size_t)E_probe,0.0));
                                                     for (int h=0; h<nq_p; h++) {
                                                         for (int64_t n=0;n<E_probe;n++){ const uint8_t* row=wob+(size_t)n*(size_t)bpr2*18; double acc=0;
-                                                            for(int64_t b2=h*2;b2<h*2+2;b2++){const uint8_t* blk=row+(size_t)b2*18;ggml_fp16_t sh2;memcpy(&sh2,blk,2);float sc=ggml_fp16_to_fp32(sh2);const uint8_t* qs=blk+2;
+                                                            for(int64_t b2=h*bph_p;b2<(h+1)*bph_p;b2++){const uint8_t* blk=row+(size_t)b2*18;ggml_fp16_t sh2;memcpy(&sh2,blk,2);float sc=ggml_fp16_to_fp32(sh2);const uint8_t* qs=blk+2;
                                                                 for(int j=0;j<32;j++){int nib=(j<16)?(qs[j]&0xF):(qs[j-16]>>4);acc+=(double)((nib-8)*sc)*(double)refO_p[b2*32+j];}}
                                                             Pp[h][n]=acc; }
                                                     }
