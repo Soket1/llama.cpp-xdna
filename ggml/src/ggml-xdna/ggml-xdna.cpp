@@ -1640,7 +1640,6 @@ static std::string make_cache_key(xdna_op_kind op_kind,
         std::vector<std::string> fk_tokens;
         if (dot_mulinit_env && dot_mulinit_env[0] != '\0')
             fk_tokens.emplace_back("-DFLOWKV_DOT_MULINIT=1");
-        fk_tokens.emplace_back("-DFLOWKV_PRESCALE_Q=1");
         fk_tokens.emplace_back("-DFLOWKV_Q_IN_DIRECT=1");  // #268: read Q directly from q_in
         fk_tokens.emplace_back((value_legacy_env && value_legacy_env[0] != '\0')
                                ? "-DFLOWKV_VALUE_LEGACY=1" : "-DFLOWKV_VALUE_AMAC=1");
