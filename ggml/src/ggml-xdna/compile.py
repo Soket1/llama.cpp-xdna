@@ -309,7 +309,8 @@ def rms_norm_cache_key(size: int, dtype: str, num_aie_columns: int,
 def flowkv_decode_cache_key(num_heads: int, num_kv_heads: int, head_dim: int,
                             seq_len: int, chunk_size: int,
                             num_cols: int,
-                            tuning_fingerprint: str = "63624e81faf2e175") -> str:
+                            tuning_fingerprint: str = "63624e81faf2e175",
+                            source_hash: str | None = None) -> str:
     """Return the shared native/Python FlowKV bundle-directory key."""
     from iron.operators.flowkv_decode.contract import flowkv_bundle_cache_key
 
@@ -321,6 +322,7 @@ def flowkv_decode_cache_key(num_heads: int, num_kv_heads: int, head_dim: int,
         chunk_size,
         num_cols,
         tuning_fingerprint,
+        source_hash,
     )
 
 
@@ -2002,11 +2004,13 @@ def compile_flowkv_decode_cached(num_heads: int, num_kv_heads: int,
     flowkv_decode_main.insts.
     """
     from iron.operators.flowkv_decode.contract import (
+        _flowkv_source_hash,
         flowkv_tuning_fingerprint,
         normalize_flowkv_tuning_tokens,
     )
 
     tuning_tokens = normalize_flowkv_tuning_tokens(tuning_tokens)
+    source_hash = _flowkv_source_hash()
     key = flowkv_decode_cache_key(
         num_heads,
         num_kv_heads,
@@ -2015,6 +2019,7 @@ def compile_flowkv_decode_cached(num_heads: int, num_kv_heads: int,
         chunk_size,
         num_cols,
         flowkv_tuning_fingerprint(tuning_tokens),
+        source_hash,
     )
 
     cached = get_cached_chained_dir(

@@ -1641,6 +1641,7 @@ static std::string make_cache_key(xdna_op_kind op_kind,
         if (dot_mulinit_env && dot_mulinit_env[0] != '\0')
             fk_tokens.emplace_back("-DFLOWKV_DOT_MULINIT=1");
         fk_tokens.emplace_back("-DFLOWKV_Q_IN_DIRECT=1");  // #268: read Q directly from q_in
+        fk_tokens.emplace_back("-DFLOWKV_Q_SYNC_V2=1");    // #271: Q sync protocol v2 (separate Qc2m/Qc2s locks)
         fk_tokens.emplace_back((value_legacy_env && value_legacy_env[0] != '\0')
                                ? "-DFLOWKV_VALUE_LEGACY=1" : "-DFLOWKV_VALUE_AMAC=1");
         // #267k: F3BEST_RAWSCORE builds the score tile with FLOWKV_NOEXP so the
@@ -11109,7 +11110,7 @@ static bool flowkv_protected_geometry_macro(std::string_view name) {
 }
 
 static bool flowkv_allowed_tuning_macro(std::string_view name) {
-    static constexpr std::array<std::string_view, 10> allowed_macros = {
+    static constexpr std::array<std::string_view, 11> allowed_macros = {
         "FLOWKV_PRESCALE_Q",
         "FLOWKV_Q_IN_DIRECT",      // #268: read Q directly from q_in in chunk fn
         "FLOWKV_SCORE_STUB",
@@ -11120,6 +11121,7 @@ static bool flowkv_allowed_tuning_macro(std::string_view name) {
         "FLOWKV_VALUE_LEGACY",
         "FLOWKV_NOVALUE",
         "FLOWKV_VALUE_AMAC",
+        "FLOWKV_Q_SYNC_V2",        // #271: Q sync protocol v2 (separate Qc2m/Qc2s locks)
     };
     return std::find(allowed_macros.begin(), allowed_macros.end(), name) != allowed_macros.end();
 }
@@ -11230,15 +11232,75 @@ static bool flowkv_tuning_from_environment(xdna_flowkv_tuning * tuning) {
     return true;
 }
 
+static std::string flowkv_source_hash() {
+    // Compute hash of flowkv.cc to invalidate cache on source changes
+    // Path relative to repo root: ggml/src/ggml-xdna/../IRON-windows/aie_kernels/aie2p/flowkv.cc
+    // The compile.py runs from repo root, so we find the IRON-windows path
+    static std::string cached_hash;
+    static bool computed = false;
+    if (computed) return cached_hash;
+    computed = true;
+
+    // Try to locate flowkv.cc from the current working directory
+    std::filesystem::path cwd = std::filesystem::current_path();
+    std::vector<std::filesystem::path> candidates = {
+        cwd / "IRON-windows" / "aie_kernels" / "aie2p" / "flowkv.cc",
+        cwd.parent_path() / "IRON-windows" / "aie_kernels" / "aie2p" / "flowkv.cc",
+        cwd / ".." / "IRON-windows" / "aie_kernels" / "aie2p" / "flowkv.cc",
+        std::filesystem::path("C:/llama.cpp-xdna/IRON-windows/aie_kernels/aie2p/flowkv.cc"),
+    };
+
+    for (const auto & p : candidates) {
+        if (std::filesystem::exists(p)) {
+            std::ifstream f(p, std::ios::binary);
+            if (f) {
+                // Simple hash: file size + first 4KB + last 4KB
+                f.seekg(0, std::ios::end);
+                size_t sz = f.tellg();
+                f.seekg(0, std::ios::beg);
+                std::vector<char> buf(std::min<size_t>(sz, 8192));
+                f.read(buf.data(), buf.size());
+                if (sz > 4096) {
+                    f.seekg(-4096, std::ios::end);
+                    f.read(buf.data() + 4096, 4096);
+                }
+                // Simple FNV-1a hash
+                uint64_t h = 0xCBF29CE484222325ull;
+                for (char c : buf) {
+                    h ^= static_cast<uint8_t>(c);
+                    h *= 0x100000001B3ull;
+                }
+                h ^= sz;
+                h *= 0x100000001B3ull;
+                char buf2[33];
+                snprintf(buf2, sizeof(buf2), "%016llx", (unsigned long long)h);
+                cached_hash = buf2;
+                return cached_hash;
+            }
+        }
+    }
+    // Fallback: no source found, return empty (will use default behavior)
+    return "";
+}
+
 static std::string make_flowkv_cache_key(int64_t num_heads, int64_t num_kv_heads,
                                          int64_t head_dim, int64_t seq_len,
                                          int64_t chunk_size, int num_cols,
                                          const char * tuning_fingerprint = FLOWKV_DEFAULT_TUNING_FINGERPRINT) {
+    std::string source_hash = flowkv_source_hash();
     char buf[256];
-    snprintf(buf, sizeof(buf), "flowkv_H%lld_KV%lld_d%lld_S%lld_C%lld_%dcol_t%s",
-             (long long)num_heads, (long long)num_kv_heads,
-             (long long)head_dim, (long long)seq_len,
-             (long long)chunk_size, num_cols, tuning_fingerprint);
+    if (!source_hash.empty()) {
+        snprintf(buf, sizeof(buf), "flowkv_H%lld_KV%lld_d%lld_S%lld_C%lld_%dcol_t%s_s%s",
+                 (long long)num_heads, (long long)num_kv_heads,
+                 (long long)head_dim, (long long)seq_len,
+                 (long long)chunk_size, num_cols, tuning_fingerprint,
+                 source_hash.c_str());
+    } else {
+        snprintf(buf, sizeof(buf), "flowkv_H%lld_KV%lld_d%lld_S%lld_C%lld_%dcol_t%s",
+                 (long long)num_heads, (long long)num_kv_heads,
+                 (long long)head_dim, (long long)seq_len,
+                 (long long)chunk_size, num_cols, tuning_fingerprint);
+    }
     return std::string(buf);
 }
 
