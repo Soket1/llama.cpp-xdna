@@ -1641,6 +1641,7 @@ static std::string make_cache_key(xdna_op_kind op_kind,
         if (dot_mulinit_env && dot_mulinit_env[0] != '\0')
             fk_tokens.emplace_back("-DFLOWKV_DOT_MULINIT=1");
         fk_tokens.emplace_back("-DFLOWKV_PRESCALE_Q=1");
+        fk_tokens.emplace_back("-DFLOWKV_Q_IN_DIRECT=1");  // #268: read Q directly from q_in
         fk_tokens.emplace_back((value_legacy_env && value_legacy_env[0] != '\0')
                                ? "-DFLOWKV_VALUE_LEGACY=1" : "-DFLOWKV_VALUE_AMAC=1");
         // #267k: F3BEST_RAWSCORE builds the score tile with FLOWKV_NOEXP so the
@@ -11109,8 +11110,9 @@ static bool flowkv_protected_geometry_macro(std::string_view name) {
 }
 
 static bool flowkv_allowed_tuning_macro(std::string_view name) {
-    static constexpr std::array<std::string_view, 9> allowed_macros = {
+    static constexpr std::array<std::string_view, 10> allowed_macros = {
         "FLOWKV_PRESCALE_Q",
+        "FLOWKV_Q_IN_DIRECT",      // #268: read Q directly from q_in in chunk fn
         "FLOWKV_SCORE_STUB",
         "FLOWKV_SCORE_NOREDUCE",
         "FLOWKV_VEC_EXP",
